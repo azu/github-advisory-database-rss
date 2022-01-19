@@ -1,12 +1,6 @@
 # github-advisory-database-rss
 
-GitHub Advisory Database RSS Feeds.
-
-## Install
-
-Install with [npm](https://www.npmjs.com/):
-
-    npm install github-advisory-database-rss
+RSS Feeds for GitHub Advisory Database.
 
 ## Usage
 
