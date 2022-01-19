@@ -15,10 +15,7 @@ const createBody = (descriptionMarkdown: string, references: SecurityAdvisoryRef
         ? "\n" +
           references
               .map((ref) => {
-                  if (ref.url) {
-                      return `- <${ref.url}>`;
-                  }
-                  return `- ${ref}`;
+                  return `- <${ref.url}>`;
               })
               .join("\n")
         : "";
