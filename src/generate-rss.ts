@@ -12,7 +12,7 @@ import dayjs from "dayjs";
 const createBody = (descriptionMarkdown: string, references: SecurityAdvisoryReference[]) => {
     const md = createMarkdown();
     const referencesMD = references.length
-        ? "\n" +
+        ? "\n### References\n\n" +
           references
               .map((ref) => {
                   return `- <${ref.url}>`;
