@@ -189,8 +189,7 @@ if (require.main === module) {
             return `<li><code>${ecosystem.ecosystem}</code>: <a href="${ecosystem.link}">${ecosystem.link}</a></li>`;
         }).join("\n");
         const index = {
-            html: `
-            <!DOCTYPE html>
+            html: `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
