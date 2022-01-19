@@ -197,7 +197,7 @@ if (require.main === module) {
     <meta name="description" content="RSS Feeds for GitHub Advisory Database" />
 </head>
 <body>
-<p>These RSS Feeds are <a href="https://github.com/advisories">GitHub Advisory Database</a>>. Your RSS reader need to support JSON RSS.</p>
+<p>These RSS Feeds are <a href="https://github.com/advisories">GitHub Advisory Database</a>. Your RSS reader need to support JSON RSS.</p>
 <p><a href="./index.opml">OPML Feeds(All ecosystems)</a></p>
 <ul>
 ${links}
