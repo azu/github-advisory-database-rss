@@ -87,9 +87,8 @@ export const search = ({
             }
         }
     ).then((res) => {
-        const edges = res.securityVulnerabilities.edges ?? [];
-        return edges?.map((edge) => {
-            const node = edge?.node;
+        const nodes = res.securityVulnerabilities.nodes ?? [];
+        return nodes?.map((node) => {
             if (!node) {
                 throw new Error("Non node");
             }
