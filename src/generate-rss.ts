@@ -175,13 +175,21 @@ if (require.main === module) {
             if (!items) {
                 throw new Error("Can not found:" + ecosystem);
             }
-            const rss = generateRSS(items, {
+            const jsonRSS = generateRSS(items, {
                 ...options,
                 description: `${rssFeed.title} on GitHub`,
                 updated: new Date()
             });
-            const filename = path.basename(rssFeed.link);
-            await fs.writeFile(path.join(distDir, filename), rss, "utf-8");
+            const atomRSS = generateRSS(items, {
+                ...options,
+                link: rssFeed.link.replace(/\.json$/, ".rss"),
+                description: `${rssFeed.title} on GitHub`,
+                updated: new Date()
+            });
+
+            const filename = path.basename(rssFeed.link, ".json");
+            await fs.writeFile(path.join(distDir, filename + ".json"), jsonRSS, "utf-8");
+            await fs.writeFile(path.join(distDir, filename + ".rss"), atomRSS, "utf-8");
         }
         const opml = convertJsonToOPML(RSS_FEEDS);
         await fs.writeFile(path.join(distDir, "index.opml"), opml, "utf-8");
