@@ -10,6 +10,11 @@ Install with [npm](https://www.npmjs.com/):
 
 ## Usage
 
+1. Visit <https://azu.github.io/github-advisory-database-rss/>
+2. Subscribe RSS Feeds
+
+:memo: Currently it only support [JSON Feed](https://www.jsonfeed.org/).
+
 ## Add "ECOSYSTEM"
 
 1. Edit [RSS_FEEDS.ts](./src/RSS_FEEDS.ts)
