@@ -194,7 +194,9 @@ if (require.main === module) {
         const opml = convertJsonToOPML(RSS_FEEDS);
         await fs.writeFile(path.join(distDir, "index.opml"), opml, "utf-8");
         const links = RSS_FEEDS.map((ecosystem) => {
-            return `<li><code>${ecosystem.ecosystem}</code>: <a href="${ecosystem.link}">${ecosystem.link}</a></li>`;
+            return `<li><code>${ecosystem.ecosystem}</code>: <a href="${ecosystem.link}">${
+                ecosystem.link
+            }</a> (<a href="${ecosystem.link.replace(/\.json$/, ".rss")}">atom</a>)</li>`;
         }).join("\n");
         const index = {
             html: `<!DOCTYPE html>
@@ -206,7 +208,7 @@ if (require.main === module) {
 </head>
 <body>
 <a href="https://github.com/azu/github-advisory-database-rss"><img style="position: absolute; top: 0; right: 0; border: 0;" src="https://s3.amazonaws.com/github/ribbons/forkme_right_darkblue_121621.png" alt="Fork me on GitHub"></a>
-<p>These RSS Feeds is a collection of <a href="https://github.com/advisories">GitHub Advisory Database</a>. Your RSS reader need to support JSON RSS.</p>
+<p>These RSS Feeds is a collection of <a href="https://github.com/advisories">GitHub Advisory Database</a>.</p>
 <p><a href="./index.opml">OPML Feeds(All ecosystems)</a></p>
 <ul>
 ${links}
