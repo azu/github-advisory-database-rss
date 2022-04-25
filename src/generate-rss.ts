@@ -166,30 +166,35 @@ if (require.main === module) {
             recursive: true
         });
         for (const rssFeed of RSS_FEEDS) {
-            const { ecosystem, ...options } = rssFeed;
-            const items = await search({
-                ecosystem,
-                GITHUB_TOKEN: GITHUB_TOKEN,
-                SIZE: 20
-            });
-            if (!items) {
-                throw new Error("Can not found:" + ecosystem);
-            }
-            const jsonRSS = generateRSS(items, {
-                ...options,
-                description: `${rssFeed.title} on GitHub`,
-                updated: new Date()
-            });
-            const atomRSS = generateRSS(items, {
-                ...options,
-                link: rssFeed.link.replace(/\.json$/, ".rss"),
-                description: `${rssFeed.title} on GitHub`,
-                updated: new Date()
-            });
+            try {
+                const { ecosystem, ...options } = rssFeed;
+                const items = await search({
+                    ecosystem,
+                    GITHUB_TOKEN: GITHUB_TOKEN,
+                    SIZE: 20
+                });
+                if (!items) {
+                    throw new Error("Can not found:" + ecosystem);
+                }
+                const jsonRSS = generateRSS(items, {
+                    ...options,
+                    description: `${rssFeed.title} on GitHub`,
+                    updated: new Date()
+                });
+                const atomRSS = generateRSS(items, {
+                    ...options,
+                    link: rssFeed.link.replace(/\.json$/, ".rss"),
+                    description: `${rssFeed.title} on GitHub`,
+                    updated: new Date()
+                });
 
-            const filename = path.basename(rssFeed.link, ".json");
-            await fs.writeFile(path.join(distDir, filename + ".json"), jsonRSS, "utf-8");
-            await fs.writeFile(path.join(distDir, filename + ".rss"), atomRSS, "utf-8");
+                const filename = path.basename(rssFeed.link, ".json");
+                await fs.writeFile(path.join(distDir, filename + ".json"), jsonRSS, "utf-8");
+                await fs.writeFile(path.join(distDir, filename + ".rss"), atomRSS, "utf-8");
+            } catch (error) {
+                console.error(`Error on ${rssFeed.ecosystem}`, error);
+                console.log("But continue to next");
+            }
         }
         const opml = convertJsonToOPML(RSS_FEEDS);
         await fs.writeFile(path.join(distDir, "index.opml"), opml, "utf-8");
@@ -209,6 +214,11 @@ if (require.main === module) {
 <body>
 <a href="https://github.com/azu/github-advisory-database-rss"><img style="position: absolute; top: 0; right: 0; border: 0;" src="https://s3.amazonaws.com/github/ribbons/forkme_right_darkblue_121621.png" alt="Fork me on GitHub"></a>
 <p>These RSS Feeds is a collection of <a href="https://github.com/advisories">GitHub Advisory Database</a>.</p>
+<p>Supported Feed types</p>
+<ul>
+    <li>JSON Feed</li>
+    <li>Atom Feed</li>
+</ul>
 <p><a href="./index.opml">OPML Feeds(All ecosystems)</a></p>
 <ul>
 ${links}
