@@ -42,5 +42,9 @@ export const RSS_FEEDS: RSS_FEED[] = [
     {
         title: "Security Advisory for Rust crates",
         ...createBase("RUST")
+    },
+    {
+        title: "Security Advisory for Erlang/Elixir packages hosted at hex.pm",
+        ...createBase("ERLANG")
     }
 ];
