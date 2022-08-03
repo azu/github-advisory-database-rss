@@ -236,7 +236,7 @@ if (require.main === module) {
 ${links}
 </ul>
 <footer>
-<a href="https://github.com/azu/github-search-rss">Source Code</a>
+<a href="https://github.com/azu/github-advisory-database-rss">Source Code</a>
 </footer>
 </body>
 </html>
