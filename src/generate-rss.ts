@@ -26,6 +26,7 @@ type Item = {
     title: string;
     createdAt: string;
     updatedAt: string;
+    severity: string;
     author: {
         avatarUrl: string;
         login: string;
@@ -97,6 +98,7 @@ export const search = ({
                 title: `[${node.package.name}] ${node.advisory.summary}`,
                 createdAt: node.advisory.publishedAt,
                 updatedAt: node.advisory.updatedAt,
+                severity: node.severity,
                 author: {
                     // FIXME: want to use published account
                     avatarUrl: "",
@@ -122,6 +124,10 @@ export const generateRSS = (items: Item[], options: GenerateRSSOptions) => {
         updated: options.updated,
         generator: "github-advisory-database-rss"
     });
+    feed.addCategory("CRITICAL");
+    feed.addCategory("HIGH");
+    feed.addCategory("MODERATE");
+    feed.addCategory("LOW");
     const filter = options.filter;
     const filteredItems = filter ? items.filter((item) => filter(item)) : items;
     filteredItems.forEach((item) => {
@@ -133,6 +139,12 @@ export const generateRSS = (items: Item[], options: GenerateRSSOptions) => {
             title: item.title,
             content: image + body,
             link: item.url,
+            category: [
+                {
+                    name: "severity",
+                    term: item.severity
+                }
+            ],
             author: [
                 {
                     name: item.author.login,
