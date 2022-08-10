@@ -46,5 +46,9 @@ export const RSS_FEEDS: RSS_FEED[] = [
     {
         title: "Security Advisory for Erlang/Elixir packages hosted at hex.pm",
         ...createBase("ERLANG")
-    }
+    },
+    {
+        title: "Security Advisory for Github Actions",
+        ...createBase("ACTIONS")
+    },
 ];
