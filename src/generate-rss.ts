@@ -141,8 +141,8 @@ export const generateRSS = (items: Item[], options: GenerateRSSOptions) => {
             link: item.url,
             category: [
                 {
-                    term: "severity",
-                    name: item.severity
+                    term: item.severity,
+                    name: "severity"
                 }
             ],
             author: [
