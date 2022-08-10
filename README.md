@@ -1,6 +1,6 @@
 # github-advisory-database-rss
 
-RSS Feeds for GitHub Advisory Database.
+RSS Feeds for [GitHub Advisory Database](https://github.com/advisories).
 
 ## Usage
 
