@@ -7,12 +7,14 @@ RSS Feeds for GitHub Advisory Database.
 1. Visit <https://azu.github.io/github-advisory-database-rss/>
 2. Subscribe RSS Feeds
 
-:memo: It outputs [JSON Feed](https://www.jsonfeed.org/).
+:memo: It outputs [JSON Feed](https://www.jsonfeed.org/) and Atom Feed.
 
 ## Add "ECOSYSTEM"
 
 1. Edit [RSS_FEEDS.ts](./src/RSS_FEEDS.ts)
 2. Add new ECOSYSTEM
+
+:memo: You may need to run `yarn upgrade` for updating types.
 
 ## Debug
 
