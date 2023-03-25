@@ -36,6 +36,10 @@ export const RSS_FEEDS: RSS_FEED[] = [
         ...createBase("PIP")
     },
     {
+        title: "Security Advisory for Dart packages hosted at pub.dev",
+        ...createBase("PUB")
+    },
+    {
         title: "Security Advisory for Ruby gems hosted at RubyGems.org",
         ...createBase("RUBYGEMS")
     },
