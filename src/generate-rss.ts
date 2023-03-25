@@ -231,7 +231,7 @@ if (require.main === module) {
     <li>JSON Feed</li>
     <li>Atom Feed</li>
 </ul>
-<p><a href="./index.opml">OPML Feeds(All ecosystems)</a></p>
+<p>OPML Feeds(All ecosystems): <a href="./index.opml">https://azu.github.io/github-advisory-database-rss/index.opml</a></p>
 <ul>
 ${links}
 </ul>
