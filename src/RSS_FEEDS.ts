@@ -49,7 +49,6 @@ export const RSS_FEEDS: RSS_FEED[] = [
     },
     {
         title: "Security Advisory for Github Actions",
-        // @ts-expect-error: no type yet
         ...createBase("ACTIONS")
     }
 ];
