@@ -224,7 +224,7 @@ if (require.main === module) {
     <meta name="description" content="RSS Feeds for GitHub Advisory Database" />
 </head>
 <body>
-<a href="https://github.com/azu/github-advisory-database-rss"><img style="position: absolute; top: 0; right: 0; border: 0;" src="https://s3.amazonaws.com/github/ribbons/forkme_right_darkblue_121621.png" alt="Fork me on GitHub"></a>
+<a href="https://github.com/azu/github-advisory-database-rss"><img style="position: absolute; top: 0; right: 0; border: 0;" src="https://github.blog/wp-content/uploads/2008/12/forkme_right_darkblue_121621.png" alt="Fork me on GitHub"></a>
 <p>These RSS Feeds is a collection of <a href="https://github.com/advisories">GitHub Advisory Database</a>.</p>
 <p>Supported Feed types</p>
 <ul>
