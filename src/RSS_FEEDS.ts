@@ -54,5 +54,9 @@ export const RSS_FEEDS: RSS_FEED[] = [
     {
         title: "Security Advisory for Github Actions",
         ...createBase("ACTIONS")
+    },
+    {
+        title: "Security Advisory for Swift",
+        ...createBase("SWIFT")
     }
 ];
