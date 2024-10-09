@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rust.rss</id>
     <title>Security Advisory for Rust crates</title>
-    <updated>2024-10-09T19:01:29.989Z</updated>
+    <updated>2024-10-09T20:01:25.462Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arust"/>
     <subtitle>Security Advisory for Rust crates on GitHub</subtitle>
@@ -11,6 +11,916 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[wasmtime] Wasmtime race condition could lead to WebAssembly control-flow integrity and type safety violations]]></title>
+        <id>https://github.com/advisories/GHSA-7qmx-3fpx-r45m</id>
+        <link href="https://github.com/advisories/GHSA-7qmx-3fpx-r45m"/>
+        <updated>2024-10-09T19:14:36.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Under certain concurrent event orderings, a <code>wasmtime::Engine</code>'s internal type registry was susceptible to double-unregistration bugs due to a race condition, leading to panics and potentially type registry corruption. That registry corruption could, following an additional and particular sequence of concurrent events, lead to violations of WebAssembly's control-flow integrity (CFI) and type safety. Users that do not use <code>wasmtime::Engine</code> across multiple threads are not affected. Users that only create new modules across threads over time are additionally not affected.</p>
+<p>Reproducing this bug requires creating and dropping multiple type instances (such as <code>wasmtime::FuncType</code> or <code>wasmtime::ArrayType</code>) concurrently on multiple threads, where all types are associated with the same <code>wasmtime::Engine</code>. <strong>Wasm guests cannot trigger this bug.</strong> See the "References" section below for a list of Wasmtime types-related APIs that are affected.</p>
+<p>Wasmtime maintains an internal registry of types within a <code>wasmtime::Engine</code> and an engine is shareable across threads. Types can be created and referenced through creation of a <code>wasmtime::Module</code>, creation of <code>wasmtime::FuncType</code>, or a number of other APIs where the host creates a function (see "References" below). Each of these cases interacts with an engine to deduplicate type information and manage type indices that are used to implement type checks in WebAssembly's <code>call_indirect</code> function, for example. This bug is a race condition in this management where the internal type registry could be corrupted to trigger an assert or contain invalid state.</p>
+<p>Wasmtime's internal representation of a type has individual types (e.g. one-per-host-function) maintain a registration count of how many time it's been used. Types additionally have state within an engine behind a read-write lock such as lookup/deduplication information. The race here is a time-of-check versus time-of-use (TOCTOU) bug where one thread atomically decrements a type entry's registration count, observes zero registrations, and then acquires a lock in order to unregister that entry. However, between when this first thread observed the zero-registration count and when it acquires that lock, another thread could perform the following sequence of events: re-register another copy of the type, which deduplicates to that same entry, resurrecting it and incrementing its registration count; then drop the type and decrement its registration count; observe that the registration count is now zero; acquire the type registry lock; and finally unregister the type. Now, when the original thread finally acquires the lock and unregisters the entry, it is the second time this entry has been unregistered.</p>
+<table>
+<thead>
+<tr>
+<th>Thread A</th>
+<th>Thread B</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>acquire(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td><code>decref(E) --&gt; 0</code></td>
+</tr>
+<tr>
+<td></td>
+<td><code>block_on(type registry lock)</code></td>
+</tr>
+<tr>
+<td><code>register(E') == incref(E) --&gt; 1</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>release(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>decref(E) --&gt; 0</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>acquire(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>unregister(E)</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>release(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td><code>acquire(type registry lock)</code></td>
+</tr>
+<tr>
+<td></td>
+<td><code>unregister(E)</code></td>
+</tr>
+</tbody></table>
+<p>This double-unregistration could then lead to a WebAssembly CFI violation under the following conditions: a new WebAssembly module <code>X</code> was loaded into the engine before the second, buggy unregistration occurs; <code>X</code> defined a function type <code>F</code> that was allocated in the same type registry slot where the original entry was allocated; the second, buggy unregistration incorrectly unregistered <code>F</code>; another new WebAssembly module <code>Y</code> was loaded into the engine; <code>Y</code> defined a function type <code>G</code>, different from <code>F</code>, but which is also allocated in the same type registry slot; a <code>funcref</code> of type <code>G</code> is created, either by the host or by Wasm; that <code>funcref</code> is passed to a WebAssembly instance of module <code>X</code>; that instance performs a <code>call_indirect</code> to that <code>funcref</code>; the <code>call_indirect</code>'s dynamic type check, which preserves CFI, could incorrectly pass in this case, because <code>F</code> and <code>G</code> were assigned the same type registry slot. This would, ultimately, allow calling a function with too many, too few, or wrongly-typed arguments, violating CFI and type safety.</p>
+<p>We were not able to reproduce this CFI violation in a vanilla Wasmtime build, although it remains theoretically possible. However, by modifying Wasmtime's source code to make losing the races described above more likely (by disabling certain assertions, inserting panic catches, and adding retry loops in a few places if we did <em>not</em> lose the race) we were able to incorrectly get a <code>funcref</code> to pass a type check that it should have failed, which would allow the CFI violation.</p>
+<h3 id="patches">Patches</h3>
+<p>This bug was originally introduced in Wasmtime 19's development of the WebAssembly GC proposal. This bug affects users who are not using the GC proposal, however, and affects Wasmtime in its default configuration even when the GC proposal is disabled. Wasmtime users using 19.0.0 and after are all affected by this issue. We have released the following Wasmtime versions, all of which have a fix for this bug:</p>
+<ul>
+<li>21.0.2</li>
+<li>22.0.1</li>
+<li>23.0.3</li>
+<li>24.0.1</li>
+<li>25.0.2</li>
+</ul>
+<h3 id="workarounds">Workarounds</h3>
+<p>If your application creates and drops Wasmtime types on multiple threads concurrently, there are no known workarounds. Users are encouraged to upgrade to a patched release. </p>
+<h3 id="references">References</h3>
+<p>The following APIs create or drop types, and therefore are affected by this race condition if performed on multiple threads concurrently and are all associated with the same <code>wasmtime::Engine</code>:</p>
+<ul>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.FuncType.html#method.new"><code>wasmtime::FuncType::new</code></a><ul>
+<li>Also reachable from creation of <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Func.html"><code>wasmtime::Func</code></a></li>
+<li>Also reachable from <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Linker.html#method.func_new"><code>wasmtime::Linker::func_*</code></a></li>
+</ul>
+</li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ArrayType.html#method.new"><code>wasmtime::ArrayType::new</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.StructType.html#method.new"><code>wasmtime::StructType::new</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Func.html#method.ty"><code>wasmtime::Func::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Global.html#method.ty"><code>wasmtime::Global::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Table.html#method.ty"><code>wasmtime::Table::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Extern.html#method.ty"><code>wasmtime::Extern::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Export.html#method.ty"><code>wasmtime::Export::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.UnknownImportError.html#method.ty"><code>wasmtime::UnknownImportError::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ImportType.html#method.ty"><code>wasmtime::ImportType::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ExportType.html#method.ty"><code>wasmtime::ExportType::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Val.html#method.ty"><code>wasmtime::Val::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Ref.html#method.ty"><code>wasmtime::Ref::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.AnyRef.html#method.ty"><code>wasmtime::AnyRef::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.EqRef.html#method.ty"><code>wasmtime::EqRef::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ArrayRef.html#method.ty"><code>wasmtime::ArrayRef::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.StructRef.html#method.ty"><code>wasmtime::StructRef::ty</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.FuncType.html"><code>wasmtime::FuncType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ArrayType.html"><code>wasmtime::ArrayType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.StructType.html"><code>wasmtime::StructType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ExternType.html"><code>wasmtime::ExternType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.GlobalType.html"><code>wasmtime::GlobalType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.TableType.html"><code>wasmtime::TableType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ValType.html"><code>wasmtime::ValType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.RefType.html"><code>wasmtime::RefType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.HeapType.html"><code>wasmtime::HeapType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.UnknownImportError.html"><code>wasmtime::UnknownImportError</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Linker.html"><code>wasmtime::Linker</code></a></li>
+</ul>
+<p>The change which introduced this bug was <a href="https://github.com/bytecodealliance/wasmtime/pull/7969">#7969</a></p>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-7qmx-3fpx-r45m">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-7qmx-3fpx-r45m</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2024-47813">https://nvd.nist.gov/vuln/detail/CVE-2024-47813</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/7969">https://github.com/bytecodealliance/wasmtime/pull/7969</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba">https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba</a></li>
+<li><a href="https://github.com/advisories/GHSA-7qmx-3fpx-r45m">https://github.com/advisories/GHSA-7qmx-3fpx-r45m</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-7qmx-3fpx-r45m</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2024-10-09T19:14:35.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[wasmtime] Wasmtime race condition could lead to WebAssembly control-flow integrity and type safety violations]]></title>
+        <id>https://github.com/advisories/GHSA-7qmx-3fpx-r45m</id>
+        <link href="https://github.com/advisories/GHSA-7qmx-3fpx-r45m"/>
+        <updated>2024-10-09T19:14:36.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Under certain concurrent event orderings, a <code>wasmtime::Engine</code>'s internal type registry was susceptible to double-unregistration bugs due to a race condition, leading to panics and potentially type registry corruption. That registry corruption could, following an additional and particular sequence of concurrent events, lead to violations of WebAssembly's control-flow integrity (CFI) and type safety. Users that do not use <code>wasmtime::Engine</code> across multiple threads are not affected. Users that only create new modules across threads over time are additionally not affected.</p>
+<p>Reproducing this bug requires creating and dropping multiple type instances (such as <code>wasmtime::FuncType</code> or <code>wasmtime::ArrayType</code>) concurrently on multiple threads, where all types are associated with the same <code>wasmtime::Engine</code>. <strong>Wasm guests cannot trigger this bug.</strong> See the "References" section below for a list of Wasmtime types-related APIs that are affected.</p>
+<p>Wasmtime maintains an internal registry of types within a <code>wasmtime::Engine</code> and an engine is shareable across threads. Types can be created and referenced through creation of a <code>wasmtime::Module</code>, creation of <code>wasmtime::FuncType</code>, or a number of other APIs where the host creates a function (see "References" below). Each of these cases interacts with an engine to deduplicate type information and manage type indices that are used to implement type checks in WebAssembly's <code>call_indirect</code> function, for example. This bug is a race condition in this management where the internal type registry could be corrupted to trigger an assert or contain invalid state.</p>
+<p>Wasmtime's internal representation of a type has individual types (e.g. one-per-host-function) maintain a registration count of how many time it's been used. Types additionally have state within an engine behind a read-write lock such as lookup/deduplication information. The race here is a time-of-check versus time-of-use (TOCTOU) bug where one thread atomically decrements a type entry's registration count, observes zero registrations, and then acquires a lock in order to unregister that entry. However, between when this first thread observed the zero-registration count and when it acquires that lock, another thread could perform the following sequence of events: re-register another copy of the type, which deduplicates to that same entry, resurrecting it and incrementing its registration count; then drop the type and decrement its registration count; observe that the registration count is now zero; acquire the type registry lock; and finally unregister the type. Now, when the original thread finally acquires the lock and unregisters the entry, it is the second time this entry has been unregistered.</p>
+<table>
+<thead>
+<tr>
+<th>Thread A</th>
+<th>Thread B</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>acquire(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td><code>decref(E) --&gt; 0</code></td>
+</tr>
+<tr>
+<td></td>
+<td><code>block_on(type registry lock)</code></td>
+</tr>
+<tr>
+<td><code>register(E') == incref(E) --&gt; 1</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>release(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>decref(E) --&gt; 0</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>acquire(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>unregister(E)</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>release(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td><code>acquire(type registry lock)</code></td>
+</tr>
+<tr>
+<td></td>
+<td><code>unregister(E)</code></td>
+</tr>
+</tbody></table>
+<p>This double-unregistration could then lead to a WebAssembly CFI violation under the following conditions: a new WebAssembly module <code>X</code> was loaded into the engine before the second, buggy unregistration occurs; <code>X</code> defined a function type <code>F</code> that was allocated in the same type registry slot where the original entry was allocated; the second, buggy unregistration incorrectly unregistered <code>F</code>; another new WebAssembly module <code>Y</code> was loaded into the engine; <code>Y</code> defined a function type <code>G</code>, different from <code>F</code>, but which is also allocated in the same type registry slot; a <code>funcref</code> of type <code>G</code> is created, either by the host or by Wasm; that <code>funcref</code> is passed to a WebAssembly instance of module <code>X</code>; that instance performs a <code>call_indirect</code> to that <code>funcref</code>; the <code>call_indirect</code>'s dynamic type check, which preserves CFI, could incorrectly pass in this case, because <code>F</code> and <code>G</code> were assigned the same type registry slot. This would, ultimately, allow calling a function with too many, too few, or wrongly-typed arguments, violating CFI and type safety.</p>
+<p>We were not able to reproduce this CFI violation in a vanilla Wasmtime build, although it remains theoretically possible. However, by modifying Wasmtime's source code to make losing the races described above more likely (by disabling certain assertions, inserting panic catches, and adding retry loops in a few places if we did <em>not</em> lose the race) we were able to incorrectly get a <code>funcref</code> to pass a type check that it should have failed, which would allow the CFI violation.</p>
+<h3 id="patches">Patches</h3>
+<p>This bug was originally introduced in Wasmtime 19's development of the WebAssembly GC proposal. This bug affects users who are not using the GC proposal, however, and affects Wasmtime in its default configuration even when the GC proposal is disabled. Wasmtime users using 19.0.0 and after are all affected by this issue. We have released the following Wasmtime versions, all of which have a fix for this bug:</p>
+<ul>
+<li>21.0.2</li>
+<li>22.0.1</li>
+<li>23.0.3</li>
+<li>24.0.1</li>
+<li>25.0.2</li>
+</ul>
+<h3 id="workarounds">Workarounds</h3>
+<p>If your application creates and drops Wasmtime types on multiple threads concurrently, there are no known workarounds. Users are encouraged to upgrade to a patched release. </p>
+<h3 id="references">References</h3>
+<p>The following APIs create or drop types, and therefore are affected by this race condition if performed on multiple threads concurrently and are all associated with the same <code>wasmtime::Engine</code>:</p>
+<ul>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.FuncType.html#method.new"><code>wasmtime::FuncType::new</code></a><ul>
+<li>Also reachable from creation of <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Func.html"><code>wasmtime::Func</code></a></li>
+<li>Also reachable from <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Linker.html#method.func_new"><code>wasmtime::Linker::func_*</code></a></li>
+</ul>
+</li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ArrayType.html#method.new"><code>wasmtime::ArrayType::new</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.StructType.html#method.new"><code>wasmtime::StructType::new</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Func.html#method.ty"><code>wasmtime::Func::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Global.html#method.ty"><code>wasmtime::Global::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Table.html#method.ty"><code>wasmtime::Table::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Extern.html#method.ty"><code>wasmtime::Extern::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Export.html#method.ty"><code>wasmtime::Export::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.UnknownImportError.html#method.ty"><code>wasmtime::UnknownImportError::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ImportType.html#method.ty"><code>wasmtime::ImportType::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ExportType.html#method.ty"><code>wasmtime::ExportType::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Val.html#method.ty"><code>wasmtime::Val::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Ref.html#method.ty"><code>wasmtime::Ref::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.AnyRef.html#method.ty"><code>wasmtime::AnyRef::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.EqRef.html#method.ty"><code>wasmtime::EqRef::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ArrayRef.html#method.ty"><code>wasmtime::ArrayRef::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.StructRef.html#method.ty"><code>wasmtime::StructRef::ty</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.FuncType.html"><code>wasmtime::FuncType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ArrayType.html"><code>wasmtime::ArrayType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.StructType.html"><code>wasmtime::StructType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ExternType.html"><code>wasmtime::ExternType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.GlobalType.html"><code>wasmtime::GlobalType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.TableType.html"><code>wasmtime::TableType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ValType.html"><code>wasmtime::ValType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.RefType.html"><code>wasmtime::RefType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.HeapType.html"><code>wasmtime::HeapType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.UnknownImportError.html"><code>wasmtime::UnknownImportError</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Linker.html"><code>wasmtime::Linker</code></a></li>
+</ul>
+<p>The change which introduced this bug was <a href="https://github.com/bytecodealliance/wasmtime/pull/7969">#7969</a></p>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-7qmx-3fpx-r45m">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-7qmx-3fpx-r45m</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2024-47813">https://nvd.nist.gov/vuln/detail/CVE-2024-47813</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/7969">https://github.com/bytecodealliance/wasmtime/pull/7969</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba">https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba</a></li>
+<li><a href="https://github.com/advisories/GHSA-7qmx-3fpx-r45m">https://github.com/advisories/GHSA-7qmx-3fpx-r45m</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-7qmx-3fpx-r45m</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2024-10-09T19:14:35.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[wasmtime] Wasmtime race condition could lead to WebAssembly control-flow integrity and type safety violations]]></title>
+        <id>https://github.com/advisories/GHSA-7qmx-3fpx-r45m</id>
+        <link href="https://github.com/advisories/GHSA-7qmx-3fpx-r45m"/>
+        <updated>2024-10-09T19:14:36.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Under certain concurrent event orderings, a <code>wasmtime::Engine</code>'s internal type registry was susceptible to double-unregistration bugs due to a race condition, leading to panics and potentially type registry corruption. That registry corruption could, following an additional and particular sequence of concurrent events, lead to violations of WebAssembly's control-flow integrity (CFI) and type safety. Users that do not use <code>wasmtime::Engine</code> across multiple threads are not affected. Users that only create new modules across threads over time are additionally not affected.</p>
+<p>Reproducing this bug requires creating and dropping multiple type instances (such as <code>wasmtime::FuncType</code> or <code>wasmtime::ArrayType</code>) concurrently on multiple threads, where all types are associated with the same <code>wasmtime::Engine</code>. <strong>Wasm guests cannot trigger this bug.</strong> See the "References" section below for a list of Wasmtime types-related APIs that are affected.</p>
+<p>Wasmtime maintains an internal registry of types within a <code>wasmtime::Engine</code> and an engine is shareable across threads. Types can be created and referenced through creation of a <code>wasmtime::Module</code>, creation of <code>wasmtime::FuncType</code>, or a number of other APIs where the host creates a function (see "References" below). Each of these cases interacts with an engine to deduplicate type information and manage type indices that are used to implement type checks in WebAssembly's <code>call_indirect</code> function, for example. This bug is a race condition in this management where the internal type registry could be corrupted to trigger an assert or contain invalid state.</p>
+<p>Wasmtime's internal representation of a type has individual types (e.g. one-per-host-function) maintain a registration count of how many time it's been used. Types additionally have state within an engine behind a read-write lock such as lookup/deduplication information. The race here is a time-of-check versus time-of-use (TOCTOU) bug where one thread atomically decrements a type entry's registration count, observes zero registrations, and then acquires a lock in order to unregister that entry. However, between when this first thread observed the zero-registration count and when it acquires that lock, another thread could perform the following sequence of events: re-register another copy of the type, which deduplicates to that same entry, resurrecting it and incrementing its registration count; then drop the type and decrement its registration count; observe that the registration count is now zero; acquire the type registry lock; and finally unregister the type. Now, when the original thread finally acquires the lock and unregisters the entry, it is the second time this entry has been unregistered.</p>
+<table>
+<thead>
+<tr>
+<th>Thread A</th>
+<th>Thread B</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>acquire(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td><code>decref(E) --&gt; 0</code></td>
+</tr>
+<tr>
+<td></td>
+<td><code>block_on(type registry lock)</code></td>
+</tr>
+<tr>
+<td><code>register(E') == incref(E) --&gt; 1</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>release(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>decref(E) --&gt; 0</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>acquire(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>unregister(E)</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>release(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td><code>acquire(type registry lock)</code></td>
+</tr>
+<tr>
+<td></td>
+<td><code>unregister(E)</code></td>
+</tr>
+</tbody></table>
+<p>This double-unregistration could then lead to a WebAssembly CFI violation under the following conditions: a new WebAssembly module <code>X</code> was loaded into the engine before the second, buggy unregistration occurs; <code>X</code> defined a function type <code>F</code> that was allocated in the same type registry slot where the original entry was allocated; the second, buggy unregistration incorrectly unregistered <code>F</code>; another new WebAssembly module <code>Y</code> was loaded into the engine; <code>Y</code> defined a function type <code>G</code>, different from <code>F</code>, but which is also allocated in the same type registry slot; a <code>funcref</code> of type <code>G</code> is created, either by the host or by Wasm; that <code>funcref</code> is passed to a WebAssembly instance of module <code>X</code>; that instance performs a <code>call_indirect</code> to that <code>funcref</code>; the <code>call_indirect</code>'s dynamic type check, which preserves CFI, could incorrectly pass in this case, because <code>F</code> and <code>G</code> were assigned the same type registry slot. This would, ultimately, allow calling a function with too many, too few, or wrongly-typed arguments, violating CFI and type safety.</p>
+<p>We were not able to reproduce this CFI violation in a vanilla Wasmtime build, although it remains theoretically possible. However, by modifying Wasmtime's source code to make losing the races described above more likely (by disabling certain assertions, inserting panic catches, and adding retry loops in a few places if we did <em>not</em> lose the race) we were able to incorrectly get a <code>funcref</code> to pass a type check that it should have failed, which would allow the CFI violation.</p>
+<h3 id="patches">Patches</h3>
+<p>This bug was originally introduced in Wasmtime 19's development of the WebAssembly GC proposal. This bug affects users who are not using the GC proposal, however, and affects Wasmtime in its default configuration even when the GC proposal is disabled. Wasmtime users using 19.0.0 and after are all affected by this issue. We have released the following Wasmtime versions, all of which have a fix for this bug:</p>
+<ul>
+<li>21.0.2</li>
+<li>22.0.1</li>
+<li>23.0.3</li>
+<li>24.0.1</li>
+<li>25.0.2</li>
+</ul>
+<h3 id="workarounds">Workarounds</h3>
+<p>If your application creates and drops Wasmtime types on multiple threads concurrently, there are no known workarounds. Users are encouraged to upgrade to a patched release. </p>
+<h3 id="references">References</h3>
+<p>The following APIs create or drop types, and therefore are affected by this race condition if performed on multiple threads concurrently and are all associated with the same <code>wasmtime::Engine</code>:</p>
+<ul>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.FuncType.html#method.new"><code>wasmtime::FuncType::new</code></a><ul>
+<li>Also reachable from creation of <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Func.html"><code>wasmtime::Func</code></a></li>
+<li>Also reachable from <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Linker.html#method.func_new"><code>wasmtime::Linker::func_*</code></a></li>
+</ul>
+</li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ArrayType.html#method.new"><code>wasmtime::ArrayType::new</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.StructType.html#method.new"><code>wasmtime::StructType::new</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Func.html#method.ty"><code>wasmtime::Func::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Global.html#method.ty"><code>wasmtime::Global::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Table.html#method.ty"><code>wasmtime::Table::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Extern.html#method.ty"><code>wasmtime::Extern::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Export.html#method.ty"><code>wasmtime::Export::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.UnknownImportError.html#method.ty"><code>wasmtime::UnknownImportError::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ImportType.html#method.ty"><code>wasmtime::ImportType::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ExportType.html#method.ty"><code>wasmtime::ExportType::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Val.html#method.ty"><code>wasmtime::Val::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Ref.html#method.ty"><code>wasmtime::Ref::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.AnyRef.html#method.ty"><code>wasmtime::AnyRef::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.EqRef.html#method.ty"><code>wasmtime::EqRef::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ArrayRef.html#method.ty"><code>wasmtime::ArrayRef::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.StructRef.html#method.ty"><code>wasmtime::StructRef::ty</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.FuncType.html"><code>wasmtime::FuncType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ArrayType.html"><code>wasmtime::ArrayType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.StructType.html"><code>wasmtime::StructType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ExternType.html"><code>wasmtime::ExternType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.GlobalType.html"><code>wasmtime::GlobalType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.TableType.html"><code>wasmtime::TableType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ValType.html"><code>wasmtime::ValType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.RefType.html"><code>wasmtime::RefType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.HeapType.html"><code>wasmtime::HeapType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.UnknownImportError.html"><code>wasmtime::UnknownImportError</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Linker.html"><code>wasmtime::Linker</code></a></li>
+</ul>
+<p>The change which introduced this bug was <a href="https://github.com/bytecodealliance/wasmtime/pull/7969">#7969</a></p>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-7qmx-3fpx-r45m">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-7qmx-3fpx-r45m</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2024-47813">https://nvd.nist.gov/vuln/detail/CVE-2024-47813</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/7969">https://github.com/bytecodealliance/wasmtime/pull/7969</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba">https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba</a></li>
+<li><a href="https://github.com/advisories/GHSA-7qmx-3fpx-r45m">https://github.com/advisories/GHSA-7qmx-3fpx-r45m</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-7qmx-3fpx-r45m</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2024-10-09T19:14:35.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[wasmtime] Wasmtime race condition could lead to WebAssembly control-flow integrity and type safety violations]]></title>
+        <id>https://github.com/advisories/GHSA-7qmx-3fpx-r45m</id>
+        <link href="https://github.com/advisories/GHSA-7qmx-3fpx-r45m"/>
+        <updated>2024-10-09T19:14:36.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Under certain concurrent event orderings, a <code>wasmtime::Engine</code>'s internal type registry was susceptible to double-unregistration bugs due to a race condition, leading to panics and potentially type registry corruption. That registry corruption could, following an additional and particular sequence of concurrent events, lead to violations of WebAssembly's control-flow integrity (CFI) and type safety. Users that do not use <code>wasmtime::Engine</code> across multiple threads are not affected. Users that only create new modules across threads over time are additionally not affected.</p>
+<p>Reproducing this bug requires creating and dropping multiple type instances (such as <code>wasmtime::FuncType</code> or <code>wasmtime::ArrayType</code>) concurrently on multiple threads, where all types are associated with the same <code>wasmtime::Engine</code>. <strong>Wasm guests cannot trigger this bug.</strong> See the "References" section below for a list of Wasmtime types-related APIs that are affected.</p>
+<p>Wasmtime maintains an internal registry of types within a <code>wasmtime::Engine</code> and an engine is shareable across threads. Types can be created and referenced through creation of a <code>wasmtime::Module</code>, creation of <code>wasmtime::FuncType</code>, or a number of other APIs where the host creates a function (see "References" below). Each of these cases interacts with an engine to deduplicate type information and manage type indices that are used to implement type checks in WebAssembly's <code>call_indirect</code> function, for example. This bug is a race condition in this management where the internal type registry could be corrupted to trigger an assert or contain invalid state.</p>
+<p>Wasmtime's internal representation of a type has individual types (e.g. one-per-host-function) maintain a registration count of how many time it's been used. Types additionally have state within an engine behind a read-write lock such as lookup/deduplication information. The race here is a time-of-check versus time-of-use (TOCTOU) bug where one thread atomically decrements a type entry's registration count, observes zero registrations, and then acquires a lock in order to unregister that entry. However, between when this first thread observed the zero-registration count and when it acquires that lock, another thread could perform the following sequence of events: re-register another copy of the type, which deduplicates to that same entry, resurrecting it and incrementing its registration count; then drop the type and decrement its registration count; observe that the registration count is now zero; acquire the type registry lock; and finally unregister the type. Now, when the original thread finally acquires the lock and unregisters the entry, it is the second time this entry has been unregistered.</p>
+<table>
+<thead>
+<tr>
+<th>Thread A</th>
+<th>Thread B</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>acquire(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td><code>decref(E) --&gt; 0</code></td>
+</tr>
+<tr>
+<td></td>
+<td><code>block_on(type registry lock)</code></td>
+</tr>
+<tr>
+<td><code>register(E') == incref(E) --&gt; 1</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>release(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>decref(E) --&gt; 0</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>acquire(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>unregister(E)</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>release(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td><code>acquire(type registry lock)</code></td>
+</tr>
+<tr>
+<td></td>
+<td><code>unregister(E)</code></td>
+</tr>
+</tbody></table>
+<p>This double-unregistration could then lead to a WebAssembly CFI violation under the following conditions: a new WebAssembly module <code>X</code> was loaded into the engine before the second, buggy unregistration occurs; <code>X</code> defined a function type <code>F</code> that was allocated in the same type registry slot where the original entry was allocated; the second, buggy unregistration incorrectly unregistered <code>F</code>; another new WebAssembly module <code>Y</code> was loaded into the engine; <code>Y</code> defined a function type <code>G</code>, different from <code>F</code>, but which is also allocated in the same type registry slot; a <code>funcref</code> of type <code>G</code> is created, either by the host or by Wasm; that <code>funcref</code> is passed to a WebAssembly instance of module <code>X</code>; that instance performs a <code>call_indirect</code> to that <code>funcref</code>; the <code>call_indirect</code>'s dynamic type check, which preserves CFI, could incorrectly pass in this case, because <code>F</code> and <code>G</code> were assigned the same type registry slot. This would, ultimately, allow calling a function with too many, too few, or wrongly-typed arguments, violating CFI and type safety.</p>
+<p>We were not able to reproduce this CFI violation in a vanilla Wasmtime build, although it remains theoretically possible. However, by modifying Wasmtime's source code to make losing the races described above more likely (by disabling certain assertions, inserting panic catches, and adding retry loops in a few places if we did <em>not</em> lose the race) we were able to incorrectly get a <code>funcref</code> to pass a type check that it should have failed, which would allow the CFI violation.</p>
+<h3 id="patches">Patches</h3>
+<p>This bug was originally introduced in Wasmtime 19's development of the WebAssembly GC proposal. This bug affects users who are not using the GC proposal, however, and affects Wasmtime in its default configuration even when the GC proposal is disabled. Wasmtime users using 19.0.0 and after are all affected by this issue. We have released the following Wasmtime versions, all of which have a fix for this bug:</p>
+<ul>
+<li>21.0.2</li>
+<li>22.0.1</li>
+<li>23.0.3</li>
+<li>24.0.1</li>
+<li>25.0.2</li>
+</ul>
+<h3 id="workarounds">Workarounds</h3>
+<p>If your application creates and drops Wasmtime types on multiple threads concurrently, there are no known workarounds. Users are encouraged to upgrade to a patched release. </p>
+<h3 id="references">References</h3>
+<p>The following APIs create or drop types, and therefore are affected by this race condition if performed on multiple threads concurrently and are all associated with the same <code>wasmtime::Engine</code>:</p>
+<ul>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.FuncType.html#method.new"><code>wasmtime::FuncType::new</code></a><ul>
+<li>Also reachable from creation of <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Func.html"><code>wasmtime::Func</code></a></li>
+<li>Also reachable from <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Linker.html#method.func_new"><code>wasmtime::Linker::func_*</code></a></li>
+</ul>
+</li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ArrayType.html#method.new"><code>wasmtime::ArrayType::new</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.StructType.html#method.new"><code>wasmtime::StructType::new</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Func.html#method.ty"><code>wasmtime::Func::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Global.html#method.ty"><code>wasmtime::Global::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Table.html#method.ty"><code>wasmtime::Table::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Extern.html#method.ty"><code>wasmtime::Extern::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Export.html#method.ty"><code>wasmtime::Export::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.UnknownImportError.html#method.ty"><code>wasmtime::UnknownImportError::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ImportType.html#method.ty"><code>wasmtime::ImportType::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ExportType.html#method.ty"><code>wasmtime::ExportType::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Val.html#method.ty"><code>wasmtime::Val::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Ref.html#method.ty"><code>wasmtime::Ref::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.AnyRef.html#method.ty"><code>wasmtime::AnyRef::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.EqRef.html#method.ty"><code>wasmtime::EqRef::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ArrayRef.html#method.ty"><code>wasmtime::ArrayRef::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.StructRef.html#method.ty"><code>wasmtime::StructRef::ty</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.FuncType.html"><code>wasmtime::FuncType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ArrayType.html"><code>wasmtime::ArrayType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.StructType.html"><code>wasmtime::StructType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ExternType.html"><code>wasmtime::ExternType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.GlobalType.html"><code>wasmtime::GlobalType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.TableType.html"><code>wasmtime::TableType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ValType.html"><code>wasmtime::ValType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.RefType.html"><code>wasmtime::RefType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.HeapType.html"><code>wasmtime::HeapType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.UnknownImportError.html"><code>wasmtime::UnknownImportError</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Linker.html"><code>wasmtime::Linker</code></a></li>
+</ul>
+<p>The change which introduced this bug was <a href="https://github.com/bytecodealliance/wasmtime/pull/7969">#7969</a></p>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-7qmx-3fpx-r45m">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-7qmx-3fpx-r45m</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2024-47813">https://nvd.nist.gov/vuln/detail/CVE-2024-47813</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/7969">https://github.com/bytecodealliance/wasmtime/pull/7969</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba">https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba</a></li>
+<li><a href="https://github.com/advisories/GHSA-7qmx-3fpx-r45m">https://github.com/advisories/GHSA-7qmx-3fpx-r45m</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-7qmx-3fpx-r45m</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2024-10-09T19:14:35.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[wasmtime] Wasmtime race condition could lead to WebAssembly control-flow integrity and type safety violations]]></title>
+        <id>https://github.com/advisories/GHSA-7qmx-3fpx-r45m</id>
+        <link href="https://github.com/advisories/GHSA-7qmx-3fpx-r45m"/>
+        <updated>2024-10-09T19:14:36.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Under certain concurrent event orderings, a <code>wasmtime::Engine</code>'s internal type registry was susceptible to double-unregistration bugs due to a race condition, leading to panics and potentially type registry corruption. That registry corruption could, following an additional and particular sequence of concurrent events, lead to violations of WebAssembly's control-flow integrity (CFI) and type safety. Users that do not use <code>wasmtime::Engine</code> across multiple threads are not affected. Users that only create new modules across threads over time are additionally not affected.</p>
+<p>Reproducing this bug requires creating and dropping multiple type instances (such as <code>wasmtime::FuncType</code> or <code>wasmtime::ArrayType</code>) concurrently on multiple threads, where all types are associated with the same <code>wasmtime::Engine</code>. <strong>Wasm guests cannot trigger this bug.</strong> See the "References" section below for a list of Wasmtime types-related APIs that are affected.</p>
+<p>Wasmtime maintains an internal registry of types within a <code>wasmtime::Engine</code> and an engine is shareable across threads. Types can be created and referenced through creation of a <code>wasmtime::Module</code>, creation of <code>wasmtime::FuncType</code>, or a number of other APIs where the host creates a function (see "References" below). Each of these cases interacts with an engine to deduplicate type information and manage type indices that are used to implement type checks in WebAssembly's <code>call_indirect</code> function, for example. This bug is a race condition in this management where the internal type registry could be corrupted to trigger an assert or contain invalid state.</p>
+<p>Wasmtime's internal representation of a type has individual types (e.g. one-per-host-function) maintain a registration count of how many time it's been used. Types additionally have state within an engine behind a read-write lock such as lookup/deduplication information. The race here is a time-of-check versus time-of-use (TOCTOU) bug where one thread atomically decrements a type entry's registration count, observes zero registrations, and then acquires a lock in order to unregister that entry. However, between when this first thread observed the zero-registration count and when it acquires that lock, another thread could perform the following sequence of events: re-register another copy of the type, which deduplicates to that same entry, resurrecting it and incrementing its registration count; then drop the type and decrement its registration count; observe that the registration count is now zero; acquire the type registry lock; and finally unregister the type. Now, when the original thread finally acquires the lock and unregisters the entry, it is the second time this entry has been unregistered.</p>
+<table>
+<thead>
+<tr>
+<th>Thread A</th>
+<th>Thread B</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>acquire(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td><code>decref(E) --&gt; 0</code></td>
+</tr>
+<tr>
+<td></td>
+<td><code>block_on(type registry lock)</code></td>
+</tr>
+<tr>
+<td><code>register(E') == incref(E) --&gt; 1</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>release(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>decref(E) --&gt; 0</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>acquire(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>unregister(E)</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>release(type registry lock)</code></td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td><code>acquire(type registry lock)</code></td>
+</tr>
+<tr>
+<td></td>
+<td><code>unregister(E)</code></td>
+</tr>
+</tbody></table>
+<p>This double-unregistration could then lead to a WebAssembly CFI violation under the following conditions: a new WebAssembly module <code>X</code> was loaded into the engine before the second, buggy unregistration occurs; <code>X</code> defined a function type <code>F</code> that was allocated in the same type registry slot where the original entry was allocated; the second, buggy unregistration incorrectly unregistered <code>F</code>; another new WebAssembly module <code>Y</code> was loaded into the engine; <code>Y</code> defined a function type <code>G</code>, different from <code>F</code>, but which is also allocated in the same type registry slot; a <code>funcref</code> of type <code>G</code> is created, either by the host or by Wasm; that <code>funcref</code> is passed to a WebAssembly instance of module <code>X</code>; that instance performs a <code>call_indirect</code> to that <code>funcref</code>; the <code>call_indirect</code>'s dynamic type check, which preserves CFI, could incorrectly pass in this case, because <code>F</code> and <code>G</code> were assigned the same type registry slot. This would, ultimately, allow calling a function with too many, too few, or wrongly-typed arguments, violating CFI and type safety.</p>
+<p>We were not able to reproduce this CFI violation in a vanilla Wasmtime build, although it remains theoretically possible. However, by modifying Wasmtime's source code to make losing the races described above more likely (by disabling certain assertions, inserting panic catches, and adding retry loops in a few places if we did <em>not</em> lose the race) we were able to incorrectly get a <code>funcref</code> to pass a type check that it should have failed, which would allow the CFI violation.</p>
+<h3 id="patches">Patches</h3>
+<p>This bug was originally introduced in Wasmtime 19's development of the WebAssembly GC proposal. This bug affects users who are not using the GC proposal, however, and affects Wasmtime in its default configuration even when the GC proposal is disabled. Wasmtime users using 19.0.0 and after are all affected by this issue. We have released the following Wasmtime versions, all of which have a fix for this bug:</p>
+<ul>
+<li>21.0.2</li>
+<li>22.0.1</li>
+<li>23.0.3</li>
+<li>24.0.1</li>
+<li>25.0.2</li>
+</ul>
+<h3 id="workarounds">Workarounds</h3>
+<p>If your application creates and drops Wasmtime types on multiple threads concurrently, there are no known workarounds. Users are encouraged to upgrade to a patched release. </p>
+<h3 id="references">References</h3>
+<p>The following APIs create or drop types, and therefore are affected by this race condition if performed on multiple threads concurrently and are all associated with the same <code>wasmtime::Engine</code>:</p>
+<ul>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.FuncType.html#method.new"><code>wasmtime::FuncType::new</code></a><ul>
+<li>Also reachable from creation of <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Func.html"><code>wasmtime::Func</code></a></li>
+<li>Also reachable from <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Linker.html#method.func_new"><code>wasmtime::Linker::func_*</code></a></li>
+</ul>
+</li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ArrayType.html#method.new"><code>wasmtime::ArrayType::new</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.StructType.html#method.new"><code>wasmtime::StructType::new</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Func.html#method.ty"><code>wasmtime::Func::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Global.html#method.ty"><code>wasmtime::Global::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Table.html#method.ty"><code>wasmtime::Table::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Extern.html#method.ty"><code>wasmtime::Extern::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Export.html#method.ty"><code>wasmtime::Export::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.UnknownImportError.html#method.ty"><code>wasmtime::UnknownImportError::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ImportType.html#method.ty"><code>wasmtime::ImportType::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ExportType.html#method.ty"><code>wasmtime::ExportType::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Val.html#method.ty"><code>wasmtime::Val::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Ref.html#method.ty"><code>wasmtime::Ref::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.AnyRef.html#method.ty"><code>wasmtime::AnyRef::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.EqRef.html#method.ty"><code>wasmtime::EqRef::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ArrayRef.html#method.ty"><code>wasmtime::ArrayRef::ty</code></a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.StructRef.html#method.ty"><code>wasmtime::StructRef::ty</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.FuncType.html"><code>wasmtime::FuncType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ArrayType.html"><code>wasmtime::ArrayType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.StructType.html"><code>wasmtime::StructType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ExternType.html"><code>wasmtime::ExternType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.GlobalType.html"><code>wasmtime::GlobalType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.TableType.html"><code>wasmtime::TableType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.ValType.html"><code>wasmtime::ValType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.RefType.html"><code>wasmtime::RefType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.HeapType.html"><code>wasmtime::HeapType</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.UnknownImportError.html"><code>wasmtime::UnknownImportError</code></a></li>
+<li>Dropping a <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Linker.html"><code>wasmtime::Linker</code></a></li>
+</ul>
+<p>The change which introduced this bug was <a href="https://github.com/bytecodealliance/wasmtime/pull/7969">#7969</a></p>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-7qmx-3fpx-r45m">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-7qmx-3fpx-r45m</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2024-47813">https://nvd.nist.gov/vuln/detail/CVE-2024-47813</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/7969">https://github.com/bytecodealliance/wasmtime/pull/7969</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba">https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba</a></li>
+<li><a href="https://github.com/advisories/GHSA-7qmx-3fpx-r45m">https://github.com/advisories/GHSA-7qmx-3fpx-r45m</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-7qmx-3fpx-r45m</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2024-10-09T19:14:35.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[wasmtime] wasmtime has a runtime crash when combining tail calls with trapping imports]]></title>
+        <id>https://github.com/advisories/GHSA-q8hx-mm92-4wvg</id>
+        <link href="https://github.com/advisories/GHSA-q8hx-mm92-4wvg"/>
+        <updated>2024-10-09T19:14:04.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Wasmtime's implementation of WebAssembly tail calls combined with stack traces can result in a runtime crash in certain WebAssembly modules. The runtime crash may be undefined behavior if Wasmtime was compiled with Rust 1.80 or prior. The runtime crash is a deterministic process abort when Wasmtime is compiled with Rust 1.81 and later.</p>
+<p><a href="https://github.com/webassembly/tail-call">WebAssembly tail calls</a> are a proposal which relatively recently reached stage 4 in the <a href="https://github.com/WebAssembly/proposals/">standardization process</a>. Wasmtime first enabled support for tail calls by default <a href="https://github.com/bytecodealliance/wasmtime/pull/8540">in Wasmtime 21.0.0</a>, although that release contained a bug where it was only on-by-default for some configurations. In <a href="https://github.com/bytecodealliance/wasmtime/pull/8682">Wasmtime 22.0.0</a> tail calls were enabled by default for all configurations.</p>
+<p>The specific crash happens when an exported function in a WebAssembly module (or component) performs a <code>return_call</code> (or <code>return_call_indirect</code> or <code>return_call_ref</code>) to an imported host function which captures a stack trace (for example, the host function raises a trap). In this situation, the stack-walking code previously assumed there was always at least one WebAssembly frame on the stack but with tail calls that is no longer true. With the tail-call proposal it's possible to have an entry trampoline appear as if it directly called the exit trampoline. This situation triggers an internal assert in the stack-walking code which raises a Rust <code>panic!()</code>.</p>
+<p>When Wasmtime is compiled with Rust versions 1.80 and prior this means that an <code>extern "C"</code> function in Rust is raising a <code>panic!()</code>. This is technically undefined behavior and typically manifests as a process abort when the unwinder fails to unwind Cranelift-generated frames. When Wasmtime is compiled with Rust versions 1.81 and later this panic becomes a deterministic process abort.</p>
+<p>Overall the impact of this issue is that this is a denial-of-service vector where a malicious WebAssembly module or component can cause the host to crash. There is no other impact at this time other than availability of a service as the result of the crash is always a crash and no more.</p>
+<p>This issue was discovered by routine fuzzing performed by the Wasmtime project via Google's OSS-Fuzz infrastructure. We have no evidence that it has ever been exploited by an attacker in the wild.</p>
+<h3 id="patches">Patches</h3>
+<p>All versions of Wasmtime which have tail calls enabled by default have been patched:</p>
+<ul>
+<li>21.0.x - patched in 21.0.2</li>
+<li>22.0.x - patched in 22.0.1</li>
+<li>23.0.x - patched in 23.0.3 </li>
+<li>24.0.x - patched in 24.0.1</li>
+<li>25.0.x - patched in 25.0.2</li>
+</ul>
+<p>Wasmtime versions from 12.0.x (the first release with experimental tail call support) to 20.0.x (the last release with tail-calls off-by-default) have support for tail calls but the support is disabled by default. These versions are not affected in their default configurations, but users who explicitly enabled tail call support will need to either disable tail call support or upgrade to a patched version of Wasmtime.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>The main workaround for this issue is to disable tail support for tail calls in Wasmtime, for example with <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.wasm_tail_call"><code>Config::wasm_tail_call(false)</code></a>. Users are otherwise encouraged to upgrade to patched versions.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/6774">Wasmtime's initial implementation of tail calls</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8540">Enabling of tail calls in 21.0.0</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8682">Fully enabling tail calls in 22.0.0</a></li>
+<li><a href="https://github.com/webassembly/tail-call">The WebAssembly's <code>tail-call</code> proposal</a></li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-q8hx-mm92-4wvg">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-q8hx-mm92-4wvg</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2024-47763">https://nvd.nist.gov/vuln/detail/CVE-2024-47763</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/6774">https://github.com/bytecodealliance/wasmtime/pull/6774</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8540">https://github.com/bytecodealliance/wasmtime/pull/8540</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8682">https://github.com/bytecodealliance/wasmtime/pull/8682</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba">https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba</a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.wasm_tail_call">https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.wasm_tail_call</a></li>
+<li><a href="https://github.com/WebAssembly/proposals">https://github.com/WebAssembly/proposals</a></li>
+<li><a href="https://github.com/webassembly/tail-call">https://github.com/webassembly/tail-call</a></li>
+<li><a href="https://github.com/advisories/GHSA-q8hx-mm92-4wvg">https://github.com/advisories/GHSA-q8hx-mm92-4wvg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-q8hx-mm92-4wvg</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2024-10-09T19:14:03.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[wasmtime] wasmtime has a runtime crash when combining tail calls with trapping imports]]></title>
+        <id>https://github.com/advisories/GHSA-q8hx-mm92-4wvg</id>
+        <link href="https://github.com/advisories/GHSA-q8hx-mm92-4wvg"/>
+        <updated>2024-10-09T19:14:04.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Wasmtime's implementation of WebAssembly tail calls combined with stack traces can result in a runtime crash in certain WebAssembly modules. The runtime crash may be undefined behavior if Wasmtime was compiled with Rust 1.80 or prior. The runtime crash is a deterministic process abort when Wasmtime is compiled with Rust 1.81 and later.</p>
+<p><a href="https://github.com/webassembly/tail-call">WebAssembly tail calls</a> are a proposal which relatively recently reached stage 4 in the <a href="https://github.com/WebAssembly/proposals/">standardization process</a>. Wasmtime first enabled support for tail calls by default <a href="https://github.com/bytecodealliance/wasmtime/pull/8540">in Wasmtime 21.0.0</a>, although that release contained a bug where it was only on-by-default for some configurations. In <a href="https://github.com/bytecodealliance/wasmtime/pull/8682">Wasmtime 22.0.0</a> tail calls were enabled by default for all configurations.</p>
+<p>The specific crash happens when an exported function in a WebAssembly module (or component) performs a <code>return_call</code> (or <code>return_call_indirect</code> or <code>return_call_ref</code>) to an imported host function which captures a stack trace (for example, the host function raises a trap). In this situation, the stack-walking code previously assumed there was always at least one WebAssembly frame on the stack but with tail calls that is no longer true. With the tail-call proposal it's possible to have an entry trampoline appear as if it directly called the exit trampoline. This situation triggers an internal assert in the stack-walking code which raises a Rust <code>panic!()</code>.</p>
+<p>When Wasmtime is compiled with Rust versions 1.80 and prior this means that an <code>extern "C"</code> function in Rust is raising a <code>panic!()</code>. This is technically undefined behavior and typically manifests as a process abort when the unwinder fails to unwind Cranelift-generated frames. When Wasmtime is compiled with Rust versions 1.81 and later this panic becomes a deterministic process abort.</p>
+<p>Overall the impact of this issue is that this is a denial-of-service vector where a malicious WebAssembly module or component can cause the host to crash. There is no other impact at this time other than availability of a service as the result of the crash is always a crash and no more.</p>
+<p>This issue was discovered by routine fuzzing performed by the Wasmtime project via Google's OSS-Fuzz infrastructure. We have no evidence that it has ever been exploited by an attacker in the wild.</p>
+<h3 id="patches">Patches</h3>
+<p>All versions of Wasmtime which have tail calls enabled by default have been patched:</p>
+<ul>
+<li>21.0.x - patched in 21.0.2</li>
+<li>22.0.x - patched in 22.0.1</li>
+<li>23.0.x - patched in 23.0.3 </li>
+<li>24.0.x - patched in 24.0.1</li>
+<li>25.0.x - patched in 25.0.2</li>
+</ul>
+<p>Wasmtime versions from 12.0.x (the first release with experimental tail call support) to 20.0.x (the last release with tail-calls off-by-default) have support for tail calls but the support is disabled by default. These versions are not affected in their default configurations, but users who explicitly enabled tail call support will need to either disable tail call support or upgrade to a patched version of Wasmtime.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>The main workaround for this issue is to disable tail support for tail calls in Wasmtime, for example with <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.wasm_tail_call"><code>Config::wasm_tail_call(false)</code></a>. Users are otherwise encouraged to upgrade to patched versions.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/6774">Wasmtime's initial implementation of tail calls</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8540">Enabling of tail calls in 21.0.0</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8682">Fully enabling tail calls in 22.0.0</a></li>
+<li><a href="https://github.com/webassembly/tail-call">The WebAssembly's <code>tail-call</code> proposal</a></li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-q8hx-mm92-4wvg">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-q8hx-mm92-4wvg</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2024-47763">https://nvd.nist.gov/vuln/detail/CVE-2024-47763</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/6774">https://github.com/bytecodealliance/wasmtime/pull/6774</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8540">https://github.com/bytecodealliance/wasmtime/pull/8540</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8682">https://github.com/bytecodealliance/wasmtime/pull/8682</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba">https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba</a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.wasm_tail_call">https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.wasm_tail_call</a></li>
+<li><a href="https://github.com/WebAssembly/proposals">https://github.com/WebAssembly/proposals</a></li>
+<li><a href="https://github.com/webassembly/tail-call">https://github.com/webassembly/tail-call</a></li>
+<li><a href="https://github.com/advisories/GHSA-q8hx-mm92-4wvg">https://github.com/advisories/GHSA-q8hx-mm92-4wvg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-q8hx-mm92-4wvg</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2024-10-09T19:14:03.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[wasmtime] wasmtime has a runtime crash when combining tail calls with trapping imports]]></title>
+        <id>https://github.com/advisories/GHSA-q8hx-mm92-4wvg</id>
+        <link href="https://github.com/advisories/GHSA-q8hx-mm92-4wvg"/>
+        <updated>2024-10-09T19:14:04.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Wasmtime's implementation of WebAssembly tail calls combined with stack traces can result in a runtime crash in certain WebAssembly modules. The runtime crash may be undefined behavior if Wasmtime was compiled with Rust 1.80 or prior. The runtime crash is a deterministic process abort when Wasmtime is compiled with Rust 1.81 and later.</p>
+<p><a href="https://github.com/webassembly/tail-call">WebAssembly tail calls</a> are a proposal which relatively recently reached stage 4 in the <a href="https://github.com/WebAssembly/proposals/">standardization process</a>. Wasmtime first enabled support for tail calls by default <a href="https://github.com/bytecodealliance/wasmtime/pull/8540">in Wasmtime 21.0.0</a>, although that release contained a bug where it was only on-by-default for some configurations. In <a href="https://github.com/bytecodealliance/wasmtime/pull/8682">Wasmtime 22.0.0</a> tail calls were enabled by default for all configurations.</p>
+<p>The specific crash happens when an exported function in a WebAssembly module (or component) performs a <code>return_call</code> (or <code>return_call_indirect</code> or <code>return_call_ref</code>) to an imported host function which captures a stack trace (for example, the host function raises a trap). In this situation, the stack-walking code previously assumed there was always at least one WebAssembly frame on the stack but with tail calls that is no longer true. With the tail-call proposal it's possible to have an entry trampoline appear as if it directly called the exit trampoline. This situation triggers an internal assert in the stack-walking code which raises a Rust <code>panic!()</code>.</p>
+<p>When Wasmtime is compiled with Rust versions 1.80 and prior this means that an <code>extern "C"</code> function in Rust is raising a <code>panic!()</code>. This is technically undefined behavior and typically manifests as a process abort when the unwinder fails to unwind Cranelift-generated frames. When Wasmtime is compiled with Rust versions 1.81 and later this panic becomes a deterministic process abort.</p>
+<p>Overall the impact of this issue is that this is a denial-of-service vector where a malicious WebAssembly module or component can cause the host to crash. There is no other impact at this time other than availability of a service as the result of the crash is always a crash and no more.</p>
+<p>This issue was discovered by routine fuzzing performed by the Wasmtime project via Google's OSS-Fuzz infrastructure. We have no evidence that it has ever been exploited by an attacker in the wild.</p>
+<h3 id="patches">Patches</h3>
+<p>All versions of Wasmtime which have tail calls enabled by default have been patched:</p>
+<ul>
+<li>21.0.x - patched in 21.0.2</li>
+<li>22.0.x - patched in 22.0.1</li>
+<li>23.0.x - patched in 23.0.3 </li>
+<li>24.0.x - patched in 24.0.1</li>
+<li>25.0.x - patched in 25.0.2</li>
+</ul>
+<p>Wasmtime versions from 12.0.x (the first release with experimental tail call support) to 20.0.x (the last release with tail-calls off-by-default) have support for tail calls but the support is disabled by default. These versions are not affected in their default configurations, but users who explicitly enabled tail call support will need to either disable tail call support or upgrade to a patched version of Wasmtime.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>The main workaround for this issue is to disable tail support for tail calls in Wasmtime, for example with <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.wasm_tail_call"><code>Config::wasm_tail_call(false)</code></a>. Users are otherwise encouraged to upgrade to patched versions.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/6774">Wasmtime's initial implementation of tail calls</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8540">Enabling of tail calls in 21.0.0</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8682">Fully enabling tail calls in 22.0.0</a></li>
+<li><a href="https://github.com/webassembly/tail-call">The WebAssembly's <code>tail-call</code> proposal</a></li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-q8hx-mm92-4wvg">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-q8hx-mm92-4wvg</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2024-47763">https://nvd.nist.gov/vuln/detail/CVE-2024-47763</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/6774">https://github.com/bytecodealliance/wasmtime/pull/6774</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8540">https://github.com/bytecodealliance/wasmtime/pull/8540</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8682">https://github.com/bytecodealliance/wasmtime/pull/8682</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba">https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba</a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.wasm_tail_call">https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.wasm_tail_call</a></li>
+<li><a href="https://github.com/WebAssembly/proposals">https://github.com/WebAssembly/proposals</a></li>
+<li><a href="https://github.com/webassembly/tail-call">https://github.com/webassembly/tail-call</a></li>
+<li><a href="https://github.com/advisories/GHSA-q8hx-mm92-4wvg">https://github.com/advisories/GHSA-q8hx-mm92-4wvg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-q8hx-mm92-4wvg</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2024-10-09T19:14:03.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[wasmtime] wasmtime has a runtime crash when combining tail calls with trapping imports]]></title>
+        <id>https://github.com/advisories/GHSA-q8hx-mm92-4wvg</id>
+        <link href="https://github.com/advisories/GHSA-q8hx-mm92-4wvg"/>
+        <updated>2024-10-09T19:14:04.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Wasmtime's implementation of WebAssembly tail calls combined with stack traces can result in a runtime crash in certain WebAssembly modules. The runtime crash may be undefined behavior if Wasmtime was compiled with Rust 1.80 or prior. The runtime crash is a deterministic process abort when Wasmtime is compiled with Rust 1.81 and later.</p>
+<p><a href="https://github.com/webassembly/tail-call">WebAssembly tail calls</a> are a proposal which relatively recently reached stage 4 in the <a href="https://github.com/WebAssembly/proposals/">standardization process</a>. Wasmtime first enabled support for tail calls by default <a href="https://github.com/bytecodealliance/wasmtime/pull/8540">in Wasmtime 21.0.0</a>, although that release contained a bug where it was only on-by-default for some configurations. In <a href="https://github.com/bytecodealliance/wasmtime/pull/8682">Wasmtime 22.0.0</a> tail calls were enabled by default for all configurations.</p>
+<p>The specific crash happens when an exported function in a WebAssembly module (or component) performs a <code>return_call</code> (or <code>return_call_indirect</code> or <code>return_call_ref</code>) to an imported host function which captures a stack trace (for example, the host function raises a trap). In this situation, the stack-walking code previously assumed there was always at least one WebAssembly frame on the stack but with tail calls that is no longer true. With the tail-call proposal it's possible to have an entry trampoline appear as if it directly called the exit trampoline. This situation triggers an internal assert in the stack-walking code which raises a Rust <code>panic!()</code>.</p>
+<p>When Wasmtime is compiled with Rust versions 1.80 and prior this means that an <code>extern "C"</code> function in Rust is raising a <code>panic!()</code>. This is technically undefined behavior and typically manifests as a process abort when the unwinder fails to unwind Cranelift-generated frames. When Wasmtime is compiled with Rust versions 1.81 and later this panic becomes a deterministic process abort.</p>
+<p>Overall the impact of this issue is that this is a denial-of-service vector where a malicious WebAssembly module or component can cause the host to crash. There is no other impact at this time other than availability of a service as the result of the crash is always a crash and no more.</p>
+<p>This issue was discovered by routine fuzzing performed by the Wasmtime project via Google's OSS-Fuzz infrastructure. We have no evidence that it has ever been exploited by an attacker in the wild.</p>
+<h3 id="patches">Patches</h3>
+<p>All versions of Wasmtime which have tail calls enabled by default have been patched:</p>
+<ul>
+<li>21.0.x - patched in 21.0.2</li>
+<li>22.0.x - patched in 22.0.1</li>
+<li>23.0.x - patched in 23.0.3 </li>
+<li>24.0.x - patched in 24.0.1</li>
+<li>25.0.x - patched in 25.0.2</li>
+</ul>
+<p>Wasmtime versions from 12.0.x (the first release with experimental tail call support) to 20.0.x (the last release with tail-calls off-by-default) have support for tail calls but the support is disabled by default. These versions are not affected in their default configurations, but users who explicitly enabled tail call support will need to either disable tail call support or upgrade to a patched version of Wasmtime.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>The main workaround for this issue is to disable tail support for tail calls in Wasmtime, for example with <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.wasm_tail_call"><code>Config::wasm_tail_call(false)</code></a>. Users are otherwise encouraged to upgrade to patched versions.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/6774">Wasmtime's initial implementation of tail calls</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8540">Enabling of tail calls in 21.0.0</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8682">Fully enabling tail calls in 22.0.0</a></li>
+<li><a href="https://github.com/webassembly/tail-call">The WebAssembly's <code>tail-call</code> proposal</a></li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-q8hx-mm92-4wvg">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-q8hx-mm92-4wvg</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2024-47763">https://nvd.nist.gov/vuln/detail/CVE-2024-47763</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/6774">https://github.com/bytecodealliance/wasmtime/pull/6774</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8540">https://github.com/bytecodealliance/wasmtime/pull/8540</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8682">https://github.com/bytecodealliance/wasmtime/pull/8682</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba">https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba</a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.wasm_tail_call">https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.wasm_tail_call</a></li>
+<li><a href="https://github.com/WebAssembly/proposals">https://github.com/WebAssembly/proposals</a></li>
+<li><a href="https://github.com/webassembly/tail-call">https://github.com/webassembly/tail-call</a></li>
+<li><a href="https://github.com/advisories/GHSA-q8hx-mm92-4wvg">https://github.com/advisories/GHSA-q8hx-mm92-4wvg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-q8hx-mm92-4wvg</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2024-10-09T19:14:03.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[wasmtime] wasmtime has a runtime crash when combining tail calls with trapping imports]]></title>
+        <id>https://github.com/advisories/GHSA-q8hx-mm92-4wvg</id>
+        <link href="https://github.com/advisories/GHSA-q8hx-mm92-4wvg"/>
+        <updated>2024-10-09T19:14:04.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Wasmtime's implementation of WebAssembly tail calls combined with stack traces can result in a runtime crash in certain WebAssembly modules. The runtime crash may be undefined behavior if Wasmtime was compiled with Rust 1.80 or prior. The runtime crash is a deterministic process abort when Wasmtime is compiled with Rust 1.81 and later.</p>
+<p><a href="https://github.com/webassembly/tail-call">WebAssembly tail calls</a> are a proposal which relatively recently reached stage 4 in the <a href="https://github.com/WebAssembly/proposals/">standardization process</a>. Wasmtime first enabled support for tail calls by default <a href="https://github.com/bytecodealliance/wasmtime/pull/8540">in Wasmtime 21.0.0</a>, although that release contained a bug where it was only on-by-default for some configurations. In <a href="https://github.com/bytecodealliance/wasmtime/pull/8682">Wasmtime 22.0.0</a> tail calls were enabled by default for all configurations.</p>
+<p>The specific crash happens when an exported function in a WebAssembly module (or component) performs a <code>return_call</code> (or <code>return_call_indirect</code> or <code>return_call_ref</code>) to an imported host function which captures a stack trace (for example, the host function raises a trap). In this situation, the stack-walking code previously assumed there was always at least one WebAssembly frame on the stack but with tail calls that is no longer true. With the tail-call proposal it's possible to have an entry trampoline appear as if it directly called the exit trampoline. This situation triggers an internal assert in the stack-walking code which raises a Rust <code>panic!()</code>.</p>
+<p>When Wasmtime is compiled with Rust versions 1.80 and prior this means that an <code>extern "C"</code> function in Rust is raising a <code>panic!()</code>. This is technically undefined behavior and typically manifests as a process abort when the unwinder fails to unwind Cranelift-generated frames. When Wasmtime is compiled with Rust versions 1.81 and later this panic becomes a deterministic process abort.</p>
+<p>Overall the impact of this issue is that this is a denial-of-service vector where a malicious WebAssembly module or component can cause the host to crash. There is no other impact at this time other than availability of a service as the result of the crash is always a crash and no more.</p>
+<p>This issue was discovered by routine fuzzing performed by the Wasmtime project via Google's OSS-Fuzz infrastructure. We have no evidence that it has ever been exploited by an attacker in the wild.</p>
+<h3 id="patches">Patches</h3>
+<p>All versions of Wasmtime which have tail calls enabled by default have been patched:</p>
+<ul>
+<li>21.0.x - patched in 21.0.2</li>
+<li>22.0.x - patched in 22.0.1</li>
+<li>23.0.x - patched in 23.0.3 </li>
+<li>24.0.x - patched in 24.0.1</li>
+<li>25.0.x - patched in 25.0.2</li>
+</ul>
+<p>Wasmtime versions from 12.0.x (the first release with experimental tail call support) to 20.0.x (the last release with tail-calls off-by-default) have support for tail calls but the support is disabled by default. These versions are not affected in their default configurations, but users who explicitly enabled tail call support will need to either disable tail call support or upgrade to a patched version of Wasmtime.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>The main workaround for this issue is to disable tail support for tail calls in Wasmtime, for example with <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.wasm_tail_call"><code>Config::wasm_tail_call(false)</code></a>. Users are otherwise encouraged to upgrade to patched versions.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/6774">Wasmtime's initial implementation of tail calls</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8540">Enabling of tail calls in 21.0.0</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8682">Fully enabling tail calls in 22.0.0</a></li>
+<li><a href="https://github.com/webassembly/tail-call">The WebAssembly's <code>tail-call</code> proposal</a></li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-q8hx-mm92-4wvg">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-q8hx-mm92-4wvg</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2024-47763">https://nvd.nist.gov/vuln/detail/CVE-2024-47763</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/6774">https://github.com/bytecodealliance/wasmtime/pull/6774</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8540">https://github.com/bytecodealliance/wasmtime/pull/8540</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/pull/8682">https://github.com/bytecodealliance/wasmtime/pull/8682</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba">https://github.com/bytecodealliance/wasmtime/commit/0ebe54d05f0e1f6c64b7c8bb48c9e9f6c95cacba</a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.wasm_tail_call">https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.wasm_tail_call</a></li>
+<li><a href="https://github.com/WebAssembly/proposals">https://github.com/WebAssembly/proposals</a></li>
+<li><a href="https://github.com/webassembly/tail-call">https://github.com/webassembly/tail-call</a></li>
+<li><a href="https://github.com/advisories/GHSA-q8hx-mm92-4wvg">https://github.com/advisories/GHSA-q8hx-mm92-4wvg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-q8hx-mm92-4wvg</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2024-10-09T19:14:03.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[dbn] Databento Binary Encoding (DBN) has a heap buffer overflow using c_chars_to_str function]]></title>
         <id>https://github.com/advisories/GHSA-pfr9-2p92-qrhq</id>
@@ -338,347 +1248,5 @@ The issue does NOT affect objects created with Cocoon::new which utilizes Thread
         </author>
         <category label="severity" term="HIGH"/>
         <published>2024-09-25T18:31:21.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[ouch] Ouch! allows a segmentation fault due to use of uninitialized memory]]></title>
-        <id>https://github.com/advisories/GHSA-2wq5-g96f-mv3v</id>
-        <link href="https://github.com/advisories/GHSA-2wq5-g96f-mv3v"/>
-        <updated>2024-09-23T20:47:28.000Z</updated>
-        <content type="html"><![CDATA[<p>When trying to decompress a file using "ouch", we can reach the function "ouch::archive::zip::convert_zip_date_time". In the function, there is a unsafe function, "transmute". Once the "transmute" function is called to convert the type of "month" object, the address of the object is changed to the uninitialized memory region. After that, when other function tries to dereference "month", segmentation fault occurs.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/ouch-org/ouch/issues/707">https://github.com/ouch-org/ouch/issues/707</a></li>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2024-0374.html">https://rustsec.org/advisories/RUSTSEC-2024-0374.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-2wq5-g96f-mv3v">https://github.com/advisories/GHSA-2wq5-g96f-mv3v</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-2wq5-g96f-mv3v</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2024-09-23T20:47:27.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[lexical-core] lexical-core has multiple soundness issues]]></title>
-        <id>https://github.com/advisories/GHSA-2326-pfpj-vx3h</id>
-        <link href="https://github.com/advisories/GHSA-2326-pfpj-vx3h"/>
-        <updated>2024-09-16T17:19:02.000Z</updated>
-        <content type="html"><![CDATA[<p><code>RUSTSEC-2024-0377</code> contains multiple soundness issues:</p>
-<ol>
-<li><a href="https://github.com/Alexhuszagh/rust-lexical/issues/102">Bytes::read() allows creating instances of types with invalid bit patterns</a></li>
-<li><a href="https://github.com/Alexhuszagh/rust-lexical/issues/101">BytesIter::read() advances iterators out of bounds</a></li>
-<li><a href="https://github.com/Alexhuszagh/rust-lexical/issues/104">The <code>BytesIter</code> trait has safety invariants but is public and not marked <code>unsafe</code></a></li>
-<li><a href="https://github.com/Alexhuszagh/rust-lexical/issues/95"><code>write_float()</code> calls <code>MaybeUninit::assume_init()</code> on uninitialized data, which is is not allowed by the Rust abstract machine</a></li>
-<li><a href="https://github.com/Alexhuszagh/rust-lexical/issues/126"><code>radix()</code> calls <code>MaybeUninit::assume_init()</code> on uninitialized data, which is is not allowed by the Rust abstract machine</a></li>
-</ol>
-<p>Version 1.0 fixes these issues, removes the vast majority of <code>unsafe</code> code, and also fixes some correctness issues.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Alexhuszagh/rust-lexical/issues/101">https://github.com/Alexhuszagh/rust-lexical/issues/101</a></li>
-<li><a href="https://github.com/Alexhuszagh/rust-lexical/issues/102">https://github.com/Alexhuszagh/rust-lexical/issues/102</a></li>
-<li><a href="https://github.com/Alexhuszagh/rust-lexical/issues/104">https://github.com/Alexhuszagh/rust-lexical/issues/104</a></li>
-<li><a href="https://github.com/Alexhuszagh/rust-lexical/issues/126">https://github.com/Alexhuszagh/rust-lexical/issues/126</a></li>
-<li><a href="https://github.com/Alexhuszagh/rust-lexical/issues/95">https://github.com/Alexhuszagh/rust-lexical/issues/95</a></li>
-<li><a href="https://github.com/advisories/GHSA-c2hm-mjxv-89r4">https://github.com/advisories/GHSA-c2hm-mjxv-89r4</a></li>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2023-0055">https://rustsec.org/advisories/RUSTSEC-2023-0055</a></li>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2023-0086.html">https://rustsec.org/advisories/RUSTSEC-2023-0086.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-2326-pfpj-vx3h">https://github.com/advisories/GHSA-2326-pfpj-vx3h</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-2326-pfpj-vx3h</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2024-09-16T17:19:01.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[lexical] Multiple soundness issues in lexical]]></title>
-        <id>https://github.com/advisories/GHSA-c2hm-mjxv-89r4</id>
-        <link href="https://github.com/advisories/GHSA-c2hm-mjxv-89r4"/>
-        <updated>2024-09-16T16:50:15.000Z</updated>
-        <content type="html"><![CDATA[<p><code>lexical</code> contains multiple soundness issues:</p>
-<ol>
-<li><a href="https://github.com/Alexhuszagh/rust-lexical/issues/102">Bytes::read() allows creating instances of types with invalid bit patterns</a></li>
-<li><a href="https://github.com/Alexhuszagh/rust-lexical/issues/101">BytesIter::read() advances iterators out of bounds</a></li>
-<li><a href="https://github.com/Alexhuszagh/rust-lexical/issues/104">The <code>BytesIter</code> trait has safety invariants but is public and not marked <code>unsafe</code></a></li>
-<li><a href="https://github.com/Alexhuszagh/rust-lexical/issues/95"><code>write_float()</code> calls <code>MaybeUninit::assume_init()</code> on uninitialized data, which is is not allowed by the Rust abstract machine</a></li>
-<li><a href="https://github.com/Alexhuszagh/rust-lexical/issues/126"><code>radix()</code> calls <code>MaybeUninit::assume_init()</code> on uninitialized data, which is is not allowed by the Rust abstract machine</a></li>
-</ol>
-<p>The crate also has some correctness issues.</p>
-<h2 id="alternatives">Alternatives</h2>
-<p>For quickly parsing floating-point numbers third-party crates are no longer needed. A fast float parsing algorithm by the author of <code>lexical</code> has been <a href="https://github.com/rust-lang/rust/pull/86761">merged</a> into libcore.</p>
-<p>For quickly parsing integers, consider <code>atoi</code> and <code>btoi</code> crates (100% safe code). <code>atoi_radix10</code> provides even faster parsing, but only with <code>-C target-cpu=native</code>, and at the cost of some <code>unsafe</code>.</p>
-<p>For formatting integers in a <code>#[no_std]</code> context consider the <a href="https://crates.io/crates/numtoa"><code>numtoa</code></a> crate.</p>
-<p>For working with big numbers consider <code>num-bigint</code> and <code>num-traits</code>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Alexhuszagh/rust-lexical">https://github.com/Alexhuszagh/rust-lexical</a></li>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2023-0055.html">https://rustsec.org/advisories/RUSTSEC-2023-0055.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-c2hm-mjxv-89r4">https://github.com/advisories/GHSA-c2hm-mjxv-89r4</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-c2hm-mjxv-89r4</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2023-09-04T17:02:00.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[compu-brotli-sys] Integer overflow in the bundled Brotli C library]]></title>
-        <id>https://github.com/advisories/GHSA-5v8v-66v8-mwm7</id>
-        <link href="https://github.com/advisories/GHSA-5v8v-66v8-mwm7"/>
-        <updated>2024-09-16T14:29:05.000Z</updated>
-        <content type="html"><![CDATA[<p>A buffer overflow exists in the Brotli library versions prior to 1.0.8 where an attacker controlling the input length of a "one-shot" decompression request to a script can trigger a crash, which happens when copying over chunks of data larger than 2 GiB. It is recommended to update your Brotli library to 1.0.8 or later. If one cannot update, we recommend to use the "streaming" API as opposed to the "one-shot" API, and impose chunk size limits.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2020-8927">https://nvd.nist.gov/vuln/detail/CVE-2020-8927</a></li>
-<li><a href="https://github.com/google/brotli/releases/tag/v1.0.9">https://github.com/google/brotli/releases/tag/v1.0.9</a></li>
-<li><a href="https://lists.debian.org/debian-lts-announce/2020/12/msg00003.html">https://lists.debian.org/debian-lts-announce/2020/12/msg00003.html</a></li>
-<li><a href="https://www.debian.org/security/2020/dsa-4801">https://www.debian.org/security/2020/dsa-4801</a></li>
-<li><a href="http://lists.opensuse.org/opensuse-security-announce/2020-09/msg00108.html">http://lists.opensuse.org/opensuse-security-announce/2020-09/msg00108.html</a></li>
-<li><a href="https://github.com/bitemyapp/brotli2-rs/issues/45">https://github.com/bitemyapp/brotli2-rs/issues/45</a></li>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2021-0131.html">https://rustsec.org/advisories/RUSTSEC-2021-0131.html</a></li>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2021-0132.html">https://rustsec.org/advisories/RUSTSEC-2021-0132.html</a></li>
-<li><a href="https://github.com/github/advisory-database/issues/785">https://github.com/github/advisory-database/issues/785</a></li>
-<li><a href="https://github.com/google/brotli/commit/223d80cfbec8fd346e32906c732c8ede21f0cea6">https://github.com/google/brotli/commit/223d80cfbec8fd346e32906c732c8ede21f0cea6</a></li>
-<li><a href="https://usn.ubuntu.com/4568-1">https://usn.ubuntu.com/4568-1</a></li>
-<li><a href="https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/ZXEQ3GQVELA2T4HNZG7VPMS2HDVXMJRG">https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/ZXEQ3GQVELA2T4HNZG7VPMS2HDVXMJRG</a></li>
-<li><a href="https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/WW62OZEY2GHJL4JCOLJRBSRETXDHMWRK">https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/WW62OZEY2GHJL4JCOLJRBSRETXDHMWRK</a></li>
-<li><a href="https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/W23CUADGMVMQQNFKHPHXVP7RPZJZNN6I">https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/W23CUADGMVMQQNFKHPHXVP7RPZJZNN6I</a></li>
-<li><a href="https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/MQLM7ABVCYJLF6JRPF3M3EBXW63GNC27">https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/MQLM7ABVCYJLF6JRPF3M3EBXW63GNC27</a></li>
-<li><a href="https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/MMBKACMLSRX7JJSKBTR35UOEP2WFR6QP">https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/MMBKACMLSRX7JJSKBTR35UOEP2WFR6QP</a></li>
-<li><a href="https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/M4VCDOJGL6BK3HB4XRD2WETBPYX2ITF6">https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/M4VCDOJGL6BK3HB4XRD2WETBPYX2ITF6</a></li>
-<li><a href="https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/J4E265WKWKYMK2RYYSIXBEGZTDY5IQE6">https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/J4E265WKWKYMK2RYYSIXBEGZTDY5IQE6</a></li>
-<li><a href="https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/4TOGTZ2ZWDH662ZNFFSZVL3M5AJXV6JF">https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/4TOGTZ2ZWDH662ZNFFSZVL3M5AJXV6JF</a></li>
-<li><a href="https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/356JOYTWW4BWSZ42SEFLV7NYHL3S3AEH">https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/356JOYTWW4BWSZ42SEFLV7NYHL3S3AEH</a></li>
-<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/brotli/PYSEC-2020-29.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/brotli/PYSEC-2020-29.yaml</a></li>
-<li><a href="https://github.com/google/brotli/releases/tag/v1.0.8">https://github.com/google/brotli/releases/tag/v1.0.8</a></li>
-<li><a href="https://github.com/advisories/GHSA-5v8v-66v8-mwm7">https://github.com/advisories/GHSA-5v8v-66v8-mwm7</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-5v8v-66v8-mwm7</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2022-05-24T17:28:21.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[arrayfire] Potential memory corruption in arrayfire]]></title>
-        <id>https://github.com/advisories/GHSA-69fv-gw6g-8ccg</id>
-        <link href="https://github.com/advisories/GHSA-69fv-gw6g-8ccg"/>
-        <updated>2024-09-12T20:47:22.000Z</updated>
-        <content type="html"><![CDATA[<p>The attribute repr() added to enums to be compatible with C-FFI caused memory corruption on MSVC toolchain.</p>
-<p>arrayfire crates &lt;= version 3.5.0 do not have this issue when used with Rust versions 1.27 or earlier. The issue only started to appear since Rust version 1.28.</p>
-<p>The issue seems to be interlinked with which version of Rust is being used.</p>
-<p>The issue was fixed in crate 3.6.0.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2018-20998">https://nvd.nist.gov/vuln/detail/CVE-2018-20998</a></li>
-<li><a href="https://github.com/arrayfire/arrayfire-rust/pull/177">https://github.com/arrayfire/arrayfire-rust/pull/177</a></li>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2018-0011.html">https://rustsec.org/advisories/RUSTSEC-2018-0011.html</a></li>
-<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/arrayfire/PYSEC-2019-144.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/arrayfire/PYSEC-2019-144.yaml</a></li>
-<li><a href="https://github.com/arrayfire/arrayfire-rust/commit/a5256f3e5e23b83eaad69699e0b04653aba04fb8">https://github.com/arrayfire/arrayfire-rust/commit/a5256f3e5e23b83eaad69699e0b04653aba04fb8</a></li>
-<li><a href="https://github.com/advisories/GHSA-69fv-gw6g-8ccg">https://github.com/advisories/GHSA-69fv-gw6g-8ccg</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-69fv-gw6g-8ccg</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2021-08-25T20:43:26.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[surrealdb] Untrusted Query Object Evaluation in RPC API]]></title>
-        <id>https://github.com/advisories/GHSA-64f8-pjgr-9wmr</id>
-        <link href="https://github.com/advisories/GHSA-64f8-pjgr-9wmr"/>
-        <updated>2024-09-11T19:20:10.000Z</updated>
-        <content type="html"><![CDATA[<p>During the sign in and sign up operations through the SurrealDB RPC API, an arbitrary object would be accepted in order to support a wide array of types and structures that could contain user credentials. This arbitrary object could potentially contain any SurrealDB value, including an object representing a subquery. For this to materialize, this object would need to be encoded using the bincode serialization format instead of the default JSON serialization format or the additionally supported CBOR serialization format.</p>
-<p>If a binary object containing a subquery were to be provided in this way, that subquery would be computed while executing the <code>SIGNIN</code> and <code>SIGNUP</code> queries defined by the database owner while defining a record access method. Since those queries are executed under a system user session with the editor role, an unauthenticated attacker may be able to leverage this behavior to select, create, update and delete non-IAM resources with permissions of a system user with the editor role.</p>
-<h3 id="impact">Impact</h3>
-<p>If a record access method was defined with a <code>SIGNIN</code> or a <code>SIGNUP</code> query and the SurrealDB RPC API was exposed to untrusted users, an attacker could be able to craft a binary object containing a subquery to provide in place of valid credentials when calling the <code>signin</code> and <code>signup</code> operations via the RPC API with the bincode serialization format. The attacker could use that subquery to select, create, update and delete resources in SurrealDB, but they would not be able to <em>directly</em> view the results of the query. This method cannot be used to create, update or delete IAM resources, as access to those kind of resources requires the owner role.</p>
-<h3 id="patches">Patches</h3>
-<p>Objects provided as variables to the sign in and sign up methods are now recursively validated to ensure that they do not contain any non-computed values, which include subqueries and other data types that could potentially result in query execution.</p>
-<ul>
-<li>Version 1.5.5 and later are not affected by this issue.</li>
-<li>Version 2.0.0-beta.3 and later are not affected by this issue.</li>
-</ul>
-<h3 id="workarounds">Workarounds</h3>
-<p>Users unable to update may want to disallow access to the SurrealDB RPC API using the affected binary serialization formats by conservatively allowing only requests to the <code>/rpc</code> endpoint of the SurrealDB HTTP server with the <code>application/json</code> content type. If the RPC API is not used at all or only used by trusted clients, disallowing or restricting access to the <code>/rpc</code> endpoint of the SurrealDB HTTP server will also prevent exploitation. Alternatively, if filtering HTTP requests is not possible, record access methods that define <code>SIGNIN</code> and <code>SIGNUP</code> clauses may be temporarily removed to completely prevent potential attacks leveraging this issue.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://surrealdb.com/docs/surrealdb/security/authentication#record-users">SurrealDB Documentation - Authentication (Record Users)</a></li>
-<li><a href="https://surrealdb.com/docs/surrealdb/integration/rpc#signup">SurrealDB Documentation - RPC Protocol (Signup)</a></li>
-<li><a href="https://surrealdb.com/docs/surrealdb/integration/rpc#signin">SurrealDB Documentation - RPC Protocol (Signin)</a></li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/surrealdb/surrealdb/security/advisories/GHSA-64f8-pjgr-9wmr">https://github.com/surrealdb/surrealdb/security/advisories/GHSA-64f8-pjgr-9wmr</a></li>
-<li><a href="https://github.com/surrealdb/surrealdb/commit/b7583a653a2c495a60630dffd663f506426db330">https://github.com/surrealdb/surrealdb/commit/b7583a653a2c495a60630dffd663f506426db330</a></li>
-<li><a href="https://github.com/surrealdb/surrealdb/commit/eab7ef5354168d4039f7f7b77042c99a52f770a6">https://github.com/surrealdb/surrealdb/commit/eab7ef5354168d4039f7f7b77042c99a52f770a6</a></li>
-<li><a href="https://surrealdb.com/docs/surrealdb/integration/rpc#signin">https://surrealdb.com/docs/surrealdb/integration/rpc#signin</a></li>
-<li><a href="https://surrealdb.com/docs/surrealdb/integration/rpc#signup">https://surrealdb.com/docs/surrealdb/integration/rpc#signup</a></li>
-<li><a href="https://surrealdb.com/docs/surrealdb/security/authentication#record-users">https://surrealdb.com/docs/surrealdb/security/authentication#record-users</a></li>
-<li><a href="https://github.com/advisories/GHSA-64f8-pjgr-9wmr">https://github.com/advisories/GHSA-64f8-pjgr-9wmr</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-64f8-pjgr-9wmr</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2024-09-11T19:20:07.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[surrealdb-core] Untrusted Query Object Evaluation in RPC API]]></title>
-        <id>https://github.com/advisories/GHSA-64f8-pjgr-9wmr</id>
-        <link href="https://github.com/advisories/GHSA-64f8-pjgr-9wmr"/>
-        <updated>2024-09-11T19:20:10.000Z</updated>
-        <content type="html"><![CDATA[<p>During the sign in and sign up operations through the SurrealDB RPC API, an arbitrary object would be accepted in order to support a wide array of types and structures that could contain user credentials. This arbitrary object could potentially contain any SurrealDB value, including an object representing a subquery. For this to materialize, this object would need to be encoded using the bincode serialization format instead of the default JSON serialization format or the additionally supported CBOR serialization format.</p>
-<p>If a binary object containing a subquery were to be provided in this way, that subquery would be computed while executing the <code>SIGNIN</code> and <code>SIGNUP</code> queries defined by the database owner while defining a record access method. Since those queries are executed under a system user session with the editor role, an unauthenticated attacker may be able to leverage this behavior to select, create, update and delete non-IAM resources with permissions of a system user with the editor role.</p>
-<h3 id="impact">Impact</h3>
-<p>If a record access method was defined with a <code>SIGNIN</code> or a <code>SIGNUP</code> query and the SurrealDB RPC API was exposed to untrusted users, an attacker could be able to craft a binary object containing a subquery to provide in place of valid credentials when calling the <code>signin</code> and <code>signup</code> operations via the RPC API with the bincode serialization format. The attacker could use that subquery to select, create, update and delete resources in SurrealDB, but they would not be able to <em>directly</em> view the results of the query. This method cannot be used to create, update or delete IAM resources, as access to those kind of resources requires the owner role.</p>
-<h3 id="patches">Patches</h3>
-<p>Objects provided as variables to the sign in and sign up methods are now recursively validated to ensure that they do not contain any non-computed values, which include subqueries and other data types that could potentially result in query execution.</p>
-<ul>
-<li>Version 1.5.5 and later are not affected by this issue.</li>
-<li>Version 2.0.0-beta.3 and later are not affected by this issue.</li>
-</ul>
-<h3 id="workarounds">Workarounds</h3>
-<p>Users unable to update may want to disallow access to the SurrealDB RPC API using the affected binary serialization formats by conservatively allowing only requests to the <code>/rpc</code> endpoint of the SurrealDB HTTP server with the <code>application/json</code> content type. If the RPC API is not used at all or only used by trusted clients, disallowing or restricting access to the <code>/rpc</code> endpoint of the SurrealDB HTTP server will also prevent exploitation. Alternatively, if filtering HTTP requests is not possible, record access methods that define <code>SIGNIN</code> and <code>SIGNUP</code> clauses may be temporarily removed to completely prevent potential attacks leveraging this issue.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://surrealdb.com/docs/surrealdb/security/authentication#record-users">SurrealDB Documentation - Authentication (Record Users)</a></li>
-<li><a href="https://surrealdb.com/docs/surrealdb/integration/rpc#signup">SurrealDB Documentation - RPC Protocol (Signup)</a></li>
-<li><a href="https://surrealdb.com/docs/surrealdb/integration/rpc#signin">SurrealDB Documentation - RPC Protocol (Signin)</a></li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/surrealdb/surrealdb/security/advisories/GHSA-64f8-pjgr-9wmr">https://github.com/surrealdb/surrealdb/security/advisories/GHSA-64f8-pjgr-9wmr</a></li>
-<li><a href="https://github.com/surrealdb/surrealdb/commit/b7583a653a2c495a60630dffd663f506426db330">https://github.com/surrealdb/surrealdb/commit/b7583a653a2c495a60630dffd663f506426db330</a></li>
-<li><a href="https://github.com/surrealdb/surrealdb/commit/eab7ef5354168d4039f7f7b77042c99a52f770a6">https://github.com/surrealdb/surrealdb/commit/eab7ef5354168d4039f7f7b77042c99a52f770a6</a></li>
-<li><a href="https://surrealdb.com/docs/surrealdb/integration/rpc#signin">https://surrealdb.com/docs/surrealdb/integration/rpc#signin</a></li>
-<li><a href="https://surrealdb.com/docs/surrealdb/integration/rpc#signup">https://surrealdb.com/docs/surrealdb/integration/rpc#signup</a></li>
-<li><a href="https://surrealdb.com/docs/surrealdb/security/authentication#record-users">https://surrealdb.com/docs/surrealdb/security/authentication#record-users</a></li>
-<li><a href="https://github.com/advisories/GHSA-64f8-pjgr-9wmr">https://github.com/advisories/GHSA-64f8-pjgr-9wmr</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-64f8-pjgr-9wmr</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2024-09-11T19:20:07.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[surrealdb] Untrusted Query Object Evaluation in RPC API]]></title>
-        <id>https://github.com/advisories/GHSA-64f8-pjgr-9wmr</id>
-        <link href="https://github.com/advisories/GHSA-64f8-pjgr-9wmr"/>
-        <updated>2024-09-11T19:20:10.000Z</updated>
-        <content type="html"><![CDATA[<p>During the sign in and sign up operations through the SurrealDB RPC API, an arbitrary object would be accepted in order to support a wide array of types and structures that could contain user credentials. This arbitrary object could potentially contain any SurrealDB value, including an object representing a subquery. For this to materialize, this object would need to be encoded using the bincode serialization format instead of the default JSON serialization format or the additionally supported CBOR serialization format.</p>
-<p>If a binary object containing a subquery were to be provided in this way, that subquery would be computed while executing the <code>SIGNIN</code> and <code>SIGNUP</code> queries defined by the database owner while defining a record access method. Since those queries are executed under a system user session with the editor role, an unauthenticated attacker may be able to leverage this behavior to select, create, update and delete non-IAM resources with permissions of a system user with the editor role.</p>
-<h3 id="impact">Impact</h3>
-<p>If a record access method was defined with a <code>SIGNIN</code> or a <code>SIGNUP</code> query and the SurrealDB RPC API was exposed to untrusted users, an attacker could be able to craft a binary object containing a subquery to provide in place of valid credentials when calling the <code>signin</code> and <code>signup</code> operations via the RPC API with the bincode serialization format. The attacker could use that subquery to select, create, update and delete resources in SurrealDB, but they would not be able to <em>directly</em> view the results of the query. This method cannot be used to create, update or delete IAM resources, as access to those kind of resources requires the owner role.</p>
-<h3 id="patches">Patches</h3>
-<p>Objects provided as variables to the sign in and sign up methods are now recursively validated to ensure that they do not contain any non-computed values, which include subqueries and other data types that could potentially result in query execution.</p>
-<ul>
-<li>Version 1.5.5 and later are not affected by this issue.</li>
-<li>Version 2.0.0-beta.3 and later are not affected by this issue.</li>
-</ul>
-<h3 id="workarounds">Workarounds</h3>
-<p>Users unable to update may want to disallow access to the SurrealDB RPC API using the affected binary serialization formats by conservatively allowing only requests to the <code>/rpc</code> endpoint of the SurrealDB HTTP server with the <code>application/json</code> content type. If the RPC API is not used at all or only used by trusted clients, disallowing or restricting access to the <code>/rpc</code> endpoint of the SurrealDB HTTP server will also prevent exploitation. Alternatively, if filtering HTTP requests is not possible, record access methods that define <code>SIGNIN</code> and <code>SIGNUP</code> clauses may be temporarily removed to completely prevent potential attacks leveraging this issue.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://surrealdb.com/docs/surrealdb/security/authentication#record-users">SurrealDB Documentation - Authentication (Record Users)</a></li>
-<li><a href="https://surrealdb.com/docs/surrealdb/integration/rpc#signup">SurrealDB Documentation - RPC Protocol (Signup)</a></li>
-<li><a href="https://surrealdb.com/docs/surrealdb/integration/rpc#signin">SurrealDB Documentation - RPC Protocol (Signin)</a></li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/surrealdb/surrealdb/security/advisories/GHSA-64f8-pjgr-9wmr">https://github.com/surrealdb/surrealdb/security/advisories/GHSA-64f8-pjgr-9wmr</a></li>
-<li><a href="https://github.com/surrealdb/surrealdb/commit/b7583a653a2c495a60630dffd663f506426db330">https://github.com/surrealdb/surrealdb/commit/b7583a653a2c495a60630dffd663f506426db330</a></li>
-<li><a href="https://github.com/surrealdb/surrealdb/commit/eab7ef5354168d4039f7f7b77042c99a52f770a6">https://github.com/surrealdb/surrealdb/commit/eab7ef5354168d4039f7f7b77042c99a52f770a6</a></li>
-<li><a href="https://surrealdb.com/docs/surrealdb/integration/rpc#signin">https://surrealdb.com/docs/surrealdb/integration/rpc#signin</a></li>
-<li><a href="https://surrealdb.com/docs/surrealdb/integration/rpc#signup">https://surrealdb.com/docs/surrealdb/integration/rpc#signup</a></li>
-<li><a href="https://surrealdb.com/docs/surrealdb/security/authentication#record-users">https://surrealdb.com/docs/surrealdb/security/authentication#record-users</a></li>
-<li><a href="https://github.com/advisories/GHSA-64f8-pjgr-9wmr">https://github.com/advisories/GHSA-64f8-pjgr-9wmr</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-64f8-pjgr-9wmr</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2024-09-11T19:20:07.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[miniscript] Miniscript allows stack consumption]]></title>
-        <id>https://github.com/advisories/GHSA-rv9v-r4vm-gj8x</id>
-        <link href="https://github.com/advisories/GHSA-rv9v-r4vm-gj8x"/>
-        <updated>2024-09-09T18:20:54.000Z</updated>
-        <content type="html"><![CDATA[<p>The Miniscript (aka rust-miniscript) library for Rust allows stack consumption because it does not properly track tree depth.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2024-44073">https://nvd.nist.gov/vuln/detail/CVE-2024-44073</a></li>
-<li><a href="https://github.com/rust-bitcoin/rust-miniscript/pull/704">https://github.com/rust-bitcoin/rust-miniscript/pull/704</a></li>
-<li><a href="https://github.com/rust-bitcoin/rust-miniscript/pull/712">https://github.com/rust-bitcoin/rust-miniscript/pull/712</a></li>
-<li><a href="https://github.com/rust-bitcoin/rust-miniscript/compare/11.2.0...12.2.0">https://github.com/rust-bitcoin/rust-miniscript/compare/11.2.0...12.2.0</a></li>
-<li><a href="https://github.com/rust-bitcoin/rust-miniscript/commit/5b0f5e3417f027a22b066debf825dbe6644b575b">https://github.com/rust-bitcoin/rust-miniscript/commit/5b0f5e3417f027a22b066debf825dbe6644b575b</a></li>
-<li><a href="https://github.com/rust-bitcoin/rust-miniscript/commit/8f54b5e3fb7129ed9fbed53f1cb9e6e62ea4c151">https://github.com/rust-bitcoin/rust-miniscript/commit/8f54b5e3fb7129ed9fbed53f1cb9e6e62ea4c151</a></li>
-<li><a href="https://github.com/rust-bitcoin/rust-miniscript/pull/712/files">https://github.com/rust-bitcoin/rust-miniscript/pull/712/files</a></li>
-<li><a href="https://github.com/rust-bitcoin/rust-miniscript/pull/713/files">https://github.com/rust-bitcoin/rust-miniscript/pull/713/files</a></li>
-<li><a href="https://github.com/rust-bitcoin/rust-miniscript/pull/714/files">https://github.com/rust-bitcoin/rust-miniscript/pull/714/files</a></li>
-<li><a href="https://github.com/rust-bitcoin/rust-miniscript/pull/715/files">https://github.com/rust-bitcoin/rust-miniscript/pull/715/files</a></li>
-<li><a href="https://github.com/advisories/GHSA-rv9v-r4vm-gj8x">https://github.com/advisories/GHSA-rv9v-r4vm-gj8x</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rv9v-r4vm-gj8x</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2024-08-19T03:30:48.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[miniscript] Miniscript allows stack consumption]]></title>
-        <id>https://github.com/advisories/GHSA-rv9v-r4vm-gj8x</id>
-        <link href="https://github.com/advisories/GHSA-rv9v-r4vm-gj8x"/>
-        <updated>2024-09-09T18:20:54.000Z</updated>
-        <content type="html"><![CDATA[<p>The Miniscript (aka rust-miniscript) library for Rust allows stack consumption because it does not properly track tree depth.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2024-44073">https://nvd.nist.gov/vuln/detail/CVE-2024-44073</a></li>
-<li><a href="https://github.com/rust-bitcoin/rust-miniscript/pull/704">https://github.com/rust-bitcoin/rust-miniscript/pull/704</a></li>
-<li><a href="https://github.com/rust-bitcoin/rust-miniscript/pull/712">https://github.com/rust-bitcoin/rust-miniscript/pull/712</a></li>
-<li><a href="https://github.com/rust-bitcoin/rust-miniscript/compare/11.2.0...12.2.0">https://github.com/rust-bitcoin/rust-miniscript/compare/11.2.0...12.2.0</a></li>
-<li><a href="https://github.com/rust-bitcoin/rust-miniscript/commit/5b0f5e3417f027a22b066debf825dbe6644b575b">https://github.com/rust-bitcoin/rust-miniscript/commit/5b0f5e3417f027a22b066debf825dbe6644b575b</a></li>
-<li><a href="https://github.com/rust-bitcoin/rust-miniscript/commit/8f54b5e3fb7129ed9fbed53f1cb9e6e62ea4c151">https://github.com/rust-bitcoin/rust-miniscript/commit/8f54b5e3fb7129ed9fbed53f1cb9e6e62ea4c151</a></li>
-<li><a href="https://github.com/rust-bitcoin/rust-miniscript/pull/712/files">https://github.com/rust-bitcoin/rust-miniscript/pull/712/files</a></li>
-<li><a href="https://github.com/rust-bitcoin/rust-miniscript/pull/713/files">https://github.com/rust-bitcoin/rust-miniscript/pull/713/files</a></li>
-<li><a href="https://github.com/rust-bitcoin/rust-miniscript/pull/714/files">https://github.com/rust-bitcoin/rust-miniscript/pull/714/files</a></li>
-<li><a href="https://github.com/rust-bitcoin/rust-miniscript/pull/715/files">https://github.com/rust-bitcoin/rust-miniscript/pull/715/files</a></li>
-<li><a href="https://github.com/advisories/GHSA-rv9v-r4vm-gj8x">https://github.com/advisories/GHSA-rv9v-r4vm-gj8x</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rv9v-r4vm-gj8x</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2024-08-19T03:30:48.000Z</published>
     </entry>
 </feed>
