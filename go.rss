@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2025-09-09T19:01:15.404Z</updated>
+    <updated>2025-09-09T20:01:55.137Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,115 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/coredns/coredns] CoreDNS: DNS Cache Pinning via etcd Lease ID Confusion]]></title>
+        <id>https://github.com/advisories/GHSA-93mf-426m-g6x9</id>
+        <link href="https://github.com/advisories/GHSA-93mf-426m-g6x9"/>
+        <updated>2025-09-09T19:19:36.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="summary">Summary</h1>
+<p>The CoreDNS etcd plugin contains a TTL confusion vulnerability where lease IDs are incorrectly used as TTL values, enabling cache pinning for very long periods. This can effectively cause a denial of service for DNS updates/changes to affected services.</p>
+<h1 id="details">Details</h1>
+<p>In <code>plugin/etcd/etcd.go</code>, the <code>TTL()</code> function casts the 64-bit etcd lease ID to a uint32 and uses it as the TTL:</p>
+<pre><code class="language-go">func (e *Etcd) TTL(kv *mvccpb.KeyValue, serv *msg.Service) uint32 {
+    etcdTTL := uint32(kv.Lease)  // BUG: Lease ID != TTL duration
+    // ... rest of function uses etcdTTL as actual TTL
+}
+</code></pre>
+<p>Lease IDs are identifiers, not durations. Large lease IDs can produce very large TTLs after truncation, causing downstream resolvers and clients to cache answers for years.</p>
+<p>This enables cache pinning attacks, such as:</p>
+<ol>
+<li>Attacker has etcd write access (compromised service account, misconfigured RBAC/TLS, exposed etcd, insider).</li>
+<li>Attacker writes/updates a key and attaches any lease (the actual lease duration is irrelevant; the ID is misused).</li>
+<li>CoreDNS serves the record with an extreme TTL; downstream resolvers/clients cache it for a very long time.</li>
+<li>Even after fixing/deleting the key (or restarting CoreDNS), clients continue to use the cached answer until their caches expire or enforce their own TTL caps.</li>
+</ol>
+<p>Some resolvers implement TTL caps, but values and defaults vary widely and are not guaranteed.</p>
+<h1 id="poc">PoC</h1>
+<ol>
+<li>Launch etcd:</li>
+</ol>
+<pre><code class="language-bash">etcd \
+  --data-dir ./etcd-data \
+  --listen-client-urls http://127.0.0.1:2379 \
+  --advertise-client-urls http://127.0.0.1:2379 \
+  --listen-peer-urls http://127.0.0.1:2380 \
+  --initial-advertise-peer-urls http://127.0.0.1:2380 \
+  --initial-cluster default=http://127.0.0.1:2380 \
+  --name default \
+  --initial-cluster-token etcd-ttl-poc \
+  --initial-cluster-state new &amp;
+</code></pre>
+<ol start="2">
+<li>Prepare CoreDNS configuration:</li>
+</ol>
+<pre><code class="language-bash">cat &gt; Corefile &lt;&lt; 'EOF'
+skydns.local {
+    etcd {
+        path /skydns
+        endpoint http://localhost:2379
+        debug
+    }
+    log
+    errors
+}
+EOF
+</code></pre>
+<ol start="3">
+<li>Launch CoreDNS:</li>
+</ol>
+<pre><code class="language-bash">coredns -conf Corefile -dns.port=1053
+</code></pre>
+<ol start="4">
+<li>Create an etcd record called <code>large-lease-service</code> with a lease grant of 1 hour:</li>
+</ol>
+<pre><code class="language-bash">LEASE_ID=$(etcdctl --endpoints=http://127.0.0.1:2379 lease grant 3600 | awk '{print $2}')
+
+etcdctl --endpoints=http://127.0.0.1:2379 put /skydns/local/skydns/large-lease-service '{
+  "host": "192.168.1.101",
+  "port": 8080
+}' --lease=$LEASE_ID
+</code></pre>
+<ol start="7">
+<li>Verify the lease details:</li>
+</ol>
+<pre><code class="language-bash">$ etcdctl lease timetolive $LEASE_ID
+lease 7c4a98dd35b75c23 granted with TTL(3600s), remaining(3252s)
+</code></pre>
+<ol start="8">
+<li>Query the DNS record and observe the record TTL at 28 years:</li>
+</ol>
+<pre><code class="language-bash">$ dig +noall +answer @127.0.0.1 -p 1053 large-lease-service.skydns.local A
+large-lease-service.skydns.local. 901209123 IN A 192.168.1.101
+</code></pre>
+<h1 id="impact">Impact</h1>
+<p>Affects any CoreDNS deployment using the etcd plugin for service discovery.</p>
+<ul>
+<li>Availability: High as service changes (IP rotations, failovers, rollbacks) may be ignored for extended periods by caches.</li>
+<li>Integrity: Low as stale/incorrect answers persist abnormally long. (Note: attacker with etcd write could already point to malicious endpoints; the bug magnifies persistence.)</li>
+<li>Confidentiality: None.</li>
+</ul>
+<p>The bug was introduced in #1702 as part of the CoreDNS <a href="https://github.com/coredns/coredns/releases/tag/v1.2.0">v1.2.0 release</a>.</p>
+<h1 id="mitigation">Mitigation</h1>
+<p>The TTL function should utilise etcd's Lease API to determine the proper TTL for leased records. Add configurable limits for minimum and maximum TTL when passing lease records, to clamp potentially extreme TTL values set as lease grant.</p>
+<h1 id="credit">Credit</h1>
+<p>Thanks to <a href="https://github.com/thevilledev">@thevilledev</a> for disclovering this vulnerability and contributing a fix.</p>
+<h1 id="for-more-information">For more information</h1>
+<p>Please consult our <a href="https://github.com/coredns/coredns/blob/master/.github/SECURITY.md">security guide</a> for more information regarding our security process.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/coredns/coredns/security/advisories/GHSA-93mf-426m-g6x9">https://github.com/coredns/coredns/security/advisories/GHSA-93mf-426m-g6x9</a></li>
+<li><a href="https://github.com/coredns/coredns/commit/e1768a5d272e9da649dfb8588595e5c6e4e640bf">https://github.com/coredns/coredns/commit/e1768a5d272e9da649dfb8588595e5c6e4e640bf</a></li>
+<li><a href="https://github.com/advisories/GHSA-93mf-426m-g6x9">https://github.com/advisories/GHSA-93mf-426m-g6x9</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-93mf-426m-g6x9</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2025-09-09T19:19:33.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/prest/prest/v2] pREST has a Systemic SQL Injection Vulnerability]]></title>
         <id>https://github.com/advisories/GHSA-p46v-f2x8-qp98</id>
@@ -979,28 +1088,6 @@ p, proj:myProject:project-automation-role, applications, get, myProject/*, allow
     </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/mattermost/mattermost-server/v6] Mattermost Fails to Validate Remote Cluster Upload Sessions]]></title>
-        <id>https://github.com/advisories/GHSA-q453-638c-h4mr</id>
-        <link href="https://github.com/advisories/GHSA-q453-638c-h4mr"/>
-        <updated>2025-08-29T20:58:15.000Z</updated>
-        <content type="html"><![CDATA[<p>Mattermost versions 10.8.x &lt;= 10.8.3, 10.5.x &lt;= 10.5.8, 9.11.x &lt;= 9.11.17, 10.9.x &lt;= 10.9.2, 10.10.x &lt;= 10.10.0 fail to validate upload types in remote cluster upload sessions which allows a system admin to upload non-attachment file types via shared channels that could potentially be placed in arbitrary filesystem directories.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-49222">https://nvd.nist.gov/vuln/detail/CVE-2025-49222</a></li>
-<li><a href="https://mattermost.com/security-updates">https://mattermost.com/security-updates</a></li>
-<li><a href="https://pkg.go.dev/vuln/GO-2025-3904">https://pkg.go.dev/vuln/GO-2025-3904</a></li>
-<li><a href="https://github.com/advisories/GHSA-q453-638c-h4mr">https://github.com/advisories/GHSA-q453-638c-h4mr</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-q453-638c-h4mr</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2025-08-21T09:30:21.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/mattermost/mattermost-server/v5] Mattermost Fails to Validate Remote Cluster Upload Sessions]]></title>
         <id>https://github.com/advisories/GHSA-q453-638c-h4mr</id>
         <link href="https://github.com/advisories/GHSA-q453-638c-h4mr"/>
         <updated>2025-08-29T20:58:15.000Z</updated>
