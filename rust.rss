@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rust.rss</id>
     <title>Security Advisory for Rust crates</title>
-    <updated>2026-01-13T15:02:58.330Z</updated>
+    <updated>2026-01-13T16:03:56.335Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arust"/>
     <subtitle>Security Advisory for Rust crates on GitHub</subtitle>
@@ -11,6 +11,123 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[ml-dsa] RustCrypto: Signatures has timing side-channel in ML-DSA decomposition]]></title>
+        <id>https://github.com/advisories/GHSA-hcp2-x6j4-29j7</id>
+        <link href="https://github.com/advisories/GHSA-hcp2-x6j4-29j7"/>
+        <updated>2026-01-13T15:10:06.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A timing side-channel was discovered in the Decompose algorithm which is used during ML-DSA signing to generate hints for the signature.</p>
+<h3 id="details">Details</h3>
+<p>The analysis was performed using a constant-time analyzer that examines compiled assembly code for instructions with data-dependent timing behavior. The analyzer flags:</p>
+<ul>
+<li><strong>UDIV/SDIV instructions</strong>: Hardware division instructions have early termination optimizations where execution time depends on operand values.</li>
+</ul>
+<p>The <code>decompose</code> function used a hardware division instruction to compute <code>r1.0 / TwoGamma2::U32</code>. This function is called during signing through <code>high_bits()</code> and <code>low_bits()</code>, which process values derived from secret key components:</p>
+<ul>
+<li><code>(&amp;w - &amp;cs2).low_bits()</code> where <code>cs2</code> is derived from secret key component <code>s2</code></li>
+<li><code>Hint::new()</code> calls <code>high_bits()</code> on values derived from secret key component <code>t0</code></li>
+</ul>
+<p><strong>Original Code</strong>:</p>
+<pre><code class="language-rust">fn decompose&lt;TwoGamma2: Unsigned&gt;(self) -&gt; (Elem, Elem) {
+    // ...
+    let mut r1 = r_plus - r0;
+    r1.0 /= TwoGamma2::U32;  // Variable-time division on secret-derived data
+    (r1, r0)
+}
+</code></pre>
+<h3 id="poc">PoC</h3>
+<p>I do not have an exploit written for this, currently.</p>
+<h3 id="impact">Impact</h3>
+<p>The dividend (<code>r1.0</code>) is derived from secret key material. An attacker with precise timing measurements could extract information about the signing key by observing timing variations in the division operation.</p>
+<h3 id="mitigation">Mitigation</h3>
+<p>Replacing division with constant-time Barrett reduction mitigates this risk. Since <code>TwoGamma2</code> is a compile-time constant, we precompute the multiplicative inverse:</p>
+<pre><code class="language-patch">diff --git a/ml-dsa/src/algebra.rs b/ml-dsa/src/algebra.rs
+index 559b68a..bb126ce 100644
+--- a/ml-dsa/src/algebra.rs
++++ b/ml-dsa/src/algebra.rs
+@@ -54,8 +54,50 @@ pub(crate) trait Decompose {
+     fn decompose&lt;TwoGamma2: Unsigned&gt;(self) -&gt; (Elem, Elem);
+ }
+ 
++/// Constant-time division by a compile-time constant divisor.
++///
++/// This trait provides a constant-time alternative to the hardware division
++/// instruction, which has variable timing based on operand values.
++/// Uses Barrett reduction to compute `x / M` where M is a compile-time constant.
++pub(crate) trait ConstantTimeDiv: Unsigned {
++    /// Bit shift for Barrett reduction, chosen to provide sufficient precision
++    const CT_DIV_SHIFT: usize;
++    /// Precomputed multiplier: ceil(2^SHIFT / M)
++    const CT_DIV_MULTIPLIER: u64;
++
++    /// Perform constant-time division of x by Self::U32
++    /// Requires: x &lt; Q (the field modulus, ~2^23)
++    #[inline(always)]
++    fn ct_div(x: u32) -&gt; u32 {
++        // Barrett reduction: q = (x * MULTIPLIER) &gt;&gt; SHIFT
++        // This gives us floor(x / M) for x &lt; 2^SHIFT / MULTIPLIER * M
++        let x64 = u64::from(x);
++        let quotient = (x64 * Self::CT_DIV_MULTIPLIER) &gt;&gt; Self::CT_DIV_SHIFT;
++        quotient as u32
++    }
++}
++
++impl&lt;M&gt; ConstantTimeDiv for M
++where
++    M: Unsigned,
++{
++    // Use a shift that provides enough precision for the ML-DSA field (Q ~ 2^23)
++    // We need SHIFT &gt; log2(Q) + log2(M) to ensure accuracy
++    // With Q &lt; 2^24 and M &lt; 2^20, SHIFT = 48 is sufficient
++    const CT_DIV_SHIFT: usize = 48;
++
++    // Precompute the multiplier at compile time
++    // We add (M-1) before dividing to get ceiling division, ensuring we never underestimate
++    #[allow(clippy::integer_division_remainder_used)]
++    const CT_DIV_MULTIPLIER: u64 = ((1u64 &lt;&lt; Self::CT_DIV_SHIFT) + M::U64 - 1) / M::U64;
++}
++
+ impl Decompose for Elem {
+     // Algorithm 36 Decompose
++    //
++    // This implementation uses constant-time division to avoid timing side-channels.
++    // The original algorithm used hardware division which has variable timing based
++    // on operand values, potentially leaking secret information during signing.
+     fn decompose&lt;TwoGamma2: Unsigned&gt;(self) -&gt; (Elem, Elem) {
+         let r_plus = self.clone();
+         let r0 = r_plus.mod_plus_minus::&lt;TwoGamma2&gt;();
+@@ -63,8 +105,9 @@ impl Decompose for Elem {
+         if r_plus - r0 == Elem::new(BaseField::Q - 1) {
+             (Elem::new(0), r0 - Elem::new(1))
+         } else {
+-            let mut r1 = r_plus - r0;
+-            r1.0 /= TwoGamma2::U32;
++            let diff = r_plus - r0;
++            // Use constant-time division instead of hardware division
++            let r1 = Elem::new(TwoGamma2::ct_div(diff.0));
+             (r1, r0)
+         }
+     }
+</code></pre>
+<p>See our blog post on <a href="https://blog.trailofbits.com/2025/11/14/how-we-avoided-side-channels-in-our-new-post-quantum-go-cryptography-libraries/">how we avoided side-channels in our Go implementation of ML-DSA</a> for more information.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/RustCrypto/signatures/security/advisories/GHSA-hcp2-x6j4-29j7">https://github.com/RustCrypto/signatures/security/advisories/GHSA-hcp2-x6j4-29j7</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-22705">https://nvd.nist.gov/vuln/detail/CVE-2026-22705</a></li>
+<li><a href="https://github.com/RustCrypto/signatures/pull/1144">https://github.com/RustCrypto/signatures/pull/1144</a></li>
+<li><a href="https://github.com/RustCrypto/signatures/commit/035d9eef98486ecd00a8bf418c7817eb14dd6558">https://github.com/RustCrypto/signatures/commit/035d9eef98486ecd00a8bf418c7817eb14dd6558</a></li>
+<li><a href="https://github.com/advisories/GHSA-hcp2-x6j4-29j7">https://github.com/advisories/GHSA-hcp2-x6j4-29j7</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-hcp2-x6j4-29j7</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-01-13T15:10:03.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[sm2] RustCrypto Has Insufficient Length Validation in decrypt() in SM2-PKE]]></title>
         <id>https://github.com/advisories/GHSA-j9xq-69pf-pcm8</id>
@@ -1252,48 +1369,6 @@ cargo run --example bsgs_recover  14.44s user 0.13s system 89% cpu 16.266 total
     </entry>
     <entry>
         <title type="html"><![CDATA[[aws-sdk-voiceid] AWS SDK for Rust v1 adopted defense in depth enhancement for region parameter value]]></title>
-        <id>https://github.com/advisories/GHSA-g59m-gf8j-gjf5</id>
-        <link href="https://github.com/advisories/GHSA-g59m-gf8j-gjf5"/>
-        <updated>2026-01-08T21:46:32.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary"><strong>Summary</strong></h2>
-<p>This notification is related to the use of specific values for the region input field when calling AWS services. An actor with access to the environment in which the SDK is used could set the region input field to an invalid value.</p>
-<p>A defense-in-depth enhancement has been implemented in the AWS SDK for Rust. This enhancement validates that a region used to construct an endpoint URL is a valid host label. The change was released on November 6, 2025. This advisory is informational to help customers understand their responsibilities regarding configuration security.</p>
-<h2 id="impact"><strong>Impact</strong></h2>
-<p>Customer applications could be configured to improperly route AWS API calls to non-existent or non-AWS hosts. While the SDK was functioning safely within the requirements of the shared responsibility model, additional safeguards have been added to support secure customer implementations.</p>
-<p><strong>Impacted versions</strong>: All versions prior to <a href="https://github.com/awslabs/aws-sdk-rust/releases/tag/release-2025-11-06">November 6, 2025 release</a></p>
-<h2 id="patches"><strong>Patches</strong></h2>
-<p>On November 6, 2025, an enhancement [1] was made to the AWS SDK for Rust release, which validates the formatting of a region, providing additional safeguards.</p>
-<h2 id="workarounds"><strong>Workarounds</strong></h2>
-<p>No workarounds are needed, but as always developers should ensure that their application is following security best practices:</p>
-<ul>
-<li>Implement proper input validation in your application code</li>
-<li>Update to the latest AWS SDK for Rust release on a regular basis</li>
-<li>Follow AWS security best practices [2] for SDK configuration</li>
-</ul>
-<h2 id="references"><strong>References</strong></h2>
-<p>Contact AWS Security via the vulnerability reporting page or email <a href="mailto:aws-security@amazon.com">aws-security@amazon.com</a>.</p>
-<h2 id="acknowledgement"><strong>Acknowledgement</strong></h2>
-<p>AWS Security thanks Guy Arazi for bringing these customer security considerations to our attention through the coordinated disclosure process.</p>
-<p>[1] <a href="https://github.com/smithy-lang/smithy-rs/pull/4383">https://github.com/smithy-lang/smithy-rs/pull/4383</a>
-[2] <a href="https://docs.aws.amazon.com/sdk-for-rust/latest/dg/security.html">https://docs.aws.amazon.com/sdk-for-rust/latest/dg/security.html</a></p>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/awslabs/aws-sdk-rust/security/advisories/GHSA-g59m-gf8j-gjf5">https://github.com/awslabs/aws-sdk-rust/security/advisories/GHSA-g59m-gf8j-gjf5</a></li>
-<li><a href="https://github.com/smithy-lang/smithy-rs/pull/4383">https://github.com/smithy-lang/smithy-rs/pull/4383</a></li>
-<li><a href="https://docs.aws.amazon.com/sdk-for-rust/latest/dg/security.html">https://docs.aws.amazon.com/sdk-for-rust/latest/dg/security.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-g59m-gf8j-gjf5">https://github.com/advisories/GHSA-g59m-gf8j-gjf5</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-g59m-gf8j-gjf5</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-01-08T21:46:19.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[aws-sdk-verifiedpermissions] AWS SDK for Rust v1 adopted defense in depth enhancement for region parameter value]]></title>
         <id>https://github.com/advisories/GHSA-g59m-gf8j-gjf5</id>
         <link href="https://github.com/advisories/GHSA-g59m-gf8j-gjf5"/>
         <updated>2026-01-08T21:46:32.000Z</updated>
