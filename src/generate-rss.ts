@@ -1,11 +1,31 @@
 import { Feed } from "feed";
 import path from "path";
 import * as fs from "fs/promises";
-import { convertJsonToOPML } from "./toOPML";
-import { RSS_FEEDS } from "./RSS_FEEDS";
-import { SecurityAdvisoryEcosystem } from "@octokit/graphql-schema";
+import { convertJsonToOPML } from "./toOPML.ts";
+import { RSS_FEEDS } from "./RSS_FEEDS.ts";
+// @ts-expect-error - subpath import from CJS package without exports field
+import type { SecurityAdvisoryEcosystem } from "@octokit/graphql-schema/schema";
 import { graphql } from "@octokit/graphql";
-import { SecurityAdvisoryReference, SecurityVulnerabilityConnection } from "@octokit/graphql-schema/schema";
+
+type SecurityAdvisoryReference = {
+    url: string;
+};
+type SecurityVulnerabilityConnection = {
+    nodes?: Array<{
+        package: { name: string };
+        advisory: {
+            summary: string;
+            description: string;
+            references: SecurityAdvisoryReference[];
+            permalink: string;
+            updatedAt: string;
+            publishedAt: string;
+        };
+        severity: string;
+        updatedAt: string;
+        vulnerableVersionRange: string;
+    } | null> | null;
+};
 import { createMarkdown } from "safe-marked";
 import dayjs from "dayjs";
 
@@ -167,8 +187,8 @@ export type RSSItem = {
     query: string;
     SIZE?: number;
 } & Omit<GenerateRSSOptions, "updated" | "description">;
-if (require.main === module) {
-    const distDir = path.join(__dirname, "../dist");
+if (import.meta.main) {
+    const distDir = path.join(import.meta.dirname, "../dist");
     const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
     if (!GITHUB_TOKEN) {
         throw new Error("env.GITHUB_TOKEN required");

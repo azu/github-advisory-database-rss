@@ -1,5 +1,5 @@
 import xml from "xml";
-import { RSS_FEED } from "./RSS_FEEDS";
+import type { RSS_FEED } from "./RSS_FEEDS.ts";
 
 const convertItemToOutline = (item: RSS_FEED) => {
     return {

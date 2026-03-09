@@ -1,4 +1,5 @@
-import { SecurityAdvisoryEcosystem } from "@octokit/graphql-schema";
+// @ts-expect-error - subpath import from CJS package without exports field
+import type { SecurityAdvisoryEcosystem } from "@octokit/graphql-schema/schema";
 
 const BASE_URL = "https://azu.github.io/github-advisory-database-rss";
 const createBase = (ecosystem: SecurityAdvisoryEcosystem) => {
