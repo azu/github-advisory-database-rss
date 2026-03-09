@@ -187,7 +187,7 @@ export type RSSItem = {
     query: string;
     SIZE?: number;
 } & Omit<GenerateRSSOptions, "updated" | "description">;
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (import.meta.main) {
     const distDir = path.join(import.meta.dirname, "../dist");
     const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
     if (!GITHUB_TOKEN) {
