@@ -14,12 +14,16 @@ RSS Feeds for [GitHub Advisory Database](https://github.com/advisories).
 1. Edit [RSS_FEEDS.ts](./src/RSS_FEEDS.ts)
 2. Add new ECOSYSTEM
 
-:memo: You may need to run `yarn upgrade` for updating types.
+:memo: You may need to run `pnpm update` for updating types.
 
 ## Debug
 
-    yarn install
-    GITHUB_TOKEN=xxx yarn run main
+    pnpm install
+    GITHUB_TOKEN=xxx pnpm run main
+
+## Requirements
+
+- Node.js 24+
 
 ## Changelog
 
@@ -27,9 +31,9 @@ See [Releases page](https://github.com/azu/github-advisory-database-rss/releases
 
 ## Running tests
 
-Install devDependencies and Run `npm test`:
+Install devDependencies and Run `pnpm test`:
 
-    npm test
+    pnpm test
 
 ## Contributing
 
