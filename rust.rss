@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rust.rss</id>
     <title>Security Advisory for Rust crates</title>
-    <updated>2026-03-12T14:14:38.732Z</updated>
+    <updated>2026-03-12T15:15:17.922Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arust"/>
     <subtitle>Security Advisory for Rust crates on GitHub</subtitle>
@@ -11,6 +11,442 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[kora-lib] kora-lib: Token-2022 Transfer Fee Not Deducted During Payment Verification]]></title>
+        <id>https://github.com/advisories/GHSA-725g-w329-g7qr</id>
+        <link href="https://github.com/advisories/GHSA-725g-w329-g7qr"/>
+        <updated>2026-03-12T14:50:43.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>When a user pays transaction fees using a Token-2022 token with a <code>TransferFeeConfig</code> extension, Kora's <code>verify_token_payment()</code> credits the full raw transfer <code>amount</code> as the payment value. However, the on-chain SPL Token-2022 program withholds a portion of that amount as a transfer fee, so the paymaster's destination account only receives <code>amount - transfer_fee</code>. This means the paymaster consistently credits more value than it actually receives, resulting in systematic financial loss.</p>
+<h2 id="severity">Severity</h2>
+<p><strong>High</strong></p>
+<h2 id="affected-component">Affected Component</h2>
+<ul>
+<li><strong>File:</strong> <code>crates/lib/src/token/token.rs</code></li>
+<li><strong>Function:</strong> <code>verify_token_payment()</code></li>
+<li><strong>Lines:</strong> 529–654 (specifically 633–639)</li>
+</ul>
+<h2 id="root-cause">Root Cause</h2>
+<p>In <code>verify_token_payment()</code>, the <code>amount</code> extracted from the parsed SPL transfer instruction is the <strong>pre-fee</strong> amount (what the sender specifies in the <code>transfer_checked</code> instruction). The function passes this raw amount to <code>calculate_token_value_in_lamports()</code> to determine how many lamports the payment is worth. It never subtracts the Token-2022 transfer fee.</p>
+<p>The fee estimation path (<code>fee.rs:analyze_payment_instructions</code>) correctly accounts for transfer fees by calculating them and adding them to the total fee. But the verification path does not perform the inverse subtraction, creating an asymmetry.</p>
+<h2 id="vulnerable-code">Vulnerable Code</h2>
+<pre><code class="language-rust">// crates/lib/src/token/token.rs:529-654
+pub async fn verify_token_payment(
+    transaction_resolved: &amp;mut VersionedTransactionResolved,
+    rpc_client: &amp;RpcClient,
+    required_lamports: u64,
+    expected_destination_owner: &amp;Pubkey,
+) -&gt; Result&lt;bool, KoraError&gt; {
+    let config = get_config()?;
+    let mut total_lamport_value = 0u64;
+
+    // ...
+
+    for instruction in transaction_resolved
+        .get_or_parse_spl_instructions()?
+        .get(&amp;ParsedSPLInstructionType::SplTokenTransfer)
+        .unwrap_or(&amp;vec![])
+    {
+        if let ParsedSPLInstructionData::SplTokenTransfer {
+            source_address,
+            destination_address,
+            mint,
+            amount,      // &lt;-- This is the PRE-FEE amount from the instruction
+            is_2022,
+            ..
+        } = instruction
+        {
+            // ... destination validation ...
+
+            // LINE 633-639: Uses raw *amount without deducting transfer fee
+            let lamport_value = TokenUtil::calculate_token_value_in_lamports(
+                *amount,        // &lt;-- BUG: Should be (amount - transfer_fee)
+                &amp;token_mint,
+                config.validation.price_source.clone(),
+                rpc_client,
+            )
+            .await?;
+
+            total_lamport_value = total_lamport_value
+                .checked_add(lamport_value)
+                .ok_or_else(|| {
+                    KoraError::ValidationError("Payment accumulation overflow".to_string())
+                })?;
+        }
+    }
+
+    Ok(total_lamport_value &gt;= required_lamports)
+}
+</code></pre>
+<p>For comparison, the transfer fee calculation exists elsewhere in the codebase and is used during fee estimation:</p>
+<pre><code class="language-rust">// crates/lib/src/token/spl_token_2022.rs:165-198
+pub fn calculate_transfer_fee(
+    &amp;self,
+    amount: u64,
+    current_epoch: u64,
+) -&gt; Result&lt;Option&lt;u64&gt;, KoraError&gt; {
+    if let Some(fee_config) = self.get_transfer_fee() {
+        let transfer_fee = if current_epoch &gt;= u64::from(fee_config.newer_transfer_fee.epoch) {
+            &amp;fee_config.newer_transfer_fee
+        } else {
+            &amp;fee_config.older_transfer_fee
+        };
+        let basis_points = u16::from(transfer_fee.transfer_fee_basis_points);
+        let maximum_fee = u64::from(transfer_fee.maximum_fee);
+        let fee_amount = (amount as u128)
+            .checked_mul(basis_points as u128)
+            .and_then(|product| product.checked_div(10_000))
+            // ...
+        Ok(Some(std::cmp::min(fee_amount, maximum_fee)))
+    } else {
+        Ok(None)
+    }
+}
+</code></pre>
+<p>This function exists but is <strong>never called</strong> in <code>verify_token_payment()</code>.</p>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<h3 id="arithmetic-demonstration">Arithmetic Demonstration</h3>
+<p>Given:</p>
+<ul>
+<li>Token-2022 token with 5% transfer fee (500 basis points), whitelisted in <code>allowed_spl_paid_tokens</code></li>
+<li>Transaction fee cost: 5000 lamports equivalent</li>
+<li>Token price: 1 token = 5 lamports</li>
+</ul>
+<p><strong>What should happen:</strong></p>
+<ul>
+<li>User needs to pay 5000 lamports worth → 1000 tokens</li>
+<li>Transfer fee on 1000 tokens at 5% = 50 tokens</li>
+<li>Paymaster destination receives: 1000 - 50 = 950 tokens (worth 4750 lamports)</li>
+<li>User should be required to pay MORE to cover the fee</li>
+</ul>
+<p><strong>What actually happens:</strong></p>
+<ul>
+<li>User sends <code>transfer_checked</code> for <code>amount = 1000</code> tokens</li>
+<li><code>verify_token_payment()</code> calculates: 1000 tokens * 5 lamports/token = 5000 lamports</li>
+<li>5000 &gt;= 5000 required → <strong>payment verified as sufficient</strong></li>
+<li>But paymaster only received 950 tokens (worth 4750 lamports)</li>
+<li><strong>Paymaster lost 250 lamports on this transaction</strong></li>
+</ul>
+<p><strong>Over 1000 transactions:</strong> Paymaster loses 250,000 lamports (0.25 SOL)</p>
+<h3 id="runnable-test-using-existing-test-infrastructure">Runnable Test (using existing test infrastructure)</h3>
+<pre><code class="language-rust">#[tokio::test]
+async fn test_token2022_transfer_fee_not_deducted_in_verification() {
+    // Setup: Token-2022 mint with 10% transfer fee (1000 bps)
+    let transfer_fee_config = create_transfer_fee_config(
+        1000,      // 10% basis points
+        u64::MAX,  // no maximum fee cap
+    );
+
+    let mint_pubkey = Pubkey::new_unique();
+    let mint_account = MintAccountMockBuilder::new()
+        .with_decimals(6)
+        .with_supply(1_000_000_000_000)
+        .with_extension(ExtensionType::TransferFeeConfig)
+        .build_token2022();
+
+    // User sends transfer_checked for 1,000,000 tokens (1 token at 6 decimals)
+    let transfer_amount: u64 = 1_000_000;
+
+    // What verify_token_payment credits:
+    let credited_amount = transfer_amount;  // = 1,000,000
+
+    // What the paymaster actually receives (after 10% on-chain fee):
+    let actual_received = transfer_amount - (transfer_amount * 1000 / 10000);  // = 900,000
+
+    // BUG: credited_amount (1,000,000) &gt; actual_received (900,000)
+    // Paymaster is credited 11.1% MORE than it actually receives
+    assert!(credited_amount &gt; actual_received);
+    assert_eq!(credited_amount - actual_received, 100_000); // 100,000 token units lost
+
+    // The financial loss per transaction = 10% of the payment amount
+    // This is NOT a rounding error — it is a full percentage-based loss
+}
+</code></pre>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Systematic Financial Loss:</strong> The paymaster consistently credits more token value than it receives for every transaction paid with a transfer-fee-bearing Token-2022 token.</li>
+<li><strong>Loss Scale:</strong> Proportional to <code>transfer_fee_basis_points / 10000 * payment_amount</code> per transaction. For a token with 5% fee and 100 transactions/day at $1 each, that is $5/day or $1,825/year in losses.</li>
+<li><strong>Precondition:</strong> Requires a Token-2022 token with <code>TransferFeeConfig</code> extension to be whitelisted in <code>allowed_spl_paid_tokens</code>. The existing test infrastructure already creates such tokens (<code>TestAccountSetup::create_usdc_mint_2022()</code> with 100 bps / 1% fee).</li>
+</ul>
+<h2 id="recommendation">Recommendation</h2>
+<p>Deduct the Token-2022 transfer fee before calculating the lamport value of the payment:</p>
+<pre><code class="language-rust">// In verify_token_payment(), after extracting amount:
+let effective_amount = if *is_2022 {
+    // Fetch the mint to check for TransferFeeConfig
+    let mint_account = CacheUtil::get_account(
+        rpc_client,
+        &amp;token_mint,
+        false,
+    ).await?;
+    let mint_info = Token2022MintInfo::from_account_data(&amp;mint_account.data)?;
+
+    if let Ok(Some(fee)) = mint_info.calculate_transfer_fee(
+        *amount,
+        rpc_client.get_epoch_info().await?.epoch,
+    ) {
+        amount.saturating_sub(fee)
+    } else {
+        *amount
+    }
+} else {
+    *amount
+};
+
+let lamport_value = TokenUtil::calculate_token_value_in_lamports(
+    effective_amount,  // Use post-fee amount
+    &amp;token_mint,
+    config.validation.price_source.clone(),
+    rpc_client,
+)
+.await?;
+</code></pre>
+<h2 id="references">References</h2>
+<ul>
+<li><code>crates/lib/src/token/token.rs:529-654</code> — <code>verify_token_payment()</code> using raw amount</li>
+<li><code>crates/lib/src/token/spl_token_2022.rs:165-198</code> — <code>calculate_transfer_fee()</code> (exists but not called in verification)</li>
+<li><code>crates/lib/src/fee/fee.rs:174-204</code> — <code>analyze_payment_instructions()</code> (correctly accounts for transfer fee in estimation)</li>
+<li>SPL Token-2022 specification: transfer fees are deducted from the transfer amount by the on-chain program</li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/solana-foundation/kora/security/advisories/GHSA-725g-w329-g7qr">https://github.com/solana-foundation/kora/security/advisories/GHSA-725g-w329-g7qr</a></li>
+<li><a href="https://github.com/solana-foundation/kora/commit/8cbd8217ee505e6b37c63ef835ff095cfa8ab318">https://github.com/solana-foundation/kora/commit/8cbd8217ee505e6b37c63ef835ff095cfa8ab318</a></li>
+<li><a href="https://github.com/advisories/GHSA-725g-w329-g7qr">https://github.com/advisories/GHSA-725g-w329-g7qr</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-725g-w329-g7qr</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-03-12T14:50:43.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[kora-lib] kora-lib: Unrecognized Instruction Types Create Empty Stubs That Bypass Fee Payer Policy]]></title>
+        <id>https://github.com/advisories/GHSA-x442-m7cc-hr92</id>
+        <link href="https://github.com/advisories/GHSA-x442-m7cc-hr92"/>
+        <updated>2026-03-12T14:50:39.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>When inner CPI instructions use instruction types not recognized by Kora's parser (including Token-2022 extension instructions like <code>ConfidentialTransfer</code>, <code>TransferFeeExtension::WithdrawWithheldTokens</code>, etc.), they are reconstructed as stub instructions with empty accounts and empty data. These stubs fail deserialization during fee payer policy validation and are silently skipped, meaning any fee payer usage within those instructions goes completely unchecked.</p>
+<h2 id="severity">Severity</h2>
+<p><strong>Medium</strong></p>
+<h2 id="affected-component">Affected Component</h2>
+<ul>
+<li><strong>File:</strong> <code>crates/lib/src/transaction/instruction_util.rs</code></li>
+<li><strong>Functions:</strong> <code>reconstruct_system_instruction()</code>, <code>reconstruct_spl_token_instruction()</code></li>
+<li><strong>Lines:</strong> 750–753, 1187–1189</li>
+</ul>
+<h2 id="root-cause">Root Cause</h2>
+<p>The instruction reconstruction functions have a catch-all <code>_ =&gt;</code> arm for unrecognized instruction types that creates a stub <code>CompiledInstruction</code> with the correct <code>program_id_index</code> but <strong>empty <code>accounts</code> and empty <code>data</code></strong>. When this stub reaches the fee payer policy parsing (<code>parse_system_instructions</code> / <code>parse_token_instructions</code>), deserialization of empty data fails. The parsing functions also have a catch-all <code>_ =&gt; {}</code> that silently skips the failed instruction. The result: the instruction exists in <code>all_instructions</code> (so program allowlist checks pass), but fee payer policy is never enforced on it.</p>
+<h2 id="vulnerable-code">Vulnerable Code</h2>
+<h3 id="stub-creation">Stub Creation</h3>
+<pre><code class="language-rust">// crates/lib/src/transaction/instruction_util.rs:750-753
+// System program — unrecognized instruction type:
+_ =&gt; {
+    log::error!("Unsupported system instruction type: {}", instruction_type);
+    Ok(Self::build_default_compiled_instruction(program_id_index))
+}
+
+// crates/lib/src/transaction/instruction_util.rs:1187-1189
+// SPL Token program — unrecognized instruction type:
+_ =&gt; {
+    log::error!("Unsupported token instruction type: {}", instruction_type);
+    Ok(Self::build_default_compiled_instruction(program_id_index))
+}
+</code></pre>
+<p>The stub builder:</p>
+<pre><code class="language-rust">pub fn build_default_compiled_instruction(program_id_index: u8) -&gt; CompiledInstruction {
+    CompiledInstruction {
+        program_id_index,
+        accounts: vec![],  // &lt;-- No accounts
+        data: vec![],       // &lt;-- No data
+    }
+}
+</code></pre>
+<h3 id="silent-skip-during-policy-parsing">Silent Skip During Policy Parsing</h3>
+<pre><code class="language-rust">// In parse_system_instructions:
+if let Ok(system_instruction) = bincode::deserialize::&lt;SystemInstruction&gt;(&amp;instruction.data) {
+    match system_instruction {
+        // ... known types handled ...
+        _ =&gt; {}  // &lt;-- Unrecognized: silently skipped
+    }
+}
+// If deserialize fails (empty data), the entire `if let Ok` block is skipped.
+// The instruction is not added to any policy check map.
+
+// In parse_token_instructions:
+if let Ok(token_instruction) = TokenInstruction::unpack(&amp;instruction.data) {
+    match token_instruction {
+        // ... known types handled ...
+        _ =&gt; {}  // &lt;-- Unrecognized: silently skipped
+    }
+}
+// Same: empty data causes unpack to fail, instruction completely invisible to policy.
+</code></pre>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<h3 id="affected-token-2022-extension-instructions">Affected Token-2022 Extension Instructions</h3>
+<p>The following Token-2022 extension instruction types are NOT handled by Kora's parser and would produce empty stubs:</p>
+<table>
+<thead>
+<tr>
+<th>Extension</th>
+<th>Instruction</th>
+<th>Risk if Fee Payer is Authority</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>TransferFeeExtension</code></td>
+<td><code>WithdrawWithheldTokensFromMint</code></td>
+<td>Fee payer as withdraw authority can drain withheld fees</td>
+</tr>
+<tr>
+<td><code>TransferFeeExtension</code></td>
+<td><code>WithdrawWithheldTokensFromAccounts</code></td>
+<td>Same</td>
+</tr>
+<tr>
+<td><code>TransferFeeExtension</code></td>
+<td><code>HarvestWithheldTokensToMint</code></td>
+<td>Fee collection manipulation</td>
+</tr>
+<tr>
+<td><code>ConfidentialTransfer</code></td>
+<td><code>Transfer</code></td>
+<td>Hidden transfer amounts bypass fee tracking</td>
+</tr>
+<tr>
+<td><code>ConfidentialTransfer</code></td>
+<td><code>Withdraw</code></td>
+<td>Hidden withdrawals</td>
+</tr>
+<tr>
+<td><code>InterestBearingMint</code></td>
+<td><code>UpdateRate</code></td>
+<td>Fee payer as rate authority can manipulate interest</td>
+</tr>
+<tr>
+<td><code>TransferHook</code></td>
+<td><code>Execute</code></td>
+<td>Arbitrary hook execution</td>
+</tr>
+<tr>
+<td><code>GroupMemberPointer</code></td>
+<td><code>Update</code></td>
+<td>Metadata manipulation</td>
+</tr>
+<tr>
+<td><code>MetadataPointer</code></td>
+<td><code>Update</code></td>
+<td>Metadata manipulation</td>
+</tr>
+<tr>
+<td><code>PermanentDelegate</code></td>
+<td><code>Transfer</code> (via delegate)</td>
+<td>Delegate-based unauthorized transfers</td>
+</tr>
+</tbody></table>
+<h3 id="code-path-trace">Code Path Trace</h3>
+<pre><code>1. Transaction contains an inner CPI instruction:
+   Program: Token-2022
+   Type: "withdrawWithheldTokensFromMint" (TransferFeeExtension)
+   Accounts: [fee_payer (as withdraw_withheld_authority), mint, destination]
+
+2. RPC returns this as a Parsed inner instruction
+
+3. reconstruct_spl_token_instruction() is called:
+   - instruction_type = "withdrawWithheldTokensFromMint"
+   - No match in the known types (transfer, transferChecked, burn, etc.)
+   - Falls through to _ =&gt; arm
+   - Returns: CompiledInstruction { program_id_index, accounts: [], data: [] }
+
+4. Stub is added to all_instructions
+   → validate_programs() sees Token-2022 program ID → PASS (allowed)
+   → validate_disallowed_accounts() sees no accounts in the stub → PASS
+
+5. parse_token_instructions() processes the stub:
+   - TokenInstruction::unpack(&amp;[]) → Err (empty data)
+   - if let Ok(...) block skipped entirely
+   - Instruction not added to any ParsedSPLInstructionType map
+
+6. validate_fee_payer_usage() iterates parsed SPL instructions:
+   - No entry for "withdrawWithheldTokensFromMint"
+   - Fee payer's usage as withdraw_withheld_authority is NEVER checked
+
+7. Transaction is signed by Kora
+
+8. On-chain: fee_payer (as withdraw authority) withdraws withheld
+   transfer fees from the mint to attacker's account
+</code></pre>
+<h3 id="verifiable-test">Verifiable Test</h3>
+<pre><code class="language-rust">#[test]
+fn test_unrecognized_instruction_produces_empty_stub() {
+    // Simulate what happens for an unrecognized Token-2022 instruction
+    let program_id_index: u8 = 3; // Token-2022 at index 3
+
+    // This is what the catch-all arm produces:
+    let stub = IxUtils::build_default_compiled_instruction(program_id_index);
+
+    assert_eq!(stub.accounts.len(), 0);  // No accounts
+    assert_eq!(stub.data.len(), 0);      // No data
+
+    // Attempt to parse it:
+    let result = TokenInstruction::unpack(&amp;stub.data);
+    assert!(result.is_err());  // Cannot parse empty data
+
+    // Therefore: fee payer policy is never applied to this instruction
+    // The fee payer could be the withdraw_withheld_authority in the
+    // REAL instruction, but the stub has zero accounts — invisible.
+}
+</code></pre>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Fee Payer Policy Bypass:</strong> Token-2022 extension instructions that use the fee payer as an authority are invisible to policy enforcement.</li>
+<li><strong>Forward-Looking Risk:</strong> As Solana and SPL Token-2022 add new instruction types, they will automatically bypass all fee payer policy checks in Kora.</li>
+<li><strong>Precondition:</strong> Requires the fee payer to hold some authority role (e.g., <code>withdraw_withheld_authority</code>, <code>permanent_delegate</code>) for Token-2022 accounts. This is unlikely in typical deployments but possible in misconfigured setups.</li>
+</ul>
+<h2 id="recommendation">Recommendation</h2>
+<p>Reject transactions containing inner instructions with unrecognized types (fail-secure):</p>
+<pre><code class="language-rust">// In reconstruct_system_instruction:
+_ =&gt; {
+    return Err(KoraError::InvalidTransaction(format!(
+        "Unrecognized system instruction type '{}' in CPI — \
+         cannot validate fee payer policy. Transaction rejected.",
+        instruction_type
+    )));
+}
+
+// In reconstruct_spl_token_instruction:
+_ =&gt; {
+    return Err(KoraError::InvalidTransaction(format!(
+        "Unrecognized SPL Token instruction type '{}' in CPI — \
+         cannot validate fee payer policy. Transaction rejected.",
+        instruction_type
+    )));
+}
+</code></pre>
+<p>Alternatively, maintain a list of known-safe instruction types that don't involve authority checks, and only reject truly unknown types.</p>
+<h2 id="references">References</h2>
+<ul>
+<li><code>crates/lib/src/transaction/instruction_util.rs:750-753</code> — system instruction catch-all</li>
+<li><code>crates/lib/src/transaction/instruction_util.rs:1187-1189</code> — SPL token instruction catch-all</li>
+<li><code>crates/lib/src/transaction/instruction_util.rs:316-319</code> — <code>build_default_compiled_instruction</code></li>
+<li><a href="https://github.com/solana-labs/solana-program-library/tree/master/token/program-2022/src/extension">SPL Token-2022 instruction types</a> — full list of extension instructions</li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/solana-foundation/kora/security/advisories/GHSA-x442-m7cc-hr92">https://github.com/solana-foundation/kora/security/advisories/GHSA-x442-m7cc-hr92</a></li>
+<li><a href="https://github.com/advisories/GHSA-x442-m7cc-hr92">https://github.com/advisories/GHSA-x442-m7cc-hr92</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-x442-m7cc-hr92</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-03-12T14:50:39.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[actix-web-lab] actix-web-lab has host header poisoning in redirect middleware can generate attacker-controlled absolute redirects]]></title>
         <id>https://github.com/advisories/GHSA-vhj5-x93p-67jw</id>
@@ -843,141 +1279,5 @@ curl -v 'https://TARGET/api/v4/image/anything?file_type=jpg%3Fproxy%3Dhttp%3A%2F
         </author>
         <category label="severity" term="CRITICAL"/>
         <published>2026-03-04T20:44:35.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[neqo-qpack] neqo-qpack has iInteger overflow in qpack dynamic table indexing]]></title>
-        <id>https://github.com/advisories/GHSA-6w86-wgwq-rgq8</id>
-        <link href="https://github.com/advisories/GHSA-6w86-wgwq-rgq8"/>
-        <updated>2026-03-04T20:16:27.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>An unsanitized qpack index can lead to an integer overflow, panicing in debug mode, accessing the wrong or no dynamic table entry in release mode.</p>
-<p>What does this mean for Firefox? Firefox runs Neqo in release mode. A malicious remote can cause its own QUIC connection to fail to use qpack, i.e. compression, or enter an inconsistent state. The remote can not crash Firefox, nor affect other QUIC connections. </p>
-<h3 id="details">Details</h3>
-<p>See fuzz report in <a href="https://github.com/mozilla/neqo/issues/3406">https://github.com/mozilla/neqo/issues/3406</a>.</p>
-<h3 id="poc">PoC</h3>
-<p>See test in pull request.</p>
-<h3 id="impact">Impact</h3>
-<p>All Firefox users. Though vulnerability likely scoped to same connection, i.e. low impact.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/mozilla/neqo/security/advisories/GHSA-6w86-wgwq-rgq8">https://github.com/mozilla/neqo/security/advisories/GHSA-6w86-wgwq-rgq8</a></li>
-<li><a href="https://github.com/mozilla/neqo/issues/3406">https://github.com/mozilla/neqo/issues/3406</a></li>
-<li><a href="https://github.com/advisories/GHSA-6w86-wgwq-rgq8">https://github.com/advisories/GHSA-6w86-wgwq-rgq8</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-6w86-wgwq-rgq8</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-03-04T20:16:26.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[vaultwarden] Vaultwarden has Unauthorized Access via Partial Update API on Another User’s Cipher]]></title>
-        <id>https://github.com/advisories/GHSA-w9f8-m526-h7fh</id>
-        <link href="https://github.com/advisories/GHSA-w9f8-m526-h7fh"/>
-        <updated>2026-03-04T20:14:07.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>In the test environment, it was confirmed that an authenticated regular user can specify another user’s <code>cipher_id</code> and call:</p>
-<pre><code>PUT /api/ciphers/{id}/partial
-</code></pre>
-<p>Even though the standard retrieval API correctly denies access to that cipher, the partial update endpoint returns <strong>200 OK</strong> and exposes <code>cipherDetails</code> (including <code>name</code>, <code>notes</code>, <code>data</code>, <code>secureNote</code>, etc.).</p>
-<h2 id="description">Description</h2>
-<p><code>put_cipher_partial</code> retrieves the target Cipher but does <strong>not perform ownership or access control checks</strong> before returning <code>to_json</code>.
-Authorization checks present in the normal update API are missing here.
-src/api/core/ciphers.rs:717</p>
-<pre><code class="language-rust">let Some(cipher) = Cipher::find_by_uuid(&amp;cipher_id, &amp;conn).await else {
-    err!("Cipher doesn't exist")
-};
-
-if let Some(ref folder_id) = data.folder_id {
-    if Folder::find_by_uuid_and_user(folder_id, &amp;headers.user.uuid, &amp;conn).await.is_none() {
-        err!("Invalid folder", "Folder does not exist or belongs to another user");
-    }
-}
-
-// Move cipher
-cipher.move_to_folder(data.folder_id.clone(), &amp;headers.user.uuid, &amp;conn).await?;
-
-// Update favorite
-cipher.set_favorite(Some(data.favorite), &amp;headers.user.uuid, &amp;conn).await?;
-
-Ok(Json(cipher.to_json(&amp;headers.host, &amp;headers.user.uuid, None, CipherSyncType::User, &amp;conn).await?))
-</code></pre>
-<p>By comparison, the standard update API includes an explicit authorization check:
-src/api/core/ciphers.rs:688</p>
-<pre><code class="language-rust">if !cipher.is_write_accessible_to_user(&amp;headers.user.uuid, &amp;conn).await {
-    err!("Cipher is not write accessible")
-}
-</code></pre>
-<p>The <code>to_json</code> method does not abort processing when access restrictions are not met; instead, it proceeds to construct and return a detailed response.
-src/db/models/cipher.rs:175</p>
-<pre><code class="language-rust">let (read_only, hide_passwords, _) = if sync_type == CipherSyncType::User {
-    match self.get_access_restrictions(user_uuid, cipher_sync_data, conn).await {
-        Some((ro, hp, mn)) =&gt; (ro, hp, mn),
-        None =&gt; {
-            error!("Cipher ownership assertion failure");
-            (true, true, false)
-        }
-    }
-} else {
-    (false, false, false)
-};
-</code></pre>
-<p>src/db/models/cipher.rs:335</p>
-<pre><code class="language-rust">let mut json_object = json!({
-    "object": "cipherDetails",
-    "id": self.uuid,
-    "type": self.atype,
-    ...
-    "name": self.name,
-    "notes": self.notes,
-    "fields": fields_json,
-    "data": data_json,
-    ...
-});
-</code></pre>
-<h2 id="preconditions">Preconditions</h2>
-<ul>
-<li>The attacker possesses a valid regular-user JWT (Bearer token).</li>
-<li>The attacker knows the target (victim) <code>cipher_id</code>.</li>
-</ul>
-<h2 id="steps-to-reproduce">Steps to Reproduce</h2>
-<ol>
-<li><p>Prepare the attacker JWT and victim <code>cipher_id</code> (preconditions).</p>
-</li>
-<li><p>Baseline check: confirm that standard retrieval is denied.</p>
-<img width="2014" height="855" alt="image" src="https://github.com/user-attachments/assets/32b12cc9-3672-4a88-afd0-ef7715474662">
-
-</li>
-<li><p>Execute the vulnerable API. Confirm that <strong>200 OK</strong> is returned and that <code>cipherDetails</code> includes fields such as <code>id</code>, <code>name</code>, <code>notes</code>, <code>secureNote</code>, etc.</p>
-<img width="2018" height="1113" alt="image" src="https://github.com/user-attachments/assets/341b330c-8d55-4f06-a622-0d7da28f62fd"></li>
-</ol>
-<h2 id="potential-impact">Potential Impact</h2>
-<ul>
-<li>Unauthorized disclosure of other users’ cipher information (confidentiality breach).</li>
-<li>Creation of unauthorized associations within the attacker’s user context (e.g., <code>favorite</code> or folder operations).</li>
-<li>The response from <code>/api/ciphers/&lt;cipher_id&gt;/partial</code> includes <code>attachments[].url</code>.</li>
-</ul>
-<p>In filesystem (FS) deployments, this returns a tokenized endpoint such as:</p>
-<pre><code>/attachments/&lt;cipher&gt;/&lt;file&gt;?token=...
-</code></pre>
-<p>In object storage deployments, it returns a short-lived pre-signed URL.</p>
-<p>As a result, an attacker can use these URLs to directly download attachment data that they are not authorized to access.</p>
-<p>This can lead to disclosure of sensitive information stored in the Vault, including personal data and authentication credentials. Such exposure may further result in account compromise, lateral movement, and other secondary impacts.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/dani-garcia/vaultwarden/security/advisories/GHSA-w9f8-m526-h7fh">https://github.com/dani-garcia/vaultwarden/security/advisories/GHSA-w9f8-m526-h7fh</a></li>
-<li><a href="https://github.com/advisories/GHSA-w9f8-m526-h7fh">https://github.com/advisories/GHSA-w9f8-m526-h7fh</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-w9f8-m526-h7fh</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-03-04T20:14:06.000Z</published>
     </entry>
 </feed>
