@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/npm.rss</id>
     <title>Security Advisory for JavaScript packages hosted at npmjs.com</title>
-    <updated>2026-04-01T00:12:23.601Z</updated>
+    <updated>2026-04-01T01:31:11.352Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Anpm"/>
     <subtitle>Security Advisory for JavaScript packages hosted at npmjs.com on GitHub</subtitle>
@@ -11,6 +11,586 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[@tinacms/graphql] @tinacms/graphql's `FilesystemBridge` Path Validation Can Be Bypassed via Symlinks or Junctions]]></title>
+        <id>https://github.com/advisories/GHSA-g9c2-gf25-3x67</id>
+        <link href="https://github.com/advisories/GHSA-g9c2-gf25-3x67"/>
+        <updated>2026-04-01T00:25:22.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>@tinacms/graphql</code> uses string-based path containment checks in <code>FilesystemBridge</code>:</p>
+<ul>
+<li><code>path.resolve(path.join(baseDir, filepath))</code></li>
+<li><code>startsWith(resolvedBase + path.sep)</code></li>
+</ul>
+<p>That blocks plain <code>../</code> traversal, but it does not resolve symlink or junction targets. If a symlink/junction already exists under the allowed content root, a path like <code>content/posts/pivot/owned.md</code> is still considered "inside" the base even though the real filesystem target can be outside it.</p>
+<p>As a result, <code>FilesystemBridge.get()</code>, <code>put()</code>, <code>delete()</code>, and <code>glob()</code> can operate on files outside the intended root.</p>
+<h2 id="details">Details</h2>
+<p>The current bridge validation is:</p>
+<pre><code class="language-ts">function assertWithinBase(filepath: string, baseDir: string): string {
+  const resolvedBase = path.resolve(baseDir);
+  const resolved = path.resolve(path.join(baseDir, filepath));
+  if (
+    resolved !== resolvedBase &amp;&amp;
+    !resolved.startsWith(resolvedBase + path.sep)
+  ) {
+    throw new Error(
+      `Path traversal detected: "${filepath}" escapes the base directory`
+    );
+  }
+  return resolved;
+}
+</code></pre>
+<p>But the bridge then performs real filesystem I/O on the resulting path:</p>
+<pre><code class="language-ts">public async get(filepath: string) {
+  const resolved = assertWithinBase(filepath, this.outputPath);
+  return (await fs.readFile(resolved)).toString();
+}
+
+public async put(filepath: string, data: string, basePathOverride?: string) {
+  const basePath = basePathOverride || this.outputPath;
+  const resolved = assertWithinBase(filepath, basePath);
+  await fs.outputFile(resolved, data);
+}
+
+public async delete(filepath: string) {
+  const resolved = assertWithinBase(filepath, this.outputPath);
+  await fs.remove(resolved);
+}
+</code></pre>
+<p>This is a classic realpath gap:</p>
+<ol>
+<li>validation checks the lexical path string</li>
+<li>the filesystem follows the link target during I/O</li>
+<li>the actual target can be outside the intended root</li>
+</ol>
+<p>This is reachable from Tina's GraphQL/local database flow. The resolver builds a validated path from user-controlled <code>relativePath</code>, but that validation is also string-based:</p>
+<pre><code class="language-ts">const realPath = path.join(collection.path, relativePath);
+this.validatePath(realPath, collection, relativePath);
+</code></pre>
+<p>Database write and delete operations then call the bridge:</p>
+<pre><code class="language-ts">await this.bridge.put(normalizedPath, stringifiedFile);
+...
+await this.bridge.delete(normalizedPath);
+</code></pre>
+<h2 id="local-reproduction">Local Reproduction</h2>
+<p>This was verified llocally with a real junction on Windows, which exercises the same failure mode as a symlink on Unix-like systems.</p>
+<p>Test layout:</p>
+<ul>
+<li>content root: <code>D:\bugcrowd\tinacms\temp\junction-repro4</code></li>
+<li>allowed collection path: <code>content/posts</code></li>
+<li>junction inside collection: <code>content/posts/pivot -&gt; D:\bugcrowd\tinacms\temp\junction-repro4\outside</code></li>
+<li>file outside content root: <code>outside\secret.txt</code></li>
+</ul>
+<p>Tina's current path-validation logic was applied and used to perform bridge-style read/write operations through the junction.</p>
+<p>Observed result:</p>
+<pre><code class="language-json">{
+  "graphqlBridge": {
+    "collectionPath": "content/posts",
+    "requestedRelativePath": "pivot/owned.md",
+    "validatedRealPath": "content\\posts\\pivot\\owned.md",
+    "bridgeResolvedPath": "D:\\bugcrowd\\tinacms\\temp\\junction-repro4\\content\\posts\\pivot\\owned.md",
+    "bridgeRead": "TOP_SECRET_FROM_OUTSIDE\\r\\n",
+    "outsideGraphqlWriteExists": true,
+    "outsideGraphqlWriteContents": "GRAPHQL_ESCAPE"
+  }
+}
+</code></pre>
+<p>That is the critical point:</p>
+<ul>
+<li>the path was accepted as inside <code>content/posts</code></li>
+<li>the bridge read <code>outside\secret.txt</code></li>
+<li>the bridge wrote <code>outside\owned.md</code></li>
+</ul>
+<p>So the current containment check does not actually constrain filesystem access to the configured content root once a link exists inside that tree.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Arbitrary file read/write outside the configured content root</strong></li>
+<li><strong>Potential delete outside the configured content root</strong> via the same <code>assertWithinBase()</code> gap in <code>delete()</code></li>
+<li><strong>Breaks the assumptions of the recent path-traversal fixes</strong> because only lexical traversal is blocked</li>
+<li><strong>Practical attack chains</strong> where the content tree contains a committed symlink/junction, or an attacker can cause one to exist before issuing GraphQL/content operations</li>
+</ul>
+<p>The exact network exploitability depends on how the application exposes Tina's GraphQL/content operations, but the underlying bridge bug is real and independently security-relevant.</p>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>The containment check needs to compare canonical filesystem paths, not just string-normalized paths.</p>
+<p>For example:</p>
+<ol>
+<li>resolve the base with <code>fs.realpath()</code></li>
+<li>resolve the candidate path's parent with <code>fs.realpath()</code></li>
+<li>reject any request whose real target path escapes the real base</li>
+<li>for write operations, carefully canonicalize the nearest existing parent directory before creating the final file</li>
+</ol>
+<p>In short: use realpath-aware containment checks for every filesystem sink, not <code>path.resolve(...).startsWith(...)</code> alone.</p>
+<h2 id="resources">Resources</h2>
+<ul>
+<li><code>packages/@tinacms/graphql/src/database/bridge/filesystem.ts</code></li>
+<li><code>packages/@tinacms/graphql/src/database/index.ts</code></li>
+<li><code>packages/@tinacms/graphql/src/resolver/index.ts</code></li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/tinacms/tinacms/security/advisories/GHSA-g9c2-gf25-3x67">https://github.com/tinacms/tinacms/security/advisories/GHSA-g9c2-gf25-3x67</a></li>
+<li><a href="https://github.com/tinacms/tinacms/commit/f124eabaca10dac9a4d765c9e4135813c4830955">https://github.com/tinacms/tinacms/commit/f124eabaca10dac9a4d765c9e4135813c4830955</a></li>
+<li><a href="https://github.com/advisories/GHSA-g9c2-gf25-3x67">https://github.com/advisories/GHSA-g9c2-gf25-3x67</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-g9c2-gf25-3x67</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-04-01T00:25:22.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@tinacms/graphql] @tinacms/graphql's Media Endpoints Can Escape the Media Root via Symlinks or Junctions]]></title>
+        <id>https://github.com/advisories/GHSA-g87c-r2jp-293w</id>
+        <link href="https://github.com/advisories/GHSA-g87c-r2jp-293w"/>
+        <updated>2026-04-01T00:23:03.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>@tinacms/cli</code> recently added lexical path-traversal checks to the dev media routes, but the implementation still validates only the path string and does not resolve symlink or junction targets.</p>
+<p>If a link already exists under the media root, Tina accepts a path like <code>pivot/written-from-media.txt</code> as "inside" the media directory and then performs real filesystem operations through that link target. This allows out-of-root media listing and write access, and the same root cause also affects delete.</p>
+<h2 id="details">Details</h2>
+<p>The dev media handlers validate user-controlled paths with:</p>
+<pre><code class="language-ts">function resolveWithinBase(userPath: string, baseDir: string): string {
+  const resolvedBase = path.resolve(baseDir);
+  const resolved = path.resolve(path.join(baseDir, userPath));
+  if (resolved === resolvedBase) {
+    return resolvedBase;
+  }
+  if (resolved.startsWith(resolvedBase + path.sep)) {
+    return resolved;
+  }
+  throw new PathTraversalError(userPath);
+}
+
+function resolveStrictlyWithinBase(userPath: string, baseDir: string): string {
+  const resolvedBase = path.resolve(baseDir) + path.sep;
+  const resolved = path.resolve(path.join(baseDir, userPath));
+  if (!resolved.startsWith(resolvedBase)) {
+    throw new PathTraversalError(userPath);
+  }
+  return resolved;
+}
+</code></pre>
+<p>But the validated path is then used directly for real filesystem access:</p>
+<pre><code class="language-ts">filesStr = await fs.readdir(validatedPath);
+...
+await fs.ensureDir(path.dirname(saveTo));
+file.pipe(fs.createWriteStream(saveTo));
+...
+await fs.remove(file);
+</code></pre>
+<p>This does not account for symlinks/junctions already present below the media root. A path such as <code>pivot/secret.txt</code> can be lexically inside the media directory while the filesystem target is outside it.</p>
+<h2 id="local-reproduction">Local Reproduction</h2>
+<p>I verified this locally with a real junction on Windows.</p>
+<p>Test layout:</p>
+<ul>
+<li>media root: <code>D:\bugcrowd\tinacms\temp\junction-repro4\public\uploads</code></li>
+<li>junction under media root: <code>public\uploads\pivot -&gt; D:\bugcrowd\tinacms\temp\junction-repro4\outside</code></li>
+<li>file outside the media root: <code>outside\secret.txt</code></li>
+</ul>
+<p>Tina's current media-path validation logic was applied and used to perform the same list/write operations the route handlers use.</p>
+<p>Observed result:</p>
+<pre><code class="language-json">{
+  "media": {
+    "base": "D:\\bugcrowd\\tinacms\\temp\\junction-repro4\\public\\uploads",
+    "resolvedListPath": "D:\\bugcrowd\\tinacms\\temp\\junction-repro4\\public\\uploads\\pivot",
+    "listedEntries": [
+      "secret.txt"
+    ],
+    "resolvedWritePath": "D:\\bugcrowd\\tinacms\\temp\\junction-repro4\\public\\uploads\\pivot\\written-from-media.txt",
+    "outsideWriteExists": true,
+    "outsideWriteContents": "MEDIA_ESCAPE"
+  }
+}
+</code></pre>
+<p>This shows the problem clearly:</p>
+<ul>
+<li>the path validator accepted <code>pivot</code></li>
+<li>listing revealed a file from outside the media root</li>
+<li>writing to <code>pivot/written-from-media.txt</code> created <code>outside\written-from-media.txt</code></li>
+</ul>
+<p>The delete path uses the same flawed containment model and should be hardened at the same time.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Out-of-root file listing</strong> via <code>/media/list/...</code></li>
+<li><strong>Out-of-root file write</strong> via <code>/media/upload/...</code></li>
+<li><strong>Likely out-of-root file delete</strong> via <code>/media/...</code> <code>DELETE</code>, using the same path-validation gap</li>
+<li><strong>Bypass of the recent path traversal hardening</strong> for any deployment whose media tree contains a link to another location</li>
+</ul>
+<p>This is especially relevant in development and self-hosted workflows where the media directory may contain symlinks or junctions intentionally or via repository content.</p>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Harden media path validation with canonical filesystem checks:</p>
+<ol>
+<li>resolve the real base path with <code>fs.realpath()</code></li>
+<li>resolve the real target path, or for writes the nearest existing parent</li>
+<li>compare canonical paths rather than lexical strings</li>
+<li>reject any operation that traverses through a symlink/junction to leave the real media root</li>
+</ol>
+<p><code>path.resolve(...).startsWith(...)</code> is not sufficient for filesystem security on linked paths.</p>
+<h2 id="resources">Resources</h2>
+<ul>
+<li><code>packages/@tinacms/cli/src/next/commands/dev-command/server/media.ts</code></li>
+<li><code>packages/@tinacms/cli/src/server/models/media.ts</code></li>
+<li><code>packages/@tinacms/cli/src/utils/path.ts</code></li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/tinacms/tinacms/security/advisories/GHSA-g87c-r2jp-293w">https://github.com/tinacms/tinacms/security/advisories/GHSA-g87c-r2jp-293w</a></li>
+<li><a href="https://github.com/tinacms/tinacms/commit/f124eabaca10dac9a4d765c9e4135813c4830955">https://github.com/tinacms/tinacms/commit/f124eabaca10dac9a4d765c9e4135813c4830955</a></li>
+<li><a href="https://github.com/advisories/GHSA-g87c-r2jp-293w">https://github.com/advisories/GHSA-g87c-r2jp-293w</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-g87c-r2jp-293w</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-04-01T00:23:02.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@xmldom/xmldom] xmldom: XML injection via unsafe CDATA serialization allows attacker-controlled markup insertion]]></title>
+        <id>https://github.com/advisories/GHSA-wh4c-j3r5-mjhp</id>
+        <link href="https://github.com/advisories/GHSA-wh4c-j3r5-mjhp"/>
+        <updated>2026-04-01T00:19:07.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>@xmldom/xmldom</code> allows attacker-controlled strings containing the CDATA terminator <code>]]&gt;</code> to be inserted into a <code>CDATASection</code> node. During serialization, <code>XMLSerializer</code> emitted the CDATA content verbatim without rejecting or safely splitting the terminator. As a result, data intended to remain text-only became <strong>active XML markup</strong> in the serialized output, enabling XML structure
+injection and downstream business-logic manipulation.</p>
+<p>The sequence <code>]]&gt;</code> is not allowed inside CDATA content and must be rejected or safely handled during serialization. (<a href="https://developer.mozilla.org/">MDN Web Docs</a>)</p>
+<h3 id="attack-surface">Attack surface</h3>
+<p><code>Document.createCDATASection(data)</code> is the most direct entry point, but it is not the only one. The WHATWG DOM spec intentionally does not validate <code>]]&gt;</code> in mutation methods — only <code>createCDATASection</code> carries that guard. The following paths therefore also allow <code>]]&gt;</code> to enter a CDATASection node and reach the serializer:</p>
+<ul>
+<li><code>CharacterData.appendData()</code></li>
+<li><code>CharacterData.replaceData()</code></li>
+<li><code>CharacterData.insertData()</code></li>
+<li>Direct assignment to <code>.data</code></li>
+<li>Direct assignment to <code>.textContent</code></li>
+</ul>
+<p>(Note: assigning to <code>.nodeValue</code> does <strong>not</strong> update <code>.data</code> in this implementation — the serializer reads <code>.data</code> directly — so <code>.nodeValue</code> is not an exploitable path.)</p>
+<h3 id="parse-path">Parse path</h3>
+<p>Parsing XML that contains a CDATA section is <strong>not</strong> affected. The SAX parser's non-greedy <code>CDSect</code> regex stops at the first <code>]]&gt;</code>, so parsed CDATA data never contains the terminator.</p>
+<hr>
+<h2 id="impact">Impact</h2>
+<p>If an application uses <code>xmldom</code> to generate "trusted" XML documents that embed <strong>untrusted user input</strong> inside CDATA (a common pattern in exports, feeds, SOAP/XML integrations, etc.), an attacker can inject additional XML elements/attributes into the generated document.</p>
+<p>This can lead to:</p>
+<ul>
+<li>Integrity violation of generated XML documents.</li>
+<li>Business-logic injection in downstream consumers (e.g., injecting <code>&lt;approved&gt;true&lt;/approved&gt;</code>,  <code>&lt;role&gt;admin&lt;/role&gt;</code>, workflow flags, or other security-relevant elements).</li>
+<li>Unexpected privilege/workflow decisions if downstream logic assumes injected nodes cannot appear.</li>
+</ul>
+<p>This issue does <strong>not</strong> require malformed parsers or browser behavior; it is caused by serialization producing attacker-influenced XML markup.</p>
+<hr>
+<h2 id="root-cause-with-file--line-numbers">Root Cause (with file + line numbers)</h2>
+<p><strong>File:</strong> <code>lib/dom.js</code></p>
+<h3 id="1-no-validation-in-createcdatasection">1. No validation in <code>createCDATASection</code></h3>
+<p><code>createCDATASection: function (data)</code> accepts any string and appends it directly.</p>
+<ul>
+<li><strong>Lines 2216–2221</strong> (0.9.8)</li>
+</ul>
+<h3 id="2-unsafe-cdata-serialization">2. Unsafe CDATA serialization</h3>
+<p>Serializer prints CDATA sections as:</p>
+<pre><code>&lt;![CDATA[ + node.data + ]]&gt;
+</code></pre>
+<p>without handling <code>]]&gt;</code> in the data.</p>
+<ul>
+<li><strong>Lines 2919–2920</strong> (0.9.8)</li>
+</ul>
+<p>Because CDATA content is emitted verbatim, an embedded <code>]]&gt;</code> closes the CDATA section early and the remainder of the attacker-controlled payload is interpreted as markup in the serialized XML.</p>
+<hr>
+<h2 id="proof-of-concept--fix-a-createcdatasection-now-throws">Proof of Concept — Fix A: <code>createCDATASection</code> now throws</h2>
+<p>On patched versions, passing <code>]]&gt;</code> directly to <code>createCDATASection</code> throws <code>InvalidCharacterError</code> instead of silently accepting the payload:</p>
+<pre><code class="language-js">const { DOMImplementation } = require('./lib');
+
+const doc = new DOMImplementation().createDocument(null, 'root', null);
+try {
+  doc.createCDATASection('SAFE]]&gt;&lt;injected attr="pwn"/&gt;');
+  console.log('VULNERABLE — no error thrown');
+} catch (e) {
+  console.log('FIXED — threw:', e.name); // InvalidCharacterError
+}
+</code></pre>
+<p>Expected output on patched versions:</p>
+<pre><code>FIXED — threw: InvalidCharacterError
+</code></pre>
+<hr>
+<h2 id="proof-of-concept--fix-b-mutation-vector-now-safe">Proof of Concept — Fix B: mutation vector now safe</h2>
+<p>On patched versions, injecting <code>]]&gt;</code> via a mutation method (<code>appendData</code>, <code>replaceData</code>, <code>.data =</code>, <code>.textContent =</code>) no longer produces injectable output. The serializer splits the terminator so the result round-trips as safe text:</p>
+<pre><code class="language-js">const { DOMImplementation, XMLSerializer } = require('./lib');
+const { DOMParser } = require('./lib');
+
+const doc = new DOMImplementation().createDocument(null, 'root', null);
+
+// Start with safe data, then mutate to include the terminator
+const cdata = doc.createCDATASection('safe');
+doc.documentElement.appendChild(cdata);
+cdata.appendData(']]&gt;&lt;injected attr="pwn"/&gt;&lt;more&gt;TEXT&lt;/more&gt;&lt;![CDATA[');
+
+const out = new XMLSerializer().serializeToString(doc);
+console.log('Serialized:', out);
+
+const reparsed = new DOMParser().parseFromString(out, 'text/xml');
+const injected = reparsed.getElementsByTagName('injected').length &gt; 0;
+console.log('Injected element found in reparsed doc:', injected);
+// VULNERABLE: true  |  FIXED: false
+</code></pre>
+<p>Expected output on patched versions:</p>
+<pre><code>Serialized: &lt;root&gt;&lt;![CDATA[safe]]]]&gt;&lt;![CDATA[&gt;&lt;injected attr="pwn"/&gt;&lt;more&gt;TEXT&lt;/more&gt;&lt;![CDATA[]]&gt;&lt;/root&gt;
+Injected element found in reparsed doc: false
+</code></pre>
+<hr>
+<h2 id="fix-applied">Fix Applied</h2>
+<p>Both mitigations were implemented:</p>
+<h3 id="option-a--strictspec-aligned-reject--in-createcdatasection">Option A — Strict/spec-aligned: reject <code>]]&gt;</code> in <code>createCDATASection()</code></h3>
+<p><code>Document.createCDATASection(data)</code> now throws <code>InvalidCharacterError</code> (per the <a href="https://dom.spec.whatwg.org/#dom-document-createcdatasection">WHATWG DOM spec</a>) when <code>data</code> contains <code>]]&gt;</code>. This closes the direct entry point.</p>
+<p>Code that previously passed a string containing <code>]]&gt;</code> to <code>createCDATASection</code> and relied on the silent/unsafe behaviour will now receive <code>InvalidCharacterError</code>. Use a mutation method such as <code>appendData</code> if you intentionally need <code>]]&gt;</code> in a CDATASection node's data (the serializer split in Option B will keep the output safe).</p>
+<h3 id="option-b--defensive-serialization-split-the-terminator-during-serialization">Option B — Defensive serialization: split the terminator during serialization</h3>
+<p><code>XMLSerializer</code> now replaces every occurrence of <code>]]&gt;</code> in CDATA section data with the split sequence <code>]]]]&gt;&lt;![CDATA[&gt;</code> before emitting. This closes all mutation-vector paths that Option A alone cannot guard, and means the serialized output is always well-formed XML regardless of how <code>]]&gt;</code> entered the node.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/xmldom/xmldom/security/advisories/GHSA-wh4c-j3r5-mjhp">https://github.com/xmldom/xmldom/security/advisories/GHSA-wh4c-j3r5-mjhp</a></li>
+<li><a href="https://github.com/xmldom/xmldom/commit/2b852e836ab86dbbd6cbaf0537f584dd0b5ac184">https://github.com/xmldom/xmldom/commit/2b852e836ab86dbbd6cbaf0537f584dd0b5ac184</a></li>
+<li><a href="https://github.com/xmldom/xmldom/releases/tag/0.8.12">https://github.com/xmldom/xmldom/releases/tag/0.8.12</a></li>
+<li><a href="https://github.com/xmldom/xmldom/releases/tag/0.9.9">https://github.com/xmldom/xmldom/releases/tag/0.9.9</a></li>
+<li><a href="https://github.com/advisories/GHSA-wh4c-j3r5-mjhp">https://github.com/advisories/GHSA-wh4c-j3r5-mjhp</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-wh4c-j3r5-mjhp</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-04-01T00:19:06.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@xmldom/xmldom] xmldom: XML injection via unsafe CDATA serialization allows attacker-controlled markup insertion]]></title>
+        <id>https://github.com/advisories/GHSA-wh4c-j3r5-mjhp</id>
+        <link href="https://github.com/advisories/GHSA-wh4c-j3r5-mjhp"/>
+        <updated>2026-04-01T00:19:07.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>@xmldom/xmldom</code> allows attacker-controlled strings containing the CDATA terminator <code>]]&gt;</code> to be inserted into a <code>CDATASection</code> node. During serialization, <code>XMLSerializer</code> emitted the CDATA content verbatim without rejecting or safely splitting the terminator. As a result, data intended to remain text-only became <strong>active XML markup</strong> in the serialized output, enabling XML structure
+injection and downstream business-logic manipulation.</p>
+<p>The sequence <code>]]&gt;</code> is not allowed inside CDATA content and must be rejected or safely handled during serialization. (<a href="https://developer.mozilla.org/">MDN Web Docs</a>)</p>
+<h3 id="attack-surface">Attack surface</h3>
+<p><code>Document.createCDATASection(data)</code> is the most direct entry point, but it is not the only one. The WHATWG DOM spec intentionally does not validate <code>]]&gt;</code> in mutation methods — only <code>createCDATASection</code> carries that guard. The following paths therefore also allow <code>]]&gt;</code> to enter a CDATASection node and reach the serializer:</p>
+<ul>
+<li><code>CharacterData.appendData()</code></li>
+<li><code>CharacterData.replaceData()</code></li>
+<li><code>CharacterData.insertData()</code></li>
+<li>Direct assignment to <code>.data</code></li>
+<li>Direct assignment to <code>.textContent</code></li>
+</ul>
+<p>(Note: assigning to <code>.nodeValue</code> does <strong>not</strong> update <code>.data</code> in this implementation — the serializer reads <code>.data</code> directly — so <code>.nodeValue</code> is not an exploitable path.)</p>
+<h3 id="parse-path">Parse path</h3>
+<p>Parsing XML that contains a CDATA section is <strong>not</strong> affected. The SAX parser's non-greedy <code>CDSect</code> regex stops at the first <code>]]&gt;</code>, so parsed CDATA data never contains the terminator.</p>
+<hr>
+<h2 id="impact">Impact</h2>
+<p>If an application uses <code>xmldom</code> to generate "trusted" XML documents that embed <strong>untrusted user input</strong> inside CDATA (a common pattern in exports, feeds, SOAP/XML integrations, etc.), an attacker can inject additional XML elements/attributes into the generated document.</p>
+<p>This can lead to:</p>
+<ul>
+<li>Integrity violation of generated XML documents.</li>
+<li>Business-logic injection in downstream consumers (e.g., injecting <code>&lt;approved&gt;true&lt;/approved&gt;</code>,  <code>&lt;role&gt;admin&lt;/role&gt;</code>, workflow flags, or other security-relevant elements).</li>
+<li>Unexpected privilege/workflow decisions if downstream logic assumes injected nodes cannot appear.</li>
+</ul>
+<p>This issue does <strong>not</strong> require malformed parsers or browser behavior; it is caused by serialization producing attacker-influenced XML markup.</p>
+<hr>
+<h2 id="root-cause-with-file--line-numbers">Root Cause (with file + line numbers)</h2>
+<p><strong>File:</strong> <code>lib/dom.js</code></p>
+<h3 id="1-no-validation-in-createcdatasection">1. No validation in <code>createCDATASection</code></h3>
+<p><code>createCDATASection: function (data)</code> accepts any string and appends it directly.</p>
+<ul>
+<li><strong>Lines 2216–2221</strong> (0.9.8)</li>
+</ul>
+<h3 id="2-unsafe-cdata-serialization">2. Unsafe CDATA serialization</h3>
+<p>Serializer prints CDATA sections as:</p>
+<pre><code>&lt;![CDATA[ + node.data + ]]&gt;
+</code></pre>
+<p>without handling <code>]]&gt;</code> in the data.</p>
+<ul>
+<li><strong>Lines 2919–2920</strong> (0.9.8)</li>
+</ul>
+<p>Because CDATA content is emitted verbatim, an embedded <code>]]&gt;</code> closes the CDATA section early and the remainder of the attacker-controlled payload is interpreted as markup in the serialized XML.</p>
+<hr>
+<h2 id="proof-of-concept--fix-a-createcdatasection-now-throws">Proof of Concept — Fix A: <code>createCDATASection</code> now throws</h2>
+<p>On patched versions, passing <code>]]&gt;</code> directly to <code>createCDATASection</code> throws <code>InvalidCharacterError</code> instead of silently accepting the payload:</p>
+<pre><code class="language-js">const { DOMImplementation } = require('./lib');
+
+const doc = new DOMImplementation().createDocument(null, 'root', null);
+try {
+  doc.createCDATASection('SAFE]]&gt;&lt;injected attr="pwn"/&gt;');
+  console.log('VULNERABLE — no error thrown');
+} catch (e) {
+  console.log('FIXED — threw:', e.name); // InvalidCharacterError
+}
+</code></pre>
+<p>Expected output on patched versions:</p>
+<pre><code>FIXED — threw: InvalidCharacterError
+</code></pre>
+<hr>
+<h2 id="proof-of-concept--fix-b-mutation-vector-now-safe">Proof of Concept — Fix B: mutation vector now safe</h2>
+<p>On patched versions, injecting <code>]]&gt;</code> via a mutation method (<code>appendData</code>, <code>replaceData</code>, <code>.data =</code>, <code>.textContent =</code>) no longer produces injectable output. The serializer splits the terminator so the result round-trips as safe text:</p>
+<pre><code class="language-js">const { DOMImplementation, XMLSerializer } = require('./lib');
+const { DOMParser } = require('./lib');
+
+const doc = new DOMImplementation().createDocument(null, 'root', null);
+
+// Start with safe data, then mutate to include the terminator
+const cdata = doc.createCDATASection('safe');
+doc.documentElement.appendChild(cdata);
+cdata.appendData(']]&gt;&lt;injected attr="pwn"/&gt;&lt;more&gt;TEXT&lt;/more&gt;&lt;![CDATA[');
+
+const out = new XMLSerializer().serializeToString(doc);
+console.log('Serialized:', out);
+
+const reparsed = new DOMParser().parseFromString(out, 'text/xml');
+const injected = reparsed.getElementsByTagName('injected').length &gt; 0;
+console.log('Injected element found in reparsed doc:', injected);
+// VULNERABLE: true  |  FIXED: false
+</code></pre>
+<p>Expected output on patched versions:</p>
+<pre><code>Serialized: &lt;root&gt;&lt;![CDATA[safe]]]]&gt;&lt;![CDATA[&gt;&lt;injected attr="pwn"/&gt;&lt;more&gt;TEXT&lt;/more&gt;&lt;![CDATA[]]&gt;&lt;/root&gt;
+Injected element found in reparsed doc: false
+</code></pre>
+<hr>
+<h2 id="fix-applied">Fix Applied</h2>
+<p>Both mitigations were implemented:</p>
+<h3 id="option-a--strictspec-aligned-reject--in-createcdatasection">Option A — Strict/spec-aligned: reject <code>]]&gt;</code> in <code>createCDATASection()</code></h3>
+<p><code>Document.createCDATASection(data)</code> now throws <code>InvalidCharacterError</code> (per the <a href="https://dom.spec.whatwg.org/#dom-document-createcdatasection">WHATWG DOM spec</a>) when <code>data</code> contains <code>]]&gt;</code>. This closes the direct entry point.</p>
+<p>Code that previously passed a string containing <code>]]&gt;</code> to <code>createCDATASection</code> and relied on the silent/unsafe behaviour will now receive <code>InvalidCharacterError</code>. Use a mutation method such as <code>appendData</code> if you intentionally need <code>]]&gt;</code> in a CDATASection node's data (the serializer split in Option B will keep the output safe).</p>
+<h3 id="option-b--defensive-serialization-split-the-terminator-during-serialization">Option B — Defensive serialization: split the terminator during serialization</h3>
+<p><code>XMLSerializer</code> now replaces every occurrence of <code>]]&gt;</code> in CDATA section data with the split sequence <code>]]]]&gt;&lt;![CDATA[&gt;</code> before emitting. This closes all mutation-vector paths that Option A alone cannot guard, and means the serialized output is always well-formed XML regardless of how <code>]]&gt;</code> entered the node.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/xmldom/xmldom/security/advisories/GHSA-wh4c-j3r5-mjhp">https://github.com/xmldom/xmldom/security/advisories/GHSA-wh4c-j3r5-mjhp</a></li>
+<li><a href="https://github.com/xmldom/xmldom/commit/2b852e836ab86dbbd6cbaf0537f584dd0b5ac184">https://github.com/xmldom/xmldom/commit/2b852e836ab86dbbd6cbaf0537f584dd0b5ac184</a></li>
+<li><a href="https://github.com/xmldom/xmldom/releases/tag/0.8.12">https://github.com/xmldom/xmldom/releases/tag/0.8.12</a></li>
+<li><a href="https://github.com/xmldom/xmldom/releases/tag/0.9.9">https://github.com/xmldom/xmldom/releases/tag/0.9.9</a></li>
+<li><a href="https://github.com/advisories/GHSA-wh4c-j3r5-mjhp">https://github.com/advisories/GHSA-wh4c-j3r5-mjhp</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-wh4c-j3r5-mjhp</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-04-01T00:19:06.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[xmldom] xmldom: XML injection via unsafe CDATA serialization allows attacker-controlled markup insertion]]></title>
+        <id>https://github.com/advisories/GHSA-wh4c-j3r5-mjhp</id>
+        <link href="https://github.com/advisories/GHSA-wh4c-j3r5-mjhp"/>
+        <updated>2026-04-01T00:19:07.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>@xmldom/xmldom</code> allows attacker-controlled strings containing the CDATA terminator <code>]]&gt;</code> to be inserted into a <code>CDATASection</code> node. During serialization, <code>XMLSerializer</code> emitted the CDATA content verbatim without rejecting or safely splitting the terminator. As a result, data intended to remain text-only became <strong>active XML markup</strong> in the serialized output, enabling XML structure
+injection and downstream business-logic manipulation.</p>
+<p>The sequence <code>]]&gt;</code> is not allowed inside CDATA content and must be rejected or safely handled during serialization. (<a href="https://developer.mozilla.org/">MDN Web Docs</a>)</p>
+<h3 id="attack-surface">Attack surface</h3>
+<p><code>Document.createCDATASection(data)</code> is the most direct entry point, but it is not the only one. The WHATWG DOM spec intentionally does not validate <code>]]&gt;</code> in mutation methods — only <code>createCDATASection</code> carries that guard. The following paths therefore also allow <code>]]&gt;</code> to enter a CDATASection node and reach the serializer:</p>
+<ul>
+<li><code>CharacterData.appendData()</code></li>
+<li><code>CharacterData.replaceData()</code></li>
+<li><code>CharacterData.insertData()</code></li>
+<li>Direct assignment to <code>.data</code></li>
+<li>Direct assignment to <code>.textContent</code></li>
+</ul>
+<p>(Note: assigning to <code>.nodeValue</code> does <strong>not</strong> update <code>.data</code> in this implementation — the serializer reads <code>.data</code> directly — so <code>.nodeValue</code> is not an exploitable path.)</p>
+<h3 id="parse-path">Parse path</h3>
+<p>Parsing XML that contains a CDATA section is <strong>not</strong> affected. The SAX parser's non-greedy <code>CDSect</code> regex stops at the first <code>]]&gt;</code>, so parsed CDATA data never contains the terminator.</p>
+<hr>
+<h2 id="impact">Impact</h2>
+<p>If an application uses <code>xmldom</code> to generate "trusted" XML documents that embed <strong>untrusted user input</strong> inside CDATA (a common pattern in exports, feeds, SOAP/XML integrations, etc.), an attacker can inject additional XML elements/attributes into the generated document.</p>
+<p>This can lead to:</p>
+<ul>
+<li>Integrity violation of generated XML documents.</li>
+<li>Business-logic injection in downstream consumers (e.g., injecting <code>&lt;approved&gt;true&lt;/approved&gt;</code>,  <code>&lt;role&gt;admin&lt;/role&gt;</code>, workflow flags, or other security-relevant elements).</li>
+<li>Unexpected privilege/workflow decisions if downstream logic assumes injected nodes cannot appear.</li>
+</ul>
+<p>This issue does <strong>not</strong> require malformed parsers or browser behavior; it is caused by serialization producing attacker-influenced XML markup.</p>
+<hr>
+<h2 id="root-cause-with-file--line-numbers">Root Cause (with file + line numbers)</h2>
+<p><strong>File:</strong> <code>lib/dom.js</code></p>
+<h3 id="1-no-validation-in-createcdatasection">1. No validation in <code>createCDATASection</code></h3>
+<p><code>createCDATASection: function (data)</code> accepts any string and appends it directly.</p>
+<ul>
+<li><strong>Lines 2216–2221</strong> (0.9.8)</li>
+</ul>
+<h3 id="2-unsafe-cdata-serialization">2. Unsafe CDATA serialization</h3>
+<p>Serializer prints CDATA sections as:</p>
+<pre><code>&lt;![CDATA[ + node.data + ]]&gt;
+</code></pre>
+<p>without handling <code>]]&gt;</code> in the data.</p>
+<ul>
+<li><strong>Lines 2919–2920</strong> (0.9.8)</li>
+</ul>
+<p>Because CDATA content is emitted verbatim, an embedded <code>]]&gt;</code> closes the CDATA section early and the remainder of the attacker-controlled payload is interpreted as markup in the serialized XML.</p>
+<hr>
+<h2 id="proof-of-concept--fix-a-createcdatasection-now-throws">Proof of Concept — Fix A: <code>createCDATASection</code> now throws</h2>
+<p>On patched versions, passing <code>]]&gt;</code> directly to <code>createCDATASection</code> throws <code>InvalidCharacterError</code> instead of silently accepting the payload:</p>
+<pre><code class="language-js">const { DOMImplementation } = require('./lib');
+
+const doc = new DOMImplementation().createDocument(null, 'root', null);
+try {
+  doc.createCDATASection('SAFE]]&gt;&lt;injected attr="pwn"/&gt;');
+  console.log('VULNERABLE — no error thrown');
+} catch (e) {
+  console.log('FIXED — threw:', e.name); // InvalidCharacterError
+}
+</code></pre>
+<p>Expected output on patched versions:</p>
+<pre><code>FIXED — threw: InvalidCharacterError
+</code></pre>
+<hr>
+<h2 id="proof-of-concept--fix-b-mutation-vector-now-safe">Proof of Concept — Fix B: mutation vector now safe</h2>
+<p>On patched versions, injecting <code>]]&gt;</code> via a mutation method (<code>appendData</code>, <code>replaceData</code>, <code>.data =</code>, <code>.textContent =</code>) no longer produces injectable output. The serializer splits the terminator so the result round-trips as safe text:</p>
+<pre><code class="language-js">const { DOMImplementation, XMLSerializer } = require('./lib');
+const { DOMParser } = require('./lib');
+
+const doc = new DOMImplementation().createDocument(null, 'root', null);
+
+// Start with safe data, then mutate to include the terminator
+const cdata = doc.createCDATASection('safe');
+doc.documentElement.appendChild(cdata);
+cdata.appendData(']]&gt;&lt;injected attr="pwn"/&gt;&lt;more&gt;TEXT&lt;/more&gt;&lt;![CDATA[');
+
+const out = new XMLSerializer().serializeToString(doc);
+console.log('Serialized:', out);
+
+const reparsed = new DOMParser().parseFromString(out, 'text/xml');
+const injected = reparsed.getElementsByTagName('injected').length &gt; 0;
+console.log('Injected element found in reparsed doc:', injected);
+// VULNERABLE: true  |  FIXED: false
+</code></pre>
+<p>Expected output on patched versions:</p>
+<pre><code>Serialized: &lt;root&gt;&lt;![CDATA[safe]]]]&gt;&lt;![CDATA[&gt;&lt;injected attr="pwn"/&gt;&lt;more&gt;TEXT&lt;/more&gt;&lt;![CDATA[]]&gt;&lt;/root&gt;
+Injected element found in reparsed doc: false
+</code></pre>
+<hr>
+<h2 id="fix-applied">Fix Applied</h2>
+<p>Both mitigations were implemented:</p>
+<h3 id="option-a--strictspec-aligned-reject--in-createcdatasection">Option A — Strict/spec-aligned: reject <code>]]&gt;</code> in <code>createCDATASection()</code></h3>
+<p><code>Document.createCDATASection(data)</code> now throws <code>InvalidCharacterError</code> (per the <a href="https://dom.spec.whatwg.org/#dom-document-createcdatasection">WHATWG DOM spec</a>) when <code>data</code> contains <code>]]&gt;</code>. This closes the direct entry point.</p>
+<p>Code that previously passed a string containing <code>]]&gt;</code> to <code>createCDATASection</code> and relied on the silent/unsafe behaviour will now receive <code>InvalidCharacterError</code>. Use a mutation method such as <code>appendData</code> if you intentionally need <code>]]&gt;</code> in a CDATASection node's data (the serializer split in Option B will keep the output safe).</p>
+<h3 id="option-b--defensive-serialization-split-the-terminator-during-serialization">Option B — Defensive serialization: split the terminator during serialization</h3>
+<p><code>XMLSerializer</code> now replaces every occurrence of <code>]]&gt;</code> in CDATA section data with the split sequence <code>]]]]&gt;&lt;![CDATA[&gt;</code> before emitting. This closes all mutation-vector paths that Option A alone cannot guard, and means the serialized output is always well-formed XML regardless of how <code>]]&gt;</code> entered the node.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/xmldom/xmldom/security/advisories/GHSA-wh4c-j3r5-mjhp">https://github.com/xmldom/xmldom/security/advisories/GHSA-wh4c-j3r5-mjhp</a></li>
+<li><a href="https://github.com/xmldom/xmldom/commit/2b852e836ab86dbbd6cbaf0537f584dd0b5ac184">https://github.com/xmldom/xmldom/commit/2b852e836ab86dbbd6cbaf0537f584dd0b5ac184</a></li>
+<li><a href="https://github.com/xmldom/xmldom/releases/tag/0.8.12">https://github.com/xmldom/xmldom/releases/tag/0.8.12</a></li>
+<li><a href="https://github.com/xmldom/xmldom/releases/tag/0.9.9">https://github.com/xmldom/xmldom/releases/tag/0.9.9</a></li>
+<li><a href="https://github.com/advisories/GHSA-wh4c-j3r5-mjhp">https://github.com/advisories/GHSA-wh4c-j3r5-mjhp</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-wh4c-j3r5-mjhp</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-04-01T00:19:06.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[parse-server] Parse Server has a LiveQuery protected-field guard bypass via array-like logical operator value]]></title>
         <id>https://github.com/advisories/GHSA-mmg8-87c5-jrc2</id>
@@ -497,178 +1077,5 @@
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-03-31T23:59:17.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[openclaw] OpenClaw SSRF guard misses four IPv6 special-use ranges]]></title>
-        <id>https://github.com/advisories/GHSA-g86v-f9qv-rh6m</id>
-        <link href="https://github.com/advisories/GHSA-g86v-f9qv-rh6m"/>
-        <updated>2026-03-31T23:58:44.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The SSRF/IP classifier treated several IPv6 special-use ranges as public and allowed fetches to proceed.</p>
-<h2 id="impact">Impact</h2>
-<p>An attacker who controlled a fetched URL could target internal or non-routable IPv6 addresses that should have been blocked by the SSRF guard.</p>
-<h2 id="affected-component">Affected Component</h2>
-<p><code>src/shared/net/ip.ts, src/infra/net/ssrf.*</code></p>
-<h2 id="fixed-versions">Fixed Versions</h2>
-<ul>
-<li>Affected: <code>&lt;= 2026.3.24</code></li>
-<li>Patched: <code>&gt;= 2026.3.28</code></li>
-<li>Latest stable <code>2026.3.28</code> contains the fix.</li>
-</ul>
-<h2 id="fix">Fix</h2>
-<p>Fixed by commit <code>d61f8e5672</code> (<code>Net: block missing IPv6 special-use ranges</code>).</p>
-<p>OpenClaw thanks @nicky-cc  of Tencent zhuque Lab <a href="https://github.com/Tencent/AI-Infra-Guard">https://github.com/Tencent/AI-Infra-Guard</a> for reporting.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/openclaw/openclaw/security/advisories/GHSA-g86v-f9qv-rh6m">https://github.com/openclaw/openclaw/security/advisories/GHSA-g86v-f9qv-rh6m</a></li>
-<li><a href="https://github.com/openclaw/openclaw/commit/d61f8e56723e03573b847422468d99c44c26e34f">https://github.com/openclaw/openclaw/commit/d61f8e56723e03573b847422468d99c44c26e34f</a></li>
-<li><a href="https://github.com/advisories/GHSA-g86v-f9qv-rh6m">https://github.com/advisories/GHSA-g86v-f9qv-rh6m</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-g86v-f9qv-rh6m</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-03-31T23:58:43.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[openclaw] OpenClaw's Discord component interaction ingress skips guild/channel policy enforcement]]></title>
-        <id>https://github.com/advisories/GHSA-jp4j-q5fc-58gv</id>
-        <link href="https://github.com/advisories/GHSA-jp4j-q5fc-58gv"/>
-        <updated>2026-03-31T23:58:09.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>Discord button and component interaction ingress did not consistently reapply the same guild and channel policy gates used for normal inbound messages.</p>
-<h2 id="impact">Impact</h2>
-<p>Users could trigger privileged component actions from contexts that should have been blocked by Discord channel policy.</p>
-<h2 id="affected-component">Affected Component</h2>
-<p><code>extensions/discord/src/monitor/agent-components.ts</code></p>
-<h2 id="fixed-versions">Fixed Versions</h2>
-<ul>
-<li>Affected: <code>&gt;= 2026.2.14, &lt;= 2026.3.24</code></li>
-<li>Patched: <code>&gt;= 2026.3.28</code></li>
-<li>Latest stable <code>2026.3.28</code> contains the fix.</li>
-</ul>
-<h2 id="fix">Fix</h2>
-<p>Fixed by commit <code>511093d4b3</code> (<code>Discord: apply component interaction policy gates</code>).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/openclaw/openclaw/security/advisories/GHSA-jp4j-q5fc-58gv">https://github.com/openclaw/openclaw/security/advisories/GHSA-jp4j-q5fc-58gv</a></li>
-<li><a href="https://github.com/openclaw/openclaw/commit/511093d4b37c0831c778fabd25ec3020834983c3">https://github.com/openclaw/openclaw/commit/511093d4b37c0831c778fabd25ec3020834983c3</a></li>
-<li><a href="https://github.com/openclaw/openclaw/releases/tag/v2026.3.28">https://github.com/openclaw/openclaw/releases/tag/v2026.3.28</a></li>
-<li><a href="https://github.com/advisories/GHSA-jp4j-q5fc-58gv">https://github.com/advisories/GHSA-jp4j-q5fc-58gv</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-jp4j-q5fc-58gv</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-03-31T23:58:08.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[openclaw] OpenClaw: Gateway chat.send ACP-only provenance guard could be bypassed by client identity spoofing]]></title>
-        <id>https://github.com/advisories/GHSA-6xg4-82hv-cp6f</id>
-        <link href="https://github.com/advisories/GHSA-6xg4-82hv-cp6f"/>
-        <updated>2026-03-31T23:57:51.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>ACP-only provenance fields in <code>chat.send</code> were gated by self-declared client metadata from the WebSocket handshake rather than verified authorization state.</p>
-<h2 id="impact">Impact</h2>
-<p>A normal authenticated operator client could spoof ACP identity labels and inject reserved provenance fields intended only for the ACP bridge.</p>
-<h2 id="affected-component">Affected Component</h2>
-<p><code>src/gateway/server-methods/chat.ts, src/gateway/server/ws-connection/message-handler.ts</code></p>
-<h2 id="fixed-versions">Fixed Versions</h2>
-<ul>
-<li>Affected: <code>&lt;= 2026.3.24</code></li>
-<li>Patched: <code>&gt;= 2026.3.28</code></li>
-<li>Latest stable <code>2026.3.28</code> contains the fix.</li>
-</ul>
-<h2 id="fix">Fix</h2>
-<p>Fixed by commit <code>4b9542716c</code> (<code>Gateway: require verified scope for chat provenance</code>).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/openclaw/openclaw/security/advisories/GHSA-6xg4-82hv-cp6f">https://github.com/openclaw/openclaw/security/advisories/GHSA-6xg4-82hv-cp6f</a></li>
-<li><a href="https://github.com/openclaw/openclaw/commit/4b9542716c26ac77652bcaa0f562043b298b409f">https://github.com/openclaw/openclaw/commit/4b9542716c26ac77652bcaa0f562043b298b409f</a></li>
-<li><a href="https://github.com/advisories/GHSA-6xg4-82hv-cp6f">https://github.com/advisories/GHSA-6xg4-82hv-cp6f</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-6xg4-82hv-cp6f</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-31T23:57:51.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[openclaw] OpenClaw: Gateway `operator.write` can reach admin-only persisted `verboseLevel` via `chat.send` `/verbose`]]></title>
-        <id>https://github.com/advisories/GHSA-5h2w-qmfp-ggp6</id>
-        <link href="https://github.com/advisories/GHSA-5h2w-qmfp-ggp6"/>
-        <updated>2026-03-31T23:57:35.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The <code>chat.send</code> path let authorized write-scoped callers persist <code>/verbose</code> session overrides even though the same stored session mutation is admin-only through <code>sessions.patch</code>.</p>
-<h2 id="impact">Impact</h2>
-<p>A write-scoped gateway caller could persist verbose output for later runs and expose more reasoning or tool output than the operator intended.</p>
-<h2 id="affected-component">Affected Component</h2>
-<p><code>src/auto-reply/reply/directive-handling.impl.ts, src/gateway/sessions-patch.ts</code></p>
-<h2 id="fixed-versions">Fixed Versions</h2>
-<ul>
-<li>Affected: <code>&lt;= 2026.3.24</code></li>
-<li>Patched: <code>&gt;= 2026.3.28</code></li>
-<li>Latest stable <code>2026.3.28</code> contains the fix.</li>
-</ul>
-<h2 id="fix">Fix</h2>
-<p>Fixed by commit <code>c603123528</code> (<code>fix(gateway): require admin for persisted verbose defaults</code>).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/openclaw/openclaw/security/advisories/GHSA-5h2w-qmfp-ggp6">https://github.com/openclaw/openclaw/security/advisories/GHSA-5h2w-qmfp-ggp6</a></li>
-<li><a href="https://github.com/openclaw/openclaw/commit/c6031235288a8d3bdf2243bd974340d8c8045bc2">https://github.com/openclaw/openclaw/commit/c6031235288a8d3bdf2243bd974340d8c8045bc2</a></li>
-<li><a href="https://github.com/advisories/GHSA-5h2w-qmfp-ggp6">https://github.com/advisories/GHSA-5h2w-qmfp-ggp6</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-5h2w-qmfp-ggp6</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-31T23:57:34.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[openclaw] OpenClaw host-env blocklist missing `GIT_TEMPLATE_DIR` and `AWS_CONFIG_FILE` allows code execution via env override]]></title>
-        <id>https://github.com/advisories/GHSA-m866-6qv5-p2fg</id>
-        <link href="https://github.com/advisories/GHSA-m866-6qv5-p2fg"/>
-        <updated>2026-03-31T23:57:01.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>Host execution env sanitization did not block <code>GIT_TEMPLATE_DIR</code> or <code>AWS_CONFIG_FILE</code>, even though both can redirect trusted tooling to attacker-controlled content.</p>
-<h2 id="impact">Impact</h2>
-<p>An approved exec request could redirect git or AWS CLI behavior through attacker-controlled configuration and execute untrusted code or load attacker-selected credentials.</p>
-<h2 id="affected-component">Affected Component</h2>
-<p><code>src/infra/host-env-security-policy.json, src/infra/host-env-security.ts</code></p>
-<h2 id="fixed-versions">Fixed Versions</h2>
-<ul>
-<li>Affected: <code>&lt;= 2026.3.24</code></li>
-<li>Patched: <code>&gt;= 2026.3.28</code></li>
-<li>Latest stable <code>2026.3.28</code> contains the fix.</li>
-</ul>
-<h2 id="fix">Fix</h2>
-<p>Fixed by commit <code>6eb82fba3c</code> (<code>Infra: block additional host exec env keys</code>).</p>
-<p>OpenClaw thanks @nicky-cc of Tencent zhuque Lab <a href="https://github.com/Tencent/AI-Infra-Guard">https://github.com/Tencent/AI-Infra-Guard</a> for reporting.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/openclaw/openclaw/security/advisories/GHSA-m866-6qv5-p2fg">https://github.com/openclaw/openclaw/security/advisories/GHSA-m866-6qv5-p2fg</a></li>
-<li><a href="https://github.com/openclaw/openclaw/commit/6eb82fba3cbfd0e50b179c1fada92e1e22dce7fa">https://github.com/openclaw/openclaw/commit/6eb82fba3cbfd0e50b179c1fada92e1e22dce7fa</a></li>
-<li><a href="https://github.com/advisories/GHSA-m866-6qv5-p2fg">https://github.com/advisories/GHSA-m866-6qv5-p2fg</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-m866-6qv5-p2fg</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-03-31T23:57:00.000Z</published>
     </entry>
 </feed>
