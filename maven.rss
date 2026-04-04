@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/maven.rss</id>
     <title>Security Advisory for Java artifacts hosted at the Maven central repository</title>
-    <updated>2026-04-04T03:48:24.118Z</updated>
+    <updated>2026-04-04T04:32:57.505Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Amaven"/>
     <subtitle>Security Advisory for Java artifacts hosted at the Maven central repository on GitHub</subtitle>
@@ -11,6 +11,133 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[tools.jackson.core:jackson-core] Jackson Core: Document length constraint bypass in blocking, async, and DataInput parsers]]></title>
+        <id>https://github.com/advisories/GHSA-2m67-wjpj-xhg9</id>
+        <link href="https://github.com/advisories/GHSA-2m67-wjpj-xhg9"/>
+        <updated>2026-04-04T04:17:08.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>Jackson Core 3.x does not consistently enforce <code>StreamReadConstraints.maxDocumentLength</code>. Oversized JSON documents can be accepted without a <code>StreamConstraintsException</code> in multiple parser entry points, which allows configured size limits to be bypassed and weakens denial-of-service protections.</p>
+<h2 id="details">Details</h2>
+<p>Three code paths where <code>maxDocumentLength</code> is not fully enforced:</p>
+<h3 id="1-blocking-parsers-skip-validation-of-the-final-in-memory-buffer">1. Blocking parsers skip validation of the final in-memory buffer</h3>
+<p>Blocking parsers validate only previously processed buffers, not the final in-memory buffer:</p>
+<ul>
+<li><code>ReaderBasedJsonParser.java:255</code></li>
+<li><code>UTF8StreamJsonParser.java:208</code></li>
+</ul>
+<p>Relevant code:</p>
+<pre><code class="language-java">_currInputProcessed += bufSize;
+_streamReadConstraints.validateDocumentLength(_currInputProcessed);
+</code></pre>
+<p>This means the check occurs only when a completed buffer is rolled over. If an oversized document is fully contained in the final buffer, parsing can complete without any document-length exception.</p>
+<h3 id="2-async-parsers-skip-validation-of-the-final-chunk-on-end-of-input">2. Async parsers skip validation of the final chunk on end-of-input</h3>
+<p>Async parsers validate previously processed chunks, but do not validate the final chunk on end-of-input:</p>
+<ul>
+<li><code>NonBlockingByteArrayJsonParser.java:49</code></li>
+<li><code>NonBlockingByteBufferJsonParser.java:57</code></li>
+<li><code>NonBlockingUtf8JsonParserBase.java:75</code></li>
+</ul>
+<p>Relevant code:</p>
+<pre><code class="language-java">_currInputProcessed += _origBufferLen;
+_streamReadConstraints.validateDocumentLength(_currInputProcessed);
+
+public void endOfInput() {
+    _endOfInput = true;
+}
+</code></pre>
+<p><code>endOfInput()</code> marks EOF but does not perform a final <code>validateDocumentLength(...)</code> call, so an oversized last chunk is accepted.</p>
+<h3 id="3-datainput-parser-path-does-not-enforce-maxdocumentlength-at-all">3. DataInput parser path does not enforce <code>maxDocumentLength</code> at all</h3>
+<ul>
+<li><code>JsonFactory.java:457</code></li>
+</ul>
+<p>Relevant construction path:</p>
+<pre><code class="language-java">int firstByte = ByteSourceJsonBootstrapper.skipUTF8BOM(input);
+return new UTF8DataInputJsonParser(readCtxt, ioCtxt,
+        readCtxt.getStreamReadFeatures(_streamReadFeatures),
+        readCtxt.getFormatReadFeatures(_formatReadFeatures),
+        input, can, firstByte);
+</code></pre>
+<p><code>UTF8DataInputJsonParser</code> does not call <code>StreamReadConstraints.validateDocumentLength(...)</code>, so <code>maxDocumentLength</code> is effectively disabled for <code>createParser(..., DataInput)</code> users.</p>
+<blockquote>
+<p><strong>Note:</strong> This issue appears distinct from the recently published nesting-depth and number-length constraint advisories because it affects document-length enforcement.</p>
+</blockquote>
+<h2 id="poc">PoC</h2>
+<h3 id="async-path-reproducer">Async path reproducer</h3>
+<pre><code class="language-java">import java.nio.charset.StandardCharsets;
+import tools.jackson.core.JsonParser;
+import tools.jackson.core.ObjectReadContext;
+import tools.jackson.core.StreamReadConstraints;
+import tools.jackson.core.async.ByteArrayFeeder;
+import tools.jackson.core.json.JsonFactory;
+
+public class Poc {
+    public static void main(String[] args) throws Exception {
+        JsonFactory factory = JsonFactory.builder()
+                .streamReadConstraints(StreamReadConstraints.builder()
+                        .maxDocumentLength(10L)
+                        .build())
+                .build();
+
+        byte[] doc = "{\"a\":1,\"b\":2}".getBytes(StandardCharsets.UTF_8);
+
+        try (JsonParser p = factory.createNonBlockingByteArrayParser(ObjectReadContext.empty())) {
+            ByteArrayFeeder feeder = (ByteArrayFeeder) p.nonBlockingInputFeeder();
+            feeder.feedInput(doc, 0, doc.length);
+            feeder.endOfInput();
+
+            while (p.nextToken() != null) { }
+        }
+
+        System.out.println("Parsed successfully");
+    }
+}
+</code></pre>
+<ul>
+<li><strong>Expected result:</strong> Parsing should fail because the configured document-length limit is 10, while the input is longer than 10 bytes.</li>
+<li><strong>Actual result:</strong> The document is accepted and parsing completes.</li>
+</ul>
+<h3 id="blocking-path-reproducer">Blocking path reproducer</h3>
+<pre><code class="language-java">import java.io.ByteArrayInputStream;
+import java.nio.charset.StandardCharsets;
+import tools.jackson.core.JsonParser;
+import tools.jackson.core.StreamReadConstraints;
+import tools.jackson.core.json.JsonFactory;
+
+public class Poc2 {
+    public static void main(String[] args) throws Exception {
+        JsonFactory factory = JsonFactory.builder()
+                .streamReadConstraints(StreamReadConstraints.builder()
+                        .maxDocumentLength(10L)
+                        .build())
+                .build();
+
+        byte[] doc = "{\"a\":1,\"b\":2}".getBytes(StandardCharsets.UTF_8);
+
+        try (JsonParser p = factory.createParser(new ByteArrayInputStream(doc))) {
+            while (p.nextToken() != null) { }
+        }
+
+        System.out.println("Parsed successfully");
+    }
+}
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p>Applications that rely on <code>maxDocumentLength</code> as a safety control for untrusted JSON can accept oversized inputs without error. In network-facing services this weakens an explicit denial-of-service protection and can increase CPU and memory consumption by allowing larger-than-configured request bodies to be processed.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/FasterXML/jackson-core/security/advisories/GHSA-2m67-wjpj-xhg9">https://github.com/FasterXML/jackson-core/security/advisories/GHSA-2m67-wjpj-xhg9</a></li>
+<li><a href="https://github.com/advisories/GHSA-2m67-wjpj-xhg9">https://github.com/advisories/GHSA-2m67-wjpj-xhg9</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-2m67-wjpj-xhg9</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-04-04T04:17:07.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[io.undertow:undertow-parent] Undertow is Vulnerable to HTTP Request/Response Smuggling]]></title>
         <id>https://github.com/advisories/GHSA-vqqj-9cmv-hx43</id>
@@ -1195,31 +1322,6 @@ private static boolean urlMatchesServer(String url, String serverUrl) {
             <name>GitHub</name>
             <email>GitHub@noreply.github.com</email>
             <uri>https://github.com/advisories/GHSA-7cj7-rcw6-p68v</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-27T06:31:43.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[org.springframework.ai:spring-ai-bedrock-converse] Spring AI: Insufficient Validation causes SSRF when processing multimodal messages with user-supplied URLs]]></title>
-        <id>https://github.com/advisories/GHSA-mhrg-94vw-45c5</id>
-        <link href="https://github.com/advisories/GHSA-mhrg-94vw-45c5"/>
-        <updated>2026-03-29T15:33:26.000Z</updated>
-        <content type="html"><![CDATA[<p>Spring AI's spring-ai-bedrock-converse&nbsp;contains a Server-Side Request Forgery (SSRF) vulnerability in&nbsp;BedrockProxyChatModel&nbsp;when processing multimodal messages that include user-supplied media URLs. Insufficient validation of those URLs allows an attacker to induce the server to issue HTTP requests to unintended internal or external destinations.</p>
-<p>This issue affects Spring AI: from 1.0.0 before 1.0.5, from 1.1.0 before 1.1.4.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-22742">https://nvd.nist.gov/vuln/detail/CVE-2026-22742</a></li>
-<li><a href="https://spring.io/security/cve-2026-22742">https://spring.io/security/cve-2026-22742</a></li>
-<li><a href="https://github.com/spring-projects/spring-ai/commit/a7d3223bc11a010b93fbc40a17fa9b68c52a8118">https://github.com/spring-projects/spring-ai/commit/a7d3223bc11a010b93fbc40a17fa9b68c52a8118</a></li>
-<li><a href="https://github.com/spring-projects/spring-ai/releases/tag/v1.0.5">https://github.com/spring-projects/spring-ai/releases/tag/v1.0.5</a></li>
-<li><a href="https://github.com/spring-projects/spring-ai/releases/tag/v1.1.4">https://github.com/spring-projects/spring-ai/releases/tag/v1.1.4</a></li>
-<li><a href="https://github.com/advisories/GHSA-mhrg-94vw-45c5">https://github.com/advisories/GHSA-mhrg-94vw-45c5</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-mhrg-94vw-45c5</uri>
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-03-27T06:31:43.000Z</published>
