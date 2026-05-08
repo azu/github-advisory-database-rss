@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-05-08T16:26:27.696Z</updated>
+    <updated>2026-05-08T17:27:50.236Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,93 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[gmaps-mcp] gmaps-mcp's unauthenticated HTTP transport allows unlimited Google Maps API calls at operator expense]]></title>
+        <id>https://github.com/advisories/GHSA-52cq-7v8r-62c6</id>
+        <link href="https://github.com/advisories/GHSA-52cq-7v8r-62c6"/>
+        <updated>2026-05-08T16:32:29.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="unauthenticated-http-transport-allows-unlimited-google-maps-api-calls-at-operator-expense">Unauthenticated HTTP Transport Allows Unlimited Google Maps API Calls at Operator Expense</h2>
+<p>The <code>gmaps-mcp</code> codebase was reviewed at commit <code>e671db68c804c9e67d51582d3280839ffa65f127</code> and three issues worth flagging were discovered — one high-severity, one medium, one structural. There were no preexisiting CVEs for this package yet and the repository had no prior security issues.</p>
+<p>The primary issue is that the HTTP transport in <code>server.py</code> skips authentication entirely when <code>MCP_API_KEY</code> is not set — which is the default, since <code>.env.example</code> ships the key as a blank value. Any unauthenticated caller who knows the server's public URL can invoke all six tools and generate live, billed Google Maps API requests against the operator's key. Because the README explicitly instructs operators to expose the server via ngrok (<code>ngrok http 8000</code>, then point MCP clients at the ngrok URL), this configuration gets deployed internet-facing as a matter of normal usage.</p>
+<p><strong>Affected files and exact lines:</strong></p>
+<p><code>src/google_maps_mcp/server.py</code>, lines 186–192:</p>
+<pre><code class="language-python">expected_key = os.getenv("MCP_API_KEY")
+
+if not expected_key:
+    # If no MCP_API_KEY is set, allow all requests (development mode)
+    return await call_next(request)
+
+if api_key != expected_key:
+    return JSONResponse(
+        {"error": "Invalid or missing API key. Provide X-API-Key header."},
+        status_code=401
+    )
+</code></pre>
+<p><code>run.py</code> lines 37 and 38 bind to <code>0.0.0.0:8000</code> by default (<code>MCP_HOST=0.0.0.0</code>, <code>MCP_PORT=8000</code>). No rate-limiting middleware exists anywhere in the codebase — not in the middleware stack, not in <code>GoogleMapsClient</code>, not in the tool handlers.</p>
+<p><strong>Attack model:</strong> operator deploys with default config (blank <code>MCP_API_KEY</code>), exposes via ngrok per the README instructions, attacker discovers the ngrok URL through ngrok's public endpoint scan surface or via a targeted test of shared URLs. No credentials needed to call the server.</p>
+<p><strong>PoC — reproduces from the default config:</strong></p>
+<pre><code class="language-bash"># Start with default .env.example (MCP_API_KEY blank/unset)
+export GOOGLE_MAPS_API_KEY=&lt;operator_key&gt;
+python run.py  # binds 0.0.0.0:8000
+
+# From attacker machine — no X-API-Key header needed:
+curl -X POST http://&lt;server&gt;:8000/mcp/ \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"geocode","arguments":{"address":"Times Square New York"}}}'
+# Returns geocoding results. Request billed to operator's GCP project.
+</code></pre>
+<p>The financial harm is real and accumulates fast. Google's $200/month free credit exhausts in roughly 3 hours at Places API pricing (~$17/1,000 requests) with a sustained 1 req/sec flood. More practically: any developer testing the ngrok URL, sharing it in a project thread, or posting it in a demo context creates a window where anyone with the link can silently drain quota. The attacker doesn't need the <code>GOOGLE_MAPS_API_KEY</code> value — they only need the MCP server URL.</p>
+<p><strong>Fix — three concrete changes, no new dependencies:</strong></p>
+<ol>
+<li>In HTTP transport mode, refuse to start if <code>MCP_API_KEY</code> is unset. Add a startup check in <code>server.py</code> (or <code>run.py</code>) that exits with a clear message if the environment variable is blank when the transport is HTTP. Something like:<pre><code class="language-python">if transport == "http" and not os.getenv("MCP_API_KEY"):
+    raise SystemExit(
+        "ERROR: MCP_API_KEY must be set before starting the HTTP server. "
+        "Unset key allows unauthenticated access to all Google Maps API calls."
+    )
+</code></pre>
+</li>
+<li>Update <code>.env.example</code> — change <code>MCP_API_KEY=</code> to a comment that makes the requirement explicit: <code># Required for HTTP transport. Generate with: python -c "import secrets; print(secrets.token_hex(32))"</code></li>
+<li>Add a one-line warning to the README before the ngrok step: "Before running ngrok, set <code>MCP_API_KEY</code> in your <code>.env</code>. Without it, anyone with the URL can make unlimited Google Maps API calls billed to your account."</li>
+</ol>
+<p>A token-bucket rate limiter (e.g., <code>slowapi</code>, which is already compatible with Starlette/FastAPI-style apps) would add another layer, but the auth fix is the critical path.</p>
+<hr>
+<p>The second issue is in <code>src/google_maps_mcp/client.py</code> at line 130:</p>
+<pre><code class="language-python">url = f"https://places.googleapis.com/v1/places/{place_id}"
+</code></pre>
+<p><code>place_id</code> comes from the MCP tool caller with no format validation and is interpolated verbatim into the URL path. <code>httpx</code> does not encode <code>/</code> or <code>?</code> in f-string URLs — only when using a <code>params=</code> dict. A crafted <code>place_id</code> like <code>":searchText?textQuery=attacker-query"</code> produces <code>https://places.googleapis.com/v1/places/:searchText?textQuery=attacker-query</code>, which routes to the text search endpoint instead of the details endpoint, with attacker-controlled query content. Injection is bounded to <code>places.googleapis.com</code> since the host is hardcoded, but it lets an attacker hit different endpoint semantics within that namespace and potentially force higher-cost API calls.</p>
+<p><strong>Fix:</strong></p>
+<pre><code class="language-python">import re
+
+PLACE_ID_PATTERN = re.compile(r'^[A-Za-z0-9_\-]+(/[A-Za-z0-9_\-]+)?$')
+
+async def get_place_details(self, place_id: str) -&gt; dict:
+    if not PLACE_ID_PATTERN.match(place_id):
+        raise ValueError(f"Invalid place_id format: {place_id!r}")
+    url = f"https://places.googleapis.com/v1/places/{place_id}"
+    ...
+</code></pre>
+<p>Google Place IDs are alphanumeric strings with an optional <code>places/</code> segment prefix. That pattern eliminates all path and query injection.</p>
+<hr>
+<p>The third issue is structural and currently benign, but worth flagging given the package is installable via PyPI as <code>gmaps-mcp</code>.</p>
+<p>The repository ships <code>.claude/skills/google-maps-mcp/SKILL.md</code> at the repo root. Claude Code and any harness using the same skill auto-discovery path pattern will auto-load this file as a system-level instruction when an agent clones the repository or opens the directory after install. The current content is legitimate usage documentation, so there's no active harm — but the file is a persistent injection surface. A future commit to <code>SKILL.md</code> could plant arbitrary instructions (exfiltrate environment variables, call an attacker-controlled URL before each tool response, silently modify output) that would enter agent context without any visible indicator for every developer or agent that installs <code>gmaps-mcp</code>.</p>
+<p>The exposure is broader than it would be for a private repo: PyPI install means the audience includes every Claude Code, Cursor, and similar agent-enabled IDE user who pulls the package and opens it in an agent context.</p>
+<p><strong>Fix:</strong> Move the skill documentation out of the auto-load path. Rename it to <code>docs/claude-skill-reference.md</code> (not auto-loaded), or remove it and note in the README that users who want Claude Code skill integration should add the file locally. Either approach preserves the UX without leaving a standing injection surface in the install tree.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/arthurkatcher/google-maps-mcp/security/advisories/GHSA-52cq-7v8r-62c6">https://github.com/arthurkatcher/google-maps-mcp/security/advisories/GHSA-52cq-7v8r-62c6</a></li>
+<li><a href="https://github.com/arthurkatcher/google-maps-mcp/commit/00d872507c78e8116bbf9de7be7cd112945c0fd8">https://github.com/arthurkatcher/google-maps-mcp/commit/00d872507c78e8116bbf9de7be7cd112945c0fd8</a></li>
+<li><a href="https://github.com/arthurkatcher/google-maps-mcp/commit/3ae32643da469f962e67e8ef9726cd4d9bf4587d">https://github.com/arthurkatcher/google-maps-mcp/commit/3ae32643da469f962e67e8ef9726cd4d9bf4587d</a></li>
+<li><a href="https://github.com/advisories/GHSA-52cq-7v8r-62c6">https://github.com/advisories/GHSA-52cq-7v8r-62c6</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-52cq-7v8r-62c6</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-08T16:32:29.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[MindsDB] MindsDB has an Improper Access Control Issue]]></title>
         <id>https://github.com/advisories/GHSA-9f6m-65v9-x9g2</id>
@@ -1138,36 +1225,5 @@ Both tests confirm Cookie and Proxy-Authorization headers are sent to the attack
         </author>
         <category label="severity" term="CRITICAL"/>
         <published>2026-05-07T00:52:55.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[weblate] Weblate vulnerable to XSS via crafted Markdown]]></title>
-        <id>https://github.com/advisories/GHSA-5cmv-3rc4-7279</id>
-        <link href="https://github.com/advisories/GHSA-5cmv-3rc4-7279"/>
-        <updated>2026-05-07T00:04:27.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>The Markdown renderer used in user comments and other user-provided content didn't properly sanitize some attributes.</p>
-<h3 id="patches">Patches</h3>
-<ul>
-<li><a href="https://github.com/WeblateOrg/weblate/pull/19259">https://github.com/WeblateOrg/weblate/pull/19259</a></li>
-</ul>
-<h3 id="workarounds">Workarounds</h3>
-<p>Even though the attacker might be able to inject code into the HTML, the Weblate's strict CSP should mitigate the risks.</p>
-<h3 id="acknowlegement">Acknowlegement</h3>
-<p>Michal Čihař has identified and fixed this vulnerability.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/WeblateOrg/weblate/security/advisories/GHSA-5cmv-3rc4-7279">https://github.com/WeblateOrg/weblate/security/advisories/GHSA-5cmv-3rc4-7279</a></li>
-<li><a href="https://github.com/WeblateOrg/weblate/pull/19259">https://github.com/WeblateOrg/weblate/pull/19259</a></li>
-<li><a href="https://github.com/WeblateOrg/weblate/commit/85abc9df88b7464f4c0e794aef752e45f4230f75">https://github.com/WeblateOrg/weblate/commit/85abc9df88b7464f4c0e794aef752e45f4230f75</a></li>
-<li><a href="https://github.com/advisories/GHSA-5cmv-3rc4-7279">https://github.com/advisories/GHSA-5cmv-3rc4-7279</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-5cmv-3rc4-7279</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-07T00:04:26.000Z</published>
     </entry>
 </feed>
