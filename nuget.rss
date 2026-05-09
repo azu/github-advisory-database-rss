@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/nuget.rss</id>
     <title>Security Advisory for .NET packages hosted at the NuGet Gallery</title>
-    <updated>2026-05-08T23:16:30.710Z</updated>
+    <updated>2026-05-09T00:21:48.621Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Anuget"/>
     <subtitle>Security Advisory for .NET packages hosted at the NuGet Gallery on GitHub</subtitle>
@@ -11,6 +11,108 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[SharpCompress] SharpCompress has directory traversal via directory entries in WriteToDirectory (zip slip variant)]]></title>
+        <id>https://github.com/advisories/GHSA-6c8g-7p36-r338</id>
+        <link href="https://github.com/advisories/GHSA-6c8g-7p36-r338"/>
+        <updated>2026-05-08T23:50:41.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A path traversal vulnerability in <code>IArchive.WriteToDirectory()</code> allows a malicious archive to create directories outside the intended extraction root. For TAR archives, this can be escalated to arbitrary file writes by chaining with a symlink entry, giving a full write primitive on the target filesystem subject to the permissions of the running process.</p>
+<h3 id="details">Details</h3>
+<p>The vulnerable code is in the directory-entry branch of <code>WriteToDirectoryInternal</code> (sync, <code>IArchiveExtensions.cs:48–61</code>) and <code>WriteToDirectoryAsyncInternal</code> (async, <code>IAsyncArchiveExtensions.cs:70–84</code>):</p>
+<pre><code class="language-csharp">var dirPath = Path.Combine(destinationDirectory, entry.Key);
+Directory.CreateDirectory(Path.GetDirectoryName(dirPath + "/"));
+</code></pre>
+<p>No <code>Path.GetFullPath()</code> normalisation and no bounds check are applied before the <code>Directory.CreateDirectory</code> call. Two .NET <code>Path.Combine</code> behaviours make this exploitable:</p>
+<ul>
+<li><strong>Relative traversal</strong>: <code>Path.Combine("/safe/extract", "../../evil")</code> → the OS resolves <code>..</code> segments on the raw path, placing the directory outside the extraction root.</li>
+<li><strong>Absolute path override</strong>: <code>Path.Combine("/safe/extract", "/tmp/evil")</code> → returns <code>"/tmp/evil"</code> — the base is discarded entirely for rooted paths.</li>
+</ul>
+<p>File entries are <strong>not</strong> directly affected — they route through <code>ExtractionMethods.WriteEntryToDirectory</code> which applies the correct guard (<code>GetFullPath</code> + <code>StartsWith</code>, see <code>ExtractionMethods.cs:54–65</code>). The directory-entry branch is a separate fast-path that was added without that guard.</p>
+<p>Affected archive formats: ZIP and TAR (non-solid). Solid archives and 7-Zip use the reader path which calls the secure method.</p>
+<h4 id="escalation-to-arbitrary-file-writes-tar-only">Escalation to arbitrary file writes (TAR only)</h4>
+<p><code>Path.GetFullPath</code> on .NET does not resolve symlinks — it only normalises <code>.</code> and <code>..</code> segments. This means the file-entry guard in <code>ExtractionMethods.WriteEntryToDirectory</code> can be bypassed via symlink chaining in TAR archives when the caller supplies a <code>SymbolicLinkHandler</code>:</p>
+<pre><code class="language-csharp">archive.WriteToDirectory("/safe/extract", new ExtractionOptions
+{
+    ExtractFullPath = true,
+    SymbolicLinkHandler = (linkPath, linkTarget) =&gt;
+        File.CreateSymbolicLink(linkPath, linkTarget)  // naive — no validation of linkTarget
+});
+</code></pre>
+<p>Attack sequence in a single TAR archive:</p>
+<ol>
+<li><p><strong>Symlink entry</strong> — <code>link</code> → <code>../evil_outside/</code>
+The <code>SymbolicLinkHandler</code> creates <code>/safe/extract/link</code> pointing outside the extraction root.</p>
+</li>
+<li><p><strong>File entry</strong> — <code>link/secret.txt</code>
+<code>ExtractionMethods.WriteEntryToDirectory</code> computes:</p>
+<ul>
+<li><code>destdir = Path.GetFullPath("/safe/extract/link")</code> → <code>"/safe/extract/link"</code> — textually inside root, check passes ✓</li>
+<li><code>File.Open("/safe/extract/link/secret.txt")</code> — OS follows symlink, file is written to <code>/evil_outside/secret.txt</code></li>
+</ul>
+</li>
+</ol>
+<p>The library does not validate <code>linkTarget</code> before passing it to the caller's handler, and the XML docs do not warn that it may be a traversal path. The idiomatic handler implementation above is therefore silently exploitable.</p>
+<p>ZIP does not support symlinks in SharpCompress (<code>ZipEntry.LinkTarget</code> always returns <code>null</code>), so this escalation is TAR-only.</p>
+<table>
+<thead>
+<tr>
+<th>Attack</th>
+<th>ZIP</th>
+<th>TAR</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Directory traversal (escape extraction root)</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Escalate to arbitrary file writes via symlink chain</td>
+<td>No</td>
+<td>Yes (if caller provides <code>SymbolicLinkHandler</code>)</td>
+</tr>
+</tbody></table>
+<p><strong>Recommended fix</strong> — apply the same pattern from <code>ExtractionMethods.WriteEntryToDirectory</code> to both affected files:</p>
+<pre><code class="language-csharp">var fullDestDir = Path.GetFullPath(destinationDirectory);
+if (!fullDestDir.EndsWith(Path.DirectorySeparatorChar))
+    fullDestDir += Path.DirectorySeparatorChar;
+
+var dirPath = Path.GetFullPath(Path.Combine(fullDestDir, entry.Key));
+if (!dirPath.StartsWith(fullDestDir, PathComparison))
+    throw new ExtractionException(
+        "Entry is trying to create a directory outside of the destination directory.");
+
+Directory.CreateDirectory(dirPath);
+</code></pre>
+<p>Additionally, the library should validate <code>LinkTarget</code> before invoking the caller's <code>SymbolicLinkHandler</code>, or document clearly that callers must validate it themselves.</p>
+<h3 id="poc">PoC</h3>
+<p>A self-contained .NET console app is available at:
+<code>https://github.com/svenclaesson/poc-sharpcompress-traversal</code></p>
+<pre><code>git clone https://github.com/svenclaesson/poc-sharpcompress-traversal
+cd poc-sharpcompress-traversal
+dotnet run
+</code></pre>
+<p>The PoC crafts a ZIP with three directory entries (<code>../../escaped_relative/</code>, <code>/tmp/escaped_absolute/</code>, <code>safe_subdir/</code>) using <code>System.IO.Compression</code> (stdlib), then extracts with SharpCompress. Output shows <code>[ESCAPED]</code> for the two malicious entries and <code>[ok]</code> for the legitimate one, on both sync and async APIs.</p>
+<p>Tested against SharpCompress 0.47.4 (latest NuGet).</p>
+<h3 id="impact">Impact</h3>
+<p>This is a path traversal / zip slip vulnerability (CWE-22). Any application that calls <code>archive.WriteToDirectory()</code> on an untrusted archive is affected — which covers the primary documented extraction API.</p>
+<p>For ZIP archives the impact is limited to arbitrary directory creation, which can be used to stage privilege escalation (e.g. cron drop-ins, XDG config paths, service spool directories) or shadow expected paths to alter application behaviour.</p>
+<p>For TAR archives, callers that implement a <code>SymbolicLinkHandler</code> — which is the only way to faithfully restore a TAR — are exposed to a full arbitrary file write primitive via the symlink chaining described above.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/adamhathcock/sharpcompress/security/advisories/GHSA-6c8g-7p36-r338">https://github.com/adamhathcock/sharpcompress/security/advisories/GHSA-6c8g-7p36-r338</a></li>
+<li><a href="https://github.com/advisories/GHSA-6c8g-7p36-r338">https://github.com/advisories/GHSA-6c8g-7p36-r338</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-6c8g-7p36-r338</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-08T23:50:40.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[OpenTelemetry.Exporter.Instana] OpenTelemetry.Exporter.Instana bypasses TLS certificate validation when a proxy is configured]]></title>
         <id>https://github.com/advisories/GHSA-wfr5-454p-mjc2</id>
@@ -937,47 +1039,5 @@ Exploitation requires only the ability to send a single HTTP request to a public
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-04-23T21:43:53.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[OpenTelemetry.Exporter.OpenTelemetryProtocol] OpenTelemetry dotnet: Unbounded `grpc-status-details-bin` parsing in OTLP/gRPC retry handling]]></title>
-        <id>https://github.com/advisories/GHSA-mr8r-92fq-pj8p</id>
-        <link href="https://github.com/advisories/GHSA-mr8r-92fq-pj8p"/>
-        <updated>2026-04-23T21:40:31.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>When exporting telemetry over gRPC using the OpenTelemetry Protocol (OTLP), the exporter may parse a server-provided <code>grpc-status-details-bin</code> trailer during retry handling. Prior to the fix, a malformed trailer could encode an extremely large length-delimited protobuf field which was used directly for allocation, allowing excessive memory allocation and potential denial of service (DoS).</p>
-<h3 id="details">Details</h3>
-<p>#5980 introduced a retry path that parses <code>grpc-status-details-bin</code> to extract gRPC retry delay information for retryable responses.</p>
-<p>On that path:</p>
-<ul>
-<li><code>OtlpGrpcExportClient</code> captures <code>grpc-status-details-bin</code> from retryable status responses (<code>ResourceExhausted</code> / <code>Unavailable</code>).</li>
-<li><code>OtlpRetry</code> invokes <code>GrpcStatusDeserializer.TryGetGrpcRetryDelay</code> using this untrusted trailer value.</li>
-<li><code>GrpcStatusDeserializer.DecodeBytes</code> decoded a protobuf varint length and allocated <code>new byte[length]</code> without validating the bounds against the remaining payload size.</li>
-</ul>
-<p>A malicious or compromised collector (or a MitM in weakly-protected deployments) could return a crafted <code>grpc-status-details-bin</code> payload that forces oversized allocation and memory exhaustion in the instrumented process.</p>
-<h3 id="impact">Impact</h3>
-<p>If an OTLP/gRPC endpoint is attacker-controlled (or traffic is intercepted), a crafted retryable response can trigger large allocations during trailer parsing, which may exhaust memory and cause process instability/crash (availability impact / DoS).</p>
-<h3 id="mitigation">Mitigation</h3>
-<p>The application's configured back-end/collector endpoint needs to behave maliciously. If the collector/back-end is a well-behaved implementation response bodies should not be excessively large if a request error occurs.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>None known.</p>
-<h3 id="remediation">Remediation</h3>
-<p><a href="https://github.com/open-telemetry/opentelemetry-dotnet/pull/7064">#7064</a> updates <code>GrpcStatusDeserializer</code> to validate decoded length-delimited field sizes before allocation by ensuring the requested length is sane and does not exceed the remaining payload.</p>
-<p>This causes malformed or truncated <code>grpc-status-details-bin</code> payloads to fail safely instead of attempting unbounded allocation.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/open-telemetry/opentelemetry-dotnet/security/advisories/GHSA-mr8r-92fq-pj8p">https://github.com/open-telemetry/opentelemetry-dotnet/security/advisories/GHSA-mr8r-92fq-pj8p</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-40891">https://nvd.nist.gov/vuln/detail/CVE-2026-40891</a></li>
-<li><a href="https://github.com/open-telemetry/opentelemetry-dotnet/pull/5980">https://github.com/open-telemetry/opentelemetry-dotnet/pull/5980</a></li>
-<li><a href="https://github.com/open-telemetry/opentelemetry-dotnet/pull/7064">https://github.com/open-telemetry/opentelemetry-dotnet/pull/7064</a></li>
-<li><a href="https://github.com/advisories/GHSA-mr8r-92fq-pj8p">https://github.com/advisories/GHSA-mr8r-92fq-pj8p</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-mr8r-92fq-pj8p</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-04-23T21:40:29.000Z</published>
     </entry>
 </feed>
