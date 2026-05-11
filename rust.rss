@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rust.rss</id>
     <title>Security Advisory for Rust crates</title>
-    <updated>2026-05-11T13:51:25.697Z</updated>
+    <updated>2026-05-11T14:59:49.142Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arust"/>
     <subtitle>Security Advisory for Rust crates on GitHub</subtitle>
@@ -11,6 +11,135 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[oxidize-pdf] oxidize-pdf: NaN/inf bypass in colour content-stream emission causes PDF rejection (DoS)]]></title>
+        <id>https://github.com/advisories/GHSA-88q9-cmp2-c2vq</id>
+        <link href="https://github.com/advisories/GHSA-88q9-cmp2-c2vq"/>
+        <updated>2026-05-11T14:53:27.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>  <code>oxidize-pdf</code> defines <code>Color</code> as a <code>pub enum</code> with public tuple-struct variants <code>Rgb(f64, f64, f64)</code>, <code>Gray(f64)</code>, and <code>Cmyk(f64, f64, f64, f64)</code>. The constructors <code>Color::rgb</code>, <code>Color::gray</code>, and <code>Color::cmyk</code> clamp incoming
+  components to <code>[0.0, 1.0]</code>, but because the variants are <code>pub</code>, callers can construct values directly without going through the constructors:</p>
+<pre><code class="language-rust">let safe   = Color::rgb(f64::NAN, 0.5, 0.5);   // clamps NaN to 0.0
+let attack = Color::Rgb(f64::NAN, 0.5, 0.5);    // bypasses clamp
+
+Color: Copy allows the non-finite value to propagate freely through API surfaces and serialisation. When such a value reaches a content-stream emitter, the writer formats it via format!("{:.3}", v). The Rust standard library renders
+f64::NAN as "NaN", f64::INFINITY as "inf", and f64::NEG_INFINITY as "-inf" — none of which are valid PDF numeric tokens per ISO 32000-1 §7.3.3:
+
+▎ A numeric object shall be represented by one or more decimal digits with an optional sign and a leading, trailing, or embedded PERIOD.
+
+The resulting content stream contains an invalid token sequence (e.g. NaN 0.500 0.500 rg). Conformant PDF viewers (Adobe Acrobat, Foxit, PDF.js, Apple Preview) reject the content stream, the affected page, or the entire document
+depending on parser strictness.
+
+Affected packages (all listed in the "Affected products" section of this advisory):
+
+- oxidize-pdf on crates.io — the core Rust library where the vulnerable code path lives.
+- OxidizePdf.NET on NuGet — .NET FFI binding that exposes Color through its public API; inherits the vulnerability from its dependency on oxidize-pdf.
+- oxidize-pdf on PyPI — Python bindings (PyO3) that similarly expose colour construction; inherits the vulnerability from its dependency.
+
+Who is impacted: any application that uses these packages to generate PDFs and accepts user-influenced colour values without validation. The most exposed surfaces are server-side PDF generators that take arbitrary f64 colour
+parameters from upstream services.
+
+Reproduction (Rust API):
+use oxidize_pdf::{Document, Page, graphics::Color};
+
+let mut doc = Document::new();
+let mut page = Page::a4();
+let gc = page.graphics();
+gc.set_fill_color(Color::Rgb(f64::NAN, 0.5, 0.5));
+gc.rectangle(50.0, 50.0, 100.0, 100.0).fill();
+doc.add_page(page);
+doc.save("malformed.pdf").unwrap();
+
+// The resulting content stream contains:
+//   NaN 0.500 0.500 rg
+//   50 50 100 100 re
+//   f
+// which conformant viewers reject.
+
+Affected sites in oxidize-pdf 2.5.7 (the same code paths are reached by both .NET and Python bindings via FFI):
+
+- oxidize-pdf-core/src/text/flow.rs (TextFlowContext)
+- oxidize-pdf-core/src/text/mod.rs (TextContext::apply_text_state_parameters)
+- oxidize-pdf-core/src/graphics/mod.rs (GraphicsContext::apply_fill_color / apply_stroke_color)
+- oxidize-pdf-core/src/graphics/patterns.rs (create_checkerboard_pattern / create_stripe_pattern / create_dots_pattern)
+- ~45 sibling sites across forms/*, annotations/*, layout/rich_text.rs, and writer/pdf_writer/mod.rs that emit colour through the same code path.
+
+Patches
+
+The fix introduces a sanitising helper at the emission boundary in graphics/color.rs:
+
+pub(crate) fn finite_or_zero(val: f64) -&gt; f64 {
+    if val.is_finite() { val } else { 0.0 }
+}
+
+Every colour-operator emitter (~50 sites across 17 files) now routes through fill_color_op / stroke_color_op / write_fill_color / write_stroke_color, which apply finite_or_zero before formatting. Non-finite components are substituted
+with 0.0, so the wire format remains ISO 32000-1 conformant regardless of the input.
+
+Patched releases:
+
+- oxidize-pdf 2.6.0 on crates.io — contains the fix at the source.
+- OxidizePdf.NET on NuGet — bumped to depend on oxidize-pdf 2.6.0 (see "Patched versions" above).
+- oxidize-pdf on PyPI — bumped to depend on oxidize-pdf 2.6.0 (see "Patched versions" above).
+
+Users should upgrade to the patched version of whichever package(s) they consume.
+
+Workarounds
+
+For users who cannot upgrade immediately:
+
+- Always construct colours via the safe constructors Color::rgb(), Color::gray(), Color::cmyk(), which clamp components to [0.0, 1.0] (no NaN/inf survives clamping).
+- Never use direct enum construction (Color::Rgb(...), Color::Gray(...), Color::Cmyk(...)) when components originate from untrusted input. The same applies to the corresponding APIs in the .NET and Python bindings.
+- Validate untrusted f64 colour inputs with f64::is_finite() (Rust) or equivalent checks (!double.IsFinite(v) in .NET, math.isfinite(v) in Python) before passing them to any oxidize-pdf API.
+
+These mitigations are partial — they cover the application layer but not other code paths that may construct Color values internally. The full fix is the upgrade to the patched versions.
+
+References
+
+- Issue: https://github.com/bzsanti/oxidizePdf/issues/220
+- Companion refactor: https://github.com/bzsanti/oxidizePdf/issues/221
+- Fix PR: https://github.com/bzsanti/oxidizePdf/pull/225
+- Release PR (oxidize-pdf 2.6.0): https://github.com/bzsanti/oxidizePdf/pull/226
+- .NET binding repository: https://github.com/bzsanti/oxidize-pdf-dotnet
+- Python binding repository: https://github.com/bzsanti/oxidize-python
+- ISO 32000-1 §7.3.3 (Numeric Objects): https://www.iso.org/standard/51502.html
+
+A broader follow-up tracks the same CWE class in non-colour numeric content-stream emitters (line widths, transformation matrices, dash arrays, text positioning, path operators) — to be addressed in oxidize-pdf 2.7.0 with its own
+advisory.
+### References
+
+- &lt;https://github.com/bzsanti/oxidizePdf/security/advisories/GHSA-88q9-cmp2-c2vq&gt;
+- &lt;https://github.com/advisories/GHSA-88q9-cmp2-c2vq&gt;
+</code></pre>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-88q9-cmp2-c2vq</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-11T14:53:25.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[steamworks] Steamworks game clients/servers using P2P authentication vulnerable to denial of service]]></title>
+        <id>https://github.com/advisories/GHSA-g588-cjg3-6g78</id>
+        <link href="https://github.com/advisories/GHSA-g588-cjg3-6g78"/>
+        <updated>2026-05-11T14:40:17.000Z</updated>
+        <content type="html"><![CDATA[<p>Processing the raw <code>ValidateAuthTicketResponse_t</code> callback data panics when the <code>m_eAuthSessionResponse</code> field is <code>k_EAuthSessionResponseAuthTicketNetworkIdentityFailure</code>. This can lead to denial of service in game clients and servers using the <code>begin_authentication_session</code> API to authenticate players if a malicious game client sends an authentication ticket with a network identity that does not match that of the verifier.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/Noxime/steamworks-rs/issues/321">https://github.com/Noxime/steamworks-rs/issues/321</a></li>
+<li><a href="https://rustsec.org/advisories/RUSTSEC-2026-0121.html">https://rustsec.org/advisories/RUSTSEC-2026-0121.html</a></li>
+<li><a href="https://github.com/advisories/GHSA-g588-cjg3-6g78">https://github.com/advisories/GHSA-g588-cjg3-6g78</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-g588-cjg3-6g78</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-11T14:40:17.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[smallbitvec] smallbitvec: Integer overflow in safe API leads to heap buffer overflow]]></title>
         <id>https://github.com/advisories/GHSA-97wc-2hqc-cjgr</id>
@@ -785,52 +914,6 @@ fn main() {
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-05-07T03:13:57.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[imageproc] imageproc: Out-of-bounds read via NaN coordinates in bilinear/bicubic sampling]]></title>
-        <id>https://github.com/advisories/GHSA-qg8r-f7x3-25f7</id>
-        <link href="https://github.com/advisories/GHSA-qg8r-f7x3-25f7"/>
-        <updated>2026-05-07T03:10:15.000Z</updated>
-        <content type="html"><![CDATA[<p>A bounds check was performed in floating points before a cast to the index passed to an unchecked access function. This checked considered <code>NaN</code> cases improperly, causing them to succeed the check instead of failing it. The floating point coordinate is under caller control by passing a selected projection matrix.</p>
-<p>Carefully controlling the coordinates of an image with no data and one non-zero dimension provides an arbitrary read primitive in the first 32-bits of address space with a Bilinear sampling method.</p>
-<p>Using bicubic sampling can result in a read of a few bytes beyond an allocation.</p>
-<p>Other out-of-bounds reads may be possible.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2026-0117.html">https://rustsec.org/advisories/RUSTSEC-2026-0117.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-qg8r-f7x3-25f7">https://github.com/advisories/GHSA-qg8r-f7x3-25f7</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-qg8r-f7x3-25f7</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-07T03:10:13.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[imageproc] imageproc: Out-of-bounds read via NaN coordinates in bilinear/bicubic sampling]]></title>
-        <id>https://github.com/advisories/GHSA-qg8r-f7x3-25f7</id>
-        <link href="https://github.com/advisories/GHSA-qg8r-f7x3-25f7"/>
-        <updated>2026-05-07T03:10:15.000Z</updated>
-        <content type="html"><![CDATA[<p>A bounds check was performed in floating points before a cast to the index passed to an unchecked access function. This checked considered <code>NaN</code> cases improperly, causing them to succeed the check instead of failing it. The floating point coordinate is under caller control by passing a selected projection matrix.</p>
-<p>Carefully controlling the coordinates of an image with no data and one non-zero dimension provides an arbitrary read primitive in the first 32-bits of address space with a Bilinear sampling method.</p>
-<p>Using bicubic sampling can result in a read of a few bytes beyond an allocation.</p>
-<p>Other out-of-bounds reads may be possible.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2026-0117.html">https://rustsec.org/advisories/RUSTSEC-2026-0117.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-qg8r-f7x3-25f7">https://github.com/advisories/GHSA-qg8r-f7x3-25f7</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-qg8r-f7x3-25f7</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-07T03:10:13.000Z</published>
     </entry>
     <entry>
         <title type="html"><![CDATA[[imageproc] imageproc: Out-of-bounds read via NaN coordinates in bilinear/bicubic sampling]]></title>
