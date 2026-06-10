@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-06-10T19:46:06.174Z</updated>
+    <updated>2026-06-10T20:48:47.986Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,124 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/lxc/incus/v7] Incus has a Nil-Pointer Dereference Panic via Instance Backup Import (volume omitted)]]></title>
+        <id>https://github.com/advisories/GHSA-8g7m-96c8-8wwc</id>
+        <link href="https://github.com/advisories/GHSA-8g7m-96c8-8wwc"/>
+        <updated>2026-06-10T20:07:22.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>(*backend).CreateInstanceFromBackup</code> in <a href="https://github.com/lxc/incus/blob/1513600/internal/server/storage/backend.go"><code>internal/server/storage/backend.go</code></a> contains a nil-pointer dereference that an authenticated user with permission to create instances in any project can trigger remotely by uploading a crafted backup tarball. The Incus daemon panics and the process crashes, causing denial of service to every project on that cluster member.</p>
+<p>This is a sibling of <code>GHSA-fwj8-62r8-8p8m</code>, <code>GHSA-r7w7-mmxr-47r9</code>, and <code>GHSA-x5r6-jr56-89pv</code> (all assigned 2026-05-04). Those patches added guards on adjacent fields of the same <code>backup/config.Config</code> struct; the <code>Volume</code> field on the instance-import path was missed.</p>
+<h2 id="vulnerable-code">Vulnerable code</h2>
+<p><a href="https://github.com/lxc/incus/blob/1513600/internal/server/storage/backend.go"><code>internal/server/storage/backend.go</code></a> (current <code>main</code>, commit <code>1513600</code>):</p>
+<pre><code class="language-go">// Lines 763-767 — properly guarded:
+var volumeConfig map[string]string
+if srcBackup.Config != nil &amp;&amp; srcBackup.Config.Volume != nil {
+    volumeConfig = srcBackup.Config.Volume.Config
+}
+
+// ... a few lines later ...
+
+// Line 795 — unguarded, dereferences Config.Volume directly:
+if srcBackup.Config.Volume.Config["block.type"] == drivers.BlockVolumeTypeQcow2 {
+</code></pre>
+<p>The caller <code>createFromBackup</code> in <a href="https://github.com/lxc/incus/blob/1513600/cmd/incusd/instances_post.go"><code>cmd/incusd/instances_post.go</code></a> only verifies that <code>Config</code> and <code>Config.Container</code> are non-nil:</p>
+<pre><code class="language-go">// instances_post.go:854
+if bInfo.Config == nil || bInfo.Config.Container == nil {
+    return response.BadRequest(errors.New("Backup file is missing required information"))
+}
+</code></pre>
+<p><code>Volume</code> is not checked. The <code>Volume</code> field on <code>internal/server/backup/config.Config</code> has type <code>*api.StorageVolume</code> with <code>yaml:"volume,omitempty"</code>, so omitting <code>volume:</code> from a crafted <a href="https://github.com/lxc/incus/blob/1513600/backup/index.yaml"><code>backup/index.yaml</code></a> decodes to <code>nil</code>. The subsequent unguarded deref on line 795 panics.</p>
+<p>The panic happens on the HTTP request goroutine; no <code>recover()</code> is installed by <code>CreateInstanceFromBackup</code> or its callers, so the Go runtime kills the entire <code>incusd</code> process.</p>
+<h2 id="reach">Reach</h2>
+<ol>
+<li>The attacker is any client authenticated to the Incus REST API (TLS client certificate, OIDC, or unix socket) with permission to create instances in at least one project. This is the most common low-trust authenticated user.</li>
+<li>The attacker sends <code>POST /1.0/instances?project=&lt;p&gt;</code> with <code>Content-Type: application/octet-stream</code>.</li>
+<li>The body is an uncompressed tar (the same code path also accepts squashfs / gz / zstd / xz) containing one file, <a href="https://github.com/lxc/incus/blob/1513600/backup/index.yaml"><code>backup/index.yaml</code></a>, whose <code>config:</code> block lists <code>container:</code> and <code>pool:</code> but omits <code>volume:</code>.</li>
+<li><a href="https://github.com/lxc/incus/blob/1513600/cmd/incusd/instances_post.go"><code>cmd/incusd/instances_post.go</code></a> <code>instancesPost</code> -&gt; <code>createFromBackup</code> -&gt; the line 854 guard passes (Container is non-nil) -&gt; <code>pool.CreateInstanceFromBackup(*bInfo, backupFile, nil)</code> -&gt; <a href="https://github.com/lxc/incus/blob/1513600/internal/server/storage/backend.go#L795"><code>internal/server/storage/backend.go:795</code></a> panics on <code>srcBackup.Config.Volume.Config[...]</code>.</li>
+<li><code>incusd</code> process dies. All running operations on that cluster member are killed. Repeated requests = persistent denial of service.</li>
+</ol>
+<p>Minimal crafted <a href="https://github.com/lxc/incus/blob/1513600/backup/index.yaml"><code>backup/index.yaml</code></a>:</p>
+<pre><code class="language-yaml">name: poc
+backend: dir
+pool: default
+type: container
+optimized: false
+optimized_header: false
+config:
+  container:
+    name: poc
+    architecture: x86_64
+    type: container
+  pool:
+    name: default
+    driver: dir
+  # volume intentionally absent
+</code></pre>
+<h2 id="proof-of-concept">Proof of concept</h2>
+<p>A self-contained Go unit test imports the real <code>internal/server/backup/config</code> package, decodes the crafted YAML into the actual <code>*backupConfig.Config</code> struct used by the daemon, and executes the literal expression from <a href="https://github.com/lxc/incus/blob/1513600/backend.go#L795"><code>backend.go:795</code></a>. The test is intentionally inert (panics are recovered and reported as the expected outcome):</p>
+<pre><code class="language-go">// internal/poc_repro/poc_nil_deref_volume_test.go
+func TestPoCNilDerefVolumeImport(t *testing.T) {
+    var bi pocInfo // mirrors internal/server/backup.Info, only Config is needed
+    loader, _ := yaml.NewLoader(strings.NewReader(evilIndex))
+    _ = loader.Load(&amp;bi)
+
+    // bi.Config != nil, bi.Config.Container != nil (passes createFromBackup guard)
+    // bi.Config.Volume == nil (passes the line 765 guard's else branch)
+
+    defer func() { _ = recover() }()
+
+    // Literal copy of backend.go:795.
+    if bi.Config.Volume.Config["block.type"] == "qcow2" {
+        // unreachable
+    }
+}
+</code></pre>
+<p>Result against <code>lxc/incus@1513600</code> on Go 1.26.1:</p>
+<pre><code>=== RUN   TestPoCNilDerefVolumeImport
+    poc_nil_deref_volume_test.go:97: yaml decoded: Container != nil (passes createFromBackup guard), Volume == nil
+    poc_nil_deref_volume_test.go:99: backend.go line 795 unguarded deref about to execute...
+    poc_nil_deref_volume_test.go:123: CONFIRMED: nil-pointer panic at the exact line as backend.go:795 =&gt; runtime error: invalid memory address or nil pointer dereference
+--- PASS: TestPoCNilDerefVolumeImport (0.00s)
+</code></pre>
+<p>A tarball builder + uploader (<code>main.go</code>) is included in the report's PoC bundle. The tarball is 2560 bytes and contains a single 547-byte <a href="https://github.com/lxc/incus/blob/1513600/backup/index.yaml"><code>backup/index.yaml</code></a>.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Severity:</strong> denial of service against the entire <code>incusd</code> process. Every container / VM operation on the host (and on the cluster member, if clustered) is aborted; subsequent requests fail until the process is restarted by an operator or supervisor.</li>
+<li><strong>Privileges required:</strong> authenticated user with <code>can_create</code> permission on any project. The path is not behind the admin auth tier.</li>
+<li><strong>Network attack surface:</strong> the Incus REST API on <code>:8443</code> (or unix socket).</li>
+<li><strong>CWE-476</strong> — nil pointer dereference. <strong>CVSS estimate:</strong> 6.5 (AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:H).</li>
+</ul>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>Mirror the guard already present on line 765 a few lines higher into the path that hits line 795. For example:</p>
+<pre><code class="language-go">if srcBackup.Config == nil || srcBackup.Config.Volume == nil {
+    return nil, nil, errors.New("Backup config missing required volume metadata")
+}
+
+if srcBackup.Config.Volume.Config["block.type"] == drivers.BlockVolumeTypeQcow2 {
+</code></pre>
+<p>Alternatively, extend the existing <code>createFromBackup</code> precondition in <a href="https://github.com/lxc/incus/blob/1513600/cmd/incusd/instances_post.go#L854"><code>cmd/incusd/instances_post.go:854</code></a> to also reject backups missing <code>bInfo.Config.Volume</code>. The latter is the smaller surface change and matches the pattern of <code>CreateBucketFromBackup</code> (<a href="https://github.com/lxc/incus/blob/1513600/backend.go#L7848"><code>backend.go:7848</code></a>):</p>
+<pre><code class="language-go">if srcBackup.Config == nil || srcBackup.Config.Bucket == nil {
+    return errors.New("Valid bucket config not found in index")
+}
+</code></pre>
+<h2 id="reporter-notes">Reporter notes</h2>
+<p>Reported via Privately-Reported Vulnerability against <code>lxc/incus</code>. Reporter: tonghuaroot. The reproducer test is non-destructive (no network, no filesystem mutation beyond the temp directory used by Go's test runner) and recovers the panic.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/lxc/incus/security/advisories/GHSA-8g7m-96c8-8wwc">https://github.com/lxc/incus/security/advisories/GHSA-8g7m-96c8-8wwc</a></li>
+<li><a href="https://github.com/lxc/incus/commit/98e64f0a6fcfdc9676eea0246418d490c53297bf">https://github.com/lxc/incus/commit/98e64f0a6fcfdc9676eea0246418d490c53297bf</a></li>
+<li><a href="https://github.com/advisories/GHSA-8g7m-96c8-8wwc">https://github.com/advisories/GHSA-8g7m-96c8-8wwc</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-8g7m-96c8-8wwc</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-10T20:07:21.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/juev/nebula-mesh] nebula-mesh: Session and OIDC state cookies lack the Secure attribute]]></title>
         <id>https://github.com/advisories/GHSA-rqfj-vv8r-xhqc</id>
@@ -1749,131 +1867,6 @@ Reject invalid input with a form-level error; do not write to the host row.</li>
     </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/julien040/anyquery/plugins/safari] Anyquery: AppleScript/JXA Code Injection via Unescaped URL in macOS Chrome Plugin]]></title>
-        <id>https://github.com/advisories/GHSA-hrj8-hjv8-mgwc</id>
-        <link href="https://github.com/advisories/GHSA-hrj8-hjv8-mgwc"/>
-        <updated>2026-06-08T23:04:01.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="applescriptjxa-code-injection-via-unescaped-url-in-macos-chrome-plugin">AppleScript/JXA Code Injection via Unescaped URL in macOS Chrome Plugin</h1>
-<table>
-<thead>
-<tr>
-<th>Field</th>
-<th>Value</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>Repository</td>
-<td>julien040/anyquery</td>
-</tr>
-<tr>
-<td>Affected version</td>
-<td>0.4.4 (commit 0abd460)</td>
-</tr>
-<tr>
-<td>Vulnerability</td>
-<td>CWE-94 — Improper Control of Generation of Code</td>
-</tr>
-<tr>
-<td>Severity</td>
-<td>High</td>
-</tr>
-</tbody></table>
-<h2 id="summary">Summary</h2>
-<p>The <code>chrome_tabs</code> plugin (and equivalent Brave/Edge/Safari variants) interpolates a SQL-controlled <code>url</code> value directly into an AppleScript template via <code>fmt.Sprintf(newTabScript, url)</code> at <code>plugins/chrome/tabs.go:141</code> without any escaping, then passes the result to <code>exec.Command("osascript", "-e", ...)</code>. An authenticated anyquery user who can issue SQL <code>INSERT INTO chrome_tabs</code> statements — which requires local CLI access — can break out of the <code>{URL:"..."}</code> property record with a newline-containing payload and inject arbitrary AppleScript statements, including <code>do shell script</code>, achieving OS-level command execution on the macOS host. The same pattern applies to the <code>Update</code> path at <code>tabs.go:169</code> via the JXA <code>setURL.js</code> script.</p>
-<h2 id="affected-code">Affected Code</h2>
-<p><code>plugins/chrome/tabs.go:141</code> — SQL-supplied <code>url</code> interpolated unescaped into AppleScript template, then executed via <code>osascript -e</code></p>
-<pre><code class="language-go">func (t *tabsTable) Insert(rows [][]interface{}) error {
-    for _, row := range rows {
-        url := "chrome://newtab/"
-        if rawURL, ok := row[2].(string); ok {
-            url = rawURL
-        }
-
-        cmd := exec.Command("osascript", "-e", fmt.Sprintf(newTabScript, url))
-        output, err := cmd.CombinedOutput()
-        if err != nil {
-            return fmt.Errorf("can't run osascript: %W (message: %s)\n Script: %s", err, output, fmt.Sprintf(newTabScript, url))
-        }
-
-    }
-
-    return nil
-}
-</code></pre>
-<p><code>plugins/chrome/tabs.go:169</code> — <code>Update</code> path interpolates <code>url</code> into JXA <code>setURL.js</code> template with identical lack of escaping</p>
-<pre><code class="language-go">        if url != "" {
-            cmd := exec.Command("osascript", "-l", "JavaScript", "-e", fmt.Sprintf(setURLScript, pk, url))
-            output, err := cmd.CombinedOutput()
-            if err != nil {
-                return fmt.Errorf("can't run osascript: %W (message: %s)\n Script: %s", err, output, fmt.Sprintf(setURLScript, pk, url))
-            }
-        }
-</code></pre>
-<p>SQL INSERT <code>url</code> column (row[2]) flows through <code>tabsTable.Insert</code> → <code>fmt.Sprintf(newTabScript, url)</code> → <code>exec.Command("osascript", "-e", &lt;injected script&gt;)</code> at <code>tabs.go:141</code>.</p>
-<h2 id="proof-of-concept">Proof of Concept</h2>
-<p>Step 1 — Insert a newline-bearing URL via SQL: the generated AppleScript closes the <code>{URL:"..."}</code> property record and appends an injected <code>do shell script "id"</code> block, which is passed verbatim to <code>osascript -e</code>.</p>
-<pre><code class="language-bash">docker build -f Dockerfile -t anyquery-vuln001 .
-docker run --rm anyquery-vuln001 'x"}
-end tell
-do shell script "id"
-tell application "Google Chrome"
-        make new tab with properties {URL:"done'
-</code></pre>
-<pre><code class="language-text">SQL equivalent: INSERT INTO chrome_tabs (url) VALUES ('&lt;INJECT_URL&gt;')
-where INJECT_URL =
-x"}
-end tell
-do shell script "id"
-tell application "Google Chrome"
-    make new tab with properties {URL:"done
-</code></pre>
-<pre><code class="language-text">[sink:tabs.go:141] Script passed to osascript -e:
-tell application "Google Chrome"
-        make new tab with properties {URL:"x"}
-end tell
-do shell script "id"
-tell application "Google Chrome"
-        make new tab with properties {URL:"done"} at end of tabs of first window
-end tell
-[mock-osascript] Received script:
-tell application "Google Chrome"
-        make new tab with properties {URL:"x"}
-end tell
-do shell script "id"
-tell application "Google Chrome"
-        make new tab with properties {URL:"done"} at end of tabs of first window
-end tell
-
-RESULT: PASS — injection payload reached osascript -e verbatim; "do shell script \"id\"" present in generated script (tabs.go:141)
-</code></pre>
-<p>See attached files: Dockerfile, poc/inject_demo.go, poc/go.mod
-<a href="https://github.com/user-attachments/files/27945214/vuln-001.zip">vuln-001.zip</a></p>
-<h2 id="impact">Impact</h2>
-<p>Any local user authenticated to the anyquery CLI who can run SQL against the <code>chrome_tabs</code> virtual table can achieve arbitrary OS command execution on the macOS host with the privileges of the anyquery process. Because anyquery exposes its SQL interface over an HTTP server (accessible to any user who can reach the endpoint), this can be exploited by any client with INSERT or UPDATE access to the browser-tab plugins, without requiring Chrome credentials or macOS admin rights. The injected AppleScript runs under the user's macOS session, giving access to the file system, keychain prompts, and any application scriptable via Apple Events.</p>
-<h2 id="remediation">Remediation</h2>
-<p>Escape double-quote and newline characters in the <code>url</code> value before interpolation, or avoid string templating entirely. Specifically in <code>plugins/chrome/tabs.go</code>:</p>
-<pre><code class="language-go">// Replace fmt.Sprintf(newTabScript, url) with:
-safeURL := strings.ReplaceAll(url, `"`, `\"`)
-safeURL = strings.ReplaceAll(safeURL, "\n", "")
-safeURL = strings.ReplaceAll(safeURL, "\r", "")
-cmd := exec.Command("osascript", "-e", fmt.Sprintf(newTabScript, safeURL))
-</code></pre>
-<p>A more robust fix is to pass the URL as an AppleScript variable declared via a <code>-e</code> prefix argument rather than string-interpolating it into the script body, or to use the <code>osascript</code> <code>argv</code> mechanism so the URL never appears inside the script source. Apply the same fix to <code>fmt.Sprintf(setURLScript, pk, url)</code> at <code>tabs.go:169</code> for the <code>Update</code> path. Validate that the URL conforms to an allowed scheme (<code>https://</code>, <code>http://</code>, <code>chrome://</code>) before passing it to either handler.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/julien040/anyquery/security/advisories/GHSA-hrj8-hjv8-mgwc">https://github.com/julien040/anyquery/security/advisories/GHSA-hrj8-hjv8-mgwc</a></li>
-<li><a href="https://github.com/advisories/GHSA-hrj8-hjv8-mgwc">https://github.com/advisories/GHSA-hrj8-hjv8-mgwc</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-hrj8-hjv8-mgwc</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-06-08T23:04:00.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/julien040/anyquery/plugins/edge] Anyquery: AppleScript/JXA Code Injection via Unescaped URL in macOS Chrome Plugin]]></title>
         <id>https://github.com/advisories/GHSA-hrj8-hjv8-mgwc</id>
         <link href="https://github.com/advisories/GHSA-hrj8-hjv8-mgwc"/>
         <updated>2026-06-08T23:04:01.000Z</updated>
