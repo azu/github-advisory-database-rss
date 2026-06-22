@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-06-22T16:31:04.447Z</updated>
+    <updated>2026-06-22T18:19:18.803Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,207 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[gogs.io/gogs] Gogs has an Authentication Bypass via Unvalidated Reverse Proxy Headers]]></title>
+        <id>https://github.com/advisories/GHSA-w6j9-vw59-27wv</id>
+        <link href="https://github.com/advisories/GHSA-w6j9-vw59-27wv"/>
+        <updated>2026-06-22T17:09:52.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>When <code>ENABLE_REVERSE_PROXY_AUTHENTICATION</code> is enabled, Gogs accepts the configured authentication header (default: <code>X-WEBAUTH-USER</code>) directly from client requests without validating that the request originated from a trusted reverse proxy. Any remote attacker who can reach the Gogs service can forge this header to impersonate any user or trigger automatic account creation, completely bypassing authentication.</p>
+<h2 id="root-cause">Root Cause</h2>
+<p>The vulnerability exists because Gogs reads the authentication header directly from the incoming HTTP request without any verification that the header was set by a trusted reverse proxy.</p>
+<h3 id="vulnerable-code-flow">Vulnerable Code Flow</h3>
+<p>In <code>internal/context/auth.go</code> lines 206-234:</p>
+<pre><code class="language-go">func authenticatedUser(store AuthStore, ctx *macaron.Context, sess session.Store) (_ *database.User, isBasicAuth, isTokenAuth bool) {
+    // ... existing auth checks ...
+
+    if uid &lt;= 0 {
+        if conf.Auth.EnableReverseProxyAuthentication {
+            // Reads header DIRECTLY from client request - NO VALIDATION!
+            webAuthUser := ctx.Req.Header.Get(conf.Auth.ReverseProxyAuthenticationHeader)
+            if len(webAuthUser) &gt; 0 {
+                user, err := store.GetUserByUsername(ctx.Req.Context(), webAuthUser)
+                if err != nil {
+                    if !database.IsErrUserNotExist(err) {
+                        log.Error("Failed to get user by name: %v", err)
+                        return nil, false, false
+                    }
+
+                    // Check if enabled auto-registration.
+                    if conf.Auth.EnableReverseProxyAutoRegistration {
+                        // Creates new user with forged username!
+                        user, err = store.CreateUser(
+                            ctx.Req.Context(),
+                            webAuthUser,
+                            gouuid.NewV4().String()+"@localhost",
+                            database.CreateUserOptions{
+                                Activated: true,
+                            },
+                        )
+                        if err != nil {
+                            log.Error("Failed to create user %q: %v", webAuthUser, err)
+                            return nil, false, false
+                        }
+                    }
+                }
+                // Returns user as authenticated without any verification!
+                return user, false, false
+            }
+        }
+        // ... fallback to basic auth ...
+    }
+    // ...
+}
+</code></pre>
+<p>The code has <strong>zero validation</strong> that:</p>
+<ol>
+<li>The request came through a reverse proxy</li>
+<li>The header was set by the proxy (not the client)</li>
+<li>Gogs is actually behind a reverse proxy</li>
+<li>The direct access to Gogs is restricted</li>
+</ol>
+<p>The vulnerability occurs when:</p>
+<ul>
+<li>Gogs is publicly accessible (e.g., <code>0.0.0.0:3000</code>)</li>
+<li><code>ENABLE_REVERSE_PROXY_AUTHENTICATION = true</code></li>
+</ul>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<h3 id="prerequisites">Prerequisites</h3>
+<p>Gogs instance with the following configuration in <code>custom/conf/app.ini</code>:</p>
+<pre><code class="language-ini">[auth]
+ENABLE_REVERSE_PROXY_AUTHENTICATION = true
+</code></pre>
+<p>An attacker can impersonate any user including administrators:</p>
+<pre><code class="language-bash"># Become admin instantly
+curl http://gogs.example.com/ -H "X-WEBAUTH-USER: &lt;username&gt;"
+</code></pre>
+<img width="1835" height="1143" alt="impersonation_example" src="https://github.com/user-attachments/assets/bae60772-5eb3-4f54-9fe0-5db01595bd56">
+
+<h2 id="recommended-fixes">Recommended Fixes</h2>
+<p>Add validation to ensure headers come from trusted sources:</p>
+<pre><code class="language-go">func authenticatedUser(store AuthStore, ctx *macaron.Context, sess session.Store) (_ *database.User, isBasicAuth, isTokenAuth bool) {
+    // ... existing code ...
+
+    if uid &lt;= 0 {
+        if conf.Auth.EnableReverseProxyAuthentication {
+            // Validate request is from trusted proxy
+            if !isRequestFromTrustedProxy(ctx.Req) {
+                log.Warn("Reverse proxy auth header received from untrusted source: %s", ctx.RemoteAddr())
+                return nil, false, false
+            }
+
+            webAuthUser := ctx.Req.Header.Get(conf.Auth.ReverseProxyAuthenticationHeader)
+            // ... rest of the code ...
+        }
+    }
+    // ...
+}
+
+// New validation function
+func isRequestFromTrustedProxy(req *http.Request) bool {
+    // Check if request is from localhost/trusted IPs
+    remoteIP := getRemoteIP(req)
+
+    // Only accept from localhost by default
+    if remoteIP.IsLoopback() {
+        return true
+    }
+
+    // Check against configured trusted proxy IPs
+    for _, trustedIP := range conf.Auth.TrustedProxyIPs {
+        if remoteIP.String() == trustedIP {
+            return true
+        }
+    }
+
+    return false
+}
+</code></pre>
+<p>Add configuration option:</p>
+<pre><code class="language-ini">[auth]
+ENABLE_REVERSE_PROXY_AUTHENTICATION = false
+REVERSE_PROXY_AUTHENTICATION_HEADER = X-WEBAUTH-USER
+; Comma-separated list of trusted proxy IPs (default: 127.0.0.1)
+TRUSTED_PROXY_IPS = 127.0.0.1,::1
+; Whether to require trusted proxy validation (recommended: true)
+REQUIRE_TRUSTED_PROXY = true
+</code></pre>
+<h2 id="references">References</h2>
+<ul>
+<li><a href="https://cwe.mitre.org/data/definitions/290.html">CWE-290: Authentication Bypass by Spoofing</a></li>
+<li><a href="https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html">OWASP: Authentication Cheat Sheet</a></li>
+<li><a href="https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures/">OWASP Top 10 2021 - A07: Identification and Authentication Failures</a></li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/gogs/gogs/security/advisories/GHSA-w6j9-vw59-27wv">https://github.com/gogs/gogs/security/advisories/GHSA-w6j9-vw59-27wv</a></li>
+<li><a href="https://github.com/gogs/gogs/pull/8264">https://github.com/gogs/gogs/pull/8264</a></li>
+<li><a href="https://github.com/gogs/gogs/commit/0089c4c8e5b8d99eb6e5c8727f8f40d765f1f58a">https://github.com/gogs/gogs/commit/0089c4c8e5b8d99eb6e5c8727f8f40d765f1f58a</a></li>
+<li><a href="https://github.com/gogs/gogs/releases/tag/v0.14.3">https://github.com/gogs/gogs/releases/tag/v0.14.3</a></li>
+<li><a href="https://github.com/advisories/GHSA-w6j9-vw59-27wv">https://github.com/advisories/GHSA-w6j9-vw59-27wv</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-w6j9-vw59-27wv</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-22T17:09:51.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[gogs.io/gogs] Gogs has a Denial of Service in repository/wiki file listing web pages]]></title>
+        <id>https://github.com/advisories/GHSA-3qq3-668m-v9mj</id>
+        <link href="https://github.com/advisories/GHSA-3qq3-668m-v9mj"/>
+        <updated>2026-06-22T16:58:32.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A malicious user with rights to create a new file on a repository or wiki page can trigger a denial of service condition in which the pages containing the listing of files will return HTTP error 500 and render the web interface unusable for the repository or wiki.</p>
+<h3 id="details">Details</h3>
+<p>The issue is present in file <code>internal/route/repo/wiki.go</code> and <code>internal/route/repo/view.go</code> where the pages try to recover commit information. If errors are returned while recovering commit information, the page will return a 500 error and stop rendering, resulting in a denial of service.
+In <code>view.go</code> the issue occurs at <a href="https://github.com/gogs/gogs/blob/89f0f86c7e1a3be7f48d99e27818a79d17357558/internal/route/repo/view.go#L56">line 56</a> while a slightly different issue occurs in <code>wiki.go</code> at <a href="https://github.com/gogs/gogs/blob/89f0f86c7e1a3be7f48d99e27818a79d17357558/internal/route/repo/wiki.go#L174">line 174</a> where <code>commits[0]</code> is dereferenced without checking if it contains value.
+It is possible to trigger issues in assigning the correct value to variable <code>commits</code> by using a specific string as part of the page title. 
+The issue is linked to the fact that file names can contain special characters such as <code>*</code>, <code>?</code>, <code>[</code>, <code>]</code>, etc. that will be interpreted as git's pathspec instead of a simple string. So crafting a name containing an incomplete pathspec sequence will trigger this error.</p>
+<h3 id="poc">PoC</h3>
+<p>As a proof of concept consider the file name <code>"[]</code> and how it affects repository and wiki pages.
+In the following images it is shown how pages are created, the error shown in the web page right after creation and the error as logged in the console.</p>
+<img width="835" height="503" alt="repo_creation" src="https://github.com/user-attachments/assets/cdee9625-33d9-42d3-a5fa-264fba4923ed">
+
+<p><strong>Figure 1: Creation of malicious file in repository</strong></p>
+<img width="832" height="692" alt="repo_error_web" src="https://github.com/user-attachments/assets/53c57366-8f45-4a0f-a2ac-86f4a08467cc">
+
+<p><strong>Figure 2: Malicious file in repository causes error 500</strong></p>
+<img width="934" height="56" alt="repo_error_console" src="https://github.com/user-attachments/assets/26427fc3-bead-4e41-a484-e2d53289a2da">
+
+<p><strong>Figure 3: Console error caused by malicious file in repository</strong></p>
+<img width="835" height="503" alt="wiki_creation" src="https://github.com/user-attachments/assets/7a5c9836-64e3-4824-b6e5-9f9a80e7f18a">
+
+<p><strong>Figure 4: Creation of malicious file in wiki</strong></p>
+<img width="1001" height="463" alt="wiki_error_web" src="https://github.com/user-attachments/assets/33c5a907-b81c-4157-bd37-33341412172a">
+
+<p><strong>Figure 5: Malicious file in wiki causes error 500</strong></p>
+<img width="1018" height="537" alt="wiki_error_console" src="https://github.com/user-attachments/assets/9b0ab551-5720-4715-a2ac-f7310534f025">
+
+<p><strong>Figure 6: Console error caused by malicious file in wiki</strong></p>
+<h3 id="impact">Impact</h3>
+<p>The repository and wiki pages will not render when files named with the payload are present in the repository or in the wiki.
+This condition will be present as long as the malicious file is present in the repository or wiki. The issue will not cause a DoS condition when using the server via CLI.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/gogs/gogs/security/advisories/GHSA-3qq3-668m-v9mj">https://github.com/gogs/gogs/security/advisories/GHSA-3qq3-668m-v9mj</a></li>
+<li><a href="https://github.com/gogs/gogs/pull/8116">https://github.com/gogs/gogs/pull/8116</a></li>
+<li><a href="https://github.com/gogs/gogs/commit/ae41bab5f28e4880edcef01c91d2cbb8839ec9e4">https://github.com/gogs/gogs/commit/ae41bab5f28e4880edcef01c91d2cbb8839ec9e4</a></li>
+<li><a href="https://github.com/gogs/gogs/releases/tag/v0.14.3">https://github.com/gogs/gogs/releases/tag/v0.14.3</a></li>
+<li><a href="https://github.com/advisories/GHSA-3qq3-668m-v9mj">https://github.com/advisories/GHSA-3qq3-668m-v9mj</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3qq3-668m-v9mj</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-22T16:58:31.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/canonical/microceph/microceph] Canonical MicroCeph: path traversal issue in the remote-import AP]]></title>
         <id>https://github.com/advisories/GHSA-xg3j-c7q4-f9ph</id>
@@ -1351,73 +1552,5 @@ We would like to thank [Artem Cherezov](https://github.com/cherez0ff) for respon
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-06-13T06:30:23.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/crossplane/crossplane] Crossplane: Signature verification TOCTOU allows installing unverified package content via mutable tag]]></title>
-        <id>https://github.com/advisories/GHSA-wfqx-gjrf-g28r</id>
-        <link href="https://github.com/advisories/GHSA-wfqx-gjrf-g28r"/>
-        <updated>2026-06-19T20:47:56.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>Crossplane allows package signature verification to be configured via the <code>ImageConfig</code> mechanism. When enabled, the package manager uses cosign to verify that packages are correctly signed before pulling and installing them.</p>
-<p>When a package is installed using a tag reference (e.g., a semantic version), a malicious OCI registry could serve a correctly signed image for verification, then subsequently serve an unsigned image for installation. This is possible because Crossplane resolves the tag reference separately for each step.</p>
-<p>This vulnerability is relevant only for users who do all three of the following:</p>
-<ol>
-<li>Configure signature verification for packages,</li>
-<li>Install packages using tag references rather than digests, and</li>
-<li>Install packages from registries they do not control.</li>
-</ol>
-<h2 id="mitigation">Mitigation</h2>
-<p>Installing packages by image digest rather than using tags avoids this issue.</p>
-<h2 id="fix">Fix</h2>
-<p>The package manager has been updated to resolve tag references once and use the resulting digest for both signature verification and image fetching. This ensures that Crossplane pulls the same content that had its signature verified. The fix has been applied to Crossplane's <code>main</code> branch and backported to the v2.3 and v2.2 release branches; it will be released in v2.3.3 and v2.2.3.</p>
-<h2 id="credits">Credits</h2>
-<p>This issue was reported, independently, by @bugbunny-research and @tonghuaroot.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/crossplane/crossplane/security/advisories/GHSA-wfqx-gjrf-g28r">https://github.com/crossplane/crossplane/security/advisories/GHSA-wfqx-gjrf-g28r</a></li>
-<li><a href="https://github.com/advisories/GHSA-wfqx-gjrf-g28r">https://github.com/advisories/GHSA-wfqx-gjrf-g28r</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-wfqx-gjrf-g28r</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-06-19T20:47:55.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/crossplane/crossplane/v2] Crossplane: Signature verification TOCTOU allows installing unverified package content via mutable tag]]></title>
-        <id>https://github.com/advisories/GHSA-wfqx-gjrf-g28r</id>
-        <link href="https://github.com/advisories/GHSA-wfqx-gjrf-g28r"/>
-        <updated>2026-06-19T20:47:56.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>Crossplane allows package signature verification to be configured via the <code>ImageConfig</code> mechanism. When enabled, the package manager uses cosign to verify that packages are correctly signed before pulling and installing them.</p>
-<p>When a package is installed using a tag reference (e.g., a semantic version), a malicious OCI registry could serve a correctly signed image for verification, then subsequently serve an unsigned image for installation. This is possible because Crossplane resolves the tag reference separately for each step.</p>
-<p>This vulnerability is relevant only for users who do all three of the following:</p>
-<ol>
-<li>Configure signature verification for packages,</li>
-<li>Install packages using tag references rather than digests, and</li>
-<li>Install packages from registries they do not control.</li>
-</ol>
-<h2 id="mitigation">Mitigation</h2>
-<p>Installing packages by image digest rather than using tags avoids this issue.</p>
-<h2 id="fix">Fix</h2>
-<p>The package manager has been updated to resolve tag references once and use the resulting digest for both signature verification and image fetching. This ensures that Crossplane pulls the same content that had its signature verified. The fix has been applied to Crossplane's <code>main</code> branch and backported to the v2.3 and v2.2 release branches; it will be released in v2.3.3 and v2.2.3.</p>
-<h2 id="credits">Credits</h2>
-<p>This issue was reported, independently, by @bugbunny-research and @tonghuaroot.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/crossplane/crossplane/security/advisories/GHSA-wfqx-gjrf-g28r">https://github.com/crossplane/crossplane/security/advisories/GHSA-wfqx-gjrf-g28r</a></li>
-<li><a href="https://github.com/advisories/GHSA-wfqx-gjrf-g28r">https://github.com/advisories/GHSA-wfqx-gjrf-g28r</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-wfqx-gjrf-g28r</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-06-19T20:47:55.000Z</published>
     </entry>
 </feed>
