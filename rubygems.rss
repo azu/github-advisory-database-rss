@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rubygems.rss</id>
     <title>Security Advisory for Ruby gems hosted at RubyGems.org</title>
-    <updated>2026-07-01T18:34:35.679Z</updated>
+    <updated>2026-07-01T19:31:01.197Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arubygems"/>
     <subtitle>Security Advisory for Ruby gems hosted at RubyGems.org on GitHub</subtitle>
@@ -11,6 +11,152 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[pay] pay-rails/pay: non-constant-time HMAC comparison in Paddle Billing webhook signature verifier]]></title>
+        <id>https://github.com/advisories/GHSA-mjgf-xj26-9qf9</id>
+        <link href="https://github.com/advisories/GHSA-mjgf-xj26-9qf9"/>
+        <updated>2026-07-01T18:57:03.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>Pay::Webhooks::PaddleBillingController#valid_signature?</code> (<code>app/controllers/pay/webhooks/paddle_billing_controller.rb</code>) verifies the Paddle Billing webhook signature by computing <code>OpenSSL::HMAC.hexdigest(...)</code> and comparing it to the attacker-supplied header value using Ruby's <code>String#==</code>. Ruby's <code>==</code> is non-constant-time — it returns as soon as the first byte mismatches — and exposes a per-byte timing side channel on the webhook signature verification path. The canonical mitigation is to use a constant-time primitive (<code>OpenSSL.fixed_length_secure_compare</code> / <code>ActiveSupport::SecurityUtils.secure_compare</code>).</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>CWE-208</strong> — Observable Timing Discrepancy on the webhook signature verifier.</li>
+<li>An attacker who can deliver requests to the <code>/pay/webhooks/paddle_billing</code> mount point can probe the verifier with guessed <code>Paddle-Signature</code> header values. Because <code>String#==</code> short-circuits on the first mismatching byte, the response-time distribution shifts as the prefix of the guess matches the real hex digest.</li>
+<li>A signature recovered through the oracle lets the attacker deliver forged Paddle Billing webhook events (e.g. <code>subscription.created</code> / <code>transaction.completed</code>) against the host application. Pay's webhook processor enqueues a <code>Pay::Webhooks::ProcessJob</code> for any accepted webhook, which downstream applications use to update billing state — including provisioning paid features, recording refunds, and triggering customer notifications.</li>
+<li>The endpoint is internet-reachable by definition (Paddle must POST events to it).</li>
+</ul>
+<h2 id="affected-versions">Affected versions</h2>
+<p><code>pay</code> (rubygem) ≤ v11.6.1 (latest release as of 2026-05-27).</p>
+<h2 id="vulnerable-code-fileline">Vulnerable code (file:line)</h2>
+<p><code>app/controllers/pay/webhooks/paddle_billing_controller.rb</code>:</p>
+<pre><code class="language-ruby">24:      def valid_signature?(paddle_signature)
+25:        return false if paddle_signature.blank?
+26:
+27:        ts_part, h1_part = paddle_signature.split(";")
+28:        _, ts = ts_part.split("=")
+29:        _, h1 = h1_part.split("=")
+30:
+31:        signed_payload = "#{ts}:#{request.raw_post}"
+32:
+33:        key = Pay::PaddleBilling.signing_secret
+34:        data = signed_payload
+35:        digest = OpenSSL::Digest.new("sha256")
+36:
+37:        hmac = OpenSSL::HMAC.hexdigest(digest, key, data)
+38:        hmac == h1                          # &lt;-- non-constant-time '=='
+39:      end
+</code></pre>
+<p><code>hmac</code> is the 64-character hex-encoded SHA-256 HMAC of <code>"&lt;ts&gt;:&lt;raw_post&gt;"</code> under the application's configured Paddle Billing signing secret. The comparison with <code>h1</code> (the attacker-supplied <code>h1=</code> token from the <code>Paddle-Signature</code> header) uses Ruby's native <code>String#==</code>, which is implemented in MRI as <code>rb_str_equal</code> and returns immediately on the first byte mismatch.</p>
+<h2 id="how-an-attacker-reaches-this-code">How an attacker reaches this code</h2>
+<ol>
+<li>Any Pay-using Rails application mounting <code>Pay::Engine</code> exposes <code>POST /pay/webhooks/paddle_billing</code> to the public internet (Paddle requires the endpoint to be reachable). The controller is configured by default in <code>config/routes.rb</code> when <code>paddle_billing</code> is enabled.</li>
+<li>The controller's <code>before_action :verify_signature</code> invokes <code>valid_signature?</code> on every inbound request.</li>
+<li>An attacker repeatedly POSTs forged webhook payloads with <code>Paddle-Signature: ts=&lt;now&gt;;h1=&lt;guess&gt;</code> headers and measures the response time. The verifier returns early on the first mismatching byte of the hex digest; with a sufficient probe count per byte position, response-time distribution reveals when the prefix of <code>&lt;guess&gt;</code> matches the real <code>hmac</code>.</li>
+<li>A signature recovered through the oracle lets the attacker forge arbitrary Paddle Billing webhook deliveries.</li>
+</ol>
+<h2 id="proof-of-concept-microbenchmark">Proof of concept (microbenchmark)</h2>
+<p>Local Ruby microbenchmark isolating the verifier comparison path:</p>
+<pre><code class="language-ruby">require 'openssl'
+require 'benchmark'
+require 'securerandom'
+
+key = SecureRandom.hex(32)
+payload = '1730000000:{"event_type":"transaction.completed"}'
+real_hmac = OpenSSL::HMAC.hexdigest(OpenSSL::Digest.new('sha256'), key, payload)
+puts "real_hmac=#{real_hmac}"
+
+def verify(real, guess)
+  real == guess     # mirrors paddle_billing_controller.rb:38
+end
+
+guesses = {
+  'all-wrong'    =&gt; ('0' * real_hmac.length),
+  'match-1byte'  =&gt; real_hmac[0..0]  + '0' * (real_hmac.length - 1),
+  'match-32byte' =&gt; real_hmac[0..31] + '0' * (real_hmac.length - 32),
+  'match-63byte' =&gt; real_hmac[0..62] + '0',
+  'exact-match'  =&gt; real_hmac.dup,
+}
+iters = 10_000_000
+3.times { guesses.each_value { |g| 1_000_000.times { real_hmac == g } } }  # warmup
+guesses.each do |label, g|
+  t = Benchmark.realtime { iters.times { real_hmac == g } }
+  puts "#{label.ljust(15)} avg_ns=#{(t * 1e9 / iters).round}"
+end
+</code></pre>
+<p>This isolates the same <code>String#==</code> path used by <code>valid_signature?</code>. The static defect is verifiable by <code>bundle show pay</code> and reading line 38 of the controller.</p>
+<h2 id="end-to-end-reproduction-against-gem-install-pay---version-1161">End-to-end reproduction against <code>gem install pay --version 11.6.1</code></h2>
+<p>Minimal Rails 8 app mounting <code>Pay::Engine</code> with <code>paddle_billing</code> enabled:</p>
+<pre><code class="language-bash">gem install rails -v 8.0.2
+rails new payapp --skip-test --skip-bundle
+cd payapp
+echo "gem 'pay', '11.6.1'" &gt;&gt; Gemfile
+echo "gem 'paddle', '~&gt; 2.0'" &gt;&gt; Gemfile
+bundle install
+bin/rails g pay:install
+# config/initializers/pay.rb adds Pay.setup, paddle_billing config
+# config/routes.rb already has 'mount Pay::Engine =&gt; "/pay"' from generator
+
+bin/rails server &amp;
+
+# attacker probes the webhook endpoint
+WEBHOOK="http://127.0.0.1:3000/pay/webhooks/paddle_billing"
+BODY='{"event_type":"transaction.completed","data":{}}'
+TS=$(date +%s)
+# Try guesses with different prefix-match counts; response-time delta is the oracle
+for guess in 0000000000000000000000000000000000000000000000000000000000000000 \
+             a000000000000000000000000000000000000000000000000000000000000000 ; do
+  for _ in 1 2 3; do
+    curl -s -w '%{time_total}\n' -o /dev/null \
+      -X POST -H "Paddle-Signature: ts=$TS;h1=$guess" \
+      -H 'Content-Type: application/json' -d "$BODY" "$WEBHOOK"
+  done
+done
+</code></pre>
+<p>The static defect is verifiable by:</p>
+<pre><code>$ bundle show pay
+.../gems/pay-11.6.1
+$ sed -n '38p' .../gems/pay-11.6.1/app/controllers/pay/webhooks/paddle_billing_controller.rb
+        hmac == h1
+</code></pre>
+<p>After the fix is applied, the verifier uses <code>ActiveSupport::SecurityUtils.secure_compare</code>, which compares all bytes regardless of mismatch position, and the timing oracle closes.</p>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>Replace <code>==</code> with <code>ActiveSupport::SecurityUtils.secure_compare</code> (Pay is a Rails engine, so ActiveSupport is always available).</p>
+<pre><code class="language-diff">       def valid_signature?(paddle_signature)
+         return false if paddle_signature.blank?
+ 
+         ts_part, h1_part = paddle_signature.split(";")
+         _, ts = ts_part.split("=")
+         _, h1 = h1_part.split("=")
+ 
+         signed_payload = "#{ts}:#{request.raw_post}"
+ 
+         key = Pay::PaddleBilling.signing_secret
+         data = signed_payload
+         digest = OpenSSL::Digest.new("sha256")
+ 
+         hmac = OpenSSL::HMAC.hexdigest(digest, key, data)
+-        hmac == h1
++        return false if h1.nil? || hmac.bytesize != h1.bytesize
++        ActiveSupport::SecurityUtils.secure_compare(hmac, h1)
+       end
+</code></pre>
+<p>The bytesize-equality guard ensures <code>secure_compare</code> does not return early on a length mismatch (it falls back to <code>==</code> if lengths differ on older Rails versions). For the Paddle Billing signing format the hex tag is a fixed 64 chars.</p>
+<h2 id="credit">Credit</h2>
+<p>Reported by tonghuaroot (<a href="https://github.com/tonghuaroot">https://github.com/tonghuaroot</a>).</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/pay-rails/pay/security/advisories/GHSA-mjgf-xj26-9qf9">https://github.com/pay-rails/pay/security/advisories/GHSA-mjgf-xj26-9qf9</a></li>
+<li><a href="https://github.com/advisories/GHSA-mjgf-xj26-9qf9">https://github.com/advisories/GHSA-mjgf-xj26-9qf9</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-mjgf-xj26-9qf9</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-01T18:57:02.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[yard] YARD static cache reads raw traversal paths before router sanitization]]></title>
         <id>https://github.com/advisories/GHSA-pxcc-8665-phx8</id>
@@ -1197,83 +1343,5 @@ Oj.dump(obj, mode: :object, indent: 5000)
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-06-19T19:36:47.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[oj] Oj: Stack Buffer Overflow in Oj::Doc#each_child via Deeply Nested Input]]></title>
-        <id>https://github.com/advisories/GHSA-3m6q-jj5j-38c9</id>
-        <link href="https://github.com/advisories/GHSA-3m6q-jj5j-38c9"/>
-        <updated>2026-06-19T19:36:29.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>Oj::Doc#each_child</code>, when invoked recursively over a deeply nested JSON
-document, overflows a fixed-size stack buffer and aborts the process. This is a
-denial of service reachable from untrusted JSON.</p>
-<h3 id="details">Details</h3>
-<p>Two-step chain in <code>ext/oj/fast.c</code>:</p>
-<ol>
-<li><p><strong><code>doc_each_child</code> (~line 1501)</strong> increments <code>doc-&gt;where</code> past the
-<code>where_path[MAX_STACK = 100]</code> array with no bounds check, and never restores
-it (<code>doc-&gt;where--</code> is missing). Calling <code>each_child</code> recursively from inside
-the yield block therefore drives <code>doc-&gt;where</code> beyond the array.</p>
-</li>
-<li><p><strong>On the next entry (~line 1478)</strong> the function copies the path into a
-stack-local buffer:</p>
-<pre><code class="language-c">Leaf  save_path[MAX_STACK];           // 800-byte stack buffer
-size_t wlen = doc-&gt;where - doc-&gt;where_path;
-if (0 &lt; wlen) {
-    memcpy(save_path, doc-&gt;where_path, sizeof(Leaf) * (wlen + 1));
-}
-</code></pre>
-<p>When the previous recursive call left <code>doc-&gt;where</code> past <code>where_path[100]</code>,
-<code>wlen</code> exceeds <code>MAX_STACK</code> and the <code>memcpy</code> overflows <code>save_path</code> on the C
-stack.</p>
-</li>
-</ol>
-<p>The <code>Oj::Doc</code> parser imposes no JSON nesting-depth limit (it relies on a
-C-stack pressure check), so deeply nested attacker input reaches this path.</p>
-<h3 id="proof-of-concept">Proof of Concept</h3>
-<pre><code class="language-ruby">require 'oj'
-depth = 200
-payload = '[' * depth + '1' + ']' * depth
-Oj::Doc.open(payload) do |doc|
-  r = lambda { doc.each_child { |_| r.call } }
-  r.call
-end
-</code></pre>
-<p>Recursion depth &lt;= 99 iterates normally; depth &gt;= 101 aborts. lldb backtrace
-on the affected build (<code>ruby 3.3.8 / arm64-darwin24</code>):</p>
-<pre><code>SIGABRT
-#2 __abort
-#3 __stack_chk_fail
-#4 doc_each_child   (oj.bundle, fast.c)
-</code></pre>
-<h3 id="impact">Impact</h3>
-<p>Reliable denial of service: any endpoint that calls
-<code>Oj::Doc.open(untrusted) { |d| d.each_child ... }</code> recursively can be crashed
-with a small deeply-nested payload. On builds with a stack protector (the
-default, <code>-fstack-protector-strong</code>) the canary aborts the process before the
-saved return address is used. The Step-1 heap OOB writes into <code>struct _doc</code>
-fields do occur, but are masked in practice because the Step-2 stack overflow
-crashes first; turning them into anything beyond a crash has not been
-demonstrated.</p>
-<h3 id="patches">Patches</h3>
-<p>Fixed in <strong>3.17.3</strong>: <code>doc_each_child</code> now bounds-checks before incrementing
-<code>doc-&gt;where</code> (raising <code>Oj::DepthError</code>) and restores <code>doc-&gt;where</code> after the
-loop, matching the existing <code>each_leaf</code> pattern. Verified on the fixed build:
-depth &gt;= 101 raises a clean <code>Oj::DepthError</code> instead of aborting.</p>
-<h3 id="credit">Credit</h3>
-<p>Reported by Zac Wang (@7a6163).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/ohler55/oj/security/advisories/GHSA-3m6q-jj5j-38c9">https://github.com/ohler55/oj/security/advisories/GHSA-3m6q-jj5j-38c9</a></li>
-<li><a href="https://github.com/advisories/GHSA-3m6q-jj5j-38c9">https://github.com/advisories/GHSA-3m6q-jj5j-38c9</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-3m6q-jj5j-38c9</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-19T19:36:28.000Z</published>
     </entry>
 </feed>
