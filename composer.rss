@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/composer.rss</id>
     <title>Security Advisory for PHP packages hosted at packagist.org</title>
-    <updated>2026-07-02T17:44:32.802Z</updated>
+    <updated>2026-07-02T19:07:07.013Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Acomposer"/>
     <subtitle>Security Advisory for PHP packages hosted at packagist.org on GitHub</subtitle>
@@ -11,6 +11,413 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[craftcms/cms] Craft CMS: Missing peer-permission check in `AssetsController::actionDeleteFolder` allows deletion of other users' assets]]></title>
+        <id>https://github.com/advisories/GHSA-7h62-6v23-v8fm</id>
+        <link href="https://github.com/advisories/GHSA-7h62-6v23-v8fm"/>
+        <updated>2026-07-02T18:49:08.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>AssetsController::actionDeleteFolder()</code> only requires the <code>deleteAssets:&lt;volume-uid&gt;</code> permission for the target folder. It never enforces <code>deletePeerAssets:&lt;volume-uid&gt;</code>, even though <code>Assets::deleteFoldersByIds()</code> cascades deletion to every descendant folder and every asset inside, regardless of who uploaded them. A low-privilege user who has been granted folder-management rights on a shared volume can therefore destroy assets uploaded by other users (peer assets), bypassing the per-asset peer-permission check that the sibling <code>actionDeleteAsset</code> endpoint correctly applies.</p>
+<p>This is the same bug class that was just fixed in <code>actionMoveFolder</code> as <strong>GHSA-3w32-23wj-rxg3</strong> (commit <code>05c2042</code>, Apr 23 2026); the fix added <code>requireVolumePermissionByFolder('deletePeerAssets', …)</code> and <code>savePeerAssets</code> checks to the move endpoint but did not propagate to the delete-folder endpoint.</p>
+<h2 id="details">Details</h2>
+<p><code>src/controllers/AssetsController.php:552-569</code>:</p>
+<pre><code class="language-php">public function actionDeleteFolder(): Response
+{
+    $this-&gt;requireAcceptsJson();
+    $folderId = $this-&gt;request-&gt;getRequiredBodyParam('folderId');
+
+    $assets = Craft::$app-&gt;getAssets();
+    $folder = $assets-&gt;getFolderById($folderId);
+
+    if (!$folder) {
+        throw new BadRequestHttpException('The folder cannot be found');
+    }
+
+    // Check if it's possible to delete objects in the target volume.
+    $this-&gt;requireVolumePermissionByFolder('deleteAssets', $folder); // &lt;-- only checks deleteAssets
+    $assets-&gt;deleteFoldersByIds($folderId);
+
+    return $this-&gt;asSuccess();
+}
+</code></pre>
+<p><code>requireVolumePermissionByFolder()</code> (<code>src/controllers/AssetsControllerTrait.php:75-88</code>) only resolves to a single <code>requirePermission('deleteAssets:&lt;vol-uid&gt;')</code> call. The peer-equivalent helper (<code>requirePeerVolumePermissionByAsset</code>) is never invoked because there is no folder-level peer helper that iterates the folder's contents.</p>
+<p><code>Assets::deleteFoldersByIds()</code> (<code>src/services/Assets.php:311-349</code>) then enumerates the folder + every descendant folder, queries every asset under those IDs, and calls <code>Craft::$app-&gt;getElements()-&gt;deleteElement($asset, true)</code> directly:</p>
+<pre><code class="language-php">$assetQuery = Asset::find()-&gt;folderId($allFolderIds);
+$elementService = Craft::$app-&gt;getElements();
+
+foreach (Db::each($assetQuery) as $asset) {
+    $asset-&gt;keepFileOnDelete = !$deleteDir;
+    $elementService-&gt;deleteElement($asset, true);
+}
+</code></pre>
+<p>This bypasses <code>Asset::canDelete()</code> (<code>src/elements/Asset.php:1515-1536</code>):</p>
+<pre><code class="language-php">public function canDelete(User $user): bool
+{
+    if ($this-&gt;isFolder) { return false; }
+    if (parent::canDelete($user)) { return true; }
+    $volume = $this-&gt;getVolume();
+    if (Assets::isTempUploadFs($volume-&gt;getFs())) { return true; }
+
+    if ($this-&gt;uploaderId !== $user-&gt;id) {
+        return $user-&gt;can("deletePeerAssets:$volume-&gt;uid"); // &lt;-- never reached on cascade delete
+    }
+    return $user-&gt;can("deleteAssets:$volume-&gt;uid");
+}
+</code></pre>
+<p>Compare to <code>actionDeleteAsset</code> (<code>src/controllers/AssetsController.php:579-613</code>), which correctly does:</p>
+<pre><code class="language-php">$this-&gt;requireVolumePermissionByAsset('deleteAssets', $asset);
+$this-&gt;requirePeerVolumePermissionByAsset('deletePeerAssets', $asset);
+</code></pre>
+<p>The fix that landed in <code>05c2042</code> for <code>actionMoveFolder</code> (<code>src/controllers/AssetsController.php:733-765</code>) added both <code>savePeerAssets</code> and <code>deletePeerAssets</code> <code>requireVolumePermissionByFolder</code> checks to mirror the per-asset pattern, but the same hardening was not applied to <code>actionDeleteFolder</code> or <code>actionRenameFolder</code> (which also calls <code>deleteFoldersByIds</code> indirectly through later logic).</p>
+<p>The asymmetry between the two endpoints demonstrates the missing check.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li>Integrity / availability of other users' assets on any volume where the attacker has <code>deleteAssets</code> but not <code>deletePeerAssets</code>: the attacker can permanently delete peer-owned files (and their parent folder structure) on the underlying filesystem, with no recovery via Craft's UI.</li>
+<li>The Craft permission model explicitly distinguishes "delete your own assets" (<code>deleteAssets</code>) from "delete other users' assets" (<code>deletePeerAssets</code>) precisely so administrators can grant the former without the latter on shared volumes — this finding renders that distinction unenforceable for any user given folder-delete rights.</li>
+<li>No information disclosure or remote code execution; impact is bounded to the affected volume's contents.</li>
+<li>Does not require any non-default configuration: the affected endpoint is enabled by default and only requires that an administrator has split <code>deleteAssets</code> from <code>deletePeerAssets</code> (the documented, supported permission model).</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/craftcms/cms/security/advisories/GHSA-7h62-6v23-v8fm">https://github.com/craftcms/cms/security/advisories/GHSA-7h62-6v23-v8fm</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-50284">https://nvd.nist.gov/vuln/detail/CVE-2026-50284</a></li>
+<li><a href="https://github.com/craftcms/cms/commit/b4e08977f0c9bdf002a77f9f6d1346cd55ac0598">https://github.com/craftcms/cms/commit/b4e08977f0c9bdf002a77f9f6d1346cd55ac0598</a></li>
+<li><a href="https://github.com/advisories/GHSA-7h62-6v23-v8fm">https://github.com/advisories/GHSA-7h62-6v23-v8fm</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-7h62-6v23-v8fm</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-02T18:49:04.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[craftcms/cms] Craft CMS: Missing peer-permission check in `AssetsController::actionDeleteFolder` allows deletion of other users' assets]]></title>
+        <id>https://github.com/advisories/GHSA-7h62-6v23-v8fm</id>
+        <link href="https://github.com/advisories/GHSA-7h62-6v23-v8fm"/>
+        <updated>2026-07-02T18:49:08.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>AssetsController::actionDeleteFolder()</code> only requires the <code>deleteAssets:&lt;volume-uid&gt;</code> permission for the target folder. It never enforces <code>deletePeerAssets:&lt;volume-uid&gt;</code>, even though <code>Assets::deleteFoldersByIds()</code> cascades deletion to every descendant folder and every asset inside, regardless of who uploaded them. A low-privilege user who has been granted folder-management rights on a shared volume can therefore destroy assets uploaded by other users (peer assets), bypassing the per-asset peer-permission check that the sibling <code>actionDeleteAsset</code> endpoint correctly applies.</p>
+<p>This is the same bug class that was just fixed in <code>actionMoveFolder</code> as <strong>GHSA-3w32-23wj-rxg3</strong> (commit <code>05c2042</code>, Apr 23 2026); the fix added <code>requireVolumePermissionByFolder('deletePeerAssets', …)</code> and <code>savePeerAssets</code> checks to the move endpoint but did not propagate to the delete-folder endpoint.</p>
+<h2 id="details">Details</h2>
+<p><code>src/controllers/AssetsController.php:552-569</code>:</p>
+<pre><code class="language-php">public function actionDeleteFolder(): Response
+{
+    $this-&gt;requireAcceptsJson();
+    $folderId = $this-&gt;request-&gt;getRequiredBodyParam('folderId');
+
+    $assets = Craft::$app-&gt;getAssets();
+    $folder = $assets-&gt;getFolderById($folderId);
+
+    if (!$folder) {
+        throw new BadRequestHttpException('The folder cannot be found');
+    }
+
+    // Check if it's possible to delete objects in the target volume.
+    $this-&gt;requireVolumePermissionByFolder('deleteAssets', $folder); // &lt;-- only checks deleteAssets
+    $assets-&gt;deleteFoldersByIds($folderId);
+
+    return $this-&gt;asSuccess();
+}
+</code></pre>
+<p><code>requireVolumePermissionByFolder()</code> (<code>src/controllers/AssetsControllerTrait.php:75-88</code>) only resolves to a single <code>requirePermission('deleteAssets:&lt;vol-uid&gt;')</code> call. The peer-equivalent helper (<code>requirePeerVolumePermissionByAsset</code>) is never invoked because there is no folder-level peer helper that iterates the folder's contents.</p>
+<p><code>Assets::deleteFoldersByIds()</code> (<code>src/services/Assets.php:311-349</code>) then enumerates the folder + every descendant folder, queries every asset under those IDs, and calls <code>Craft::$app-&gt;getElements()-&gt;deleteElement($asset, true)</code> directly:</p>
+<pre><code class="language-php">$assetQuery = Asset::find()-&gt;folderId($allFolderIds);
+$elementService = Craft::$app-&gt;getElements();
+
+foreach (Db::each($assetQuery) as $asset) {
+    $asset-&gt;keepFileOnDelete = !$deleteDir;
+    $elementService-&gt;deleteElement($asset, true);
+}
+</code></pre>
+<p>This bypasses <code>Asset::canDelete()</code> (<code>src/elements/Asset.php:1515-1536</code>):</p>
+<pre><code class="language-php">public function canDelete(User $user): bool
+{
+    if ($this-&gt;isFolder) { return false; }
+    if (parent::canDelete($user)) { return true; }
+    $volume = $this-&gt;getVolume();
+    if (Assets::isTempUploadFs($volume-&gt;getFs())) { return true; }
+
+    if ($this-&gt;uploaderId !== $user-&gt;id) {
+        return $user-&gt;can("deletePeerAssets:$volume-&gt;uid"); // &lt;-- never reached on cascade delete
+    }
+    return $user-&gt;can("deleteAssets:$volume-&gt;uid");
+}
+</code></pre>
+<p>Compare to <code>actionDeleteAsset</code> (<code>src/controllers/AssetsController.php:579-613</code>), which correctly does:</p>
+<pre><code class="language-php">$this-&gt;requireVolumePermissionByAsset('deleteAssets', $asset);
+$this-&gt;requirePeerVolumePermissionByAsset('deletePeerAssets', $asset);
+</code></pre>
+<p>The fix that landed in <code>05c2042</code> for <code>actionMoveFolder</code> (<code>src/controllers/AssetsController.php:733-765</code>) added both <code>savePeerAssets</code> and <code>deletePeerAssets</code> <code>requireVolumePermissionByFolder</code> checks to mirror the per-asset pattern, but the same hardening was not applied to <code>actionDeleteFolder</code> or <code>actionRenameFolder</code> (which also calls <code>deleteFoldersByIds</code> indirectly through later logic).</p>
+<p>The asymmetry between the two endpoints demonstrates the missing check.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li>Integrity / availability of other users' assets on any volume where the attacker has <code>deleteAssets</code> but not <code>deletePeerAssets</code>: the attacker can permanently delete peer-owned files (and their parent folder structure) on the underlying filesystem, with no recovery via Craft's UI.</li>
+<li>The Craft permission model explicitly distinguishes "delete your own assets" (<code>deleteAssets</code>) from "delete other users' assets" (<code>deletePeerAssets</code>) precisely so administrators can grant the former without the latter on shared volumes — this finding renders that distinction unenforceable for any user given folder-delete rights.</li>
+<li>No information disclosure or remote code execution; impact is bounded to the affected volume's contents.</li>
+<li>Does not require any non-default configuration: the affected endpoint is enabled by default and only requires that an administrator has split <code>deleteAssets</code> from <code>deletePeerAssets</code> (the documented, supported permission model).</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/craftcms/cms/security/advisories/GHSA-7h62-6v23-v8fm">https://github.com/craftcms/cms/security/advisories/GHSA-7h62-6v23-v8fm</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-50284">https://nvd.nist.gov/vuln/detail/CVE-2026-50284</a></li>
+<li><a href="https://github.com/craftcms/cms/commit/b4e08977f0c9bdf002a77f9f6d1346cd55ac0598">https://github.com/craftcms/cms/commit/b4e08977f0c9bdf002a77f9f6d1346cd55ac0598</a></li>
+<li><a href="https://github.com/advisories/GHSA-7h62-6v23-v8fm">https://github.com/advisories/GHSA-7h62-6v23-v8fm</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-7h62-6v23-v8fm</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-02T18:49:04.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[craftcms/cms] Craft CMS: Unauthorized Deletion of Source Assets During File Replacement]]></title>
+        <id>https://github.com/advisories/GHSA-qh45-9g5p-m2v4</id>
+        <link href="https://github.com/advisories/GHSA-qh45-9g5p-m2v4"/>
+        <updated>2026-07-02T18:48:28.000Z</updated>
+        <content type="html"><![CDATA[<p>We have identified an authorization issue in Craft CMS <code>AssetsController::actionReplaceFile</code> that can delete a source asset without source delete permission by supplying both <code>assetId</code> and <code>sourceAssetId</code>.</p>
+<h3 id="description">Description</h3>
+<p>Craft CMS’s <code>craft\\controllers\\AssetsController::actionReplaceFile()</code> supports replacing a target asset file using another existing asset as the source. The action loads:</p>
+<ul>
+<li><code>$assetToReplace</code> from <code>assetId</code>  </li>
+<li><code>$sourceAsset</code> from <code>sourceAssetId</code></li>
+</ul>
+<p>It then enforces replace permissions using <code>($assetToReplace ?: $sourceAsset)</code>. When both IDs are provided, this expression resolves to the target asset so no permission check is performed against the source asset volume.</p>
+<pre><code class="language-php">$this-&gt;requireVolumePermissionByAsset('replaceFiles', $assetToReplace ?: $sourceAsset);
+$this-&gt;requirePeerVolumePermissionByAsset('replacePeerFiles', $assetToReplace ?: $sourceAsset);
+</code></pre>
+<p><a href="https://github.com/craftcms/cms/blob/5.x/src/controllers/AssetsController.php#L433-L434"><em>src/controllers/AssetsController.php:L433-L434</em></a></p>
+<p>In the branch where both assets are present, Craft copies the source file into the target and then deletes the source asset. There is no check for <code>deleteAssets:&lt;sourceVolumeUid&gt;</code> or <code>deletePeerAssets:&lt;sourceVolumeUid&gt;</code> for the source asset before deletion.</p>
+<pre><code class="language-php">$assets-&gt;replaceAssetFile($assetToReplace, $tempPath, $assetToReplace-&gt;getFilename(), $sourceAsset-&gt;getMimeType());
+Craft::$app-&gt;getElements()-&gt;deleteElement($sourceAsset);
+</code></pre>
+<p><a href="https://github.com/craftcms/cms/blob/5.x/src/controllers/AssetsController.php#L462-L463"><em>src/controllers/AssetsController.php:L462-L463</em></a></p>
+<h3 id="impact">Impact</h3>
+<p>An authenticated user who can replace files in one volume can delete assets in another volume where they do not have delete permission, as long as they can obtain a <code>sourceAssetId</code>. This can lead to unauthorized asset deletion, broken content references, and data loss.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/craftcms/cms/security/advisories/GHSA-qh45-9g5p-m2v4">https://github.com/craftcms/cms/security/advisories/GHSA-qh45-9g5p-m2v4</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-50283">https://nvd.nist.gov/vuln/detail/CVE-2026-50283</a></li>
+<li><a href="https://github.com/craftcms/cms/commit/2c2579c7f1030872423f268d0c8b48377101961d">https://github.com/craftcms/cms/commit/2c2579c7f1030872423f268d0c8b48377101961d</a></li>
+<li><a href="https://github.com/advisories/GHSA-qh45-9g5p-m2v4">https://github.com/advisories/GHSA-qh45-9g5p-m2v4</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-qh45-9g5p-m2v4</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-02T18:48:27.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[craftcms/cms] Craft CMS: Unauthorized Deletion of Source Assets During File Replacement]]></title>
+        <id>https://github.com/advisories/GHSA-qh45-9g5p-m2v4</id>
+        <link href="https://github.com/advisories/GHSA-qh45-9g5p-m2v4"/>
+        <updated>2026-07-02T18:48:28.000Z</updated>
+        <content type="html"><![CDATA[<p>We have identified an authorization issue in Craft CMS <code>AssetsController::actionReplaceFile</code> that can delete a source asset without source delete permission by supplying both <code>assetId</code> and <code>sourceAssetId</code>.</p>
+<h3 id="description">Description</h3>
+<p>Craft CMS’s <code>craft\\controllers\\AssetsController::actionReplaceFile()</code> supports replacing a target asset file using another existing asset as the source. The action loads:</p>
+<ul>
+<li><code>$assetToReplace</code> from <code>assetId</code>  </li>
+<li><code>$sourceAsset</code> from <code>sourceAssetId</code></li>
+</ul>
+<p>It then enforces replace permissions using <code>($assetToReplace ?: $sourceAsset)</code>. When both IDs are provided, this expression resolves to the target asset so no permission check is performed against the source asset volume.</p>
+<pre><code class="language-php">$this-&gt;requireVolumePermissionByAsset('replaceFiles', $assetToReplace ?: $sourceAsset);
+$this-&gt;requirePeerVolumePermissionByAsset('replacePeerFiles', $assetToReplace ?: $sourceAsset);
+</code></pre>
+<p><a href="https://github.com/craftcms/cms/blob/5.x/src/controllers/AssetsController.php#L433-L434"><em>src/controllers/AssetsController.php:L433-L434</em></a></p>
+<p>In the branch where both assets are present, Craft copies the source file into the target and then deletes the source asset. There is no check for <code>deleteAssets:&lt;sourceVolumeUid&gt;</code> or <code>deletePeerAssets:&lt;sourceVolumeUid&gt;</code> for the source asset before deletion.</p>
+<pre><code class="language-php">$assets-&gt;replaceAssetFile($assetToReplace, $tempPath, $assetToReplace-&gt;getFilename(), $sourceAsset-&gt;getMimeType());
+Craft::$app-&gt;getElements()-&gt;deleteElement($sourceAsset);
+</code></pre>
+<p><a href="https://github.com/craftcms/cms/blob/5.x/src/controllers/AssetsController.php#L462-L463"><em>src/controllers/AssetsController.php:L462-L463</em></a></p>
+<h3 id="impact">Impact</h3>
+<p>An authenticated user who can replace files in one volume can delete assets in another volume where they do not have delete permission, as long as they can obtain a <code>sourceAssetId</code>. This can lead to unauthorized asset deletion, broken content references, and data loss.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/craftcms/cms/security/advisories/GHSA-qh45-9g5p-m2v4">https://github.com/craftcms/cms/security/advisories/GHSA-qh45-9g5p-m2v4</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-50283">https://nvd.nist.gov/vuln/detail/CVE-2026-50283</a></li>
+<li><a href="https://github.com/craftcms/cms/commit/2c2579c7f1030872423f268d0c8b48377101961d">https://github.com/craftcms/cms/commit/2c2579c7f1030872423f268d0c8b48377101961d</a></li>
+<li><a href="https://github.com/advisories/GHSA-qh45-9g5p-m2v4">https://github.com/advisories/GHSA-qh45-9g5p-m2v4</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-qh45-9g5p-m2v4</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-02T18:48:27.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[craftcms/cms] Craft CMS: Authorization bypass in `entries/move-to-section` via missing target-section save check]]></title>
+        <id>https://github.com/advisories/GHSA-43cq-c2gq-pfpw</id>
+        <link href="https://github.com/advisories/GHSA-43cq-c2gq-pfpw"/>
+        <updated>2026-07-02T18:47:38.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The <code>EntriesController::actionMoveToSection()</code> endpoint checks only whether the current user can view the destination section, but it does not require permission to save entries into that section. A low-privileged authenticated control-panel user who can move an entry out of its current section can therefore move that entry into a different section where they have read access but no write access.</p>
+<h3 id="details">Details</h3>
+<p>The vulnerable route is implemented in <a href="/D:/files/projects/cms-5.9.19/cms-5.9.19/src/controllers/EntriesController.php">EntriesController.php</a>:465:</p>
+<p>The destination check is only <code>viewEntries:$section-&gt;uid</code> . The source-entry gate is <code>Entry::canMove()</code>, which verifies whether the user can move the existing entry based on the source section:</p>
+<p>This closes the exploit chain:</p>
+<ol>
+<li>External source: authenticated CP request to <code>entries/move-to-section</code>.</li>
+<li>Missing authorization check: destination section requires only <code>viewEntries</code>, not <code>saveEntries</code>.</li>
+<li>Privileged sink: <code>moveEntryToSection()</code> rewrites <code>sectionId</code> and saves the entry into the unauthorized section.</li>
+</ol>
+<p>Preconditions derived from the code:</p>
+<ol>
+<li>The attacker is authenticated to the control panel.</li>
+<li>Entry <code>345</code> is movable by the attacker from its current section.</li>
+<li>The attacker can satisfy <code>viewEntries</code> on destination section <code>12</code>.</li>
+<li>The attacker does not have <code>saveEntries:DESTINATION_UID</code>, which is the missing check that makes the bypass possible.</li>
+</ol>
+<p>Result:</p>
+<ol>
+<li>The controller accepts the request because <code>viewEntries:$section-&gt;uid</code> passes.</li>
+<li>Each source entry passes <code>canMove()</code> based on source-section permissions.</li>
+<li><code>moveEntryToSection()</code> updates the entry’s <code>sectionId</code> and saves it.</li>
+<li>The entry is now located in a section where the attacker did not have write permission.</li>
+</ol>
+<h3 id="impact">Impact</h3>
+<p>This breaks the intended section-level authorization model. A user with limited content permissions can inject or relocate content into a protected section, interfering with editorial boundaries, approval workflows, section-specific business logic, and content ownership expectations.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/craftcms/cms/security/advisories/GHSA-43cq-c2gq-pfpw">https://github.com/craftcms/cms/security/advisories/GHSA-43cq-c2gq-pfpw</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-50280">https://nvd.nist.gov/vuln/detail/CVE-2026-50280</a></li>
+<li><a href="https://github.com/craftcms/cms/commit/0a6b916f6367b0162b2eaf2366add67b45fa98ea">https://github.com/craftcms/cms/commit/0a6b916f6367b0162b2eaf2366add67b45fa98ea</a></li>
+<li><a href="https://github.com/advisories/GHSA-43cq-c2gq-pfpw">https://github.com/advisories/GHSA-43cq-c2gq-pfpw</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-43cq-c2gq-pfpw</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-02T18:47:37.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[craftcms/cms] Craft CMS: Authorship spoofing in `entries/save-entry` via pre-check/post-mutation authorization gap]]></title>
+        <id>https://github.com/advisories/GHSA-qq2c-2q8j-jh27</id>
+        <link href="https://github.com/advisories/GHSA-qq2c-2q8j-jh27"/>
+        <updated>2026-07-02T18:45:30.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>EntriesController::actionSaveEntry()</code> performs entry-edit permission checks before request-controlled author changes are applied to the model. The subsequent author mutation path accepts attacker-supplied <code>authors</code> / <code>author</code> parameters and allows the change when the current user is one of the old authors. Because the controller does not re-run authorization after mutating the author list, a low-privileged user can reassign an entry’s authorship to another user without holding the dedicated peer-author-change permission.</p>
+<h3 id="details">Details</h3>
+<p>The control flow begins in <a href="/D:/files/projects/cms-5.9.19/cms-5.9.19/src/controllers/EntriesController.php">EntriesController.php</a>:249. <code>actionSaveEntry()</code> loads the entry and enforces edit permissions before calling <code>_populateEntryModel()</code>:</p>
+<pre><code class="language-php">public function actionSaveEntry(bool $duplicate = false): ?Response
+{
+    ...
+    $entry = $this-&gt;_editableEntry($this-&gt;request-&gt;getBodyParam('entryId'), $siteId);
+    ...
+    $this-&gt;enforceEditEntryPermissions($entry, $duplicate);
+    ...
+    $this-&gt;_populateEntryModel($entry);
+    ...
+    $success = Craft::$app-&gt;getElements()-&gt;saveElement($entry);
+}
+</code></pre>
+<p>The attacker-controlled source is in <a href="/D:/files/projects/cms-5.9.19/cms-5.9.19/src/controllers/EntriesController.php">EntriesController.php</a>:588:</p>
+<pre><code class="language-php">$entry-&gt;setAttributesFromRequest(array_filter([
+    'authorIds' =&gt; $this-&gt;request-&gt;getBodyParam('authors') ??
+        $this-&gt;request-&gt;getBodyParam('author') ??
+        $entry-&gt;getAuthorId() ??
+        static::currentUser()-&gt;id,
+]));
+</code></pre>
+<p><code>Entry::setAttributesFromRequest()</code> in <a href="/D:/files/projects/cms-5.9.19/cms-5.9.19/src/elements/Entry.php">Entry.php</a>:1124 extracts the new author IDs and applies them if <code>canChangeAuthor()</code> returns true:</p>
+<pre><code class="language-php">if (
+    ($authorIds !== null || $authorId !== null) &amp;&amp;
+    $this-&gt;canChangeAuthor()
+) {
+    $this-&gt;_oldAuthorIds = $oldAuthorIds;
+    $this-&gt;setAuthorIds($authorIds);
+}
+</code></pre>
+<p><code>canChangeAuthor()</code> at <a href="/D:/files/projects/cms-5.9.19/cms-5.9.19/src/elements/Entry.php">Entry.php</a>:2789 allows the author change when the current user can view peer entries and is already one of the existing authors:</p>
+<pre><code class="language-php">return (
+    empty($authorIds) ||
+    in_array($user-&gt;id, $authorIds) ||
+    $user-&gt;can("changeAuthorForPeerEntries:$section-&gt;uid")
+);
+</code></pre>
+<p>After the author list is mutated, the controller does not re-check authorization. </p>
+<p>This closes the exploit chain:</p>
+<ol>
+<li>External source: authenticated request to <code>entries/save-entry</code> with attacker-controlled <code>authors[]</code>.</li>
+<li>Trust boundary failure: authorization is checked on the pre-mutation entry state, not on the post-mutation author assignment.</li>
+<li>Privileged sink: the author relationship is rewritten in persistent storage.</li>
+</ol>
+<p>Preconditions derived from the source:</p>
+<ol>
+<li>The attacker is authenticated and can edit entry <code>345</code>.</li>
+<li>The attacker is among the existing authors of entry <code>345</code>, or otherwise satisfies <code>canChangeAuthor()</code> through the old author set.</li>
+<li>The attacker has <code>viewPeerEntries</code> for the section.</li>
+<li>User ID <code>1</code> exists and can be assigned as an author in that section.</li>
+</ol>
+<p>Result:</p>
+<ol>
+<li><code>enforceEditEntryPermissions()</code> succeeds on the original entry state.</li>
+<li><code>_populateEntryModel()</code> reads <code>authors[]=1</code> from the request body.</li>
+<li><code>setAttributesFromRequest()</code> updates <code>authorIds</code> because <code>canChangeAuthor()</code> is evaluated against the old authorship state.</li>
+<li><code>saveElement()</code> persists the change and <code>_saveAuthors()</code> rewrites the entry-author relation.</li>
+<li>Entry <code>345</code> now appears authored by user <code>1</code>.</li>
+</ol>
+<h3 id="impact">Impact</h3>
+<p>This allows low-privileged users to falsify content ownership and alter the authorship of entries without having the dedicated author-management permission. The impact includes corrupted audit trails, misleading notifications, broken approval workflows, and unauthorized reassignment of content responsibility.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/craftcms/cms/security/advisories/GHSA-qq2c-2q8j-jh27">https://github.com/craftcms/cms/security/advisories/GHSA-qq2c-2q8j-jh27</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-50279">https://nvd.nist.gov/vuln/detail/CVE-2026-50279</a></li>
+<li><a href="https://github.com/craftcms/cms/commit/9cc493be8b414d7116c7f2bc2a6d0926e73f1248">https://github.com/craftcms/cms/commit/9cc493be8b414d7116c7f2bc2a6d0926e73f1248</a></li>
+<li><a href="https://github.com/advisories/GHSA-qq2c-2q8j-jh27">https://github.com/advisories/GHSA-qq2c-2q8j-jh27</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-qq2c-2q8j-jh27</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-02T18:45:28.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[mediawiki/maps] mediawiki/maps has stored XSS through the overlays parameter in the display_map parser function]]></title>
+        <id>https://github.com/advisories/GHSA-4h7g-5542-v3fc</id>
+        <link href="https://github.com/advisories/GHSA-4h7g-5542-v3fc"/>
+        <updated>2026-07-02T17:51:27.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>Stored XSS through wikitext can be performed by inserting malicious HTML into the <code>overlays</code> parameter of the <code>display_map</code> parser function when using the leaflet service.</p>
+<h3 id="details">Details</h3>
+<p>The maps extension doesn't escape overlay names before passing them to leaflet.
+Leaflet then inserts them as HTML: <a href="https://github.com/ProfessionalWiki/Maps/blob/ca5139fabd75f3c34f47ea3fd161306506b053bc/resources/lib/leaflet/leaflet.js#L5243">https://github.com/ProfessionalWiki/Maps/blob/ca5139fabd75f3c34f47ea3fd161306506b053bc/resources/lib/leaflet/leaflet.js#L5243</a></p>
+<h3 id="poc">PoC</h3>
+<p>Preview the following wikitext, using the default configuration options of the extension:</p>
+<pre><code>{{#display_map:0,0|service=leaflet|overlays=OpenTopoMap.&lt;img src=x onerror="alert(1);"&gt;}}
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>Stored XSS can be performed by any user with the <code>edit</code> permission.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/ProfessionalWiki/Maps/security/advisories/GHSA-4h7g-5542-v3fc">https://github.com/ProfessionalWiki/Maps/security/advisories/GHSA-4h7g-5542-v3fc</a></li>
+<li><a href="https://github.com/advisories/GHSA-4h7g-5542-v3fc">https://github.com/advisories/GHSA-4h7g-5542-v3fc</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-4h7g-5542-v3fc</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-02T17:51:24.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[kimai/kimai] Kimai Password Reset Link Remains Valid After Password Change]]></title>
         <id>https://github.com/advisories/GHSA-m492-gv72-xvxj</id>
@@ -423,177 +830,5 @@
         </author>
         <category label="severity" term="CRITICAL"/>
         <published>2026-05-26T13:30:27.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[dolibarr/dolibarr] Dolibarr ERP CRM contains a remote code evaluation vulnerability]]></title>
-        <id>https://github.com/advisories/GHSA-hxmh-2xc4-c894</id>
-        <link href="https://github.com/advisories/GHSA-hxmh-2xc4-c894"/>
-        <updated>2026-06-30T17:50:55.000Z</updated>
-        <content type="html"><![CDATA[<p>Dolibarr ERP CRM 7.0.3 contains a remote code evaluation vulnerability that allows unauthenticated attackers to execute arbitrary code by injecting PHP code through the db_name parameter. Attackers can send a POST request to install/step1.php with malicious PHP code in the db_name parameter, then execute commands via the check.php endpoint using the cmd GET parameter.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2018-25357">https://nvd.nist.gov/vuln/detail/CVE-2018-25357</a></li>
-<li><a href="https://dolibarr.org">https://dolibarr.org</a></li>
-<li><a href="https://github.com/Dolibarr/dolibarr">https://github.com/Dolibarr/dolibarr</a></li>
-<li><a href="https://www.exploit-db.com/exploits/44964">https://www.exploit-db.com/exploits/44964</a></li>
-<li><a href="https://www.vulncheck.com/advisories/dolibarr-erp-crm-remote-code-evaluation-via-install-step1-php">https://www.vulncheck.com/advisories/dolibarr-erp-crm-remote-code-evaluation-via-install-step1-php</a></li>
-<li><a href="https://github.com/Dolibarr/dolibarr/issues/9032">https://github.com/Dolibarr/dolibarr/issues/9032</a></li>
-<li><a href="https://github.com/Dolibarr/dolibarr/commit/41709f07d0aef384723164877395ed081b44b810">https://github.com/Dolibarr/dolibarr/commit/41709f07d0aef384723164877395ed081b44b810</a></li>
-<li><a href="https://github.com/advisories/GHSA-hxmh-2xc4-c894">https://github.com/advisories/GHSA-hxmh-2xc4-c894</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-hxmh-2xc4-c894</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-05-26T13:30:27.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[paymenter/paymenter] Paymenter has URL parameter injection that bypasses paid plan limits at checkout]]></title>
-        <id>https://github.com/advisories/GHSA-5q4q-834j-g8g4</id>
-        <link href="https://github.com/advisories/GHSA-5q4q-834j-g8g4"/>
-        <updated>2026-06-30T16:44:31.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The checkout component improperly filters URL-writable properties, allowing authenticated users to inject arbitrary key-value pairs into server provisioning parameters. Because bundled server extensions prioritize these user-supplied properties over administrator-defined configurations, a regular user can override hosting plans and resource limits at checkout without special privileges.</p>
-<h3 id="technical-details">Technical Details</h3>
-<p>The <code>Checkout</code> Livewire component (<code>app/Livewire/Products/Checkout.php</code>) exposes the <code>$checkoutConfig</code> property to URL query parameters via the <code>#[Url]</code> attribute (aliased as <code>config</code>). </p>
-<p>When processing this input:</p>
-<ol>
-<li>Validation rules are dynamically generated <em>only</em> for keys explicitly defined by an extension's <code>getCheckoutConfig()</code> method. Any undefined keys injected into the query parameter bypass validation entirely.</li>
-<li>The cart component (<code>app/Livewire/Cart.php</code>) stores all keys from <code>checkout_config</code> directly into the database without sanitation:</li>
-</ol>
-<pre><code class="language-php">   foreach ($item-&gt;checkout_config as $key =&gt; $value) {
-       $service-&gt;properties()-&gt;updateOrCreate(['key' =&gt; $key], ['value' =&gt; $value]);
-   }
-</code></pre>
-<ol start="3">
-<li>During server provisioning, app/Helpers/ExtensionHelper.php retrieves these stored properties and passes them to the extension's createServer() method.</li>
-</ol>
-<p>Because of how individual server extensions handle these properties, user-injected data overrides intended administrator settings.</p>
-<h3 id="impact">Impact</h3>
-<p>This is a business logic flaw that allows remote, authenticated users to manipulate server provisioning parameters.</p>
-<p>Depending on the active extension, this leads to unauthorized overrides of core resource limits (such as CPU, RAM, storage, or package tiers). No administrative privileges are required to exploit this vulnerability.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Paymenter/Paymenter/security/advisories/GHSA-5q4q-834j-g8g4">https://github.com/Paymenter/Paymenter/security/advisories/GHSA-5q4q-834j-g8g4</a></li>
-<li><a href="https://github.com/advisories/GHSA-5q4q-834j-g8g4">https://github.com/advisories/GHSA-5q4q-834j-g8g4</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-5q4q-834j-g8g4</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-30T16:44:31.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[concrete5/concrete5] Concrete CMS is vulnerable to Stored XSS via page name in the Atomik theme]]></title>
-        <id>https://github.com/advisories/GHSA-q9fm-mpg8-8jqm</id>
-        <link href="https://github.com/advisories/GHSA-q9fm-mpg8-8jqm"/>
-        <updated>2026-06-29T23:04:43.000Z</updated>
-        <content type="html"><![CDATA[<p>Concrete CMS version 9.0 to 9.5.0 is vulnerable to Stored XSS via page name in the Atomik theme. A rogue editor&nbsp;can inject arbitrary JavaScript that executes in the context of any authenticated user visiting the affected account pages. This can lead to session hijacking, credential theft, malicious actions performed on behalf of users, and potential privilege escalation.&nbsp;Thanks&nbsp;Yonatan Drori (Tenzai) for reporting.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-8353">https://nvd.nist.gov/vuln/detail/CVE-2026-8353</a></li>
-<li><a href="https://documentation.concretecms.org/9-x/developers/introduction/version-history/951-release-notes">https://documentation.concretecms.org/9-x/developers/introduction/version-history/951-release-notes</a></li>
-<li><a href="https://github.com/advisories/GHSA-q9fm-mpg8-8jqm">https://github.com/advisories/GHSA-q9fm-mpg8-8jqm</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-q9fm-mpg8-8jqm</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-05-26T13:30:17.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[concrete5/concrete5] Concrete CMS is vulnerable to CSRF via Backend\File::approveVersion]]></title>
-        <id>https://github.com/advisories/GHSA-xjg6-5v39-v7fc</id>
-        <link href="https://github.com/advisories/GHSA-xjg6-5v39-v7fc"/>
-        <updated>2026-06-29T23:04:08.000Z</updated>
-        <content type="html"><![CDATA[<p>Concrete CMS 9.5.0 and below is vulnerable to CSRF via Backend\File::approveVersion.&nbsp;Victim with&nbsp;edit_file_contents&nbsp;permission is CSRF'd into publishing an attacker-chosen previously-uploaded version (downgrade to an older version of a file, or activation of a co-editor's unpublished version). Thanks Winston Crooker for reporting.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-8340">https://nvd.nist.gov/vuln/detail/CVE-2026-8340</a></li>
-<li><a href="https://documentation.concretecms.org/9-x/developers/introduction/version-history/951-release-notes">https://documentation.concretecms.org/9-x/developers/introduction/version-history/951-release-notes</a></li>
-<li><a href="https://github.com/advisories/GHSA-xjg6-5v39-v7fc">https://github.com/advisories/GHSA-xjg6-5v39-v7fc</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-xjg6-5v39-v7fc</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-05-26T13:30:17.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[concrete5/concrete5] Concrete CMS is vulnerable to IDOR + wrong-authorization-level in the Express association Reorder dialog]]></title>
-        <id>https://github.com/advisories/GHSA-jqvq-gv67-3567</id>
-        <link href="https://github.com/advisories/GHSA-jqvq-gv67-3567"/>
-        <updated>2026-06-29T23:03:44.000Z</updated>
-        <content type="html"><![CDATA[<p>Concrete CMS 9.5.0 and below is vulnerable to IDOR + wrong-authorization-level in the Express association Reorder dialog.&nbsp; This can cause&nbsp;Cross-entity state tampering&nbsp;with view-only permission on one entry.&nbsp;To be affected, a website has to be using express and relying on express entity ordering.&nbsp;Thanks Winston Crooker for reporting.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-8347">https://nvd.nist.gov/vuln/detail/CVE-2026-8347</a></li>
-<li><a href="https://documentation.concretecms.org/9-x/developers/introduction/version-history/951-release-notes">https://documentation.concretecms.org/9-x/developers/introduction/version-history/951-release-notes</a></li>
-<li><a href="https://github.com/advisories/GHSA-jqvq-gv67-3567">https://github.com/advisories/GHSA-jqvq-gv67-3567</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-jqvq-gv67-3567</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-05-26T13:30:17.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[evoweb/sf-register] TYPO3 sf_register extension allows unauthorized assignment of frontend user groups]]></title>
-        <id>https://github.com/advisories/GHSA-v348-vr4q-fv9p</id>
-        <link href="https://github.com/advisories/GHSA-v348-vr4q-fv9p"/>
-        <updated>2026-06-29T22:58:07.000Z</updated>
-        <content type="html"><![CDATA[<p>The <code>create</code> and <code>edit</code> flows in the TYPO3 extension sf_register do not restrict which user properties may be submitted, and do not enforce access control on the frontend user group assignment. As a result, an attacker can assign an arbitrary frontend user group to a newly registered or edited account, gaining unauthorized access to content and functionality restricted to privileged frontend user groups.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-46721">https://nvd.nist.gov/vuln/detail/CVE-2026-46721</a></li>
-<li><a href="https://typo3.org/security/advisory/typo3-ext-sa-2026-009">https://typo3.org/security/advisory/typo3-ext-sa-2026-009</a></li>
-<li><a href="https://github.com/FriendsOfPHP/security-advisories/blob/master/evoweb/sf-register/CVE-2026-46721.yaml">https://github.com/FriendsOfPHP/security-advisories/blob/master/evoweb/sf-register/CVE-2026-46721.yaml</a></li>
-<li><a href="https://github.com/advisories/GHSA-v348-vr4q-fv9p">https://github.com/advisories/GHSA-v348-vr4q-fv9p</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-v348-vr4q-fv9p</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-19T12:31:39.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[evoweb/sf-register] TYPO3 sf_register extension allows unauthorized assignment of frontend user groups]]></title>
-        <id>https://github.com/advisories/GHSA-v348-vr4q-fv9p</id>
-        <link href="https://github.com/advisories/GHSA-v348-vr4q-fv9p"/>
-        <updated>2026-06-29T22:58:07.000Z</updated>
-        <content type="html"><![CDATA[<p>The <code>create</code> and <code>edit</code> flows in the TYPO3 extension sf_register do not restrict which user properties may be submitted, and do not enforce access control on the frontend user group assignment. As a result, an attacker can assign an arbitrary frontend user group to a newly registered or edited account, gaining unauthorized access to content and functionality restricted to privileged frontend user groups.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-46721">https://nvd.nist.gov/vuln/detail/CVE-2026-46721</a></li>
-<li><a href="https://typo3.org/security/advisory/typo3-ext-sa-2026-009">https://typo3.org/security/advisory/typo3-ext-sa-2026-009</a></li>
-<li><a href="https://github.com/FriendsOfPHP/security-advisories/blob/master/evoweb/sf-register/CVE-2026-46721.yaml">https://github.com/FriendsOfPHP/security-advisories/blob/master/evoweb/sf-register/CVE-2026-46721.yaml</a></li>
-<li><a href="https://github.com/advisories/GHSA-v348-vr4q-fv9p">https://github.com/advisories/GHSA-v348-vr4q-fv9p</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-v348-vr4q-fv9p</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-05-19T12:31:39.000Z</published>
     </entry>
 </feed>
