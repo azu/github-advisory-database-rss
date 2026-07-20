@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-07-20T11:34:18.551Z</updated>
+    <updated>2026-07-20T13:45:42.362Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,172 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[vllm] vLLM: incomplete CVE-2026-22778 fix leaks PIL repr addresses via Anthropic router]]></title>
+        <id>https://github.com/advisories/GHSA-hgg8-fqqc-vfmw</id>
+        <link href="https://github.com/advisories/GHSA-hgg8-fqqc-vfmw"/>
+        <updated>2026-07-20T13:36:38.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="vllm-incomplete-cve-2026-22778-fix-leaks-pil-repr-addresses-via-the-anthropic-api-router">vLLM: incomplete CVE-2026-22778 fix leaks PIL repr addresses via the Anthropic API router</h1>
+<p><strong>Researcher:</strong> Kai Aizen — SnailSploit (@SnailSploit), Adversarial &amp; Offensive Security Research
+<strong>Severity:</strong> CVSS 3.1 5.3 (Medium)  <code>AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N</code>
+<strong>Target:</strong> <a href="https://github.com/vllm-project/vllm">https://github.com/vllm-project/vllm</a></p>
+<hr>
+<h2 id="summary">Summary</h2>
+<p>The fix for CVE-2026-22778 / GHSA-4r2x-xpjr-7cvv (PRs #31987 and #32319) introduced <code>sanitize_message</code> and applied it at four FastAPI exception-handling sites in the OpenAI router. The sanitizer strips object-repr memory addresses (<code>&lt;_io.BytesIO object at 0x7a95e299e750&gt;</code> → <code>&lt;_io.BytesIO object&gt;</code>) before error messages reach the client, defeating the ASLR-bypass primitive that CVE-2026-22778 chained with a libopenjp2 heap overflow for RCE.</p>
+<p>The fix is incomplete: response paths added to vLLM at or after the same time as the fix continue to echo <code>str(exc)</code> directly to clients without <code>sanitize_message</code>. The original Stage 1 primitive — sending malformed image bytes so PIL raises <code>UnidentifiedImageError</code> whose message contains the BytesIO object repr — reaches all of them unmodified and leaks the heap address verbatim in the response body.</p>
+<p>All five lines below are present in <code>main</code> HEAD (<code>771e1e48b</code>, 2026-05-26).</p>
+<h2 id="affected-sites">Affected sites</h2>
+<p>Current <code>main</code> HEAD (<code>771e1e48b</code>, 2026-05-26):</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>File</th>
+<th>Line</th>
+<th>Code</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td><code>vllm/entrypoints/anthropic/api_router.py</code></td>
+<td>78</td>
+<td><code>message=str(e),</code> (inside <code>POST /v1/messages</code> exception handler)</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>vllm/entrypoints/anthropic/api_router.py</code></td>
+<td>124</td>
+<td><code>message=str(e),</code> (inside <code>POST /v1/messages/count_tokens</code>)</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>vllm/entrypoints/anthropic/serving.py</code></td>
+<td>808</td>
+<td><code>error=AnthropicError(type="internal_error", message=str(e)),</code> (SSE streaming converter)</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>vllm/entrypoints/speech_to_text/realtime/connection.py</code></td>
+<td>75</td>
+<td><code>await self.send_error(str(e), "processing_error")</code> (WebSocket event loop)</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>vllm/entrypoints/speech_to_text/realtime/connection.py</code></td>
+<td>265</td>
+<td><code>await self.send_error(str(e), "processing_error")</code> (WebSocket generation loop)</td>
+</tr>
+</tbody></table>
+<h2 id="why-the-global-exception-handler-does-not-save-these-paths">Why the global exception handler does not save these paths</h2>
+<p><code>api_server.py</code> registers a catch-all <code>app.exception_handler(Exception)(exception_handler)</code> at line 262, and that handler calls <code>create_error_response(exc)</code> which DOES apply <code>sanitize_message</code>. However, FastAPI exception handlers fire only on <strong>unhandled</strong> exceptions that propagate out of a route function.</p>
+<p>All affected HTTP paths catch <code>Exception</code> <em>inside</em> the route coroutine and construct the response themselves:</p>
+<pre><code class="language-python"># vllm/entrypoints/anthropic/api_router.py:71-81 (POST /v1/messages)
+try:
+    generator = await handler.create_messages(request, raw_request)
+except Exception as e:
+    logger.exception("Error in create_messages: %s", e)
+    return JSONResponse(
+        status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        content=AnthropicErrorResponse(
+            error=AnthropicError(
+                type="internal_error",
+                message=str(e),       # &lt;-- unsanitized
+            )
+        ).model_dump(),
+    )
+</code></pre>
+<p>Because the exception is caught and a <code>JSONResponse</code> is returned in-route, every registered FastAPI exception handler — including the sanitizing global one — is bypassed. The WebSocket path bypasses it for a different reason: WebSocket frames don't traverse FastAPI's HTTP exception handler chain at all.</p>
+<h2 id="reachability--the-same-primitive-as-the-parent-cve">Reachability — the same primitive as the parent CVE</h2>
+<p>The Anthropic Messages API accepts image content parts in the request body (<code>type: "image"</code> with base64 <code>source.data</code> or <code>type: "image_url"</code>). Image bytes are passed to the same multimodal loader used by the OpenAI router. Malformed bytes cause <code>PIL.Image.open</code> to raise:</p>
+<pre><code>UnidentifiedImageError: cannot identify image file &lt;_io.BytesIO object at 0x7a95e299e750&gt;
+</code></pre>
+<p>The exception propagates up through <code>handler.create_messages</code> into the <code>except Exception as e:</code> at <code>api_router.py:75</code>. <code>str(e)</code> returns the exception message verbatim, including the address. The address ends up in the <code>error.message</code> field of the JSON response body returned to the attacker. ASLR entropy on the affected process drops from ~4 billion to ~8 candidates, identically to CVE-2026-22778 Stage 1.</p>
+<p>The same primitive is reachable on <code>POST /v1/messages/count_tokens</code> (route #2), inside the SSE streaming converter when an exception is raised mid-stream (route #3), and over the realtime speech-to-text WebSocket when audio decoder or generation paths raise an exception containing any object repr (routes #4, #5).</p>
+<h2 id="chronology--these-are-scope-misses-not-legacy-code">Chronology — these are scope misses, not legacy code</h2>
+<ul>
+<li><strong>2026-01-09:</strong> PR #31987 (<code>aa125ecf0</code>) introduces <code>sanitize_message</code> and applies it to OpenAI router HTTP exception handlers.</li>
+<li><strong>2026-01-15</strong> (six days later): PR #32369 (<code>4c1c501a7</code>) adds <code>vllm/entrypoints/anthropic/api_router.py</code> containing line 78's <code>message=str(e)</code>. The fix was not applied to the new router.</li>
+<li><strong>2026-03-02</strong> (~two months later): PR #35588 (<code>9a87b0578</code>) adds the Anthropic <code>count_tokens</code> endpoint, replicating the same <code>message=str(e)</code> pattern at line 124.</li>
+<li><strong>2026-05-12</strong> (~four months later): PR #42370 (<code>d37e25ffb</code>) consolidates speech-to-text entrypoints and the realtime WebSocket uses <code>send_error(str(e), ...)</code> for both error paths.</li>
+<li><strong>2026-05-26:</strong> current <code>main</code> HEAD, all five lines still present.</li>
+</ul>
+<h2 id="cvss-v31">CVSS v3.1</h2>
+<p><code>AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N</code> — Base 5.3 (MEDIUM)</p>
+<p>The parent CVE-2026-22778 was 9.8 (CRITICAL) because it chained the Stage 1 leak with a Stage 2 libopenjp2 heap overflow. Stage 2 is patched in OpenCV ≥ 4.13.0 (PR #32668 bumped the requirement), so Stage 1 alone here is a partial ASLR-bypass info-disclosure primitive rather than a complete RCE. Deployments that ship vLLM alongside an older OpenCV/libopenjp2 (system OpenCV on long-LTS distros, custom Docker images, downstream rebuilds) re-enable the full chain via the affected endpoints.</p>
+<h2 id="cwe">CWE</h2>
+<p>CWE-532 (Insertion of Sensitive Information into Log File / Error Message). Same CWE assigned to the parent CVE-2026-22778.</p>
+<h2 id="remediation">Remediation</h2>
+<h3 id="1-apply-sanitize_message-symmetrically-to-the-five-sites">1. Apply <code>sanitize_message</code> symmetrically to the five sites</h3>
+<pre><code class="language-python"># vllm/entrypoints/anthropic/api_router.py — add at top:
+from vllm.entrypoints.utils import sanitize_message
+
+# Line 78 (POST /v1/messages) and Line 124 (count_tokens):
+message=sanitize_message(str(e)),
+</code></pre>
+<pre><code class="language-python"># vllm/entrypoints/anthropic/serving.py — add at top:
+from vllm.entrypoints.utils import sanitize_message
+
+# Line 808:
+error=AnthropicError(type="internal_error", message=sanitize_message(str(e))),
+</code></pre>
+<pre><code class="language-python"># vllm/entrypoints/speech_to_text/realtime/connection.py — add at top:
+from vllm.entrypoints.utils import sanitize_message
+
+# Lines 75 and 265:
+await self.send_error(sanitize_message(str(e)), "processing_error")
+</code></pre>
+<h3 id="2-tighten-the-regex-defense-in-depth">2. Tighten the regex (defense in depth)</h3>
+<p>The current regex <code>r" at 0x[0-9a-f]+&gt;"</code> is narrow — it only matches the exact CPython builtin object-repr suffix in lowercase hex with a trailing <code>&gt;</code>. Future Python versions, C extensions, or custom <code>__repr__</code> methods could produce non-matching formats that re-enable the leak:</p>
+<pre><code class="language-python"># vllm/entrypoints/utils.py
+def sanitize_message(message: str) -&gt; str:
+    # Strip any standalone hex address; downstream observers don't need them.
+    return re.sub(r"\b0x[0-9a-fA-F]{6,}\b", "0x?", message)
+</code></pre>
+<h3 id="3-future-proofing-consider-a-response-middleware">3. Future-proofing: consider a response middleware</h3>
+<p>Both the route-local exception handling pattern (Anthropic router) and the WebSocket path bypass FastAPI's exception handler chain. A response-level middleware that always invokes <code>sanitize_message</code> on outgoing error bodies would prevent this class of regression entirely.</p>
+<h2 id="affected-versions">Affected versions</h2>
+<ul>
+<li>All vLLM versions containing <code>vllm/entrypoints/anthropic/api_router.py</code> (introduced 2026-01-15 in PR #32369).</li>
+<li>All vLLM versions containing <code>vllm/entrypoints/speech_to_text/realtime/connection.py</code> (introduced 2026-05-12 in PR #42370).</li>
+<li>Confirmed present in <code>main</code> HEAD <code>771e1e48b</code> (2026-05-26).</li>
+</ul>
+<h2 id="references">References</h2>
+<ul>
+<li>Parent advisory: <a href="https://github.com/vllm-project/vllm/security/advisories/GHSA-4r2x-xpjr-7cvv">https://github.com/vllm-project/vllm/security/advisories/GHSA-4r2x-xpjr-7cvv</a> (CVE-2026-22778)</li>
+<li>Fix PRs to model the patch on: #31987, #32319, #32668</li>
+<li><code>vllm/entrypoints/utils.py:sanitize_message</code>: <a href="https://github.com/vllm-project/vllm/blob/771e1e48b/vllm/entrypoints/utils.py#L323-L326">https://github.com/vllm-project/vllm/blob/771e1e48b/vllm/entrypoints/utils.py#L323-L326</a></li>
+<li><code>vllm/entrypoints/anthropic/api_router.py</code> leak site: <a href="https://github.com/vllm-project/vllm/blob/771e1e48b/vllm/entrypoints/anthropic/api_router.py#L78">https://github.com/vllm-project/vllm/blob/771e1e48b/vllm/entrypoints/anthropic/api_router.py#L78</a></li>
+</ul>
+<h2 id="steps-to-reproduce">Steps to reproduce</h2>
+<ol>
+<li>Clone the target: <code>git clone --depth 1 https://github.com/vllm-project/vllm</code></li>
+<li>Run the proof of concept (<code>PoC.py</code>) against the cloned source.</li>
+<li>Observe the result shown under <em>Verified result</em> below.</li>
+</ol>
+<h2 id="credit">Credit</h2>
+<p>Kai Aizen — SnailSploit (@SnailSploit). Adversarial &amp; Offensive Security Research.</p>
+<h2 id="fix">Fix</h2>
+<p>A fix for this vulnerability was added here: <a href="https://github.com/vllm-project/vllm/pull/45119">https://github.com/vllm-project/vllm/pull/45119</a></p>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/vllm-project/vllm/security/advisories/GHSA-hgg8-fqqc-vfmw">https://github.com/vllm-project/vllm/security/advisories/GHSA-hgg8-fqqc-vfmw</a></li>
+<li><a href="https://github.com/vllm-project/vllm/pull/45119">https://github.com/vllm-project/vllm/pull/45119</a></li>
+<li><a href="https://github.com/vllm-project/vllm/commit/94923629729381d7f7c9efde72071a2441f7fd82">https://github.com/vllm-project/vllm/commit/94923629729381d7f7c9efde72071a2441f7fd82</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-54236">https://nvd.nist.gov/vuln/detail/CVE-2026-54236</a></li>
+<li><a href="https://github.com/advisories/GHSA-hgg8-fqqc-vfmw">https://github.com/advisories/GHSA-hgg8-fqqc-vfmw</a></li>
+<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/vllm/PYSEC-2026-3408.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/vllm/PYSEC-2026-3408.yaml</a></li>
+<li><a href="https://github.com/vllm-project/vllm">https://github.com/vllm-project/vllm</a></li>
+<li><a href="https://pypi.org/project/vllm">https://pypi.org/project/vllm</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-hgg8-fqqc-vfmw</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-17T14:04:09.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[pocketsphinx] PocketSphinx: Buffer overflows in language and acoustic model loading code]]></title>
         <id>https://github.com/advisories/GHSA-56r5-2p2f-7cxp</id>
@@ -2210,51 +2376,5 @@ vllm.v1.engine.exceptions.EngineDeadError: EngineCore encountered an issue. See 
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-06-17T14:02:22.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[vllm] vLLM: OOM Denial of Service via Audio Decompression Bomb]]></title>
-        <id>https://github.com/advisories/GHSA-6pr9-rp53-2pmc</id>
-        <link href="https://github.com/advisories/GHSA-6pr9-rp53-2pmc"/>
-        <updated>2026-07-17T16:39:17.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>vLLM's <code>/v1/audio/transcriptions</code> endpoint limits compressed upload size but not decoded PCM output. A 25MB OPUS file expands to ~14.9GB of float32 PCM at decode time. Tested on vLLM v0.19.0.</p>
-<h3 id="details">Details</h3>
-<p><code>SpeechToTextProcessor</code> rejects uploads over <code>VLLM_MAX_AUDIO_CLIP_FILESIZE_MB</code> (default 25MB) based on compressed byte length, but the audio decoder in <code>audio.py</code> accumulates all decoded frames into memory with no size limit before returning:</p>
-<pre><code class="language-python"># speech_to_text.py L184-189
-if len(audio_data) / 1024 ** 2 &gt; self.max_audio_filesize_mb:
-    raise VLLMValidationError(...)
-y, sr = load_audio(buf, sr=self.asr_config.sample_rate)  # decoded size unchecked
-
-# audio.py L77-107
-chunks: list[npt.NDArray] = []
-for frame in container.decode(stream):
-    chunks.append(frame.to_ndarray())
-audio = np.concatenate(chunks, axis=-1).astype(np.float32)  # single contiguous allocation
-</code></pre>
-<p>A 25MB OPUS file at 6kbps encodes ~8.7 hours of audio. Decoding produces ~5.7GB of float32 PCM (232x amplification), and <code>np.concatenate</code> then allocates a second contiguous array, bringing peak RSS to ~14.9GB from a single request. <code>SpeechToTextConfig.max_audio_clip_s</code> (default 30s) applies only after the full decode and does not prevent the allocation.</p>
-<h3 id="impact">Impact</h3>
-<p>An unauthenticated attacker can exhaust server memory with a small number of concurrent requests, each a valid upload within the documented size limit. Severity was assessed with reference to prior OOM vulnerability reports in vLLM.</p>
-<h3 id="fix">Fix</h3>
-<p>A fix for this vulnerability was merged here: <a href="https://github.com/vllm-project/vllm/pull/44970">https://github.com/vllm-project/vllm/pull/44970</a></p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/vllm-project/vllm/security/advisories/GHSA-6pr9-rp53-2pmc">https://github.com/vllm-project/vllm/security/advisories/GHSA-6pr9-rp53-2pmc</a></li>
-<li><a href="https://github.com/vllm-project/vllm/pull/44970">https://github.com/vllm-project/vllm/pull/44970</a></li>
-<li><a href="https://github.com/vllm-project/vllm/commit/1b1359c33269446f13c05da9a90c25174cbea590">https://github.com/vllm-project/vllm/commit/1b1359c33269446f13c05da9a90c25174cbea590</a></li>
-<li><a href="https://github.com/vllm-project/vllm/releases/tag/v0.23.1rc0">https://github.com/vllm-project/vllm/releases/tag/v0.23.1rc0</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-54233">https://nvd.nist.gov/vuln/detail/CVE-2026-54233</a></li>
-<li><a href="https://github.com/advisories/GHSA-6pr9-rp53-2pmc">https://github.com/advisories/GHSA-6pr9-rp53-2pmc</a></li>
-<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/vllm/PYSEC-2026-3404.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/vllm/PYSEC-2026-3404.yaml</a></li>
-<li><a href="https://github.com/vllm-project/vllm">https://github.com/vllm-project/vllm</a></li>
-<li><a href="https://pypi.org/project/vllm">https://pypi.org/project/vllm</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-6pr9-rp53-2pmc</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-17T14:06:22.000Z</published>
     </entry>
 </feed>
