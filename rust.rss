@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rust.rss</id>
     <title>Security Advisory for Rust crates</title>
-    <updated>2026-07-28T12:29:16.121Z</updated>
+    <updated>2026-07-28T15:10:09.136Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arust"/>
     <subtitle>Security Advisory for Rust crates on GitHub</subtitle>
@@ -11,6 +11,157 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[lettre] lettre has TLS hostname verification disabled when using Boring TLS backend]]></title>
+        <id>https://github.com/advisories/GHSA-4pj9-g833-qx53</id>
+        <link href="https://github.com/advisories/GHSA-4pj9-g833-qx53"/>
+        <updated>2026-07-28T14:29:11.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>An inverted-boolean bug in lettre's <code>boring-tls</code> integration silently
+disables TLS hostname verification for callers using the default (strict)
+configuration. An on-path attacker presenting any chain-valid certificate
+for any domain can intercept SMTP submission, including PLAIN/LOGIN
+credentials and message contents, against any lettre user built with the
+<code>boring-tls</code> feature. Other TLS backends (<code>native-tls</code>, <code>rustls</code>) are
+unaffected.</p>
+<h3 id="details">Details</h3>
+<p>boring's <code>SslConnectorBuilder::set_verify_hostname(bool)</code> /
+<code>verify_hostname(bool)</code> API takes a <em>verify</em> flag — <code>true</code> means enforce
+hostname verification, <code>false</code> means skip it. (Boring docs:
+<a href="https://docs.rs/boring/latest/boring/ssl/struct.ConnectConfiguration.html#method.set_verify_hostname">https://docs.rs/boring/latest/boring/ssl/struct.ConnectConfiguration.html#method.set_verify_hostname</a>)
+lettre's <code>TlsParametersBuilder</code> exposes the opposite-named flag
+<code>accept_invalid_hostnames: bool</code> — <code>true</code> means <em>accept invalid</em> (skip
+verification), <code>false</code> means verify. lettre passes this flag directly to
+boring at both TLS-upgrade sites, inverting the semantics:
+src/transport/smtp/client/net.rs:202 (sync)
+    .verify_hostname(*accept_invalid_hostnames)
+src/transport/smtp/client/async_net.rs:377 (async)
+    config.set_verify_hostname(accept_invalid_hostnames);
+Concrete behaviour under <code>boring-tls</code>:</p>
+<ul>
+<li>accept_invalid_hostnames = false  (the strict default)
+  → set_verify_hostname(false)  → hostname verification SKIPPED
+(wrong; the caller asked for strict verification)</li>
+<li>accept_invalid_hostnames = true   (explicit opt-in to "dangerous")
+  → set_verify_hostname(true)   → hostname verification ENFORCED
+(wrong; the caller opted into accepting any name)</li>
+</ul>
+<p>Boring's own warning on <code>set_verify_hostname</code>:
+    "If hostname verification is not used, <em>any</em> valid certificate for
+    <em>any</em> site will be trusted for use from any other. This introduces
+    a significant vulnerability to man-in-the-middle attacks."
+<code>native-tls</code> (src/transport/smtp/client/tls.rs:355) uses
+<code>danger_accept_invalid_hostnames(self.accept_invalid_hostnames)</code>, whose
+flag name and semantics match lettre's — unaffected. <code>rustls</code> uses a
+separate verifier path — unaffected.
+The bug was introduced in PR #797 ("Add support for boring TLS"), commit
+985fa7e, first released in v0.10.1, and persists unchanged through v0.11.21
+(latest). Zero existing tests cover <code>accept_invalid_hostnames</code> end-to-end
+with any backend, which is why the inversion has gone undetected.
+Fix: negate the flag at both call sites. Two-line patch:
+    -    .verify_hostname(*accept_invalid_hostnames)
+    +    .verify_hostname(!*accept_invalid_hostnames)
+    -    config.set_verify_hostname(accept_invalid_hostnames);
+    +    config.set_verify_hostname(!accept_invalid_hostnames);
+I have the patch ready locally and can push to a private fork if a
+collaborative fix branch is preferred.</p>
+<h3 id="poc">PoC</h3>
+<p>Setup (any lettre version &gt;= v0.10.1, built with the <code>boring-tls</code>
+feature, default-strict configuration):</p>
+<ol>
+<li>Generate a TLS cert for any hostname the attacker controls, e.g.
+<code>attacker.example</code>, signed by any CA in the client's trust store
+(e.g. a Let's Encrypt cert is sufficient).</li>
+<li>Stand up an attacker SMTP server on the network path between the
+lettre client and the intended MX. Have it present the
+<code>attacker.example</code> cert on STARTTLS or implicit TLS.</li>
+<li>Use lettre with default-strict TLS to send to the real MX hostname,
+e.g. <code>mail.example.com</code>:
+use lettre::transport::smtp::client::{Tls, TlsParameters};
+use lettre::{AsyncSmtpTransport, Tokio1Executor, Message};
+let tls = TlsParameters::builder("mail.example.com".to_owned())
+    .build_boring()
+    .unwrap();
+let mailer = AsyncSmtpTransport::::relay(
+        "mail.example.com",
+    )?
+    .tls(Tls::Required(tls))
+    .build();
+mailer.send(message).await?;     // succeeds against attacker</li>
+</ol>
+<p>Expected with hostname verification: handshake fails because the
+presented leaf cert's SAN does not match <code>mail.example.com</code>.
+Actual on <code>boring-tls</code>: handshake succeeds. lettre proceeds with the
+SMTP transaction, sending MAIL FROM, RCPT TO, message body, and any
+configured SMTP AUTH credentials to the attacker.
+Symmetric inverse PoC (proves the inversion, not just a missing check):
+configure <code>.dangerous_accept_invalid_hostnames(true)</code> and try to connect
+to a server whose cert SAN matches the connect domain. With the bug,
+the handshake <em>fails</em> because lettre passes <code>true</code> to <code>verify_hostname</code>
+and boring rejects... actually wait, it succeeds (SAN matches). Better
+inverse demonstration: connect to a server whose cert SAN matches the
+connect domain with <code>accept_invalid_hostnames=true</code>, then connect to a
+mismatched-SAN server with the same flag — the latter is rejected,
+proving the flag is inverted (the user opted into accepting any name,
+yet lettre enforces strict verification).
+A reproducer cargo project can be produced on request.</p>
+<h3 id="impact">Impact</h3>
+<p>Who is impacted: any lettre user who</p>
+<ol>
+<li>enables the <code>boring-tls</code> feature, AND</li>
+<li>relies on default-strict hostname verification
+(i.e. does NOT call <code>.dangerous_accept_invalid_hostnames(true)</code>).
+This is the entire "I want strict TLS" population on <code>boring-tls</code>. They
+get the opposite of what they asked for: a TLS handshake that ignores
+hostname mismatch.
+Exploitation: an attacker on the network path between the lettre client
+and the target SMTP server, holding any chain-valid TLS certificate
+(e.g. a free Let's Encrypt cert for a domain the attacker owns), can
+present that certificate when the lettre client connects to the intended
+MX. boring accepts the handshake, lettre proceeds, and the attacker
+gains read/write access to:</li>
+</ol>
+<ul>
+<li>SMTP envelope (MAIL FROM, RCPT TO)</li>
+<li>Message bodies, attachments, headers</li>
+<li>Any SMTP AUTH credentials (PLAIN, LOGIN, CRAM-MD5, etc.)</li>
+<li>Any DKIM signatures and DMARC alignment downstream depends on
+can be inspected and selectively dropped
+Confidentiality and integrity impact: High. Availability impact: None
+direct (the attacker can choose to forward or drop, but the bug itself
+does not deny service).
+Cloudflare's email-fwdr independently identified and mitigated this
+downstream by promoting a previously-metric-only post-handshake SAN
+check to a hard error (fix landed 2026-05-12). Because we're mitigated
+downstream, we are not on a publication clock; we are reporting so the
+upstream fix can ship and other lettre+boring-tls deployments can stop
+relying on per-caller workarounds. Happy to coordinate on embargo
+timing.
+Affected versions: every released lettre version with <code>boring-tls</code>
+support, from v0.10.1 (PR #797, commit 985fa7e) through v0.11.21
+(latest). No prior advisory or fix.
+Suggested fix: two-line negation of the flag at the boring call sites
+(see Details). Patch is ready locally and can be attached to a private
+collaboration fork.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/lettre/lettre/security/advisories/GHSA-4pj9-g833-qx53">https://github.com/lettre/lettre/security/advisories/GHSA-4pj9-g833-qx53</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-46428">https://nvd.nist.gov/vuln/detail/CVE-2026-46428</a></li>
+<li><a href="https://github.com/lettre/lettre/commit/f5efffc88360dbdbfcef80f465e42d5bce68ca35">https://github.com/lettre/lettre/commit/f5efffc88360dbdbfcef80f465e42d5bce68ca35</a></li>
+<li><a href="https://github.com/lettre/lettre/releases/tag/v0.11.22">https://github.com/lettre/lettre/releases/tag/v0.11.22</a></li>
+<li><a href="https://rustsec.org/advisories/RUSTSEC-2026-0141.html">https://rustsec.org/advisories/RUSTSEC-2026-0141.html</a></li>
+<li><a href="https://github.com/advisories/GHSA-4pj9-g833-qx53">https://github.com/advisories/GHSA-4pj9-g833-qx53</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-4pj9-g833-qx53</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-07-28T14:29:10.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[aws-smithy-http-server] Smithy-RS: Allocation of resources without limits in the default aws-smithy-http-server serve() path allows unauthenticated Slowloris denial of service]]></title>
         <id>https://github.com/advisories/GHSA-jvxp-qmx7-gjpx</id>
@@ -1296,44 +1447,5 @@ fn main() {
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-07-09T23:20:12.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[oneringbuf] OneRingBuf has a Use After Free Vulnerability]]></title>
-        <id>https://github.com/advisories/GHSA-q95x-7g78-rccv</id>
-        <link href="https://github.com/advisories/GHSA-q95x-7g78-rccv"/>
-        <updated>2026-07-08T20:26:24.000Z</updated>
-        <content type="html"><![CDATA[<p>Affected versions of <code>oneringbuf</code> exposed the obsolete <code>IntoRef::into_ref</code> method through the public <code>IntoRef</code> trait. For heap-backed ring buffers, this method returned a <code>DroppableRef</code> handle.</p>
-<p><code>DroppableRef</code> stored an owning raw pointer created from <code>Box::into_raw</code>. Its <code>Clone</code> implementation copied this raw pointer without incrementing the internal <code>alive_iters</code> counter. Internally, this clone pattern appears to rely on a fixed number of handles being created to match the initial <code>alive_iters</code> value. However, exposing <code>DroppableRef</code> through the public <code>IntoRef::TargetRef</code> associated type allows safe external code to create additional clones beyond that fixed count, breaking the lifetime protocol. <code>Drop</code> later dereferenced the pointer and could free the backing allocation with <code>Box::from_raw</code>.</p>
-<p>Safe code could call <code>IntoRef::into_ref</code> to obtain a <code>DroppableRef</code> and then clone it. Each clone pointed to the same allocation, but the internal <code>alive_iters</code> counter was not increased. As a result, one clone could free the allocation while another clone still existed. Dropping the remaining clone then accessed freed memory, causing a heap-use-after-free.</p>
-<p>The issue was fixed in version 0.8.0 by removing the obsolete <code>into_ref</code> method.</p>
-<h2 id="trigger">Trigger</h2>
-<pre><code class="language-rust">use oneringbuf::{IntoRef, LocalHeapRB};
-
-fn main() {
-    let rb = LocalHeapRB::&lt;usize&gt;::from(vec![1, 2, 3]);
-
-    let r = &lt;LocalHeapRB&lt;usize&gt; as IntoRef&gt;::into_ref(rb);
-    let r2 = r.clone();
-    let r3 = r.clone();
-
-    drop(r);
-    drop(r2);
-    drop(r3); // AddressSanitizer: heap-use-after-free
-}
-</code></pre>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/skilvingr/rust-oneringbuf/commit/643a24b30914068416dff9021a069c12c865a316">https://github.com/skilvingr/rust-oneringbuf/commit/643a24b30914068416dff9021a069c12c865a316</a></li>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2026-0152.html">https://rustsec.org/advisories/RUSTSEC-2026-0152.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-q95x-7g78-rccv">https://github.com/advisories/GHSA-q95x-7g78-rccv</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-q95x-7g78-rccv</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-08T20:26:23.000Z</published>
     </entry>
 </feed>
