@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rust.rss</id>
     <title>Security Advisory for Rust crates</title>
-    <updated>2026-07-31T19:05:49.956Z</updated>
+    <updated>2026-07-31T20:51:46.506Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arust"/>
     <subtitle>Security Advisory for Rust crates on GitHub</subtitle>
@@ -11,6 +11,114 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[zaino-state] zaino-state has a Non-Finalized State Reorg — No Cycle Detection or Depth Limit]]></title>
+        <id>https://github.com/advisories/GHSA-3whf-vgf2-9w6g</id>
+        <link href="https://github.com/advisories/GHSA-3whf-vgf2-9w6g"/>
+        <updated>2026-07-31T19:49:36.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>NonFinalizedState::handle_reorg</code> is a recursive, unbounded async function that traverses parent blocks until it finds a common ancestor on the main chain. It has <strong>no recursion depth limit</strong> and <strong>no cycle detection</strong>. A malicious or buggy validator can serve a block whose <code>previous_block_hash</code> points back to itself (or forms a cycle with other blocks), causing <code>handle_reorg</code> to infinite-loop, consuming 100% CPU and never making sync progress. Additionally, <code>update()</code> contains an <code>.expect("empty snapshot impossible")</code> that panics if the non-finalized snapshot becomes empty after trimming finalized blocks.</p>
+<h3 id="details">Details</h3>
+<p><strong>Location:</strong> <code>packages/zaino-state/src/chain_index/non_finalised_state.rs:443-489</code></p>
+<pre><code class="language-rust">async fn handle_reorg(
+    &amp;self,
+    working_snapshot: &amp;mut NonfinalizedBlockCacheSnapshot,
+    block: &amp;impl Block,
+) -&gt; Result&lt;IndexedBlock, SyncError&gt; {
+    let prev_block = match working_snapshot
+        .get_block_by_hash_bytes_in_serialized_order(block.prev_hash_bytes_serialized_order())
+        .cloned()
+    {
+        Some(prev_block) =&gt; {
+            if !working_snapshot
+                .heights_to_hashes
+                .values()
+                .any(|hash| hash == prev_block.hash())
+            {
+                Box::pin(self.handle_reorg(working_snapshot, &amp;prev_block)).await?  // &lt;-- LINE 459
+            } else {
+                prev_block
+            }
+        }
+        None =&gt; {
+            let prev_block = self
+                .source
+                .get_block(HashOrHeight::Hash(
+                    zebra_chain::block::Hash::from_bytes_in_serialized_order(
+                        block.prev_hash_bytes_serialized_order(),
+                    ),
+                ))
+                .await
+                .map_err(|e| { ... })?
+                .ok_or(SyncError::ValidatorConnectionError(...))?;
+            Box::pin(self.handle_reorg(working_snapshot, &amp;*prev_block)).await?  // &lt;-- LINE 483
+        }
+    };
+    let indexed_block = block.to_indexed_block(&amp;prev_block, self).await?;
+    working_snapshot.add_block_new_chaintip(indexed_block.clone());
+    Ok(indexed_block)
+}
+</code></pre>
+<p><strong>Infinite loop via self-referencing block:</strong></p>
+<ol>
+<li>A compromised validator serves a block <code>B</code> where <code>B.prev_hash == B.hash</code>.</li>
+<li><code>handle_reorg</code> is called with <code>B</code>.</li>
+<li><code>get_block_by_hash_bytes_in_serialized_order(B.prev_hash)</code> finds <code>B</code> itself in <code>working_snapshot.blocks</code>.</li>
+<li>Check: is <code>B.hash</code> in <code>working_snapshot.heights_to_hashes</code>? If <code>B</code> is a new chaintip not yet on the main chain, <strong>no</strong>.</li>
+<li>Recurse with <code>prev_block</code> = <code>B</code> (the exact same block).</li>
+<li>This repeats forever. The async recursion builds a new <code>Box::pin</code> future each iteration, consuming heap memory and CPU.</li>
+</ol>
+<p><strong>Stack exhaustion via deep reorg:</strong>
+A deep reorg of &gt;1000 blocks would recurse &gt;1000 times. Each async recursion creates a new <code>Box::pin</code> future on the heap. While this won't exhaust the native stack immediately, it will allocate unbounded heap memory and CPU time, effectively DoS-ing the sync task.</p>
+<p><strong><code>.expect("empty snapshot impossible")</code> panic:</strong></p>
+<p><strong>Location:</strong> <code>packages/zaino-state/src/chain_index/non_finalised_state.rs:543-548</code></p>
+<pre><code class="language-rust">new_snapshot.remove_finalized_blocks(finalized_height);
+let best_block = &amp;new_snapshot
+    .blocks
+    .values()
+    .max_by_key(|block| block.chainwork())
+    .cloned()
+    .expect("empty snapshot impossible"); // &lt;-- LINE 548
+</code></pre>
+<p>If <code>finalized_height</code> is greater than or equal to all blocks in <code>new_snapshot.blocks</code>, <code>remove_finalized_blocks</code> retains only blocks at or above that height. If none exist, <code>new_snapshot.blocks</code> becomes empty. The <code>.expect()</code> then panics. While the comment claims this is "impossible," defensive programming dictates it is reachable under corruption or edge-case sync conditions.</p>
+<h3 id="poc">PoC</h3>
+<ol>
+<li>Run a regtest.</li>
+<li>Serve a block where <code>header.previous_block_hash == block.hash()</code>.</li>
+<li>Zaino's <code>NonFinalizedState::sync</code> enters <code>handle_reorg</code> and infinite-loops.</li>
+<li>Sync never completes. CPU usage pegs to 100%. No new blocks are served to clients.</li>
+</ol>
+<h3 id="fix">Fix</h3>
+<ol>
+<li><strong>Add an explicit recursion depth limit</strong> (e.g., max 1000 iterations) and return <code>SyncError::ReorgFailure</code> if exceeded:<pre><code class="language-rust">const MAX_REORG_DEPTH: usize = 1000;
+</code></pre>
+</li>
+<li><strong>Track visited hashes</strong> in a <code>HashSet&lt;BlockHash&gt;</code> during traversal to detect cycles and abort with an error.</li>
+<li><strong>Replace <code>.expect("empty snapshot impossible")</code></strong> with a proper <code>Err(UpdateError::DatabaseHole)</code> or similar error return.</li>
+</ol>
+<h3 id="additional-attack-vectors">Additional Attack Vectors</h3>
+<ul>
+<li><strong>Deep reorg DoS:</strong> A miner with significant hash power (or a compromised validator) triggers a deep reorg. Zaino spends excessive CPU and memory in <code>handle_reorg</code>, starving the async runtime and stalling response serving.</li>
+<li><strong>Fork-choice manipulation:</strong> By serving cyclic or very deep sidechains, an attacker can keep Zaino stuck in reorg handling indefinitely, preventing it from ever serving the real best chain.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/zingolabs/zaino/security/advisories/GHSA-3whf-vgf2-9w6g">https://github.com/zingolabs/zaino/security/advisories/GHSA-3whf-vgf2-9w6g</a></li>
+<li><a href="https://github.com/zingolabs/zaino/pull/1172">https://github.com/zingolabs/zaino/pull/1172</a></li>
+<li><a href="https://github.com/zingolabs/zaino/commit/428822509bc722eb9727681752686ede9bc87e77">https://github.com/zingolabs/zaino/commit/428822509bc722eb9727681752686ede9bc87e77</a></li>
+<li><a href="https://github.com/zingolabs/zaino/commit/d874295f1377bec7fd712ef75b364181b8c77d46">https://github.com/zingolabs/zaino/commit/d874295f1377bec7fd712ef75b364181b8c77d46</a></li>
+<li><a href="https://github.com/zingolabs/zaino/commit/e05112aac54ec3cdb6da29fbc143ea710b32f009">https://github.com/zingolabs/zaino/commit/e05112aac54ec3cdb6da29fbc143ea710b32f009</a></li>
+<li><a href="https://github.com/advisories/GHSA-3whf-vgf2-9w6g">https://github.com/advisories/GHSA-3whf-vgf2-9w6g</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-3whf-vgf2-9w6g</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-31T19:49:35.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[skilo] skilo add follows symbolic links, allowing arbitrary local file disclosure from a malicious skill source]]></title>
         <id>https://github.com/advisories/GHSA-6xx4-9wp6-65p7</id>
@@ -1426,27 +1534,5 @@ fn main() {
         </author>
         <category label="severity" term="LOW"/>
         <published>2026-07-14T17:48:35.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[exploration] `exploration` was removed from crates.io for malicious code]]></title>
-        <id>https://github.com/advisories/GHSA-99j7-fhr2-xfj4</id>
-        <link href="https://github.com/advisories/GHSA-99j7-fhr2-xfj4"/>
-        <updated>2026-07-10T19:32:24.000Z</updated>
-        <content type="html"><![CDATA[<p>A method within the <code>exploration</code> crate attempted to download and execute a payload from a remote site.</p>
-<p>The malicious crate had 1 version published on 2026-06-02, approximately 1 hour before removal, and had no evidence of actual usage. This crate had no dependencies on crates.io.</p>
-<p>Rustsec to Kirill Boychenko from the <a href="https://socket.dev/">Socket Threat Research Team</a> for reporting this crate.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2026-0155.html">https://rustsec.org/advisories/RUSTSEC-2026-0155.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-99j7-fhr2-xfj4">https://github.com/advisories/GHSA-99j7-fhr2-xfj4</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-99j7-fhr2-xfj4</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-07-10T19:32:24.000Z</published>
     </entry>
 </feed>

