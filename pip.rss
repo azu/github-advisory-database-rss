@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-08-13T17:48:13.028Z</updated>
+    <updated>2026-08-13T18:45:46.980Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,181 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[vllm] vLLM: Completion prompt lists fan out into unbounded engine requests]]></title>
+        <id>https://github.com/advisories/GHSA-87x5-vmc3-756j</id>
+        <link href="https://github.com/advisories/GHSA-87x5-vmc3-756j"/>
+        <updated>2026-08-13T18:40:09.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The <code>/v1/completions</code> request model accepts <code>prompt</code> as a list of text prompts or a list of token-id prompts without any outer prompt-count bound. The serving path turns each element into a separate engine input, creates one engine generator per element, merges all generators, and allocates a response slot per prompt. An authenticated API client can therefore turn one request into an attacker-chosen number of backend subrequests before any aggregate request-count budget is enforced.</p>
+<h2 id="technical-details">Technical Details</h2>
+<p><code>CompletionRequest.prompt</code> allows both list-shaped prompt inputs and scalar prompts:</p>
+<pre><code class="language-python"># vllm/entrypoints/openai/completion/protocol.py
+prompt: (
+    list[Annotated[int, Field(ge=0)]]
+    | list[list[Annotated[int, Field(ge=0)]]]
+    | str
+    | list[str]
+    | None
+) = None
+</code></pre>
+<p>The validator only requires some prompt-like input to be present:</p>
+<pre><code class="language-python">def validate_prompt_and_prompt_embeds(cls, data):
+    prompt = data.get("prompt")
+    prompt_embeds = data.get("prompt_embeds")
+    ...
+    if prompt_is_empty and embeds_is_empty:
+        raise VLLMValidationError(...)
+</code></pre>
+<p>The renderer then expands list-shaped prompts as a sequence. <code>prompt_to_seq()</code> wraps a scalar string or a single token-id list, but returns a <code>list[str]</code> or <code>list[list[int]]</code> unchanged:</p>
+<pre><code class="language-python"># vllm/renderers/inputs/preprocess.py
+def prompt_to_seq(prompt_or_prompts):
+    if isinstance(prompt_or_prompts, (dict, str, bytes)) or (
+        len(prompt_or_prompts) &gt; 0 and is_list_of(prompt_or_prompts, int)
+    ):
+        return [prompt_or_prompts]
+
+    return prompt_or_prompts
+</code></pre>
+<p><code>OnlineRenderer.preprocess_completion()</code> appends that whole sequence, and the renderer processes every element:</p>
+<pre><code class="language-python"># vllm/renderers/online_renderer.py
+prompts = list[SingletonPrompt | bytes]()
+if prompt_input is not None:
+    prompts.extend(prompt_to_seq(prompt_input))
+...
+parsed_prompts = [
+    prompt if isinstance(prompt, bytes) else parse_model_prompt(model_config, prompt)
+    for prompt in prompts
+]
+return await renderer.render_cmpl_async(parsed_prompts, tok_params, ...)
+</code></pre>
+<p>Finally, completion serving creates one backend generator and one response slot per rendered prompt:</p>
+<pre><code class="language-python"># vllm/entrypoints/openai/completion/serving.py
+generators: list[AsyncGenerator[RequestOutput, None]] = []
+for i, engine_input in enumerate(engine_inputs):
+    ...
+    generator = self.engine_client.generate(...)
+    generators.append(generator)
+
+result_generator = merge_async_iterators(*generators)
+num_prompts = len(engine_inputs)
+...
+final_res_batch: list[RequestOutput | None] = [None] * num_prompts
+</code></pre>
+<p>The violated invariant is that one HTTP request should have a bounded backend request count. Current code enforces per-prompt token and sampling limits, but not the number of prompts in the outer completion request.</p>
+<h2 id="pov">PoV</h2>
+<p>A minimal oversized request keeps normal generation parameters small but supplies a large outer prompt list:</p>
+<pre><code class="language-json">{
+  "model": "served-model",
+  "prompt": ["x", "x", "x"],
+  "max_tokens": 1,
+  "n": 1
+}
+</code></pre>
+<p>Scaling the <code>prompt</code> array to tens or hundreds of thousands of short entries makes the server allocate, preprocess, schedule, merge, and buffer one subrequest per entry. The same applies to token-id prompt lists:</p>
+<pre><code class="language-json">{
+  "model": "served-model",
+  "prompt": [[1], [1], [1]],
+  "max_tokens": 1,
+  "n": 1
+}
+</code></pre>
+<p>The intended negative control is a scalar prompt:</p>
+<pre><code class="language-json">{
+  "model": "served-model",
+  "prompt": "x",
+  "max_tokens": 1,
+  "n": 1
+}
+</code></pre>
+<p>The scalar string is wrapped as one prompt; the list form is not bounded and fans out by list length.</p>
+<h2 id="impact">Impact</h2>
+<p>An authenticated API client can make one <code>/v1/completions</code> request consume CPU, memory, async task scheduling, engine request slots, and response buffering proportional to an attacker-chosen outer prompt list. This can starve or disrupt other tenants sharing the same vLLM server. The report does not claim unauthenticated access, confidentiality impact, integrity impact, code execution, or impact where <code>/v1/completions</code> is not reachable by untrusted or semi-trusted clients.</p>
+<h2 id="suggested-fix">Suggested Fix</h2>
+<p>Reject oversized prompt lists before renderer preprocessing. Add an outer prompt-count limit to <code>CompletionRequest.prompt</code> when the prompt is <code>list[str]</code> or <code>list[list[int]]</code>, and consider making the limit configurable in the same style as the batch-chat and sampling-list bounds. The check should run before <code>OnlineRenderer.preprocess_completion()</code> expands the prompt sequence, so oversized requests do not allocate parsed prompt lists, async render/tokenization tasks, engine generators, or response result slots.</p>
+<p>Regression coverage should include a scalar prompt, a bounded prompt list, an oversized <code>list[str]</code>, and an oversized <code>list[list[int]]</code>. The oversized requests should fail with a controlled validation error before any backend generator is created.</p>
+<h2 id="affected-packageversions">Affected Package/Versions</h2>
+<p>Package ecosystem: pip</p>
+<p>Package name: <code>vllm</code></p>
+<p>Affected range confirmed by source proof: <code>&gt;=0.19.0, &lt;=0.24.0</code>; current <code>main</code> at <code>cbe9c40f998f13975b967773ac7e7920e115387f</code> remains affected.</p>
+<p>Patched versions: unknown.</p>
+<p>Latest release checked: <code>v0.24.0</code>, published on 2026-06-29.</p>
+<h2 id="github-advisory-metadata">GitHub Advisory Metadata</h2>
+<p>Package ecosystem: pip</p>
+<p>Package name: <code>vllm</code></p>
+<p>Vulnerable version range: <code>&gt;=0.19.0, &lt;=0.24.0</code></p>
+<p>Patched versions: unknown</p>
+<h2 id="advisory-history">Advisory History</h2>
+<p>Public issue and PR searches for <code>CompletionRequest prompt list</code>, <code>"prompt" "list[str]" "completion"</code>, and <code>"CompletionRequest" "max_length"</code> did not find an existing report or fix for this exact path.</p>
+<p>The closest published advisory is <code>GHSA-3mwp-wvh9-7528</code>, "OOM Denial of Service via Unbounded <code>n</code> Parameter in OpenAI API Server", patched in <code>0.19.0</code>. This report is distinct because it keeps <code>n=1</code> and uses the <code>/v1/completions</code> <code>prompt</code> outer list to create one engine request per prompt. The fix invariant is an outer prompt-count and aggregate request budget, not only a generated-sequence-count cap.</p>
+<p>The closest public PR is <code>vllm-project/vllm#45390</code>, which covers multiple DoS fixes including <code>GHSA-83mh-6mwq-3hg9</code> for <code>BatchChatCompletionRequest.messages</code>. That PR adds an outer bound to batch chat conversations, but its diff does not touch <code>vllm/entrypoints/openai/completion/protocol.py</code> or <code>vllm/entrypoints/openai/completion/serving.py</code>.</p>
+<p>Prior local/private report families checked included pooling/rerank batch fanout, derender token-id postprocessing, explicit <code>truncation_side</code> tokenizer-limit bypass, Python disaggregated generate prompt-length bypass, and priority scheduling. Those reports differ by endpoint, attacker-controlled field, sink, and fix surface.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/vllm-project/vllm/security/advisories/GHSA-87x5-vmc3-756j">https://github.com/vllm-project/vllm/security/advisories/GHSA-87x5-vmc3-756j</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-73559">https://nvd.nist.gov/vuln/detail/CVE-2026-73559</a></li>
+<li><a href="https://github.com/vllm-project/vllm/pull/47845">https://github.com/vllm-project/vllm/pull/47845</a></li>
+<li><a href="https://github.com/vllm-project/vllm/commit/675f4295cdfe0d870471c2b51bfeca3a68a9569e">https://github.com/vllm-project/vllm/commit/675f4295cdfe0d870471c2b51bfeca3a68a9569e</a></li>
+<li><a href="https://github.com/vllm-project/vllm/releases/tag/v0.26.0">https://github.com/vllm-project/vllm/releases/tag/v0.26.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-87x5-vmc3-756j">https://github.com/advisories/GHSA-87x5-vmc3-756j</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-87x5-vmc3-756j</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-08-13T18:40:06.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[homeassistant] Home Assistant Core vulnerable to Path Traversal via backup upload during onboarding]]></title>
+        <id>https://github.com/advisories/GHSA-5hxg-r395-fqxx</id>
+        <link href="https://github.com/advisories/GHSA-5hxg-r395-fqxx"/>
+        <updated>2026-08-13T18:37:35.000Z</updated>
+        <content type="html"><![CDATA[<p>Home Assistant Core before 2026.6.0 contains a path traversal vulnerability that allows unauthenticated attackers to write arbitrary files to any directory on the host filesystem by uploading a crafted backup archive during the initial onboarding window. Attackers can manipulate the 'name' field inside the uploaded archive's backup.json to supply an absolute path, causing pathlib.Path.<strong>truediv</strong> to discard the configured backup directory prefix and write attacker-controlled content to arbitrary locations, with full filesystem access when the process runs as root.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-64825">https://nvd.nist.gov/vuln/detail/CVE-2026-64825</a></li>
+<li><a href="https://github.com/home-assistant/core/pull/172368">https://github.com/home-assistant/core/pull/172368</a></li>
+<li><a href="https://github.com/home-assistant/core/commit/567fe858289876b68b8162a77bd46e1e1af79752">https://github.com/home-assistant/core/commit/567fe858289876b68b8162a77bd46e1e1af79752</a></li>
+<li><a href="https://github.com/home-assistant/core/releases/tag/2026.6.0">https://github.com/home-assistant/core/releases/tag/2026.6.0</a></li>
+<li><a href="https://www.vulncheck.com/advisories/home-assistant-core-path-traversal-file-write-via-backup-upload">https://www.vulncheck.com/advisories/home-assistant-core-path-traversal-file-write-via-backup-upload</a></li>
+<li><a href="https://github.com/advisories/GHSA-5hxg-r395-fqxx">https://github.com/advisories/GHSA-5hxg-r395-fqxx</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-5hxg-r395-fqxx</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-07-21T18:31:02.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[mlflow] MLflow: trace API endpoints lack proper authorization validators]]></title>
+        <id>https://github.com/advisories/GHSA-2cm6-r77w-6g96</id>
+        <link href="https://github.com/advisories/GHSA-2cm6-r77w-6g96"/>
+        <updated>2026-08-13T18:27:49.000Z</updated>
+        <content type="html"><![CDATA[<p>In MLflow versions prior to 3.13.0, when running with authentication enabled, the trace API endpoints lack proper authorization validators. This allows any authenticated user to bypass experiment-level authorization controls on all trace operations, including reading, deleting, and modifying traces on experiments they do not have permission to access. The issue arises from the <code>_before_request</code> handler, which does not register authorization validators for trace endpoints, resulting in requests proceeding without validation. This vulnerability can expose sensitive data, destroy audit logs, and allow unauthorized modifications.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-8147">https://nvd.nist.gov/vuln/detail/CVE-2026-8147</a></li>
+<li><a href="https://github.com/mlflow/mlflow/commit/f9b1eb510478570609ef451984a255775aa4b937">https://github.com/mlflow/mlflow/commit/f9b1eb510478570609ef451984a255775aa4b937</a></li>
+<li><a href="https://huntr.com/bounties/b00c3ddd-373e-492f-9bf0-41a28bb21ed5">https://huntr.com/bounties/b00c3ddd-373e-492f-9bf0-41a28bb21ed5</a></li>
+<li><a href="https://github.com/mlflow/mlflow/pull/23014">https://github.com/mlflow/mlflow/pull/23014</a></li>
+<li><a href="https://github.com/mlflow/mlflow/releases/tag/v3.13.0">https://github.com/mlflow/mlflow/releases/tag/v3.13.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-2cm6-r77w-6g96">https://github.com/advisories/GHSA-2cm6-r77w-6g96</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-2cm6-r77w-6g96</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-02T09:32:03.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[libp2p] libp2p: yamux connection DoS via oversized data frame]]></title>
         <id>https://github.com/advisories/GHSA-hmj8-5xmh-5573</id>
@@ -1127,86 +1302,5 @@ def _check_private_networks(self, ip_addr, hostname):
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-07-19T21:30:20.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[keras] Keras: TorchModuleWrapper can deserialize unsafe PyTorch pickle data]]></title>
-        <id>https://github.com/advisories/GHSA-v2w2-w228-c444</id>
-        <link href="https://github.com/advisories/GHSA-v2w2-w228-c444"/>
-        <updated>2026-08-07T20:33:50.000Z</updated>
-        <content type="html"><![CDATA[<p>A vulnerability in keras-team/keras version 3.15.0 allows unsafe deserialization of attacker-controlled PyTorch pickle data through the public <code>keras.layers.TorchModuleWrapper.from_config</code> method. This method invokes <code>torch.load(..., weights_only=False)</code> without requiring an explicit unsafe opt-in, such as a <code>safe_mode=False</code> parameter. When called outside a <code>SafeModeScope(True)</code> context, the absence of an ambient safe mode state permits unsafe deserialization by default. This issue can lead to arbitrary code execution if untrusted Keras layer configurations are processed using this method. The vulnerability arises because the method does not enforce safe deserialization practices unless explicitly guarded by Keras safe mode.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-12484">https://nvd.nist.gov/vuln/detail/CVE-2026-12484</a></li>
-<li><a href="https://huntr.com/bounties/ab14df49-13b5-4442-b754-3189430bfa28">https://huntr.com/bounties/ab14df49-13b5-4442-b754-3189430bfa28</a></li>
-<li><a href="https://github.com/keras-team/keras/pull/23048">https://github.com/keras-team/keras/pull/23048</a></li>
-<li><a href="https://github.com/keras-team/keras/pull/23165">https://github.com/keras-team/keras/pull/23165</a></li>
-<li><a href="https://github.com/keras-team/keras/commit/55888d3becbdbb45dc16a55b489900f911e2dde5">https://github.com/keras-team/keras/commit/55888d3becbdbb45dc16a55b489900f911e2dde5</a></li>
-<li><a href="https://github.com/keras-team/keras/commit/d338a45204bdc787c8b3c4a9b82c1911cd52dedf">https://github.com/keras-team/keras/commit/d338a45204bdc787c8b3c4a9b82c1911cd52dedf</a></li>
-<li><a href="https://github.com/keras-team/keras/releases/tag/v3.12.3">https://github.com/keras-team/keras/releases/tag/v3.12.3</a></li>
-<li><a href="https://github.com/keras-team/keras/releases/tag/v3.15.0">https://github.com/keras-team/keras/releases/tag/v3.15.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-v2w2-w228-c444">https://github.com/advisories/GHSA-v2w2-w228-c444</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-v2w2-w228-c444</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-19T21:30:20.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[keras] Keras: tar extraction permits symlink-based path traversal]]></title>
-        <id>https://github.com/advisories/GHSA-58hv-7753-xmfq</id>
-        <link href="https://github.com/advisories/GHSA-58hv-7753-xmfq"/>
-        <updated>2026-08-07T20:32:13.000Z</updated>
-        <content type="html"><![CDATA[<p>A vulnerability in keras-team/keras version 3.12.0 allows an attacker to craft a malicious tar archive that bypasses the <code>filter_safe_tarinfos</code> validation in <code>keras/src/utils/file_utils.py</code>. Specifically, symlink entries are not subjected to the same <code>is_path_in_dir</code> validation as regular file entries, allowing symlinks to be created outside the intended extraction directory. This can lead to symlink-based file read, file overwrite, or directory escape attacks. The issue is particularly impactful on Python 3.10 and 3.11, where <code>filter_safe_tarinfos</code> is the sole defense against tar path traversal. This vulnerability is distinct from CVE-2025-12060 and other previously reported issues.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-12482">https://nvd.nist.gov/vuln/detail/CVE-2026-12482</a></li>
-<li><a href="https://huntr.com/bounties/5d3638e8-a9f6-4964-a865-ddb9fe4d4b6e">https://huntr.com/bounties/5d3638e8-a9f6-4964-a865-ddb9fe4d4b6e</a></li>
-<li><a href="https://github.com/keras-team/keras/pull/23015">https://github.com/keras-team/keras/pull/23015</a></li>
-<li><a href="https://github.com/keras-team/keras/pull/23165">https://github.com/keras-team/keras/pull/23165</a></li>
-<li><a href="https://github.com/keras-team/keras/commit/9867df45c456dd1077a6243bb56219f66e288150">https://github.com/keras-team/keras/commit/9867df45c456dd1077a6243bb56219f66e288150</a></li>
-<li><a href="https://github.com/keras-team/keras/commit/d338a45204bdc787c8b3c4a9b82c1911cd52dedf">https://github.com/keras-team/keras/commit/d338a45204bdc787c8b3c4a9b82c1911cd52dedf</a></li>
-<li><a href="https://github.com/keras-team/keras/releases/tag/v3.12.3">https://github.com/keras-team/keras/releases/tag/v3.12.3</a></li>
-<li><a href="https://github.com/keras-team/keras/releases/tag/v3.15.0">https://github.com/keras-team/keras/releases/tag/v3.15.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-58hv-7753-xmfq">https://github.com/advisories/GHSA-58hv-7753-xmfq</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-58hv-7753-xmfq</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-07-14T06:31:23.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[keras] Keras: tar extraction permits symlink-based path traversal]]></title>
-        <id>https://github.com/advisories/GHSA-58hv-7753-xmfq</id>
-        <link href="https://github.com/advisories/GHSA-58hv-7753-xmfq"/>
-        <updated>2026-08-07T20:32:13.000Z</updated>
-        <content type="html"><![CDATA[<p>A vulnerability in keras-team/keras version 3.12.0 allows an attacker to craft a malicious tar archive that bypasses the <code>filter_safe_tarinfos</code> validation in <code>keras/src/utils/file_utils.py</code>. Specifically, symlink entries are not subjected to the same <code>is_path_in_dir</code> validation as regular file entries, allowing symlinks to be created outside the intended extraction directory. This can lead to symlink-based file read, file overwrite, or directory escape attacks. The issue is particularly impactful on Python 3.10 and 3.11, where <code>filter_safe_tarinfos</code> is the sole defense against tar path traversal. This vulnerability is distinct from CVE-2025-12060 and other previously reported issues.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-12482">https://nvd.nist.gov/vuln/detail/CVE-2026-12482</a></li>
-<li><a href="https://huntr.com/bounties/5d3638e8-a9f6-4964-a865-ddb9fe4d4b6e">https://huntr.com/bounties/5d3638e8-a9f6-4964-a865-ddb9fe4d4b6e</a></li>
-<li><a href="https://github.com/keras-team/keras/pull/23015">https://github.com/keras-team/keras/pull/23015</a></li>
-<li><a href="https://github.com/keras-team/keras/pull/23165">https://github.com/keras-team/keras/pull/23165</a></li>
-<li><a href="https://github.com/keras-team/keras/commit/9867df45c456dd1077a6243bb56219f66e288150">https://github.com/keras-team/keras/commit/9867df45c456dd1077a6243bb56219f66e288150</a></li>
-<li><a href="https://github.com/keras-team/keras/commit/d338a45204bdc787c8b3c4a9b82c1911cd52dedf">https://github.com/keras-team/keras/commit/d338a45204bdc787c8b3c4a9b82c1911cd52dedf</a></li>
-<li><a href="https://github.com/keras-team/keras/releases/tag/v3.12.3">https://github.com/keras-team/keras/releases/tag/v3.12.3</a></li>
-<li><a href="https://github.com/keras-team/keras/releases/tag/v3.15.0">https://github.com/keras-team/keras/releases/tag/v3.15.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-58hv-7753-xmfq">https://github.com/advisories/GHSA-58hv-7753-xmfq</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-58hv-7753-xmfq</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-07-14T06:31:23.000Z</published>
     </entry>
 </feed>
