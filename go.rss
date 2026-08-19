@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-08-19T18:17:09.803Z</updated>
+    <updated>2026-08-19T19:16:51.451Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,100 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/inspektor-gadget/inspektor-gadget] Uprobe gadgets: unprivileged container's ld.so.cache causes high CPU utilization and container startup DoS]]></title>
+        <id>https://github.com/advisories/GHSA-vjhx-2cqw-3q6q</id>
+        <link href="https://github.com/advisories/GHSA-vjhx-2cqw-3q6q"/>
+        <updated>2026-08-19T19:16:35.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>An unprivileged container can block all other containers from starting on the
+same host by placing a crafted <code>/etc/ld.so.cache</code> file in its filesystem. When
+Inspektor Gadget attaches any uprobe-based gadget, it parses this file in the
+container startup path. A malicious cache causes ~53 seconds of CPU burn,
+during which Docker cannot start any other container. No special capabilities
+are required.</p>
+<h2 id="severity">Severity</h2>
+<p>To be assessed — Availability impact, no confidentiality or integrity impact.</p>
+<h2 id="affected-versions">Affected Versions</h2>
+<p>All versions of Inspektor Gadget that support uprobe-based gadgets (trace_malloc, trace_open, trace_ssl, trace_grpc, etc.).</p>
+<h2 id="description">Description</h2>
+<p>When Inspektor Gadget attaches uprobe-based gadgets to containers, it resolves library paths by parsing the container's <code>/etc/ld.so.cache</code> file (<code>pkg/uprobetracer/ldcache_parser.go</code>). This file is fully controlled by the container.</p>
+<p>The parser has three vulnerabilities:</p>
+<ol>
+<li><p><strong>Quadratic string building</strong> (<code>pkg/uprobetracer/bytes.go:36-44</code>): The <code>readStringFromBytes</code> function concatenates one byte at a time (<code>res += string(data[i])</code>), which is O(n²) in Go due to string immutability. With a 16MB cache file containing large regions without null terminators, this causes massive CPU and memory churn.</p>
+</li>
+<li><p><strong>Insufficient entry count validation</strong> (<code>pkg/uprobetracer/ldcache_parser.go:120</code>): The <code>EntryCount</code> field is read directly from the untrusted file. While a per-entry bounds check prevents out-of-bounds access, the loop still iterates up to <code>(fileSize - headerSize) / entrySize ≈ 700,000</code> times, calling <code>readStringFromBytes</code> on each iteration.</p>
+</li>
+<li><p><strong>Integer overflow in format detection</strong> (<code>pkg/uprobetracer/ldcache_parser.go:174</code>): The <code>cache1Len</code> computation uses uint32 arithmetic (<code>ldCache1Size + cache1.EntryCount*ldCache1EntrySize</code>). With a crafted <code>EntryCount</code>, this overflows and produces a small value, causing the parser to misidentify the cache format.</p>
+</li>
+</ol>
+<p>Combined, these cause ~53 seconds of CPU burn per container attachment when a crafted 16MB <code>/etc/ld.so.cache</code> is present.</p>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Container runtime DoS</strong>: IG uses fanotify hooks (<code>pkg/container-hook</code>) to pause container startup until uprobe attachment completes. While IG is blocked processing the malicious cache, this pause is held, and Docker serializes container starts — meaning no other container can start on the host until IG finishes. This effectively causes a denial of service on the entire container runtime, not just on IG itself.</li>
+<li><strong>Container startup delay</strong>: When any uprobe-based gadget is running (trace_malloc, trace_ssl, etc.), starting a container with a crafted ld.so.cache delays startup by ~1 minute.</li>
+<li><strong>Monitoring degradation</strong>: The IG daemon is blocked processing the malicious cache, potentially missing events from other containers.</li>
+<li><strong>Amplification</strong>: Multiple containers with crafted caches can be started simultaneously to amplify the effect.</li>
+<li><strong>No special privileges required</strong>: Any container can include a crafted <code>/etc/ld.so.cache</code> in its image, mount one via a volume, or overwrite it at runtime before IG starts a uprobe gadget. In this last case, IG inspects all already-running containers when the gadget starts — this still burns CPU but does not block other containers from starting (since the fanotify pause only applies to new container starts).</li>
+</ul>
+<h2 id="root-cause-analysis">Root Cause Analysis</h2>
+<p>In <code>pkg/uprobetracer/ldcache_parser.go</code>, the function <code>readCacheFormat2</code> is called with the full file content:</p>
+<pre><code class="language-go">for i := uint32(0); i &lt; ldCache.EntryCount; i++ {
+    entryOffset := ldEntriesOffset + i*ldCache2EntrySize
+    if uint32(len(data)) &lt;= entryOffset+ldCache2EntrySize {
+        return nil  // bounds check stops iteration
+    }
+    // ... reads entry ...
+    key := readStringFromBytes(data, keyOffset)    // O(n²) per call
+    value := readStringFromBytes(data, valueOffset) // O(n²) per call
+}
+</code></pre>
+<p>The per-entry bounds check correctly prevents out-of-bounds access, but:</p>
+<ul>
+<li>The loop iterates ~700K times (limited by file size, not EntryCount)</li>
+<li>Each <code>readStringFromBytes</code> call uses quadratic string concatenation</li>
+</ul>
+<p>In <code>pkg/uprobetracer/bytes.go</code>:</p>
+<pre><code class="language-go">func readStringFromBytes(data []byte, startPos uint32) string {
+    res := ""
+    for i := startPos; i &lt; uint32(len(data)); i++ {
+        if data[i] == 0 {
+            return res
+        }
+        res += string(data[i])  // O(n²) — allocates new string each iteration
+    }
+    return ""
+}
+</code></pre>
+<h2 id="note-on-slice-bounds-checks">Note on Slice Bounds Checks</h2>
+<p>The code also performs slice accesses without proper bounds checks (e.g.,
+<code>data[:len(cache2Header)]</code> when <code>data</code> may be shorter than 20 bytes, and
+<code>ldCacheFile[:len(cache1Header)]</code> when the file may be shorter than 11 bytes).</p>
+<p>In practice, a malicious container <strong>cannot currently trigger a panic</strong> from these
+missing checks. This is because Go's <code>io.ReadAll</code> (used to read the file) always
+returns slices with <code>cap &gt;= 512</code> due to its initial buffer allocation
+(<code>make([]byte, 0, 512)</code> in Go's standard library). In Go, <code>s[:n]</code> only panics
+when <code>n &gt; cap(s)</code>, not when <code>n &gt; len(s)</code>. Since both header lengths (11 and 20)
+are well below 512, the slice expressions succeed — they simply read zero bytes
+beyond <code>len</code>, which don't match any valid header magic.</p>
+<p>However, this relies on an <strong>undocumented implementation detail</strong> of <code>io.ReadAll</code>
+which could change in future Go versions. The bounds checks are still necessary
+for correctness and defense in depth.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/inspektor-gadget/inspektor-gadget/security/advisories/GHSA-vjhx-2cqw-3q6q">https://github.com/inspektor-gadget/inspektor-gadget/security/advisories/GHSA-vjhx-2cqw-3q6q</a></li>
+<li><a href="https://github.com/inspektor-gadget/inspektor-gadget/releases/tag/v0.53.1">https://github.com/inspektor-gadget/inspektor-gadget/releases/tag/v0.53.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-vjhx-2cqw-3q6q">https://github.com/advisories/GHSA-vjhx-2cqw-3q6q</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-vjhx-2cqw-3q6q</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-08-19T19:16:35.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/moby/go-archive] moby/go-archive: Crafted tar archive can write outside the extraction directory]]></title>
         <id>https://github.com/advisories/GHSA-hfg8-hc9c-6c3h</id>
@@ -753,30 +847,6 @@ This is not a vulnerability, as the user can already run an arbitrary command wi
             <name>GitHub</name>
             <email>GitHub@noreply.github.com</email>
             <uri>https://github.com/advisories/GHSA-8g5p-jxp9-457c</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-06-10T15:31:33.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/kubev2v/migration-planner] Openshift Migration Advisor: Improper input sanitization allows specially crafted RVTools .xlsx files to include malicious SQL commands]]></title>
-        <id>https://github.com/advisories/GHSA-vf2h-7x3w-97fr</id>
-        <link href="https://github.com/advisories/GHSA-vf2h-7x3w-97fr"/>
-        <updated>2026-08-14T19:19:28.000Z</updated>
-        <content type="html"><![CDATA[<p>A flaw was found in migration-planner. A remote authenticated attacker could exploit this vulnerability by uploading a specially crafted RVTools .xlsx file. Due to improper input sanitization, malicious SQL embedded within a spreadsheet cell is executed when cluster names are processed. This SQL Injection allows for arbitrary file reading on the system, potentially exposing sensitive information such as Kubernetes service account tokens and other credentials, which could lead to a full compromise of the SaaS environment.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-53474">https://nvd.nist.gov/vuln/detail/CVE-2026-53474</a></li>
-<li><a href="https://github.com/kubev2v/migration-planner/pull/1231">https://github.com/kubev2v/migration-planner/pull/1231</a></li>
-<li><a href="https://access.redhat.com/security/cve/CVE-2026-53474">https://access.redhat.com/security/cve/CVE-2026-53474</a></li>
-<li><a href="https://bugzilla.redhat.com/show_bug.cgi?id=2487231">https://bugzilla.redhat.com/show_bug.cgi?id=2487231</a></li>
-<li><a href="https://github.com/kubev2v/migration-planner/commit/6110711b1b71bb0d15348b934a490a5932b41f83">https://github.com/kubev2v/migration-planner/commit/6110711b1b71bb0d15348b934a490a5932b41f83</a></li>
-<li><a href="https://github.com/advisories/GHSA-vf2h-7x3w-97fr">https://github.com/advisories/GHSA-vf2h-7x3w-97fr</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-vf2h-7x3w-97fr</uri>
         </author>
         <category label="severity" term="CRITICAL"/>
         <published>2026-06-10T15:31:33.000Z</published>
