@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-08-27T13:17:43.313Z</updated>
+    <updated>2026-08-27T23:20:09.285Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,179 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[webob] WebOb: Open redirect in Location header normalization via leading C0 control / space characters]]></title>
+        <id>https://github.com/advisories/GHSA-6hx8-3wjj-gr8g</id>
+        <link href="https://github.com/advisories/GHSA-6hx8-3wjj-gr8g"/>
+        <updated>2026-08-27T22:10:08.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>This is a third follow-up to <strong>CVE-2024-42353 / GHSA-mg3v-6m49-jhp3</strong>
+and <strong>CVE-2026-44889 / GHSA-fh3h-vg37-cc95</strong>.</p>
+<p>WebOb makes the <code>Location</code> header absolute when it serves a redirect. To stop a
+relative or protocol-relative target from redirecting users off-host, it checks
+the value for a URI scheme and for a leading <code>//</code>, then joins it against the
+request URI with <code>urllib.parse.urljoin()</code>. The previous fix additionally stripped
+ASCII tab/CR/LF from the value before those checks.</p>
+<p>However, on Python 3.10+ <code>urllib.parse.urljoin()</code> (via <code>urlsplit()</code>) does more
+than remove tab/CR/LF: <strong>it also strips leading and trailing C0 control
+characters (<code>U+0000</code>–<code>U+001F</code>) and spaces from the URL before parsing it.</strong>
+Because WebOb's guard checks (<code>SCHEME_RE</code> and <code>startswith("//")</code>) run against the
+<em>un-stripped</em> value, a single leading space or control byte slips past them, and
+<code>urljoin()</code> then silently removes that byte and parses what remains as a
+protocol-relative — or even absolute — URL. The result is an open redirect to an
+attacker-controlled host.</p>
+<h2 id="details">Details</h2>
+<p><code>Response._make_location_absolute()</code> (in <code>src/webob/response.py</code>) performed,
+prior to the fix:</p>
+<pre><code class="language-python">value = value.replace("\t", "").replace("\r", "").replace("\n", "")
+
+if SCHEME_RE.search(value):          # ^[a-z]+:   -&gt; already absolute, return as-is
+    return value
+
+if value.startswith("//"):           # neutralize protocol-relative URLs
+    value = f"/%2f{value[2:]}"
+
+new_location = urlparse.urljoin(_request_uri(environ), value)
+</code></pre>
+<p>Consider the Location value <code>" //www.example.com/test"</code> (a single leading space):</p>
+<ol>
+<li>The explicit strip only removes <code>\t</code>, <code>\r</code>, <code>\n</code> — the leading <strong>space</strong>
+survives.</li>
+<li><code>SCHEME_RE</code> (<code>^[a-z]+:</code>) does <strong>not</strong> match — the value starts with a space.</li>
+<li><code>value.startswith("//")</code> is <strong>False</strong> — the value starts with a space, not
+<code>/</code>. The <code>//</code> → <code>/%2f</code> neutralization is skipped.</li>
+<li><code>urllib.parse.urljoin(_request_uri(environ), " //www.example.com/test")</code> then
+<strong>strips the leading space</strong> before parsing, sees <code>//www.example.com/test</code>,
+treats it as protocol-relative, and returns
+<code>http://www.example.com/test</code>.</li>
+</ol>
+<p>The same bypass works with a value such as <code>" https://www.example.com/test"</code>
+(leading space + a full scheme): <code>SCHEME_RE</code> does not match the space-prefixed
+string, but <code>urljoin()</code> strips the space and returns the fully absolute
+attacker URL <code>https://www.example.com/test</code>.</p>
+<p>Any C0 control character works equally well in place of the space, e.g.
+<code>"\x00//www.example.com/test"</code> or <code>"\x1f//www.example.com/test"</code>, because
+<code>urlsplit()</code> strips the whole leading C0-control-and-space run.</p>
+<h3 id="affected-entry-points">Affected entry points</h3>
+<ul>
+<li><strong><code>Response.location</code></strong> — any application that sets a relative/attacker-influenced
+<code>Location</code> and serves the response (the classic redirect path).</li>
+<li><strong><code>Request.relative_url()</code></strong> — used <code>urllib.parse.urljoin()</code> directly and was
+subject to the same character stripping.</li>
+<li><strong><code>webob.exc._HTTPMove</code> subclasses</strong> (<code>HTTPMovedPermanently</code>, <code>HTTPFound</code>,
+<code>HTTPSeeOther</code>, <code>HTTPTemporaryRedirect</code>, <code>HTTPPermanentRedirect</code>, etc.) — these
+built their absolute Location with <code>urlparse.urljoin(req.path_url, self.location)</code>
+<strong>without</strong> going through <code>_make_location_absolute()</code> at all, so they bypassed
+even the tab/CR/LF strip and the <code>//</code> → <code>/%2f</code> neutralization. A protocol-relative
+location passed to e.g. <code>HTTPFound(location="//evil.example")</code> redirected off-host.</li>
+</ul>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<pre><code class="language-python">from webob import Response
+from webob.request import Request
+
+res = Response()
+res.status = "301"
+res.location = " //www.example.com/test"   # note the single leading space
+
+req = Request.blank("/")                    # request host is "localhost"
+print(req.get_response(res).location)
+# Vulnerable (&lt;= 1.8.10):  http://www.example.com/test   &lt;-- open redirect
+# Fixed:                   http://localhost/ //www.example.com/test
+</code></pre>
+<p>Absolute-URL variant:</p>
+<pre><code class="language-python">res.location = " https://www.example.com/test"
+# Vulnerable: https://www.example.com/test   &lt;-- off-host
+# Fixed:      http://localhost/ https://www.example.com/test
+</code></pre>
+<p>Via the HTTP exceptions:</p>
+<pre><code class="language-python">from webob import exc
+
+environ = {
+    "wsgi.url_scheme": "http", "SERVER_NAME": "localhost",
+    "SERVER_PORT": "80", "REQUEST_METHOD": "HEAD", "PATH_INFO": "/",
+}
+m = exc.HTTPFound(location="//www.example.com/test")
+m(environ, lambda *a, **k: None)
+print(m.location)
+# Vulnerable: //www.example.com/test          &lt;-- open redirect
+# Fixed:      http://localhost/%2fwww.example.com/test
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p>An unauthenticated remote attacker who controls (in whole or part) the redirect
+target of an application built on WebOb can redirect a user from a trusted host to
+an attacker-controlled host. This enables phishing and credential-theft campaigns
+that abuse the trusted origin, and can be chained with OAuth/SSO <code>redirect_uri</code>
+flows to leak tokens. Exploitation requires user interaction (following the
+redirect). Confidentiality and integrity impact are limited (<code>L</code>); the scope is
+changed (<code>C</code>) because the trust boundary of the originating site is crossed.</p>
+<h2 id="patches">Patches</h2>
+<p>Fixed by replacing the use of <code>urllib.parse.urljoin()</code> with WebOb's own
+RFC 3986 reference-resolution implementation, <code>webob.util.urljoin()</code>, which
+resolves the reference <strong>exactly as given, character for character, with no
+whitespace or control-character removal</strong>.</p>
+<ul>
+<li><code>Response._make_location_absolute()</code> now uses <code>webob.util.urljoin()</code>.</li>
+<li><code>Request.relative_url()</code> now uses <code>webob.util.urljoin()</code>.</li>
+<li><code>webob.exc._HTTPMove</code> now normalizes its Location through the same
+<code>_make_location_absolute()</code> code path as <code>Response</code>, so protocol-relative and
+whitespace-smuggled locations are neutralized there too.</li>
+</ul>
+<p>Users should upgrade to the patched release. There are no API changes.</p>
+<h2 id="workarounds">Workarounds</h2>
+<ul>
+<li>Only ever set the <code>Location</code> header / redirect target to a fully-qualified URI
+whose host you control, or strictly allowlist redirect destinations before
+handing them to WebOb.</li>
+<li>Reject any redirect target that does not begin with <code>https://yourhost/</code> (or a
+validated relative path with no leading whitespace/control bytes).</li>
+</ul>
+<h2 id="references">References</h2>
+<ul>
+<li>This advisory: GHSA-6hx8-3wjj-gr8g</li>
+<li>GHSA-fh3h-vg37-cc95 (CVE-2026-44889) — second incomplete fix (tab/CR/LF)</li>
+<li>GHSA-mg3v-6m49-jhp3 (CVE-2024-42353) — original open redirect fix</li>
+<li>RFC 3986, Section 5 — Reference Resolution: <a href="https://www.rfc-editor.org/rfc/rfc3986#section-5">https://www.rfc-editor.org/rfc/rfc3986#section-5</a></li>
+<li>Python <code>urllib.parse</code> URL stripping behavior (CPython 3.10+, removal of leading
+and trailing C0 control and space characters): <a href="https://docs.python.org/3/library/urllib.parse.html">https://docs.python.org/3/library/urllib.parse.html</a></li>
+</ul>
+<p>To report a vulnerability to the Pylons Project please take a look at:</p>
+<ul>
+<li>Pylons Project security policy and reporting process:
+  <a href="https://github.com/Pylons/.github/blob/main/SECURITY.md">https://github.com/Pylons/.github/blob/main/SECURITY.md</a></li>
+<li>Security contact (private, coordinated disclosure): <code>pylons-project-security@googlegroups.com</code>
+(the Pylons Project requests a 90-day disclosure embargo)</li>
+</ul>
+<h2 id="credit">Credit</h2>
+<p>Reported via the Pylons Project security mailing list by:</p>
+<ul>
+<li><strong>tonghuaroot</strong> — for the residual open redirect in
+<code>Response._make_location_absolute()</code>: the 1.8.10 fix stripped only ASCII
+tab/CR/LF, but <code>urllib.parse.urljoin()</code> also strips leading C0 control and
+space characters, so values such as <code>" //attacker.example/path"</code> (and
+<code>" https://attacker.example/path"</code>) still escaped off-host.</li>
+<li><strong>Matheus Polkorny</strong> — for identifying that the <code>webob.exc._HTTPMove</code>
+redirect exceptions (<code>HTTPFound</code> and friends) performed their own
+<code>urllib.parse.urljoin()</code> normalization and never went through
+<code>_make_location_absolute()</code>, so a protocol-relative location such as
+<code>//evil.example/path/</code> redirected off-host through that separate code path.</li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/Pylons/webob/security/advisories/GHSA-6hx8-3wjj-gr8g">https://github.com/Pylons/webob/security/advisories/GHSA-6hx8-3wjj-gr8g</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-54770">https://nvd.nist.gov/vuln/detail/CVE-2026-54770</a></li>
+<li><a href="https://github.com/Pylons/webob/commit/ff89560643fb252751b4db8806a283b5377f1f07">https://github.com/Pylons/webob/commit/ff89560643fb252751b4db8806a283b5377f1f07</a></li>
+<li><a href="https://github.com/Pylons/webob/tree/1.8.11">https://github.com/Pylons/webob/tree/1.8.11</a></li>
+<li><a href="https://github.com/advisories/GHSA-6hx8-3wjj-gr8g">https://github.com/advisories/GHSA-6hx8-3wjj-gr8g</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-6hx8-3wjj-gr8g</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-08-27T22:10:07.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[asyncssh] asyncssh has SCP Path Traversal to Arbitrary File Write]]></title>
         <id>https://github.com/advisories/GHSA-2wxc-x7rj-hg8f</id>
@@ -1540,31 +1713,6 @@ async def upload_sound(
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-08-23T15:33:06.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[ironic] OpenStack Ironic can return unredacted sensitive information when applying a PATCH to update fields in volume properties]]></title>
-        <id>https://github.com/advisories/GHSA-j4cw-mcg2-2q78</id>
-        <link href="https://github.com/advisories/GHSA-j4cw-mcg2-2q78"/>
-        <updated>2026-08-25T16:34:55.000Z</updated>
-        <content type="html"><![CDATA[<p>In OpenStack Ironic through 35.0.1, when applying a PATCH to update fields in volume properties the user is authorized for, Ironic can return unredacted sensitive information (such as iSCSI credentials). The PATCH outcome is a security issue; the POST outcome is not a security issue.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-54421">https://nvd.nist.gov/vuln/detail/CVE-2026-54421</a></li>
-<li><a href="https://bugs.launchpad.net/ironic/+bug/2155049">https://bugs.launchpad.net/ironic/+bug/2155049</a></li>
-<li><a href="https://security.openstack.org/ossa/OSSA-2026-023.html">https://security.openstack.org/ossa/OSSA-2026-023.html</a></li>
-<li><a href="http://www.openwall.com/lists/oss-security/2026/06/16/10">http://www.openwall.com/lists/oss-security/2026/06/16/10</a></li>
-<li><a href="https://github.com/openstack/ironic/commit/dd2df520fe0ae019cb247a8295542abc2d4b46dd">https://github.com/openstack/ironic/commit/dd2df520fe0ae019cb247a8295542abc2d4b46dd</a></li>
-<li><a href="https://review.opendev.org/c/openstack/ironic/+/990430">https://review.opendev.org/c/openstack/ironic/+/990430</a></li>
-<li><a href="https://github.com/advisories/GHSA-j4cw-mcg2-2q78">https://github.com/advisories/GHSA-j4cw-mcg2-2q78</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-j4cw-mcg2-2q78</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-14T06:30:24.000Z</published>
     </entry>
     <entry>
         <title type="html"><![CDATA[[ironic] OpenStack Ironic can return unredacted sensitive information when applying a PATCH to update fields in volume properties]]></title>
