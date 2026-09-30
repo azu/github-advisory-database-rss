@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/pip.rss</id>
     <title>Security Advisory for Python packages hosted at PyPI.org</title>
-    <updated>2026-09-30T13:08:34.470Z</updated>
+    <updated>2026-09-30T18:40:45.731Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Apip"/>
     <subtitle>Security Advisory for Python packages hosted at PyPI.org on GitHub</subtitle>
@@ -11,6 +11,371 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[PyJWT] PyJWT: Unauthenticated RecursionError DoS in pre-verification payload parse (PyJWKClient.get_signing_key_from_jwt / verify_signature=False)]]></title>
+        <id>https://github.com/advisories/GHSA-42vr-xj54-vc7v</id>
+        <link href="https://github.com/advisories/GHSA-42vr-xj54-vc7v"/>
+        <updated>2026-09-30T15:41:07.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>PyJWKClient.get_signing_key_from_jwt(token)</code> — the first step of the JWKS
+verification flow documented in <code>docs/usage.rst</code> — must decode a token's
+payload before its signature can be checked, via
+<code>jwt.api_jwt.decode_complete(token, options={"verify_signature": False})</code>.
+That call parses the payload with <code>json.loads</code> in <code>PyJWT._decode_payload</code>
+(<code>jwt/api_jwt.py:297-300</code>), whose <code>except</code> clause catches only <code>ValueError</code>.
+A payload that is valid JSON but nested ~20,000 levels deep makes
+<code>json.loads</code> raise <code>RecursionError</code>, which is <strong>not</strong> a <code>ValueError</code> and
+escapes as a raw, undocumented exception type — not <code>DecodeError</code>,
+<code>InvalidTokenError</code>, or <code>PyJWTError</code>, so every documented error-handling
+pattern in <code>docs/usage.rst</code> misses it.</p>
+<p>The token needs no valid signature and no network access — the crash
+happens during payload parsing, before the <code>kid</code> is even looked up. A
+single unauthenticated ~50KB request crashes the caller's auth handler
+(HTTP 500 / dead worker), repeatably. The same path is reachable through
+plain <code>jwt.decode(token, options={"verify_signature": False})</code> too.</p>
+<p>Notably, this project already fixed the <strong>identical</strong> bug class for the
+JWS <strong>header</strong> path — <code>PyJWS._load</code> catches <code>(ValueError, RecursionError)</code>
+and wraps it in <code>DecodeError</code> (<code>jwt/api_jws.py:360-361</code>), and
+<code>CHANGELOG.rst</code> (v2.14.0, "Security") states "Handle deeply nested and
+malformed JWS/JWK input without uncaught recursion errors." The payload
+path — the one part of a forged token an unauthenticated attacker fully
+controls — was left catching <code>ValueError</code> alone, so that security fix does
+not fully hold.</p>
+<p>A second, related instance: <code>PyJWKClient.fetch_data</code> (<code>jwt/jwks_client.py:168</code>)
+parses a JWKS endpoint's response with <code>json.load(response)</code> inside a
+<code>try</code> that only catches <code>(URLError, TimeoutError, http.client.HTTPException)</code>
+— a deeply-nested JSON response from a JWKS endpoint raises the same raw
+<code>RecursionError</code>, uncaught entirely (worse than the payload path, which at
+least caught plain <code>ValueError</code>).</p>
+<p><strong>Affected versions:</strong> confirmed present in the current release, 2.14.0,
+and on the current <code>master</code> branch (commit <code>4adcd02722f5011c60079d3978dfc167b9a8eaa5</code>).</p>
+<h2 id="reproduction">Reproduction</h2>
+<pre><code class="language-python">import base64, json, jwt
+
+def b64url(b):
+    return base64.urlsafe_b64encode(b).rstrip(b"=")
+
+header = b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+payload = b64url(b"[" * 20_000 + b"]" * 20_000)
+token = (header + b"." + payload + b"." + b64url(b"forged-sig")).decode()
+
+jwt.decode(token, options={"verify_signature": False})
+# raises: RecursionError (not DecodeError/InvalidTokenError/PyJWTError)
+</code></pre>
+<p>Control: the same deeply-nested structure moved into the token's <strong>header</strong>
+instead of its payload is correctly converted to <code>jwt.DecodeError</code> by the
+already-hardened <code>jwt/api_jws.py:360</code> — confirming the payload path is
+specifically the missed half of the v2.14.0 hardening, not a general gap.</p>
+<h2 id="impact-assessment">Impact assessment</h2>
+<p>Unauthenticated denial-of-service via unhandled exception on an auth path.
+Not an auth bypass — rated medium. With signature verification enabled,
+this parse runs after <code>_verify_signature</code>, so only the pre-verification
+paths (<code>get_signing_key_from_jwt</code>, explicit <code>verify_signature=False</code>) are
+attacker-reachable pre-auth; the JWKS-endpoint variant requires control of
+(or a MITM on) the configured JWKS endpoint rather than being reachable
+from an arbitrary client token.</p>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>In <code>jwt/api_jwt.py:299</code>, change <code>except ValueError as e:</code> to
+<code>except (ValueError, RecursionError) as e:</code>, mirroring
+<code>jwt/api_jws.py:360</code> exactly. In <code>jwt/jwks_client.py</code>, add the same
+<code>(ValueError, RecursionError)</code> handling around <code>json.load(response)</code> in
+<code>fetch_data</code>, raising <code>PyJWKClientError</code> (consistent with the method's
+existing documented error contract). A patch implementing both, verified
+against the full test suite (457 passed, 4 skipped — pre-existing,
+environment-related) and against the reproduction above (now correctly
+raises <code>DecodeError</code>), is attached (<code>fix.patch</code>).</p>
+<h2 id="discovery-method">Discovery method</h2>
+<p>Found and verified using <code>scopegrep</code> (<a href="https://github.com/not-ekalabya/scopegrep">https://github.com/not-ekalabya/scopegrep</a>)
+— a semantic code-retrieval tool that surfaces every other call site of a
+symbol alongside relevance-ranked results, which is what surfaced the
+already-hardened header path as the direct comparison here — paired with
+an LLM coding agent (GLM-5.3) run as an open-ended security review of this
+repository. Independently reproduced against the exact commit above before
+this report was written. Happy to share the full session transcript on
+request.</p>
+<h2 id="disclosure-status">Disclosure status</h2>
+<p>Not shared with any other party or published. Submitting through this
+private channel per the project's stated security policy; no planned
+public/conference disclosure ahead of a coordinated timeline.</p>
+<hr>
+<h2 id="maintainer-triage-update-2026-09-22">Maintainer triage update (2026-09-22)</h2>
+<h3 id="confirmed-finding-and-scope">Confirmed finding and scope</h3>
+<p>We confirmed that an attacker-controlled recursively nested JWT payload can cause a raw Python <code>RecursionError</code> to escape PyJWT at PyJWT 2.14.0 and the tested current source. The confirmed in-scope paths are direct decoding with <code>verify_signature=False</code> and <code>PyJWKClient.get_signing_key_from_jwt</code>, where payload parsing occurs before key lookup.</p>
+<p>The demonstrated impact is limited to an uncaught exception for the affected call, which may surface as an application HTTP 500 when the application does not catch it. Testing did not demonstrate a worker or process crash, persistent resource exhaustion, resource amplification, authentication bypass, or confidentiality or integrity impact.</p>
+<p>The separate JWKS-response subclaim is out of scope under the policy boundary that requires the application to trust its configured JWKS source and transport. The confirmed payload finding is not a duplicate of the earlier protected-header parser finding: it occurs in a distinct payload parsing path that remained affected after the earlier header-only fix.</p>
+<h3 id="version-and-remediation-status">Version and remediation status</h3>
+<p>Historical testing reproduced the confirmed payload behavior in all 20 official supported PyJWT 2.x releases from 2.0.0a1 through 2.14.0, inclusive. Unsupported PyJWT 1.7.1 also reproduces the behavior, but it is excluded from the advisory range under the supported-2.x policy. No supported unaffected release and no patched release exists. The exact evidence is <code>/Users/jpadilla/.codex/security-advisories/pyjwt/GHSA-42vr-xj54-vc7v-historical-range-20260922.md</code> (SHA-256 <code>c48f1ac35641e9382d53e6a879a71ad9a8fb4432bbe871f2b8330f8d166a2d81</code>) and <code>/Users/jpadilla/.codex/security-advisories/pyjwt/historical-range-42vr-20260922/historical-range-results.json</code> (SHA-256 <code>324997f231561bf6da39b8f9d1e272f69bfde8871a7863f5cb7b70e22e91f076</code>). The evidence-backed supported affected range is <code>&gt;= 2.0.0a1, &lt;= 2.14.0</code>.</p>
+<p>Historical range verification is complete. A local fix commit exists and has passed independent review and the complete local CI suite, but it has not been merged into <code>master</code> or released. Consequently, <code>patched_versions</code> remains empty and this advisory remains in <code>triage</code>. The remaining next step is a maintainer decision on remediation and merge. After a fix lands in <code>master</code> and is released, <code>patched_versions</code> and advisory lifecycle can be updated in a separate approved batch.</p>
+<hr>
+<h2 id="maintainer-remediation-update-2026-09-23">Maintainer remediation update (2026-09-23)</h2>
+<p>The confirmed payload-parser finding has been fixed on <code>master</code>. Commit
+<code>5fde08a6cf906aa7698de2d6391d88b73006b17b</code> converts a recursive
+payload parse failure to the expected <code>DecodeError</code>; commit
+<code>9bc06658f875b9b40091539140bbbdc4639161c3</code> makes the regression tests
+deterministic across supported Python versions. This update supersedes the
+2026-09-22 remediation-status statement that the fix had not landed.</p>
+<p>The original pre-verification payload reproducer and the
+<code>PyJWKClient.get_signing_key_from_jwt</code> path were covered by regression tests.
+The exact landed tree passed the full 39-environment local tox matrix and
+GitHub CI for commit <code>9bc06658f875b9b40091539140bbbdc4639161c3</code> passed
+all 25 jobs, including Ubuntu Python 3.14 and 3.15. The demonstrated impact
+remains an uncaught request-level exception in affected releases; there is
+still no evidence of process termination, persistent resource exhaustion,
+authentication bypass, or confidentiality or integrity impact.</p>
+<p>The supported affected range remains <code>&gt;= 2.0.0a1, &lt;= 2.14.0</code>. The latest
+released version is 2.14.0, which predates these commits; no released
+patched version exists yet, so <code>patched_versions</code> remains unset. CVSS v3.1
+5.3 (Medium) and CWE-248 remain unchanged. The advisory may now move from
+triage to private draft. The next lifecycle step is a new supported 2.x
+release containing the fix, followed by separately approved patched-version
+and publication updates after release verification.</p>
+<hr>
+<h2 id="maintainer-release-update-2026-09-23">Maintainer release update (2026-09-23)</h2>
+<p>PyJWT 2.15.0 is the first released version containing the payload-parser fix. Its GitHub release tag points to commit <code>1d41a6478e1562e68ff667fcd703356acf085f68</code>, which includes fix commit <code>5fde08a6cf906aa7698de2d6391d88b73006b17b</code> and deterministic regression-test commit <code>9bc06658f875b9b40091539140bbbdc4639161c3</code>. PyPI published both the wheel and source distribution from that release commit through the successful production workflow at <a href="https://github.com/jpadilla/pyjwt/actions/runs/35891602963">https://github.com/jpadilla/pyjwt/actions/runs/35891602963</a>.</p>
+<p>The published PyPI wheel (<code>pyjwt-2.15.0-py3-none-any.whl</code>, SHA-256 <code>7a3742debf6b879e912dbb9819ceec1594be812452b78c5f2e2dfc56564954f8</code>) was checked directly: the deeply nested unsigned payload now raises <code>DecodeError</code>, while an ordinary unsigned payload still decodes. The supported affected range remains <code>&gt;= 2.0.0a1, &lt;= 2.14.0</code>; the patched version is <code>2.15.0</code>. Earlier statements in this advisory that no released patched version exists are superseded by this update.</p>
+<p>The confirmed impact remains an uncaught request-level exception in affected versions, not a demonstrated process crash or authentication bypass. The separate JWKS-response subclaim remains outside this advisory's confirmed PyJWT-owned scope.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/jpadilla/pyjwt/security/advisories/GHSA-42vr-xj54-vc7v">https://github.com/jpadilla/pyjwt/security/advisories/GHSA-42vr-xj54-vc7v</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-101918">https://nvd.nist.gov/vuln/detail/CVE-2026-101918</a></li>
+<li><a href="https://github.com/jpadilla/pyjwt/commit/5fde08a6cf906aa7698de2d6391d88b73006b17b">https://github.com/jpadilla/pyjwt/commit/5fde08a6cf906aa7698de2d6391d88b73006b17b</a></li>
+<li><a href="https://github.com/jpadilla/pyjwt/releases/tag/2.15.0">https://github.com/jpadilla/pyjwt/releases/tag/2.15.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-42vr-xj54-vc7v">https://github.com/advisories/GHSA-42vr-xj54-vc7v</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-42vr-xj54-vc7v</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-09-30T15:41:05.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[urllib3] urllib3: Chunked Deflate streaming can enter an infinite loop]]></title>
+        <id>https://github.com/advisories/GHSA-gh4c-6fx4-qh6g</id>
+        <link href="https://github.com/advisories/GHSA-gh4c-6fx4-qh6g"/>
+        <updated>2026-09-30T15:00:39.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
+<p>urllib3's streaming API is designed for the efficient handling of large HTTP responses by reading content in chunks instead of loading the entire response body into memory at once.</p>
+<p>urllib3 can decompress response bodies according to the HTTP <code>Content-Encoding</code> header. When streaming a compressed, chunked response, urllib3 first consumes data already buffered by the decoder before reading the next HTTP chunk.</p>
+<p>However, urllib3 versions from 2.6.2 through 2.7.0 could enter an infinite loop when a chunked response contained bytes after the end of the Deflate stream. If the decompressed body exceeded the requested streaming chunk size, Python's zlib implementation could retain the trailing bytes as unconsumed input after reaching the end of the compressed stream. urllib3 would repeatedly attempt to decode those same bytes without making progress or reading more data from the network.</p>
+<p>A malicious server could exploit this behavior to cause excessive CPU usage and prevent the affected request from completing on the client. Network read timeouts would not interrupt the loop because no further socket operation was required.</p>
+<h3 id="affected-usages">Affected usages</h3>
+<p>Applications and libraries using urllib3 versions 2.6.2 through 2.7.0 may be affected when all of the following conditions are met:</p>
+<ol>
+<li>Compressed responses from an untrusted source are streamed using <code>HTTPResponse.stream(amt=N)</code> or <code>HTTPResponse.read_chunked(amt=N)</code> with a positive, finite chunk size.</li>
+<li>Content decoding is enabled.</li>
+<li>The response uses both <code>Transfer-Encoding: chunked</code> and <code>Content-Encoding: deflate</code>.</li>
+<li>The decoded body exceeds the requested chunk size and the encoded body contains bytes after the end of the Deflate stream.</li>
+</ol>
+<p><code>HTTPResponse.stream()</code> uses a finite chunk size by default and is therefore affected when the other conditions are met.</p>
+<h3 id="remediation">Remediation</h3>
+<p>Upgrade to urllib3 2.8.0, in which the Deflate decoder stops accepting input after reaching the end of the compressed stream and no longer reports trailing bytes as data that can produce more decoded output.</p>
+<p>If upgrading is not immediately possible, disable automatic content decoding for responses from untrusted sources by setting <code>decode_content=False</code>, or reject streamed responses using the Deflate content encoding. Applications that disable automatic decoding must handle the compressed response safely at another layer.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/urllib3/urllib3/security/advisories/GHSA-gh4c-6fx4-qh6g">https://github.com/urllib3/urllib3/security/advisories/GHSA-gh4c-6fx4-qh6g</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-97688">https://nvd.nist.gov/vuln/detail/CVE-2026-97688</a></li>
+<li><a href="https://github.com/urllib3/urllib3/commit/ea2ad7b21a80da3632f80016526a18864586077f">https://github.com/urllib3/urllib3/commit/ea2ad7b21a80da3632f80016526a18864586077f</a></li>
+<li><a href="https://github.com/urllib3/urllib3/releases/tag/2.8.0">https://github.com/urllib3/urllib3/releases/tag/2.8.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-gh4c-6fx4-qh6g">https://github.com/advisories/GHSA-gh4c-6fx4-qh6g</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-gh4c-6fx4-qh6g</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-09-30T15:00:38.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[urllib3] urllib3: HTTPResponse.stream()/read_chunked() buffers an unbounded chunk-size line into memory]]></title>
+        <id>https://github.com/advisories/GHSA-vxq7-64xx-v4gw</id>
+        <link href="https://github.com/advisories/GHSA-vxq7-64xx-v4gw"/>
+        <updated>2026-09-30T14:46:20.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
+<p>urllib3's <a href="https://urllib3.readthedocs.io/en/2.7.0/advanced-usage.html#streaming-and-i-o">streaming API</a> is designed for efficiently handling large HTTP responses by reading the content in chunks, rather than loading the entire response body into memory at once. When decoding a <a href="https://httpwg.org/specs/rfc9112.html#chunked.encoding">chunked-transfer-encoded response</a>, this API reads each chunk's size field by buffering until it sees <code>\n</code> or EOF.</p>
+<p>A malicious HTTP server can return <code>Transfer-Encoding: chunked</code> and then send a very long run of bytes without any newline, causing the streaming client to buffer that entire run before urllib3 can reject the chunk size as invalid and allocate more memory than intended.</p>
+<p>To fix the issue, we'll reject chunk-size fields larger than 65536 bytes, as already done in the non-streaming case, which is currently handled by the Python standard library. Note that this only applies to reading the chunk-size field, not the chunk data, which is already handled correctly. Thus, there shouldn't be any impact for non-malicious servers.</p>
+<h2 id="affected-usages">Affected usages</h2>
+<p>Applications and libraries using urllib3 versions earlier than 2.8.0 may be affected when streaming a chunked response from untrusted sources. Specifically, this affects the <a href="https://urllib3.readthedocs.io/en/stable/reference/urllib3.response.html#urllib3.response.BaseHTTPResponse.read_chunked">read_chunked()</a> and <a href="https://urllib3.readthedocs.io/en/stable/reference/urllib3.response.html#urllib3.response.BaseHTTPResponse.stream">stream()</a> methods of the HTTPResponse object.</p>
+<p>This also affects requests streaming API, which uses urllib3 under the hood.</p>
+<h2 id="remediation">Remediation</h2>
+<p>Upgrade to urllib3 version 2.8.0 or later, where chunk-size fields larger than 65536 will be rejected. If upgrading is not immediately possible, consider reading the response at once using the <a href="https://urllib3.readthedocs.io/en/stable/reference/urllib3.response.html#urllib3.response.BaseHTTPResponse.read">read()</a> method.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/urllib3/urllib3/security/advisories/GHSA-vxq7-64xx-v4gw">https://github.com/urllib3/urllib3/security/advisories/GHSA-vxq7-64xx-v4gw</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-97689">https://nvd.nist.gov/vuln/detail/CVE-2026-97689</a></li>
+<li><a href="https://github.com/urllib3/urllib3/commit/cd770b059b543be29298ea5c52afb0b1b090f5ed">https://github.com/urllib3/urllib3/commit/cd770b059b543be29298ea5c52afb0b1b090f5ed</a></li>
+<li><a href="https://github.com/urllib3/urllib3/releases/tag/2.8.0">https://github.com/urllib3/urllib3/releases/tag/2.8.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-vxq7-64xx-v4gw">https://github.com/advisories/GHSA-vxq7-64xx-v4gw</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-vxq7-64xx-v4gw</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-09-30T14:46:18.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[urllib3] urllib3: HTTPS proxy TLS configuration may be ignored or overridden]]></title>
+        <id>https://github.com/advisories/GHSA-8988-9cw3-xx77</id>
+        <link href="https://github.com/advisories/GHSA-8988-9cw3-xx77"/>
+        <updated>2026-09-30T14:46:05.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
+<p>urllib3 supports configuring TLS independently for an HTTPS proxy and the target server.</p>
+<p><code>proxy_ssl_context</code>, <code>proxy_assert_hostname</code>, and <code>proxy_assert_fingerprint</code> configure the TLS connection to the proxy. <code>ssl_context</code> and the other target-specific TLS parameters configure the connection to the target server.</p>
+<p>In urllib3 versions 1.26.0 through 2.7.0, these configurations were not consistently separated. Depending on the proxy mode, urllib3 could:</p>
+<ol>
+<li>Ignore <code>proxy_ssl_context</code> and use the target server's SSL context for the TLS connection to an HTTPS forwarding proxy.</li>
+<li>Override the HTTPS proxy's certificate-verification policy with the target server's certificate-verification policy.</li>
+<li>Apply target-specific SNI, hostname assertions, certificate fingerprint assertions, or TLS client credentials to the TLS connection to an HTTPS forwarding proxy.</li>
+</ol>
+<p>In particular, configuring <code>cert_reqs="CERT_NONE"</code> for a target server could overwrite the <code>verify_mode</code> of the SSL context configured for the HTTPS proxy. This modification occurred in place and persisted on the context object, potentially disabling proxy certificate verification for later connections that reused the same context.</p>
+<p>An attacker able to intercept the connection to an HTTPS proxy may be able to impersonate the proxy when the effective proxy TLS configuration disables certificate verification or otherwise accepts the attacker's certificate. This may occur, for example, when the target server's trust or identity policy is incorrectly applied to the proxy connection.</p>
+<p>When HTTPS forwarding is enabled, an impersonated proxy can observe or modify forwarded requests and responses, potentially exposing credentials, authentication tokens, request bodies, response data, and other sensitive information.</p>
+<p>A TLS client certificate intended for the target server may also be presented to the proxy or to an attacker impersonating it. This can disclose the client's identity and provide proof of possession of the corresponding private key. The private key itself is not transmitted during the TLS handshake.</p>
+<p>In CONNECT tunneling mode, impersonating the HTTPS proxy does not by itself defeat the separate end-to-end TLS connection between the client and the target server.</p>
+<h2 id="affected-usages">Affected Usages</h2>
+<p>Code using urllib3 versions 1.26.0 through 2.7.0 may be affected in any of the following cases.</p>
+<h3 id="1-the-target-ssl-context-is-used-for-an-https-forwarding-proxy">1. The target SSL context is used for an HTTPS forwarding proxy</h3>
+<p>HTTPS requests are forwarded through an HTTPS proxy with <code>use_forwarding_for_https=True</code>, and <code>proxy_ssl_context</code> is configured for the proxy.</p>
+<p>urllib3 may ignore <code>proxy_ssl_context</code> and use the target server's <code>ssl_context</code> for the proxy TLS handshake. The proxy may therefore be verified using the target server's trust and certificate policy instead of the policy explicitly configured for the proxy.</p>
+<h3 id="2-the-target-verification-policy-overrides-the-proxy-policy">2. The target verification policy overrides the proxy policy</h3>
+<p>An HTTPS proxy is configured with <code>proxy_ssl_context</code>, while the target server uses a different certificate-verification policy.</p>
+<p>urllib3 may apply the target server's <code>cert_reqs</code> value to the proxy SSL context. For example, setting <code>cert_reqs="CERT_NONE"</code> for the target server may also disable certificate verification for the HTTPS proxy, even when <code>proxy_ssl_context</code> was configured to require verification.</p>
+<p>This issue can affect the TLS connection to an HTTPS proxy in both forwarding and CONNECT tunneling configurations.</p>
+<h3 id="3-a-mutated-proxy-ssl-context-is-reused">3. A mutated proxy SSL context is reused</h3>
+<p>The same SSL context is reused as <code>proxy_ssl_context</code> across multiple connections, and certificate verification is disabled for one target server.</p>
+<p>urllib3 may modify the proxy SSL context's <code>verify_mode</code> in place. Later connections that reuse the same context may therefore connect to the HTTPS proxy without certificate verification.</p>
+<h3 id="4-target-specific-tls-identity-or-credentials-are-applied-to-the-proxy">4. Target-specific TLS identity or credentials are applied to the proxy</h3>
+<p>HTTPS requests are forwarded through an HTTPS proxy with <code>use_forwarding_for_https=True</code>, and target-specific SNI, hostname assertions, certificate fingerprint assertions, or TLS client credentials are configured.</p>
+<p>urllib3 may apply these target-specific settings to the proxy TLS handshake. This may cause urllib3 to:</p>
+<ul>
+<li>send SNI intended for the target server to the proxy;</li>
+<li>verify the proxy using a hostname or certificate fingerprint intended for the target server; or</li>
+<li>present a TLS client certificate intended for the target server to the proxy.</li>
+</ul>
+<p>Code connecting through a plain HTTP proxy does not establish a TLS connection to the proxy and is not affected by this issue.</p>
+<h2 id="remediation">Remediation</h2>
+<p>Upgrade to urllib3 2.8.0 or later.</p>
+<p>urllib3 2.8.0 independently applies the explicitly configured <code>proxy_ssl_context</code> and proxy-specific certificate assertions to the HTTPS proxy connection. Target-specific SNI, certificate assertions, and TLS client certificate parameters are no longer applied to the HTTPS proxy handshake.</p>
+<p>For backward compatibility, when an HTTPS proxy is used with <code>use_forwarding_for_https=True</code> and <code>proxy_ssl_context</code> is not provided, urllib3 2.8.0 continues to use <code>ssl_context</code> for the TLS connection to the proxy. This configuration emits a <code>FutureWarning</code>. In urllib3 3.0, passing <code>ssl_context</code> with <code>use_forwarding_for_https=True</code> for an HTTPS proxy will raise an error. Applications should use <code>proxy_ssl_context</code> to configure TLS for an HTTPS forwarding proxy.</p>
+<p>The fixes were implemented in commits b6447295fff7b38fdffc67e0df9712d60cef3cc3 and 07408cec79d1856d81bb42c74a904a24fdb9e465.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/urllib3/urllib3/security/advisories/GHSA-8988-9cw3-xx77">https://github.com/urllib3/urllib3/security/advisories/GHSA-8988-9cw3-xx77</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-97687">https://nvd.nist.gov/vuln/detail/CVE-2026-97687</a></li>
+<li><a href="https://github.com/urllib3/urllib3/pull/5093">https://github.com/urllib3/urllib3/pull/5093</a></li>
+<li><a href="https://github.com/urllib3/urllib3/commit/07408cec79d1856d81bb42c74a904a24fdb9e465">https://github.com/urllib3/urllib3/commit/07408cec79d1856d81bb42c74a904a24fdb9e465</a></li>
+<li><a href="https://github.com/urllib3/urllib3/commit/b6447295fff7b38fdffc67e0df9712d60cef3cc3">https://github.com/urllib3/urllib3/commit/b6447295fff7b38fdffc67e0df9712d60cef3cc3</a></li>
+<li><a href="https://github.com/urllib3/urllib3/releases/tag/2.8.0">https://github.com/urllib3/urllib3/releases/tag/2.8.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-8988-9cw3-xx77">https://github.com/advisories/GHSA-8988-9cw3-xx77</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-8988-9cw3-xx77</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-09-30T14:46:04.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[pyjwt] PyJWT: ReDoS vulnerability when calling the `is_pem_format` function.]]></title>
+        <id>https://github.com/advisories/GHSA-jwrc-g2q2-pq5p</id>
+        <link href="https://github.com/advisories/GHSA-jwrc-g2q2-pq5p"/>
+        <updated>2026-09-30T14:40:26.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>There is a Re-DoS vulnerability in the <code>is_pem_format</code> function which results in a intesive CPU usage if an attacker is been able to provide a custom certificate.</p>
+<h3 id="details">Details</h3>
+<p>The problem is that the lazy quantifier <code>.+?</code> will always first try to match as little as possible until it finds a <code>---- END</code>. Normally this means the complexity of this should be O(N). However, by providing an input which consists only of <code>----BEGIN CERTIFICATE-----</code> lines and no <code>---- END</code> line, the regex algorithm will first try to match the first line and then, with the lazy quantifier, all the lines until the end O(N), which then fails since it is unable to find a <code>---- END</code> line. It will then jump to the next line, resulting in N re-scans of the whole string, which means the complexity basically results in O(N²). </p>
+<h3 id="poc">PoC</h3>
+<pre><code class="language-python">import time
+import re
+
+
+BEGIN_LINE = b"-----BEGIN CERTIFICATE-----\n"
+
+_PEMS = {
+    b"CERTIFICATE",
+    b"TRUSTED CERTIFICATE",
+    b"PRIVATE KEY",
+    b"PUBLIC KEY",
+    b"ENCRYPTED PRIVATE KEY",
+    b"OPENSSH PRIVATE KEY",
+    b"DSA PRIVATE KEY",
+    b"RSA PRIVATE KEY",
+    b"RSA PUBLIC KEY",
+    b"EC PRIVATE KEY",
+    b"DH PARAMETERS",
+    b"NEW CERTIFICATE REQUEST",
+    b"CERTIFICATE REQUEST",
+    b"SSH2 PUBLIC KEY",
+    b"SSH2 ENCRYPTED PRIVATE KEY",
+    b"X509 CRL",
+}
+
+_PEM_RE = re.compile(
+    b"----[- ]BEGIN ("
+    + b"|".join(_PEMS)
+    + b""")[- ]----\r?
+.+?\r?
+----[- ]END \\1[- ]----\r?\n?""",
+    re.DOTALL,
+)
+
+
+def is_pem_format(key: bytes) -&gt; bool:
+    return bool(_PEM_RE.search(key))
+
+
+def make_payload(num_headers: int) -&gt; bytes:
+    return BEGIN_LINE * num_headers
+
+
+def measure(num_headers: int) -&gt; float:
+    payload = make_payload(num_headers)
+    start = time.perf_counter()
+    is_pem_format(payload)  # returns False, but burns CPU getting there
+    elapsed = time.perf_counter() - start
+    print(
+        f"  headers={num_headers:&gt;4}  size={len(payload)//1024:&gt;3} KB"
+        f"   time={elapsed*1000:&gt;7.1f} ms"
+    )
+    return elapsed
+
+
+for n in (1000, 2000, 4000, 8000):
+    measure(n)
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>The attacker could use extensive resources, which could make the resource (e.g. a web server) unavailable.</p>
+<h3 id="maintainer-update-2026-09-10">Maintainer update (2026-09-10):</h3>
+<p>We reproduced the reported quadratic regex behavior on malformed PEM-like input: doubling repeated BEGIN lines produced approximately fourfold runtime growth, while equal-sized ordinary input remained negligible. The affected path is reached when an application passes attacker-controlled key or certificate bytes to PyJWT’s key preparation, and the impact is resource exhaustion. The fix is on master in commit 8b4e233a22206b34ec1186e912e75c0b2396ac07; it replaces the backtracking PEM regex with a bounded marker scan. Fresh Astra/max review accepted the fix and confirmed malformed, mixed-label, and valid-input controls. This is a distinct ReDoS finding from the later PEM-recognition report that shares the implementation commit. The fix has not yet shipped in a released PyJWT 2.x version, so this advisory is being moved to draft and remains unpublished pending release.</p>
+<h2 id="maintainer-update--2026-09-11">Maintainer update — 2026-09-11</h2>
+<p>The verified fix for this advisory is included in PyJWT 2.14.0, released on 2026-09-11 and available on PyPI. PyJWT 2.14.0 is the first release containing the fix. This advisory is now published with the release recorded as the patched version.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/jpadilla/pyjwt/security/advisories/GHSA-jwrc-g2q2-pq5p">https://github.com/jpadilla/pyjwt/security/advisories/GHSA-jwrc-g2q2-pq5p</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-102270">https://nvd.nist.gov/vuln/detail/CVE-2026-102270</a></li>
+<li><a href="https://github.com/jpadilla/pyjwt/commit/8b4e233a22206b34ec1186e912e75c0b2396ac07">https://github.com/jpadilla/pyjwt/commit/8b4e233a22206b34ec1186e912e75c0b2396ac07</a></li>
+<li><a href="https://github.com/jpadilla/pyjwt/releases/tag/2.14.0">https://github.com/jpadilla/pyjwt/releases/tag/2.14.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-jwrc-g2q2-pq5p">https://github.com/advisories/GHSA-jwrc-g2q2-pq5p</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-jwrc-g2q2-pq5p</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-09-30T14:40:25.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[PyJWT] PyJWT: PyJWK accepts empty HMAC keys, bypassing PyJWT's empty-key validation]]></title>
         <id>https://github.com/advisories/GHSA-9j54-fg26-wv3r</id>
@@ -1644,353 +2009,5 @@ def home_static_files(file_path: str):
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-09-24T19:58:14.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[social-auth-core] social-auth-core: VK App backend accepts unsigned callback data when auth_key is missing]]></title>
-        <id>https://github.com/advisories/GHSA-3c93-f73f-qc9h</id>
-        <link href="https://github.com/advisories/GHSA-3c93-f73f-qc9h"/>
-        <updated>2026-09-24T19:57:25.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>The <code>vk-app</code> backend accepted VK application callback data without verifying the callback signature when the <code>auth_key</code> parameter was omitted.</p>
-<p>Applications using this backend could treat unsigned attacker-controlled data as a verified VK identity. An attacker could choose callback fields such as <code>viewer_id</code>, <code>access_token</code>, <code>api_id</code>, and <code>api_result</code>, potentially allowing authentication as an arbitrary VK user ID.</p>
-<p>The issue affects only applications using the <code>vk-app</code> backend.</p>
-<h3 id="patches">Patches</h3>
-<p>The issue has been fixed by requiring <code>auth_key</code> to be present and valid before callback data is trusted.</p>
-<p>Users should upgrade to a patched version.</p>
-<p>Fix:</p>
-<ul>
-<li><a href="https://github.com/python-social-auth/social-core/pull/1811">https://github.com/python-social-auth/social-core/pull/1811</a></li>
-</ul>
-<h3 id="workarounds">Workarounds</h3>
-<p>Applications that cannot upgrade immediately should disable the <code>vk-app</code> backend by removing <code>social_core.backends.vk.VKAppOAuth2</code> from <code>SOCIAL_AUTH_AUTHENTICATION_BACKENDS</code>.</p>
-<p>There is no complete workaround while continuing to use the vulnerable backend.</p>
-<h3 id="credits">Credits</h3>
-<p>Reported by @lalalala5678 through GitHub private vulnerability reporting.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/python-social-auth/social-core/security/advisories/GHSA-3c93-f73f-qc9h">https://github.com/python-social-auth/social-core/security/advisories/GHSA-3c93-f73f-qc9h</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-57178">https://nvd.nist.gov/vuln/detail/CVE-2026-57178</a></li>
-<li><a href="https://github.com/python-social-auth/social-core/pull/1811">https://github.com/python-social-auth/social-core/pull/1811</a></li>
-<li><a href="https://github.com/python-social-auth/social-core/commit/1bfacdd0379e5eb46e169a99ab648b835e9bb6a2">https://github.com/python-social-auth/social-core/commit/1bfacdd0379e5eb46e169a99ab648b835e9bb6a2</a></li>
-<li><a href="https://github.com/python-social-auth/social-core/releases/tag/5.0.0">https://github.com/python-social-auth/social-core/releases/tag/5.0.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-3c93-f73f-qc9h">https://github.com/advisories/GHSA-3c93-f73f-qc9h</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-3c93-f73f-qc9h</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-09-24T19:57:22.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[social-auth-core] social-auth-core has Login CSRF via Missing State Parameter in LoginRadius Backend]]></title>
-        <id>https://github.com/advisories/GHSA-x7qq-23vw-7pfg</id>
-        <link href="https://github.com/advisories/GHSA-x7qq-23vw-7pfg"/>
-        <updated>2026-09-24T19:56:39.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>The LoginRadius backend did not validate OAuth state during the authentication flow.</p>
-<p>Applications using this backend were vulnerable to login CSRF. An attacker could cause a victim's browser session to complete authentication using an attacker-controlled LoginRadius token, making the victim authenticated as the attacker's LoginRadius identity.</p>
-<p>The issue affects only applications using the LoginRadius backend.</p>
-<h3 id="patches">Patches</h3>
-<p>The issue has been fixed by enabling callback state validation for the LoginRadius backend.</p>
-<p>Users should upgrade to a patched version.</p>
-<p>Fix:</p>
-<ul>
-<li><a href="https://github.com/python-social-auth/social-core/pull/1808">https://github.com/python-social-auth/social-core/pull/1808</a></li>
-</ul>
-<h3 id="workarounds">Workarounds</h3>
-<p>Applications that cannot upgrade immediately should disable the LoginRadius backend by removing it from <code>SOCIAL_AUTH_AUTHENTICATION_BACKENDS</code>.</p>
-<p>There is no complete workaround while continuing to use the vulnerable backend.</p>
-<h3 id="credits">Credits</h3>
-<p>Reported through GitHub private vulnerability reporting by Liyi Zhou, Ziyue Wang, Strick, Maurice, and Chenchen Yu from the University of Sydney security research team.</p>
-<p>Reporter references:</p>
-<ul>
-<li><a href="https://lzhou1110.github.io/">https://lzhou1110.github.io/</a></li>
-<li><a href="https://zyy0530.github.io/">https://zyy0530.github.io/</a></li>
-<li><a href="https://str1ckl4nd.github.io/">https://str1ckl4nd.github.io/</a></li>
-<li><a href="https://maurice.busystar.org/">https://maurice.busystar.org/</a></li>
-<li><a href="https://7thparkk.github.io/">https://7thparkk.github.io/</a></li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/python-social-auth/social-core/security/advisories/GHSA-x7qq-23vw-7pfg">https://github.com/python-social-auth/social-core/security/advisories/GHSA-x7qq-23vw-7pfg</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-57177">https://nvd.nist.gov/vuln/detail/CVE-2026-57177</a></li>
-<li><a href="https://github.com/python-social-auth/social-core/pull/1808">https://github.com/python-social-auth/social-core/pull/1808</a></li>
-<li><a href="https://github.com/python-social-auth/social-core/commit/4d332820e6b0583fde522956105a0e2beced5335">https://github.com/python-social-auth/social-core/commit/4d332820e6b0583fde522956105a0e2beced5335</a></li>
-<li><a href="https://github.com/python-social-auth/social-core/releases/tag/5.0.0">https://github.com/python-social-auth/social-core/releases/tag/5.0.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-x7qq-23vw-7pfg">https://github.com/advisories/GHSA-x7qq-23vw-7pfg</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-x7qq-23vw-7pfg</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-09-24T19:56:39.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[social-auth-core] social-auth-core Vulnerable to Account Takeover via Identity Binding Flaw in Vend Backend]]></title>
-        <id>https://github.com/advisories/GHSA-fp7w-m676-w7gc</id>
-        <link href="https://github.com/advisories/GHSA-fp7w-m676-w7gc"/>
-        <updated>2026-09-24T19:55:59.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>The Vend OAuth2 backend used only the numeric Vend <code>user_id</code> as the social-auth UID.</p>
-<p>When multiple Vend shops authenticate through the same application, users from different shops with the same internal Vend user ID could collide in the social-auth association table. A user from one shop could then be authenticated as the local account previously associated with the same numeric user ID from another shop.</p>
-<p>The issue affects applications using the Vend OAuth2 backend with more than one Vend shop.</p>
-<h3 id="patches">Patches</h3>
-<p>The issue has been fixed by scoping Vend social-auth UIDs by shop.</p>
-<p>Users should upgrade to a patched version.</p>
-<p>Fix:</p>
-<ul>
-<li><a href="https://github.com/python-social-auth/social-core/pull/1795">https://github.com/python-social-auth/social-core/pull/1795</a></li>
-</ul>
-<h3 id="workarounds">Workarounds</h3>
-<p>Applications that cannot upgrade immediately should restrict the Vend OAuth2 backend to a single trusted Vend shop.</p>
-<p>If Vend authentication is not required, the Vend backend can also be disabled by removing it from <code>SOCIAL_AUTH_AUTHENTICATION_BACKENDS</code>.</p>
-<p>There is no complete workaround while continuing to allow authentication from multiple Vend shops with the vulnerable backend.</p>
-<h3 id="credits">Credits</h3>
-<p>Reported through GitHub private vulnerability reporting by Liyi Zhou, Ziyue Wang, Strick, Maurice, and Chenchen Yu from the University of Sydney security research team.</p>
-<p>Reporter references:</p>
-<ul>
-<li><a href="https://lzhou1110.github.io/">https://lzhou1110.github.io/</a></li>
-<li><a href="https://zyy0530.github.io/">https://zyy0530.github.io/</a></li>
-<li><a href="https://str1ckl4nd.github.io/">https://str1ckl4nd.github.io/</a></li>
-<li><a href="https://maurice.busystar.org/">https://maurice.busystar.org/</a></li>
-<li><a href="https://7thparkk.github.io/">https://7thparkk.github.io/</a></li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/python-social-auth/social-core/security/advisories/GHSA-fp7w-m676-w7gc">https://github.com/python-social-auth/social-core/security/advisories/GHSA-fp7w-m676-w7gc</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-57176">https://nvd.nist.gov/vuln/detail/CVE-2026-57176</a></li>
-<li><a href="https://github.com/python-social-auth/social-core/pull/1795">https://github.com/python-social-auth/social-core/pull/1795</a></li>
-<li><a href="https://github.com/python-social-auth/social-core/commit/dee7ad1785877afd355dd6860598823d2631b76e">https://github.com/python-social-auth/social-core/commit/dee7ad1785877afd355dd6860598823d2631b76e</a></li>
-<li><a href="https://github.com/python-social-auth/social-core/releases/tag/5.0.0">https://github.com/python-social-auth/social-core/releases/tag/5.0.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-fp7w-m676-w7gc">https://github.com/advisories/GHSA-fp7w-m676-w7gc</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-fp7w-m676-w7gc</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-09-24T19:55:57.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[social-auth-core] social-auth-core has an Improper Authentication issue]]></title>
-        <id>https://github.com/advisories/GHSA-vq6g-g6c7-5f2j</id>
-        <link href="https://github.com/advisories/GHSA-vq6g-g6c7-5f2j"/>
-        <updated>2026-09-24T19:54:49.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>The SAML backend accepted SAML responses on the Assertion Consumer Service endpoint without verifying that they matched a previously issued <code>AuthnRequest</code>.</p>
-<p>Applications using SAML account association could allow an attacker with a valid account on a trusted IdP to link the attacker's SAML identity to a logged-in victim's local account. The attacker could then authenticate through SAML and gain access to the victim's account.</p>
-<p>The issue affects applications using the SAML backend together with authenticated account association.</p>
-<h3 id="patches">Patches</h3>
-<p>The issue has been fixed by validating SAML responses against stored <code>AuthnRequest</code> IDs.</p>
-<p>Users should upgrade to a patched version.</p>
-<p>Fix:</p>
-<ul>
-<li><a href="https://github.com/python-social-auth/social-core/pull/1794">https://github.com/python-social-auth/social-core/pull/1794</a></li>
-</ul>
-<h3 id="workarounds">Workarounds</h3>
-<p>Applications that cannot upgrade immediately should disable SAML account association for already authenticated users.</p>
-<p>If SAML login is not required, the SAML backend can also be disabled by removing it from <code>SOCIAL_AUTH_AUTHENTICATION_BACKENDS</code>.</p>
-<p>There is no complete workaround while continuing to allow vulnerable SAML account association.</p>
-<h3 id="credits">Credits</h3>
-<p>Reported through GitHub private vulnerability reporting by Liyi Zhou, Ziyue Wang, Strick, Maurice, and Chenchen Yu from the University of Sydney security research team.</p>
-<p>Reporter references:</p>
-<ul>
-<li><a href="https://lzhou1110.github.io/">https://lzhou1110.github.io/</a></li>
-<li><a href="https://zyy0530.github.io/">https://zyy0530.github.io/</a></li>
-<li><a href="https://str1ckl4nd.github.io/">https://str1ckl4nd.github.io/</a></li>
-<li><a href="https://maurice.busystar.org/">https://maurice.busystar.org/</a></li>
-<li><a href="https://7thparkk.github.io/">https://7thparkk.github.io/</a></li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/python-social-auth/social-core/security/advisories/GHSA-vq6g-g6c7-5f2j">https://github.com/python-social-auth/social-core/security/advisories/GHSA-vq6g-g6c7-5f2j</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-57175">https://nvd.nist.gov/vuln/detail/CVE-2026-57175</a></li>
-<li><a href="https://github.com/python-social-auth/social-core/pull/1794">https://github.com/python-social-auth/social-core/pull/1794</a></li>
-<li><a href="https://github.com/python-social-auth/social-core/commit/5c72f71125bc60e4411f09e2a9f998de5da7fcb6">https://github.com/python-social-auth/social-core/commit/5c72f71125bc60e4411f09e2a9f998de5da7fcb6</a></li>
-<li><a href="https://github.com/python-social-auth/social-core/releases/tag/5.0.0">https://github.com/python-social-auth/social-core/releases/tag/5.0.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-vq6g-g6c7-5f2j">https://github.com/advisories/GHSA-vq6g-g6c7-5f2j</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-vq6g-g6c7-5f2j</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-09-24T19:54:48.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[compliance-trestle] Trestle is vulnerable to arbitrary file write via path traversal in author generate commands (Incomplete fix of CVE-2026-46345)]]></title>
-        <id>https://github.com/advisories/GHSA-r4vp-3vw6-r2x5</id>
-        <link href="https://github.com/advisories/GHSA-r4vp-3vw6-r2x5"/>
-        <updated>2026-09-24T19:52:36.000Z</updated>
-        <content type="html"><![CDATA[<p><strong>At a glance</strong></p>
-<ul>
-<li><p><strong>Actor:</strong> attacker who controls the -o/--output argument to trestle author {catalog,profile,ssp}-generate (e.g. via a CI pipeline that derives the output directory from repository-controlled data)</p>
-</li>
-<li><p><strong>Primitive:</strong> attacker-controlled --output value reaches trestle_root / args.output write sink with only is_directory_name_allowed() (parts[0]-only task-name-collision check), not the PathSecurityValidator.validate_local_path() guard added by the CVE-2026-46345 fix</p>
-</li>
-<li><p><strong>Impact:</strong> arbitrary-location file write outside the trestle workspace as the process owner (8.4 High; conservative C:N variant 7.7, still High); with --force-overwrite, the attacker-chosen directory is first recursively deleted shutil.rmtree)</p>
-</li>
-<li><p><strong>Precondition:</strong> attacker influences the -o argument in a CI/automation pipeline or multi-tenant trestle workspace running these generate subcommands</p>
-</li>
-<li><p><strong>Fix:</strong> call PathSecurityValidator.validate_local_path(markdown_path, trestle_root) immediately after building markdown_path in catalog.py, ssp.py, and prof.py, mirroring the existing jinja fix</p>
-</li>
-</ul>
-<h2 id="overview">Overview</h2>
-<p>The remediation for <strong>CVE-2026-46345 / GHSA-4q5v-7g7x-j79w</strong> ("Arbitrary File Write via Path Traversal in compliance-trestle – jinja") added a new PathSecurityValidator.validate_local_path() guard and wired it into the jinja command's output path. The identical output = trestle_root / args.output write pattern in the sibling author commands — catalog-generate, profile-generate, and ssp-generate — was <strong>not</strong> updated. Those commands instead rely on is_directory_name_allowed(), a task-name-collision check that does not stop path traversal: an absolute --output or a --output whose first component is innocuous subdir/../../../...) escapes the trestle workspace and writes generated markdown under an attacker-chosen output root outside the workspace, subject to the invoking process's filesystem permissions.</p>
-<h2 id="impact">Impact</h2>
-<p><strong>Threat model.</strong> This is not a claim that a local user harms themselves by intentionally choosing an unsafe -o. The security boundary is crossed when a trusted automation job, CI workflow, shared trestle service, or wrapper invokes one of these subcommands and derives --output from repository-controlled, tenant-controlled, or otherwise untrusted data while expecting trestle to keep generated output inside the workspace. The attacker does not need local shell access to the trestle host; they only need influence over the data that the trusted automation maps into the --output argument.</p>
-<p><strong>Primary claim (confirmed):</strong> Such an invocation writes control-markdown files <strong>outside</strong> the trestle workspace — arbitrary-location file write as the process owner. This is runtime-confirmed for catalog-generate: catalog-generate -o /tmp/TRESTLE_ESCAPE_ABS produced files outside the workspace on a v4.0.3 install while the same install blocked the equivalent jinja -o with a Security violation error. profile-generate and ssp-generate are source-confirmed siblings (identical trestle_root / args.output join, the same is_directory_name_allowed-only gate, no validate_local_path call); see Runtime-confirmed scope in the End-to-end verification below.</p>
-<p><strong>Destructive variant --force-overwrite, source-confirmed):</strong> before generating, the force-overwrite path clears the selected output directory via clear_folder(...) trestle/core/commands/common/cmd_utils.py), which performs shutil.rmtree on that directory. Because clear_folder early-returns unless the target is an existing <strong>directory</strong>, the primitive is recursive deletion of an attacker-selected directory tree outside the workspace (e.g. wiping a directory the process owner can write), not pinpoint deletion of an arbitrary single file. This is the integrity + availability impact behind I:HA:H.</p>
-<p><strong>Secondary (conditional) escalation:</strong> The affected population extends to every consumer that runs these generate subcommands in a CI/automation pipeline, shared/multi-tenant trestle workspace, or wrapper that forwards an externally supplied name — the same threat model GitHub/the maintainer accepted for CVE-2026-46345. Indirect code execution (e.g. overwriting a script the CI pipeline later invokes) is the bounded escalation beyond the demonstrated file-write primitive.</p>
-<h2 id="technical-details">Technical Details</h2>
-<p><strong>Source → Transform → Sink → Missing-guard → Result:</strong> attacker-controlled --output CLI argument → trestle_root / args.output join in catalog.pyssp.pyprof.py → CatalogAPI.write_catalog_as_markdown() writes files under the resolved path → only is_directory_name_allowed() (parts[0]-only task-name check) applied, not PathSecurityValidator.validate_local_path() → files written outside the trestle workspace.</p>
-<h3 id="the-fix-is-scoped-to-jinjapy-only">The fix is scoped to jinja.py only</h3>
-<p>Both fix commits 247fcce2…, 7d107b3a…, "add path traversal protection and prevent SSTI in jinja templating") touch only trestle/core/commands/author/jinja.py (+ its tests). The new guard:</p>
-<pre><code class="language-python"># trestle/core/commands/author/jinja.py
-output_file = trestle_root / r_output_file
-PathSecurityValidator.validate_local_path(output_file, trestle_root)   # :229 (and :278, :297)
-</code></pre>
-<p>validate_local_path trestle/core/remote/security.py:326) is the correct guard — it .resolve()s the path and calls relative_to(trestle_root), rejecting both .. traversal and absolute paths.</p>
-<h3 id="the-sibling-generate-commands-were-not-updated">The sibling generate commands were not updated</h3>
-<p>catalog-generate, profile-generate, and ssp-generate build the output path with the <strong>same</strong> join but never call validate_local_path. The only check is is_directory_name_allowed:</p>
-<pre><code class="language-python"># trestle/core/commands/author/catalog.py:69 / ssp.py:97 / prof.py:86  (identical in all three)
-if not file_utils.is_directory_name_allowed(args.output):
-    raise TrestleError(f'{args.output} is not an allowed directory name')
-...
-markdown_path = trestle_root / args.output           # catalog.py:90 / prof.py:110 (var markdown_path); ssp.py:111 (var md_path) — same join
-</code></pre>
-<p>is_directory_name_allowed trestle/common/file_utils.py:95) was designed to stop task names that collide with OSCAL model directories, not traversal. It inspects only parts[0]:</p>
-<pre><code class="language-python">def is_directory_name_allowed(name: str) -&gt; bool:
-    pathed_name = pathlib.Path(name)
-    root_path = pathed_name.parts[0]
-    if root_path in const.MODEL_TYPE_TO_MODEL_DIR.values(): return False  # blocks "catalogs", "profiles", ...
-    if root_path[0] == '.':                                return False  # blocks leading "." (i.e. "../x")
-    if pathed_name.suffix != '':                           return False  # blocks names with a file suffix
-    if '__global__' in pathed_name.parts:                  return False
-    return True
-</code></pre>
-<p>Two payloads defeat it:</p>
-<ol>
-<li><p><strong>Absolute path</strong> — --output /tmp/pwned. parts[0] is / (not an OSCAL dir, not .-prefixed, no suffix) → allowed. trestle_root / '/tmp/pwned' collapses to /tmp/pwned (pathlib discards the left operand on absolute join).</p>
-</li>
-<li><p><strong>Non-leading ..</strong> — --output subdir/../../../../../../tmp/pwned. parts[0] is subdir (innocuous) → allowed. The .. segments resolve out of the workspace at write time.</p>
-</li>
-</ol>
-<p>The validated value flows unchanged to the write sink with no further sanitisation grep for resolve()/relative_to/validate_local_path across the catalog write path returns zero hits): ControlContext.generate(..., md_root=markdown_path, ...) stores it as a dataclass field trestle/core/control_context.py:46) and CatalogAPI.write_catalog_as_markdown() calls self._context.md_root.mkdir(exist_ok=True, parents=True) trestle/core/catalog/catalog_api.py:72) then writes .md files under it.</p>
-<h3 id="additional-unguarded-siblings-create-replicate">Additional unguarded siblings create, replicate)</h3>
-<p>trestle create trestle/core/commands/create.py:95, desired_model_dir = trestle_root / plural_path / args.output) and trestle replicate replicate.py:90) have <strong>no</strong> is_directory_name_allowed check at all and accept the same absolute / .. --output. They write a structured OSCAL model file and refuse to overwrite an existing target .exists() raises), so the primitive is create-only there — lower impact than the generate commands, but the same missing-guard root cause. These are flagged as related defense-in-depth sinks sharing the root cause, not as the primary impact claim of this report.</p>
-<h3 id="severity-note">Severity note</h3>
-<p>Metrics mirror the parent CVE-2026-46345 (8.4, AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H). I:HA:H are direct and demonstrated: out-of-workspace file creation, plus recursive shutil.rmtree of an attacker-chosen directory under --force-overwrite. C:H is proposed for consistency with the parent advisory's published score for the same out-of-workspace write boundary; however, the directly demonstrated primitive is write/overwrite rather than file read, so a conservative vector with C:N AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:H) yields <strong>7.7, still High</strong>. S:U because trestle writes as the invoking user.</p>
-<h3 id="why-oscal-id-validation-does-not-prevent-this">Why OSCAL id-validation does not prevent this</h3>
-<p>OSCAL model ids control.id, group.id) are NCName-validated constr(regex=…)) and cannot contain /, , or a leading .., so the per-control <strong>leaf</strong> filenames grp1/ac-1.md) cannot themselves traverse. That validation does not help here: the <strong>base</strong> output root md_root = trestle_root / args.output is built from the raw, unconstrained -o/--output CLI string and is joined before those safe leaves. An absolute or non-leading.. -o escapes the workspace, and the NCName-safe leaves are written underneath the escaped root — confirmed by the PoC, where the escape occurs at md_root /tmp/TRESTLE_ESCAPE_ABS) with grp1/ac-1.md written beneath it.</p>
-<h2 id="reproduction">Reproduction</h2>
-<p>Non-web target (Python CLI). PoC is a command sequence run against a <strong>local</strong> install of the project's current source (HEAD e22e35bd, reports as v4.0.3) — no vendor infrastructure touched.</p>
-<h3 id="step-1--set-up-a-normal-trestle-workspace-with-a-one-control-catalog">Step 1 — Set up a normal trestle workspace with a one-control catalog</h3>
-<pre><code class="language-bash">pip install -e .                      # editable install of the affected source (v4.0.3)
-mkdir /tmp/poc_ws &amp;&amp; cd /tmp/poc_ws
-trestle init
-mkdir -p catalogs/mycat
-python3 - &lt;&lt;'PY'
-import uuid, json
-cat = {"catalog":{"uuid":str(uuid.uuid4()),
-  "metadata":{"title":"PoC Catalog","last-modified":"2026-01-01T00:00:00.000+00:00","version":"1.0","oscal-version":"1.0.4"},
-  "groups":[{"id":"grp1","title":"Group One","controls":[
-     {"id":"ac-1","title":"PoC Control","parts":[{"id":"ac-1_smt","name":"statement","prose":"PoC statement prose."}]}]}]}}
-json.dump(cat, open("catalogs/mycat/catalog.json","w"), indent=2)
-PY
-</code></pre>
-<h3 id="step-2--trigger-the-boundary-failure-absolute-path-escape">Step 2 — Trigger the boundary failure (absolute-path escape)</h3>
-<pre><code class="language-bash">trestle author catalog-generate -n mycat -o /tmp/TRESTLE_ESCAPE_ABS
-ls /tmp/TRESTLE_ESCAPE_ABS/grp1/ac-1.md
-</code></pre>
-<p>Recorded output:</p>
-<pre><code class="language-text">$ ls /tmp/TRESTLE_ESCAPE_ABS/grp1/ac-1.md
-/tmp/TRESTLE_ESCAPE_ABS/grp1/ac-1.md          # written OUTSIDE /tmp/poc_ws
-$ head -3 /tmp/TRESTLE_ESCAPE_ABS/grp1/ac-1.md
-# ac-1 - \[Group One\] PoC Control
-## Control Statement
-</code></pre>
-<h3 id="step-3--same-escape-via-non-leading--defeats-is_directory_name_allowed">Step 3 — Same escape via non-leading .. (defeats is_directory_name_allowed)</h3>
-<pre><code class="language-bash">trestle author catalog-generate -n mycat -o 'subdir/../../../../../../tmp/TRESTLE_ESCAPE_DOTDOT'
-ls /tmp/TRESTLE_ESCAPE_DOTDOT/grp1/ac-1.md   # -&gt; exists, outside the workspace
-</code></pre>
-<h3 id="step-4--differential-the-patched-jinja--o-is-blocked-on-the-same-install">Step 4 — Differential: the patched jinja -o is blocked on the SAME install</h3>
-<pre><code class="language-bash">echo 'hello {{ 1+1 }}' &gt; template.j2
-trestle author jinja -i template.j2 -o '/tmp/TRESTLE_JINJA_BLOCKED'
-</code></pre>
-<p>Recorded output (fix is active; proves this is an incomplete fix, not an unpatched version):</p>
-<pre><code class="language-text">ERROR: ... Security violation: Path traversal blocked. Attempted to access
-"/tmp/TRESTLE_JINJA_BLOCKED" which is outside the trestle workspace "/tmp/poc_ws"
-# (no file created)
-</code></pre>
-<p>catalog-generate escapes while jinja is blocked → the validate_local_path remediation was never applied to the generate commands.</p>
-<h3 id="end-to-end-verification-runtime">End-to-end verification (runtime)</h3>
-<ul>
-<li><p><strong>Lab setup:</strong> editable install pip install -e .) of the affected source at HEAD e22e35bd (reports as v4.0.3, the release that contains the GHSA-4q5v jinja fix). import trestle.core.commands.author.catalog resolves to the in-tree source file, confirming the run exercises HEAD, not a stale wheel.</p>
-</li>
-<li><p><strong>Observed end-to-end effect (not an intermediate return value):</strong> files physically written outside the workspace — /tmp/TRESTLE_ESCAPE_ABS/grp1/ac-1.md and /tmp/TRESTLE_ESCAPE_DOTDOT/grp1/ac-1.md — while /tmp/poc_ws (the trestle root) contained no such directory. Confirmed by findls.</p>
-</li>
-<li><p><strong>Differential control:</strong> the same install rejects the equivalent jinja -o with Security violation: Path traversal blocked … outside the trestle workspace, writing nothing. The guard exists and works in jinja; it is simply absent from the generate commands.</p>
-</li>
-<li><p><strong>Guard bypass, isolated:</strong> importing is_directory_name_allowed semantics and joining via pathlib confirms -o /tmp/pwned (absolute) and -o subdir/../../../tmp/pwned (innocuous leading component) both pass the check and resolve outside the root, while the naive -o ../../tmp/pwned is the only form the check stops.</p>
-</li>
-<li><p><strong>Runtime-confirmed scope (what was executed vs source-confirmed):</strong> the write escape is runtime-confirmed for catalog-generate (Steps 2–4 above). profile-generate and ssp-generate are source-confirmed siblings — same trestle_root / args.output join prof.py:110, ssp.py:111), same is_directory_name_allowed-only gate prof.py:86, ssp.py:97), no validate_local_path — and should be fixed in the same patch. The --force-overwrite recursive-delete primitive clear_folder → shutil.rmtree, with an early return unless the target is an existing directory) is source-confirmed; the PoC above exercises the write escape, not -fo.</p>
-</li>
-</ul>
-<h2 id="suggested-fix">Suggested Fix</h2>
-<p><strong>Root-cause fix:</strong> Mirror the jinja fix in the three generate commands (and, for completeness, createreplicate): after constructing the output path, call the existing guard before any mkdir/write.</p>
-<pre><code class="language-python"># catalog.py / ssp.py / prof.py, immediately after markdown_path = trestle_root / args.output
-from trestle.core.remote.security import PathSecurityValidator
-PathSecurityValidator.validate_local_path(markdown_path, trestle_root)
-</code></pre>
-<p>is_directory_name_allowed() should be retained for its original purpose (OSCAL-dir-collision prevention) but must not be relied on for traversal defence.</p>
-<p><strong>Defense-in-depth:</strong> Harden is_directory_name_allowed to reject absolute paths pathed_name.is_absolute()) and any .. component so it provides a secondary layer even if the primary validate_local_path call is accidentally omitted in future.</p>
-<h2 id="references">References</h2>
-<ul>
-<li><p>Vendor security policy: <a href="https://github.com/oscal-compass/compliance-trestle/security/policy">https://github.com/oscal-compass/compliance-trestle/security/policy</a></p>
-</li>
-<li><p>Submission endpoint: <a href="https://github.com/oscal-compass/compliance-trestle/security/advisories/new">https://github.com/oscal-compass/compliance-trestle/security/advisories/new</a></p>
-</li>
-<li><p>Parent advisory (incompletely fixed): GHSA-4q5v-7g7x-j79w / CVE-2026-46345 — "Arbitrary File Write via Path Traversal in compliance-trestle – jinja"</p>
-</li>
-<li><p>Coordinated disclosure batch (part of the same PathSecurityValidator remediation): GHSA-gg2g-p7xc-qqmm (SSTI RCE), GHSA-g3vg-vx23-3858 (cache path traversal), GHSA-mj4x-vf5c-5xg8 (profile-import path traversal read), GHSA-w76h-q7c6-jpjp (SSRF)</p>
-</li>
-<li><p>Fix commits (jinja-only scope): 247fcce289f60103f3d8e28d8ec51a6986b94fb6, 7d107b3ac53caca7bde97a6278b23cd739d94525</p>
-</li>
-<li><p>Affected sinks: trestle/core/commands/author/catalog.py:69,90; author/ssp.py:97,111; author/prof.py:86,110; bypassed guard trestle/common/file_utils.py:95; write sink trestle/core/catalog/catalog_api.py:72; unused-here correct guard trestle/core/remote/security.py:326</p>
-</li>
-<li><p>Additional unguarded siblings: trestle/core/commands/create.py:95, trestle/core/commands/replicate.py:90</p>
-</li>
-</ul>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/oscal-compass/compliance-trestle/security/advisories/GHSA-4q5v-7g7x-j79w">https://github.com/oscal-compass/compliance-trestle/security/advisories/GHSA-4q5v-7g7x-j79w</a></li>
-<li><a href="https://github.com/oscal-compass/compliance-trestle/security/advisories/GHSA-r4vp-3vw6-r2x5">https://github.com/oscal-compass/compliance-trestle/security/advisories/GHSA-r4vp-3vw6-r2x5</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-57171">https://nvd.nist.gov/vuln/detail/CVE-2026-57171</a></li>
-<li><a href="https://github.com/oscal-compass/compliance-trestle/pull/2270">https://github.com/oscal-compass/compliance-trestle/pull/2270</a></li>
-<li><a href="https://github.com/oscal-compass/compliance-trestle/commit/37ed44f5f2e074202c8eb7c2f203c05d19461cdc">https://github.com/oscal-compass/compliance-trestle/commit/37ed44f5f2e074202c8eb7c2f203c05d19461cdc</a></li>
-<li><a href="https://github.com/oscal-compass/compliance-trestle/commit/5335ff873a2a68eb7de43df029bea09cadff22fd">https://github.com/oscal-compass/compliance-trestle/commit/5335ff873a2a68eb7de43df029bea09cadff22fd</a></li>
-<li><a href="https://github.com/oscal-compass/compliance-trestle/releases/tag/v3.12.4">https://github.com/oscal-compass/compliance-trestle/releases/tag/v3.12.4</a></li>
-<li><a href="https://github.com/oscal-compass/compliance-trestle/releases/tag/v4.1.0">https://github.com/oscal-compass/compliance-trestle/releases/tag/v4.1.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-r4vp-3vw6-r2x5">https://github.com/advisories/GHSA-r4vp-3vw6-r2x5</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-r4vp-3vw6-r2x5</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-09-24T19:52:34.000Z</published>
     </entry>
 </feed>
