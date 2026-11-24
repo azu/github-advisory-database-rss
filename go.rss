@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://azu.github.io/github-advisory-database-rss/go.rss</id>
     <title>Security Advisory for Go modules</title>
-    <updated>2026-11-23T13:49:11.431Z</updated>
+    <updated>2026-11-24T01:20:30.628Z</updated>
     <generator>github-advisory-database-rss</generator>
     <link rel="alternate" href="https://github.com/advisories?query=type%3Areviewed+ecosystem%3Ago"/>
     <subtitle>Security Advisory for Go modules on GitHub</subtitle>
@@ -11,6 +11,132 @@
     <category term="HIGH"/>
     <category term="MODERATE"/>
     <category term="LOW"/>
+    <entry>
+        <title type="html"><![CDATA[[github.com/klever-io/klever-go] Klever Go counts bitmap padding bits toward BLS quorum, allowing blocks with insufficient signatures]]></title>
+        <id>https://github.com/advisories/GHSA-f9h7-4mmq-vgcq</id>
+        <link href="https://github.com/advisories/GHSA-f9h7-4mmq-vgcq"/>
+        <updated>2026-11-23T20:55:36.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="summary">Summary</h2>
+<p>When validating an incoming block header, <code>HeaderSigVerifier.verifyConsensusSize</code> counts <em>every</em> set bit in <code>PubKeysBitmap</code> — including bits that correspond to no validator (the padding bits of the final byte, which exist whenever the consensus group size is not a multiple of 8). The subsequent BLS aggregate-signature verification (<code>blsMultiSigner.Verify</code>) only checks signature validity for real validator indices and silently ignores those padding bits. As a result, a malicious or compromised block producer can set the padding bits to make the on-bits reach the PBFT quorum while only gathering a smaller number of real validator signature shares, causing a block to be accepted as correctly signed without a genuine two-thirds validator quorum.</p>
+<h2 id="details">Details</h2>
+<p>Quorum counter counts padding bits — <code>core/process/headerCheck/headerSignatureVerify.go:145-183</code>:</p>
+<pre><code class="language-go">func (hsv *HeaderSigVerifier) verifyConsensusSize(consensusPubKeys []string, header data.HeaderHandler) error {
+    consensusSize := len(consensusPubKeys)
+    bitmap := header.GetPubKeysBitmap()
+
+    expectedBitmapSize := consensusSize / 8
+    if consensusSize%8 != 0 {
+        expectedBitmapSize++
+    }
+    if len(bitmap) != expectedBitmapSize {
+        ...
+        return ErrWrongSizeBitmap
+    }
+
+    numOfOnesInBitmap := 0
+    for index := range bitmap {
+        numOfOnesInBitmap += bits.OnesCount8(bitmap[index])   // &lt;-- counts ALL bits incl. padding
+    }
+
+    minNumRequiredSignatures := consensus.GetPBFTThreshold(consensusSize)
+    ...
+    if numOfOnesInBitmap &gt;= minNumRequiredSignatures {
+        return nil
+    }
+    ...
+    return ErrNotEnoughSignatures
+}
+</code></pre>
+<p>The bitmap-byte-length check above only ensures the byte array is the right <em>size</em>; it never requires the padding bits (bits <code>[consensusSize … expectedBitmapSize*8)</code>) to be zero. So any combination of padding bits is accepted toward the quorum.</p>
+<p><code>VerifySignature</code> (<code>:92-143</code>) then builds the verifier from the <em>real</em> public keys, sets the aggregate signature, and calls <code>verifier.Verify(hash, bitmap)</code>.</p>
+<p>The BLS verifier ignores padding bits — <code>crypto/signing/multisig/blsMultisig.go:272-297</code>:</p>
+<pre><code class="language-go">func (bms *blsMultiSigner) Verify(message []byte, bitmap []byte) error {
+    ...
+    maxFlags := len(bitmap) * 8
+    flagsMismatch := maxFlags &lt; len(bms.data.pubKeys)   // only rejects *too few* bytes
+    if flagsMismatch {
+        return crypto.ErrBitmapMismatch
+    }
+
+    pubKeys := make([]crypto.PublicKey, 0)
+    for i := range bms.data.pubKeys {                    // &lt;-- only real validator indices
+        err := bms.isIndexInBitmap(uint16(i), bitmap)
+        if err != nil {
+            continue
+        }
+        pubKeys = append(pubKeys, bms.data.pubKeys[i])
+    }
+
+    return bms.llSigner.VerifyAggregatedSig(bms.keyGen.Suite(), pubKeys, bms.data.aggSig, message)
+}
+</code></pre>
+<p>Because the loop only walks <code>range bms.data.pubKeys</code>, a bit set at position <code>i &gt;= len(pubKeys)</code> is never inspected by <code>isIndexInBitmap</code> and is therefore silently dropped from signature verification, even though <code>verifyConsensusSize</code> already counted it toward quorum.</p>
+<p>PBFT threshold — <code>core/consensus/consensus.go:5-8</code> (<code>consensusSize*2/3 + 1</code>) and fallback <code>:10-13</code> (<code>consensusSize/2 + 1</code>).</p>
+<p>Reachable from received blocks — <code>core/process/block/interceptedBlocks/interceptedBlock.go:181-201</code> runs <code>CheckValidity()</code> → <code>VerifySignature</code> on every header received from peers.</p>
+<h3 id="worked-example-consensus-size--5">Worked example (consensus size = 5)</h3>
+<ul>
+<li>Required PBFT quorum: <code>5*2/3 + 1 = 4</code>.</li>
+<li>Valid validator bit positions: 0..4. Bits 5, 6, 7 are padding (no validator).</li>
+<li>Attacker gathers only <strong>one</strong> real signature share (validator 0) and aggregates it.</li>
+<li>Sets bitmap byte to <code>0b1110_0001</code> (<code>0xE1</code>): bit 0 (real) + bits 5, 6, 7 (padding).</li>
+<li><code>verifyConsensusSize</code> sees <code>bits.OnesCount8(0xE1) = 4</code> ≥ 4 → passes quorum.</li>
+<li><code>blsMultiSigner.Verify</code> only validates against validator 0's public key (padding ignored) → passes.</li>
+<li>The block is accepted with one real signer instead of four.</li>
+</ul>
+<p>For any <code>consensusSize</code> not divisible by 8, up to <code>8 - (consensusSize % 8)</code> fake "padding" signatures can be counted toward quorum. On a 21-member group (one padding bit) the attacker shaves one vote; on smaller/sharded groups with <code>consensusSize % 8</code> close to 7 the relative impact is larger.</p>
+<h2 id="poc">PoC</h2>
+<p>Reproduced locally against current <code>develop</code> (<code>085a5d1</code>) with this test (run under <code>core/process/headerCheck</code>, removed after verification):</p>
+<pre><code class="language-go">func TestPOCHeaderSigVerifierCountsPaddingBitsTowardQuorum(t *testing.T) {
+    args := createHeaderSigVerifierArgs()
+    args.NodesCoordinator = &amp;cMock.NodesCoordinatorMock{
+        GetValidatorsPublicKeysCalled: func(_ []byte, _ uint64, _ uint32) ([]string, error) {
+            return []string{"pk0", "pk1", "pk2", "pk3", "pk4"}, nil // consensus size 5 -&gt; need 4
+        },
+    }
+    verifyCalled := false
+    args.MultiSigVerifier = &amp;cMock.BelNevMock{
+        CreateMock: func(pubKeys []string, index uint16) (crypto.MultiSigner, error) {
+            return &amp;cMock.BelNevMock{
+                VerifyMock: func(msg []byte, bitmap []byte) error {
+                    verifyCalled = true          // verifier is reached even though only 1 real signer bit is set
+                    require.Equal(t, []byte{0xe1}, bitmap)
+                    return nil                  // single-signer aggregate verifies OK
+                },
+            }, nil
+        },
+    }
+    hdrSigVerifier, _ := headerCheck.NewHeaderSigVerifier(args)
+    header := &amp;block.Block{
+        Header:        &amp;block.BlockHeader{PrevRandSeed: []byte("seed")},
+        PubKeysBitmap: []byte{0xe1}, // bit0 (real) + padding bits 5,6,7 =&gt; counted as 4/5 quorum
+        Signature:     []byte("aggregate-of-only-real-bit-0"),
+    }
+    err := hdrSigVerifier.VerifySignature(header)
+    require.NoError(t, err)   // &lt;-- accepted with 1 real signature instead of the required 4
+    require.True(t, verifyCalled)
+}
+</code></pre>
+<p>Run: <code>go test ./core/process/headerCheck -run TestPOCHeaderSigVerifierCountsPaddingBitsTowardQuorum -count=1</code> → <code>ok</code>. The test asserts the current code accepts the header; a corrected implementation must return an error because only one real signer bit is set.</p>
+<h2 id="impact">Impact</h2>
+<p>This is an improper-verification / consensus-integrity vulnerability. A block proposer who can produce a valid leader signature plus a single valid aggregate BLS signature share can still satisfy the block-level quorum check by populating the padding bits of <code>PubKeysBitmap</code>. This weakens the PBFT two-thirds assumption: blocks can be accepted with fewer honest validator signatures than the protocol requires, enabling acceptance of attacker-favored blocks under collusion/compromise below the intended threshold and undermining finality guarantees. Any node that imports/intercepts headers (<code>interceptedBlock.CheckValidity</code>) is affected. Note the attacker still needs at least one valid consensus-group signature share and a valid leader signature, hence <code>PR:L</code> / <code>AC:H</code>.</p>
+<h2 id="suggested-fix">Suggested fix</h2>
+<p>In <code>verifyConsensusSize</code>, count only bits whose index <code>&lt; consensusSize</code> and additionally reject any non-zero bit in the padding region of the final bitmap byte (i.e. mask the last byte with <code>(1 &lt;&lt; (consensusSize % 8)) - 1</code> before counting, and fail if the original last byte has bits set above that mask). Mirror the same padding-bit rejection in <code>blsMultiSigner.Verify</code> so the verifier fails closed rather than silently ignoring unknown bits.</p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://github.com/klever-io/klever-go/security/advisories/GHSA-f9h7-4mmq-vgcq">https://github.com/klever-io/klever-go/security/advisories/GHSA-f9h7-4mmq-vgcq</a></li>
+<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-58262">https://nvd.nist.gov/vuln/detail/CVE-2026-58262</a></li>
+<li><a href="https://github.com/klever-io/klever-go/commit/a11cb28e495e608d8034dbe83a91e89d0c68e0f7">https://github.com/klever-io/klever-go/commit/a11cb28e495e608d8034dbe83a91e89d0c68e0f7</a></li>
+<li><a href="https://github.com/advisories/GHSA-f9h7-4mmq-vgcq">https://github.com/advisories/GHSA-f9h7-4mmq-vgcq</a></li>
+</ul>
+]]></content>
+        <author>
+            <name>GitHub</name>
+            <email>GitHub@noreply.github.com</email>
+            <uri>https://github.com/advisories/GHSA-f9h7-4mmq-vgcq</uri>
+        </author>
+        <category label="severity" term="HIGH"/>
+        <published>2026-11-23T20:55:35.000Z</published>
+    </entry>
     <entry>
         <title type="html"><![CDATA[[github.com/nats-io/nats-server/v2] nats-server Leaf node connections bypass Nats-Trace-Dest permission check]]></title>
         <id>https://github.com/advisories/GHSA-p3j5-5hrq-p75h</id>
@@ -743,158 +869,5 @@ VerifyServerSignature(encoded, "some-secret") // panics: assignment to entry in 
         </author>
         <category label="severity" term="MODERATE"/>
         <published>2026-11-20T00:20:38.000Z</published>
-    </entry>
-    <entry>
-        <title type="html"><![CDATA[[github.com/daptin/daptin] Daptin: Broken Access Control (IDOR) in the generic YJS collaboration endpoint]]></title>
-        <id>https://github.com/advisories/GHSA-wj7x-58c2-5793</id>
-        <link href="https://github.com/advisories/GHSA-wj7x-58c2-5793"/>
-        <updated>2026-11-20T00:14:15.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="summary">Summary</h3>
-<p>Daptin registers a generic WebSocket endpoint, <code>GET /yjs/:documentName</code>, for real-time collaborative
-document editing (YJS/CRDT). Unlike its purpose-built sibling route, this generic endpoint performs
-no per-resource authorization check - it only verifies that <em>some</em> user session exists. Because the
-document store parses <code>:documentName</code> as <code>typename.referenceId.columnName</code> and fetches that row's
-real column content unconditionally, any authenticated user (including a brand-new, zero-privilege,
-self-registered account) can read - and, since YJS sync is bidirectional, also write - the content
-of any <code>file.*</code>-typed column on any row of any table, including tables that are admin-only by
-default.</p>
-<h3 id="details">Details</h3>
-<p><code>InitializeYjsResources</code> (<code>server/endpoint_yjs.go</code>) registers two routes.</p>
-<p>The purpose-built, correctly-secured route, registered once per <code>file.*</code>-typed column on every
-table:</p>
-<pre><code class="language-go">// server/endpoint_yjs.go:47-113 (abridged)
-path := fmt.Sprintf("/live/%v/:referenceId/%v/yjs", typename, columnInfo.ColumnName)
-...
-return func(ginContext *gin.Context) {
-    sessionUser := ...
-    if sessionUser == nil { ginContext.AbortWithStatus(403); return }
-    ...
-    object, _, getErr := cruds[typename].GetSingleRowByReferenceIdWithTransaction(typename, parsedId, nil, tx)
-    if getErr != nil { ginContext.AbortWithStatus(404); return }
-    ...
-    objectPermission := cruds[typename].GetRowPermission(object, tx2)
-    if !objectPermission.CanUpdate(user.UserReferenceId, user.Groups, cruds[typename].AdministratorGroupId) {
-        ginContext.AbortWithStatus(401)
-        return
-    }
-    roomName := fmt.Sprintf("%v%v%v%v%v", typename, ".", referenceId, ".", columnInfo.ColumnName)
-    ...
-    yjsConnectionHandler(ginContext.Writer, ginContext.Request)
-}
-</code></pre>
-<p>This route correctly requires a session, loads the actual row, and checks
-<code>objectPermission.CanUpdate(...)</code> for the specific requesting user before allowing the WebSocket
-upgrade.</p>
-<p>A second, generic route is registered right above it, with none of those checks:</p>
-<pre><code class="language-go">// server/endpoint_yjs.go:27-38
-defaultRouter.GET("/yjs/:documentName", func(ginContext *gin.Context) {
-    sessionUser := ginContext.Request.Context().Value("user")
-    if sessionUser == nil {
-        ginContext.AbortWithStatus(403)
-        return
-    }
-    yjsConnectionHandler(ginContext.Writer, ginContext.Request)
-})
-</code></pre>
-<p>The only gate here is "is some session present" - there is no lookup of the referenced row, no
-<code>GetRowPermission</code>, no <code>CanUpdate</code>/<code>CanRead</code> check at all. <code>:documentName</code> is taken verbatim from
-the URL and handed straight to <code>yjsConnectionHandler</code>.</p>
-<p>The YJS document store's content provider parses <code>documentName</code> using exactly the
-<code>typename.referenceId.columnName</code> convention the secure route builds internally as <code>roomName</code>, and
-uses it to fetch the real row from the database with no authorization check of its own:</p>
-<pre><code class="language-go">// server/yjs_doucment_provider.go:41-115 (abridged)
-ydb.WithInitialContentProvider(func(documentPath string) []byte {
-    pathParts := strings.Split(documentPath, ".")
-    typeName, referenceId, columnName := pathParts[0], pathParts[1], pathParts[2]
-    crud := cruds[typeName]
-    object, _, getErr := crud.GetSingleRowByReferenceIdWithTransaction(typeName, parsedId,
-        map[string]bool{columnName: true}, tx)
-    ...
-    // decodes and returns the actual file/column content, base64-decoded, as the
-    // initial content of the shared collaborative document
-})
-</code></pre>
-<p>Because the generic route performs no permission check, any authenticated user can supply
-<code>documentName = "&lt;any table&gt;.&lt;any reference_id&gt;.&lt;any file.* column&gt;"</code> and the initial YJS sync will
-serve them that row's real content - including rows whose table has <code>DefaultGroups: adminsGroup</code>
-(admin-only by default, e.g. the built-in <code>calendar</code> table) or rows an ordinary user's own row-level
-permissions would otherwise forbid them from reading. Since YJS sync is bidirectional, a connected
-client can also push edits, which legitimate collaborators may later pull back in through the
-correctly secured <code>/live/...</code> route, giving a write/corruption path as well as a read path.</p>
-<h3 id="poc">PoC</h3>
-<p>Built and ran current HEAD in a clean container; created two accounts (<code>admin@admin.com</code>, first
-signup -&gt; admin; <code>bob@bob.com</code>, second signup -&gt; ordinary, non-admin user with default permissions
-only):</p>
-<pre><code class="language-bash"># 1) Generic endpoint accepts ANY authenticated session for ANY document name,
-#    including a syntactically-valid-but-nonexistent reference_id on an admin-only table:
-curl -i -N \
-  -H "Authorization: Bearer $BOB_TOKEN" \
-  -H "Connection: Upgrade" -H "Upgrade: websocket" \
-  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
-  "http://localhost:6336/yjs/calendar.deadbeef-0000-0000-0000-000000000000.content"
-# =&gt; HTTP/1.1 101 Switching Protocols        &lt;-- ACCEPTED, no ownership/permission check at all
-
-# 2) The purpose-built, secured sibling route correctly validates the very same identifier:
-curl -i -N \
-  -H "Authorization: Bearer $BOB_TOKEN" \
-  -H "Connection: Upgrade" -H "Upgrade: websocket" \
-  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
-  "http://localhost:6336/live/calendar/deadbeef-0000-0000-0000-000000000000/content/yjs"
-# =&gt; HTTP/1.1 404 Not Found                  &lt;-- looks the row up, would 401 if it existed and Bob lacked access
-
-# 3) Sanity check: the generic endpoint DOES require *some* session (not fully unauthenticated) --
-#    the flaw is specifically the missing per-resource check, not a missing session check:
-curl -i -N \
-  -H "Connection: Upgrade" -H "Upgrade: websocket" \
-  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
-  "http://localhost:6336/yjs/calendar.deadbeef-0000-0000-0000-000000000000.content"
-# =&gt; HTTP/1.1 403 Forbidden
-</code></pre>
-<p><code>bob@bob.com</code> has zero relationship to the <code>calendar</code> table (whose <code>DefaultGroups</code> is <code>adminsGroup</code></p>
-<ul>
-<li>admin-only by default) or to the fabricated reference ID, yet the generic route unconditionally
-upgrades the connection for him. Any real row's <code>typename.referenceId.columnName</code> - reference IDs
-routinely appear in ordinary list/read API responses even when the sensitive column itself is
-restricted - is enough to pull that column's actual content through this side channel, fully
-bypassing the row/column permission system that the sibling <code>/live/...</code> route (and the rest of
-Daptin's permission model) correctly enforces.</li>
-</ul>
-<h3 id="impact">Impact</h3>
-<ul>
-<li><strong>Confidentiality:</strong> any signed-up user, including a brand-new self-registered account with no
-group memberships, can read the live content of any <code>file.*</code>-typed column on any row of any
-table - including tables that are admin-only by default (e.g. <code>calendar</code>) and rows whose
-row-level permissions would otherwise block that user - by supplying the right
-<code>typename.referenceId.columnName</code> triple to <code>GET /yjs/:documentName</code>.</li>
-<li><strong>Integrity:</strong> because YJS sync is bidirectional CRDT replication, the same low-privileged
-connection can push edits into the shared document; those edits are visible to any legitimate
-collaborator who later opens the same document through the correctly-secured <code>/live/...</code> route.</li>
-<li><strong>Who is impacted:</strong> every Daptin deployment with at least one <code>file.*</code>-typed column (built-in
-examples: <code>calendar.content</code> (<code>file.ical</code>), the generic document table's <code>document_content</code>
-(<code>file.*</code>), and any custom table an admin defines with a <code>file.xxx</code> column type), since the
-vulnerable route is registered generically for every such column across every table at startup.
-Any user able to self-register (open signup is the default) is sufficient to exploit this.</li>
-</ul>
-<h3 id="resolution">Resolution</h3>
-<p>Fixed on the default branch in daptin/daptin@a1a3c48f. Canonical database-backed YJS rooms now use the same row lookup and existing PermissionInstance.CanUpdate/CanRead authorization for both /yjs/:documentName and /live/... routes. Update permission grants read-write access; read-only permission grants a read-only YJS session; unauthorized and missing resources fail closed with 404. Standalone non-canonical room names retain their existing authenticated, shared-by-name behavior. The initial-content provider now validates the exact canonical form, UUID, table, and file.* column before database access.</p>
-<p>Read-only protocol enforcement is provided by artpar/ydb v0.4.1 (artpar/ydb@b79b01a), which fully consumes but drops all client YJS sync write subtypes while continuing to deliver history and broadcasts.</p>
-<p>Verification included YDB race tests for all sync subtypes, concatenated-frame handling, persistence/broadcast suppression, catch-up, and connection continuity; Daptin permission/parser unit tests; the full Daptin test suite; server race tests; go vet; and a fresh-instance CLI/WebSocket exercise covering authentication, fail-closed canonical routes, standalone compatibility, and canonical/live cross-route relay.</p>
-<p>No patched Daptin version is listed until a release containing a1a3c48f is published.</p>
-<h3 id="references">References</h3>
-<ul>
-<li><a href="https://github.com/daptin/daptin/security/advisories/GHSA-wj7x-58c2-5793">https://github.com/daptin/daptin/security/advisories/GHSA-wj7x-58c2-5793</a></li>
-<li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-77369">https://nvd.nist.gov/vuln/detail/CVE-2026-77369</a></li>
-<li><a href="https://github.com/daptin/daptin/commit/a1a3c48f88ce30632a57d3fe6a971033b23bd394">https://github.com/daptin/daptin/commit/a1a3c48f88ce30632a57d3fe6a971033b23bd394</a></li>
-<li><a href="https://github.com/daptin/daptin/releases/tag/v0.12.30">https://github.com/daptin/daptin/releases/tag/v0.12.30</a></li>
-<li><a href="https://github.com/advisories/GHSA-wj7x-58c2-5793">https://github.com/advisories/GHSA-wj7x-58c2-5793</a></li>
-</ul>
-]]></content>
-        <author>
-            <name>GitHub</name>
-            <email>GitHub@noreply.github.com</email>
-            <uri>https://github.com/advisories/GHSA-wj7x-58c2-5793</uri>
-        </author>
-        <category label="severity" term="CRITICAL"/>
-        <published>2026-11-20T00:14:14.000Z</published>
     </entry>
 </feed>
